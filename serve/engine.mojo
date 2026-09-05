@@ -494,6 +494,12 @@ def main() raises:
     # reduce / argmax / accept-sync buckets; "other" is the leftover
     # tokcp/bookkeeping dispatch cost inside pf_proc+pf_draft.
     var pf3 = getenv("BARO_PROFILE", "0") == "3"
+    # BARO_PROFILE=4: same idea as 2, on the ffn sub-block -- rmsnorm / gate
+    # gemm / up gemm / swiglu / down gemm / residual add. Serialized, so the
+    # stage sum exceeds the unsynchronized sub-block time; compare stages
+    # within an arm and the same stage across m, never add these into a budget.
+    var pf4 = getenv("BARO_PROFILE", "0") == "4"
+    var fc = [0, 0, 0, 0, 0, 0]
     var p3: List[Int] = [0, 0, 0, 0]
     var n_spec_windows = 0
     var pc = [0, 0, 0, 0, 0, 0, 0, 0]
@@ -707,10 +713,18 @@ def main() raises:
                 tp = now
                 tq = now
             # -- ffn sub-block --
+            if pf4:
+                ctx.synchronize()
+                tq = perf_counter_ns()
             ctx.enqueue_function[rmsc_k](
                 Xm, tens_f32(ctx, wbuf, off[w], H, h_layout), CurBm,
                 Int32(H), Float32(1e-6), grid_dim=m, block_dim=256,
             )
+            if pf4:
+                ctx.synchronize()
+                var nw = perf_counter_ns()
+                fc[0] += Int(nw - tq)
+                tq = nw
             var Wfgq = tens_q8q(ctx, wbuf, off[w + 1], H * FFN, q_h_ffn)
             var Wfgs = tens_q8s(ctx, wbuf, off[w + 1], H * FFN, s_h_ffn)
             var Wfuq = tens_q8q(ctx, wbuf, off[w + 2], H * FFN, q_h_ffn)
@@ -722,10 +736,35 @@ def main() raises:
             var Ph2 = TileTensor(p_h_d, p_h)
             var FgBm = TileTensor(fgb_d, ffnm_layout)
             gemm_q8(ctx, CurBm, Wfgq, Wfgs, Pg, m, FFN, H)
+            if pf4:
+                ctx.synchronize()
+                var nw = perf_counter_ns()
+                fc[1] += Int(nw - tq)
+                tq = nw
             gemm_q8(ctx, CurBm, Wfuq, Wfus, Pu, m, FFN, H)
+            if pf4:
+                ctx.synchronize()
+                var nw = perf_counter_ns()
+                fc[2] += Int(nw - tq)
+                tq = nw
             ctx.enqueue_function[r_swiglu](Pg, Pu, FgBm, Int32(m), Int32(FFN), grid_dim=ceildiv(m * FFN, 256), block_dim=256)
+            if pf4:
+                ctx.synchronize()
+                var nw = perf_counter_ns()
+                fc[3] += Int(nw - tq)
+                tq = nw
             gemm_q8(ctx, FgBm, Wfdq, Wfds, Ph2, m, H, FFN)
+            if pf4:
+                ctx.synchronize()
+                var nw = perf_counter_ns()
+                fc[4] += Int(nw - tq)
+                tq = nw
             ctx.enqueue_function[r_add](Ph2, Xm, Int32(m), Int32(H), grid_dim=ceildiv(m * H, 256), block_dim=256)
+            if pf4:
+                ctx.synchronize()
+                var nw = perf_counter_ns()
+                fc[5] += Int(nw - tq)
+                tq = nw
             w += 4
             if prof:
                 ctx.synchronize()
@@ -818,6 +857,11 @@ def main() raises:
                 " argmax", Float64(p3[2]) / 1e6 / nw, " accept", Float64(p3[3]) / 1e6 / nw,
                 " other", Float64(other) / 1e6 / nw,
             )
+    if pf4:
+        var fnames = ["rmsnorm", "gemm_gate", "gemm_up", "swiglu", "gemm_down", "r_add"]
+        var ft = Float64(fc[0] + fc[1] + fc[2] + fc[3] + fc[4] + fc[5])
+        for i in range(6):
+            print("ffn-kernel:", fnames[i], Float64(fc[i]) / 1e9, Float64(fc[i]) / ft)
     if pf2:
         var names = ["gemm4+reduce2", "rgates", "conv", "l2", "delta", "gated", "out_gemm+add", "-"]
         var st = Float64(pc[0] + pc[1] + pc[2] + pc[3] + pc[4] + pc[5] + pc[6])

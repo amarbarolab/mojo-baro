@@ -139,3 +139,35 @@ draft LM head (1.06 GB q8 read per drafted token) is 63% of the draft path.
 | M4 q4 draft head (`bench/draft-q4-protocol.md`) | draft path 2.4 -> <= 1.7 ms/window; real-prompt k=2 median 100.7 -> **108-115**; acceptance within 3 points of q8 draft | >= 106 AND acceptance >= 66% |
 | falsifier M1b | m=4 > 1.3x: int8 dot path does not beat fp32 FMA on this card; stop | |
 | falsifier M4 | acceptance drops > 5 points: q4 draft too lossy, try q6/q5 pack before giving up | |
+
+## Item 2 diagnosis — ffn stage split, frozen before the run (2026-09-05)
+
+Milestone item 2 asks where the +0.93 ms/window the ffn sub-block costs at m=2
+goes, given the q8row GEMM's own row-scaling ratio is only 1.04x. Item 1
+already removed the SSM from suspicion (1.15x/window for twice the rows,
+`bench/ssm-mrow-protocol.md`).
+
+Instrument: new `BARO_PROFILE=4` in `serve/engine.mojo`, the exact shape of the
+existing `BARO_PROFILE=2` SSM split, over the six ffn stages: `rmsnorm`,
+`gemm_gate`, `gemm_up`, `swiglu`, `gemm_down`, `r_add`. Serialized by
+`ctx.synchronize()`, so stage sums exceed the true sub-block time and no
+`tok/s` from a profile-4 run may be quoted. Arms: A `BARO_SPEC=0` (m=1, 63
+windows), B `BARO_SPEC=1 BARO_SPEC_K=1` (m=2, 32 windows), 3 runs each, first
+dropped, median of 2, spread gate <5%.
+
+Predictions, frozen before the run:
+
+1. The three `gemm_*` stages have B/A <= 1.15 each. They are weight-bound and
+   the weights are read once per window regardless of m.
+2. `swiglu` has B/A >= 1.7. Its grid is `ceildiv(m * FFN, 256)`, so m=2 doubles
+   both the element count and the P-buffer traffic (2 x m x 12288 f32 read,
+   m x 12288 bf16 written).
+3. The largest single absolute increase (ms/window) comes from `swiglu`, not
+   from any GEMM.
+4. `rmsnorm` and `r_add` together add < 0.10 ms/window.
+
+If prediction 3 holds, item 2's fix is a fused swiglu that consumes the two
+split-K partials directly instead of round-tripping `Pg`/`Pu` through memory,
+and the ceiling stays 115-120. If instead the GEMMs carry the increase, the
+1.04x kernel-level row scaling measured in M0 does not survive in the engine
+and item 2 is re-scoped to that discrepancy before any kernel is written.
