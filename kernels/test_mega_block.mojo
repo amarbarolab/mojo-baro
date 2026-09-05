@@ -18,7 +18,8 @@ from elementwise import amar_rmsnorm_cast
 from matmul_skinny import amar_matmul_skinny_q8row, amar_skinny_reduce, amar_skinny_reduce_add, amar_skinny_reduce_swiglu_bf16, ROW_WAVES, ROW_THREADS, SM, SPLITK
 from ssm import amar_ssm_reduce_gates, amar_ssm_conv, amar_ssm_qk_l2norm, amar_ssm_delta_step, amar_ssm_gated_out_bf16, CONV, NH_V, SSTATE
 from attn import amar_head_rmsnorm, amar_attn_decode, amar_gate_mul_cast, amar_qgate_split, amar_rope_yarn, amar_kv_append, HD, NQH, NKVH
-from mega import amar_mega_token, MEGA_G, H, FFN, QF, KV
+from mega import amar_mega_token, MEGA_G, H, FFN, QF, KV, VOCAB
+from elementwise import amar_argmax_pos
 
 comptime NL = 4
 comptime N_SSM_T = 3
@@ -55,6 +56,11 @@ comptime cache_layout = row_major[NKVH, TM, HD]()
 comptime ffnm_layout = row_major[1, FFN]()
 comptime ffn1_layout = row_major[1, FFN]()
 comptime ctr_layout = row_major[3]()
+comptime toks_layout = row_major[64]()
+comptime q_h_v = row_major[VOCAB, H]()
+comptime s_h_v = row_major[VOCAB, H // 32]()
+comptime p_v = row_major[SPLITK, SM, VOCAB]()
+comptime vm_layout = row_major[1, VOCAB]()
 comptime q_h_qf = row_major[QF, H]()
 comptime s_h_qf = row_major[QF, H // 32]()
 comptime q_h_h = row_major[H, H]()
@@ -102,13 +108,16 @@ comptime rope_q = amar_rope_yarn[type_of(qm_layout)]
 comptime rope_k = amar_rope_yarn[type_of(kvm_layout)]
 comptime append_k = amar_kv_append[type_of(cache_layout), type_of(kvm_layout)]
 comptime att_k = amar_attn_decode[type_of(qm_layout), type_of(cache_layout), type_of(qm_layout)]
+comptime g_head = amar_matmul_skinny_q8row[4, 1, XL, type_of(q_h_v), type_of(s_h_v), type_of(p_v)]
+comptime r_head = amar_skinny_reduce[type_of(p_v), type_of(vm_layout), 1]
+comptime argmax_k = amar_argmax_pos[type_of(vm_layout), type_of(toks_layout)]
 comptime gmul_k = amar_gate_mul_cast[type_of(xflat_layout), type_of(xflat_layout), type_of(xflat_layout)]
 comptime mega_k = amar_mega_token[
     XL, XL,
     type_of(convm_layout), type_of(g32m_layout), type_of(convm_layout), type_of(om_layout),
     type_of(csall_layout), type_of(ssall_layout),
     type_of(qfm_layout), type_of(kvm_flat), type_of(qm_layout), type_of(xflat_layout),
-    type_of(ffn1_layout), type_of(ffnm_layout), type_of(row_major[64]()), type_of(ctr_layout),
+    type_of(ffn1_layout), type_of(ffnm_layout), type_of(row_major[64]()), type_of(ctr_layout), type_of(toks_layout),
     TM, NL,
 ]
 
@@ -244,6 +253,9 @@ def main() raises:
         add(1, FFN, H)
         add(1, FFN, H)
         add(1, H, FFN)
+    add(0, H, 0)
+    add(1, VOCAB, H)
+    var w_head = len(off) - 2
     print("synthetic pack:", cursor, "bytes,", len(off), "entries")
 
     var wh = ctx.enqueue_create_host_buffer[u8](cursor)
@@ -315,6 +327,14 @@ def main() raises:
     var p_ffn_d = ctx.enqueue_create_buffer[f32](SPLITK * SM * FFN)
     var p_ffn2_d = ctx.enqueue_create_buffer[f32](SPLITK * SM * FFN)
     var ctr_d = ctx.enqueue_create_buffer[u32](3)
+    var toksL_d = ctx.enqueue_create_buffer[DType.int32](64)
+    var toksM_d = ctx.enqueue_create_buffer[DType.int32](64)
+    var hmax_d = ctx.enqueue_create_buffer[f32](MEGA_G)
+    var hidx_d = ctx.enqueue_create_buffer[DType.int32](MEGA_G)
+    var p_v_d = ctx.enqueue_create_buffer[f32](SPLITK * SM * VOCAB)
+    var logits_d = ctx.enqueue_create_buffer[f32](VOCAB)
+    ctx.enqueue_memset(toksL_d, 0)
+    ctx.enqueue_memset(toksM_d, 0)
     var prof_d = ctx.enqueue_create_buffer[i64](16 * NL + 4)
     var dbg_d = ctx.enqueue_create_buffer[f32](2 * NL * H)
     ctx.enqueue_memset(prof_d, 0)
@@ -359,6 +379,10 @@ def main() raises:
     var Pg1 = TileTensor(p_ffn_d, ffn1_layout)
     var Pu1 = TileTensor(p_ffn2_d, ffn1_layout)
     var Ctr = TileTensor(ctr_d, ctr_layout)
+    var ToksL = TileTensor(toksL_d, toks_layout)
+    var ToksM = TileTensor(toksM_d, toks_layout)
+    var Pv = TileTensor(p_v_d, p_v)
+    var Logits = TileTensor(logits_d, vm_layout)
     var Off = TileTensor(offd, row_major[64]())
     var XL_ = TileTensor(xL, xm_layout)
     var XM_ = TileTensor(xM, xm_layout)
@@ -417,13 +441,18 @@ def main() raises:
             ctx.enqueue_function[g_down](FgB, tq(ctx, wbuf, off[w + 3], H * FFN, q_ffn_h), ts(ctx, wbuf, off[w + 3], H * FFN, s_ffn_h), Ph, Int32(1), Int32(H), Int32(FFN), grid_dim=ceildiv(H, ROW_WAVES), block_dim=ROW_THREADS)
             ctx.enqueue_function[r_add](Ph, XL_, Int32(1), Int32(H), grid_dim=ceildiv(H, 256), block_dim=256)
             w += 4
+        ctx.enqueue_function[rmsc_k](XL_, tf(ctx, wbuf, off[w], H, h_layout), CurB, Int32(H), Float32(1e-6), grid_dim=1, block_dim=256)
+        ctx.enqueue_function[g_head](CurB, tq(ctx, wbuf, off[w + 1], VOCAB * H, q_h_v), ts(ctx, wbuf, off[w + 1], VOCAB * H, s_h_v), Pv, Int32(1), Int32(VOCAB), Int32(H), grid_dim=ceildiv(VOCAB, ROW_WAVES), block_dim=ROW_THREADS)
+        ctx.enqueue_function[r_head](Pv, Logits, Int32(1), Int32(VOCAB), grid_dim=ceildiv(VOCAB, 256), block_dim=256)
+        ctx.enqueue_function[argmax_k](Logits, ToksL, Int32(VOCAB), Int32(POS + 1), grid_dim=1, block_dim=256)
 
     @parameter
     def mega_path(ring: Int) raises:
         ctx.enqueue_function[mega_k](
             wbuf.unsafe_ptr(), Off, XM_, CurB, ResB, Qkvm, Zm, Araw, Braw, Eg, Beta, Conv, So, CsM, SsM,
             Qfm, Kflat, Vflat, Q, Gate, Ao, kcM.unsafe_ptr(), vcM.unsafe_ptr(), Pg1, Pu1, FgB, Ctr, prof_d.unsafe_ptr(), dbg_d.unsafe_ptr(),
-            Int32(ring), Int32(SLOTS), Int32(POS), Int32(0), grid_dim=MEGA_G, block_dim=ROW_THREADS,
+            ToksM, hmax_d.unsafe_ptr(), hidx_d.unsafe_ptr(),
+            Int32(ring), Int32(SLOTS), Int32(POS), Int32(0), Int32(1), grid_dim=MEGA_G, block_dim=ROW_THREADS,
         )
 
     launch_path(0)
@@ -441,10 +470,18 @@ def main() raises:
     bad += diff(ctx, "ssm states", ssL, ssM, NSS)
     bad += diff(ctx, "K cache", kcL, kcM, NKC)
     bad += diff(ctx, "V cache", vcL, vcM, NKC)
+    var tl = ctx.enqueue_create_host_buffer[DType.int32](64)
+    var tm = ctx.enqueue_create_host_buffer[DType.int32](64)
+    ctx.enqueue_copy(dst_buf=tl, src_buf=toksL_d)
+    ctx.enqueue_copy(dst_buf=tm, src_buf=toksM_d)
+    ctx.synchronize()
+    print("argmax token: launch", tl[POS + 1], " mega", tm[POS + 1])
+    if tl[POS + 1] != tm[POS + 1]:
+        bad += 1
     if bad != 0:
         print("FAIL: megakernel token differs from launch path")
         return
-    print("PASS: per-token megakernel (4 layers: ssm,ssm,ssm,attn + ffn) bit-identical to the launch path (m=1)")
+    print("PASS: per-token megakernel (4 layers: ssm,ssm,ssm,attn + ffn + head) bit-identical to the launch path (m=1)")
 
     for it in range(10):
         launch_path(it % SLOTS)
@@ -479,6 +516,8 @@ def main() raises:
         line += " tail " + String(Float64(ph[16 * layer + 11] - ph[16 * layer + 10]) / 100.0)
         if (layer + 1) % 4 != 0:
             line += " | pre-rmsc " + String(Float64(ph[16 * layer + 12] - ph[16 * layer]) / 100.0)
+        if layer == NL - 1:
+            line += " | head: rmsc " + String(Float64(ph[16 * NL + 1] - ph[16 * NL]) / 100.0) + " gemm+argmax " + String(Float64(ph[16 * NL + 2] - ph[16 * NL + 1]) / 100.0) + " final " + String(Float64(ph[16 * NL + 3] - ph[16 * NL + 2]) / 100.0)
         line += " | sub " + String(Float64(ph[16 * layer + 7] - ph[16 * layer]) / 100.0) + " ffn " + String(Float64(ph[16 * layer + 11] - ph[16 * layer + 7]) / 100.0)
         print(line)
     print("4-layer us/token: launch=", us_launch, " mega(G=", MEGA_G, ")=", us_mega, " ratio=", us_mega / us_launch, " fail=", flag[2])

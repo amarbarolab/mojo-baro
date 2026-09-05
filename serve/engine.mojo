@@ -498,6 +498,8 @@ def main() raises:
     ctx.enqueue_memset(ctr_d, 0)
     ctx.enqueue_memset(prof_d, 0)
     var dbg_d = ctx.enqueue_create_buffer[f32](2 * N_LAYERS * H)
+    var hmax_d = ctx.enqueue_create_buffer[f32](MEGA_G)
+    var hidx_d = ctx.enqueue_create_buffer[DType.int32](MEGA_G)
     var dump_h = ctx.enqueue_create_host_buffer[f32](GEN_N * 2 * N_LAYERS * H)
     var n_dumped = 0
     ctx.synchronize()
@@ -630,7 +632,8 @@ def main() raises:
                 kc_d.unsafe_ptr(), vc_d.unsafe_ptr(),
                 TileTensor(p_ffn_d, c_ffn), TileTensor(p_ffn2_d, c_ffn), TileTensor(fgb_d, ffnm_layout),
                 TileTensor(ctr_d, ctr_layout), prof_d.unsafe_ptr(), dbg_d.unsafe_ptr(),
-                Int32(ring), Int32(SLOTS), Int32(pos), Int32(1 if dump else 0), grid_dim=MEGA_G, block_dim=ROW_THREADS,
+                Toks, hmax_d.unsafe_ptr(), hidx_d.unsafe_ptr(),
+                Int32(ring), Int32(SLOTS), Int32(pos), Int32(1 if dump else 0), Int32(1), grid_dim=MEGA_G, block_dim=ROW_THREADS,
             )
         for layer in range(0 if use_mega else N_LAYERS):
             if prof:
@@ -876,20 +879,24 @@ def main() raises:
         # f32 copy of the post-final-norm hidden state (pre-LM-head): row r is
         # h(pos + r), what the MTP draft head pairs with token pos + r + 1.
         var Hnm = TileTensor(hn_d, xm_layout)
-        ctx.enqueue_function[rms_m](
-            Xm, tens_f32(ctx, wbuf, off[w], H, h_layout), Hnm,
-            Int32(H), Float32(1e-6), grid_dim=m, block_dim=256,
-        )
-        if pos + m >= len(prompt):
-            ctx.enqueue_function[rmsc_k](
-                Xm, tens_f32(ctx, wbuf, off[w], H, h_layout), CurBm,
+        if not use_mega:
+            ctx.enqueue_function[rms_m](
+                Xm, tens_f32(ctx, wbuf, off[w], H, h_layout), Hnm,
                 Int32(H), Float32(1e-6), grid_dim=m, block_dim=256,
             )
-            var Wheadq = tens_q8q(ctx, wbuf, off[w + 1], H * VOCAB, q_h_v)
-            var Wheads = tens_q8s(ctx, wbuf, off[w + 1], H * VOCAB, s_h_v)
-            gemm_q8(ctx, CurBm, Wheadq, Wheads, Pv, m, VOCAB, H)
-            ctx.enqueue_function[r_head](Pv, Logitsm, Int32(m), Int32(VOCAB), grid_dim=ceildiv(m * VOCAB, 256), block_dim=256)
-            if win_spec:
+        if pos + m >= len(prompt):
+            if not use_mega:
+                ctx.enqueue_function[rmsc_k](
+                    Xm, tens_f32(ctx, wbuf, off[w], H, h_layout), CurBm,
+                    Int32(H), Float32(1e-6), grid_dim=m, block_dim=256,
+                )
+                var Wheadq = tens_q8q(ctx, wbuf, off[w + 1], H * VOCAB, q_h_v)
+                var Wheads = tens_q8s(ctx, wbuf, off[w + 1], H * VOCAB, s_h_v)
+                gemm_q8(ctx, CurBm, Wheadq, Wheads, Pv, m, VOCAB, H)
+                ctx.enqueue_function[r_head](Pv, Logitsm, Int32(m), Int32(VOCAB), grid_dim=ceildiv(m * VOCAB, 256), block_dim=256)
+            if use_mega:
+                pass
+            elif win_spec:
                 var Dtok = TileTensor(dtok_d, dtok_layout)
                 ctx.enqueue_function[argmax_d](Logitsm, Dtok, Int32(VOCAB), Int32(0), grid_dim=m, block_dim=256)
                 var t_acc = 0
@@ -956,7 +963,8 @@ def main() raises:
             else:
                 sub_ssm += a
             ffn_us += b
-        print("mega profile (last token, us): ssm sub-blocks", sub_ssm, " attn sub-blocks", sub_att, " ffn", ffn_us, " total", Float64(ph[16 * (N_LAYERS - 1) + 11] - ph[0]) / 100.0, " fail", fl[2])
+        var head_us = Float64(ph[16 * N_LAYERS + 3] - ph[16 * N_LAYERS]) / 100.0
+        print("mega profile (last token, us): ssm sub-blocks", sub_ssm, " attn sub-blocks", sub_att, " ffn", ffn_us, " head", head_us, " total", Float64(ph[16 * N_LAYERS + 3] - ph[0]) / 100.0, " fail", fl[2])
     if prof:
         var tot = Float64(pf_att + pf_ssm + pf_ffn + pf_head)
         print("profile: attn", Float64(pf_att) / 1e9, Float64(pf_att) / tot)

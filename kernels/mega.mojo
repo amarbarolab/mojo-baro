@@ -30,6 +30,8 @@ comptime FFN = 12288
 comptime QF = 2 * H
 comptime KV = NKVH * HD
 comptime N_LAYERS = 32
+comptime VOCAB = 248320
+comptime i32 = DType.int32
 comptime ATT_SCALE = Float32(0.0625)
 comptime RMS_EPS = Float32(1e-6)
 comptime q_h_qf = row_major[QF, H]()
@@ -697,7 +699,7 @@ def amar_mega_token[
     QkvL: TensorLayout, G32mL: TensorLayout, ConvL: TensorLayout, OmL: TensorLayout,
     CsL: TensorLayout, SsL: TensorLayout,
     QfL: TensorLayout, KvfL: TensorLayout, QmL: TensorLayout, GfL: TensorLayout,
-    PfL: TensorLayout, FbL: TensorLayout, OffL: TensorLayout, CtrL: TensorLayout,
+    PfL: TensorLayout, FbL: TensorLayout, OffL: TensorLayout, CtrL: TensorLayout, TkL: TensorLayout,
     TM: Int, NL: Int,
 ](
     wbuf: MutPointer[Scalar[u8], MutAnyOrigin],
@@ -729,9 +731,12 @@ def amar_mega_token[
     Ctr: TileTensor[u32, CtrL, MutAnyOrigin],
     prof: MutPointer[Scalar[i64], MutAnyOrigin],
     dbg: MutPointer[Scalar[f32], MutAnyOrigin],
-    ring: Int32, slots: Int32, pos: Int32, dump: Int32,
+    Toks: TileTensor[i32, TkL, MutAnyOrigin],
+    hmax: MutPointer[Scalar[f32], MutAnyOrigin],
+    hidx: MutPointer[Scalar[i32], MutAnyOrigin],
+    ring: Int32, slots: Int32, pos: Int32, dump: Int32, fold_head: Int32,
 ):
-    comptime assert off.flat_rank == 1
+    comptime assert off.flat_rank == 1 and Toks.flat_rank == 1
     var X_ = X
     var CurB_ = CurB
     var ResB_ = ResB
@@ -843,3 +848,63 @@ def amar_mega_token[
             while i < H:
                 dbg[(2 * layer + 1) * H + i] = rebind[Scalar[f32]](X_[0, i])
                 i += ROW_THREADS
+    if fold_head == 0:
+        return
+    stamp(prof, 16 * NL)
+    var Toks_ = Toks
+    var ctrh = Ctr_.ptr
+    var genh = Ctr_.ptr.unsafe_offset(1)
+    var ho0 = Int(rebind[Scalar[i64]](off[w]))
+    var ho1 = Int(rebind[Scalar[i64]](off[w + 1]))
+    rmsc_phase(X_, wf[H](wbuf, ho0), CurB_)
+    if not grid_barrier(ctrh, genh, fail):
+        return
+    stamp(prof, 16 * NL + 1)
+    var Whq = wq[VOCAB, H](wbuf, ho1)
+    var Whs = ws[VOCAB, H](wbuf, ho1)
+    var tid = Int(thread_idx.x)
+    var lane = Int(lane_id())
+    var wave = tid // WARP_SIZE
+    var bid = Int(block_idx.x)
+    var nblk = Int(grid_dim.x)
+    var bv = Float32(-3.4e38)
+    var bi: Int32 = 0
+    var g = bid
+    while g < VOCAB // ROW_WAVES:
+        var row = g * ROW_WAVES + wave
+        var t = q8_row_dot(CurB_, Whq, Whs, row, lane, H)
+        if t > bv or (t == bv and Int32(row) < bi):
+            bv = t
+            bi = Int32(row)
+        g += nblk
+    var wv = stack_allocation[f32, address_space = AddressSpace.SHARED](row_major[ROW_WAVES]())
+    var wi = stack_allocation[i32, address_space = AddressSpace.SHARED](row_major[ROW_WAVES]())
+    if lane == 0:
+        wv[wave] = rebind[wv.ElementType](bv)
+        wi[wave] = rebind[wi.ElementType](bi)
+    barrier()
+    if tid == 0:
+        var pv = Float32(-3.4e38)
+        var pi: Int32 = 0
+        comptime for k in range(ROW_WAVES):
+            var v = rebind[Scalar[f32]](wv[k])
+            var ix = rebind[Scalar[i32]](wi[k])
+            if v > pv or (v == pv and ix < pi):
+                pv = v
+                pi = ix
+        hmax[bid] = pv
+        hidx[bid] = pi
+    if not grid_barrier(ctrh, genh, fail):
+        return
+    stamp(prof, 16 * NL + 2)
+    if bid == 0 and tid == 0:
+        var fv = Float32(-3.4e38)
+        var fi: Int32 = 0
+        for k in range(nblk):
+            var v = hmax[k]
+            var ix = hidx[k]
+            if v > fv or (v == fv and ix < fi):
+                fv = v
+                fi = ix
+        Toks_[p + 1] = rebind[Toks_.ElementType](fi)
+    stamp(prof, 16 * NL + 3)
