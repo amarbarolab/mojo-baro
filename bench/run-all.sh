@@ -14,7 +14,7 @@ sec "bench/run.py fp32 512^3"; ./bench/run.py 2>&1 | grep -viE crashpad | tail -
 sec "fp16 WMMA pipe ours 512/2048/4096"; bench/fp16-sizes.sh bench/bench_fp16_pipe.mojo pipe 512 2048 4096 2>&1 | grep '^{'
 sec "hipBLASLt fp16 512/2048/4096"; bench/fp16-sizes.sh bench/bench_fp16_lt.mojo lt 512 2048 4096 2>&1 | grep '^{'
 sec "kernel parity tests"
-for t in test_elementwise test_ssm_block test_attn_block test_q8_gemm test_gguf_gemm; do
+for t in test_elementwise test_ssm_block test_attn_block test_q8_gemm test_gguf_gemm test_ternary_gemm; do
   echo "--- $t"; ./.venv/bin/mojo build kernels/$t.mojo -o .work/$t $L 2>&1 | grep -E "error" -A3 | head -6; ./.work/$t 2>&1 | grep -viE crashpad | tail -4
 done
 sec "engine: repo build vs closure build, interleaved x3"
