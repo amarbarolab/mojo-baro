@@ -63,15 +63,34 @@ def identities():
     return rows
 
 
-def slice_region(engine_src, region):
+def bindings(src_dir):
+    # The comptime aliases moved out of engine.mojo into registry.mojo (9b8a399);
+    # engine.mojo's `# --- kernel bindings` block is now empty, so slicing it fed
+    # the proposer nothing and iteration 001's whole candidate set invented
+    # symbol names. Emit the real alias table instead, from wherever it lives.
+    txt = ""
+    for f in ("registry.mojo", "engine.mojo"):
+        p = src_dir / f
+        if not p.exists():
+            continue
+        rows = re.findall(r"^comptime (\w+) = (amar_\w+)", p.read_text(), re.M)
+        if rows:
+            txt += (f"\nkernel bindings defined in {f} -- these names, and ONLY these, "
+                    f"are callable as ctx.enqueue_function[<name>]:\n"
+                    + "\n".join(f"  {n} = {k}" for n, k in rows) + "\n")
+    return txt
+
+
+def slice_region(engine_src, region, src_dir):
     a, b = MARK[region]
     lines = engine_src.splitlines()
     ia = next(i for i, l in enumerate(lines) if a in l)
     ib = next(i for i, l in enumerate(lines) if b in l and i > ia)
-    ka = next(i for i, l in enumerate(lines) if "# --- kernel bindings" in l)
-    kb = next(i for i, l in enumerate(lines) if "# --- decode loop" in l)
-    return (f"engine.mojo lines {ka+1}-{kb} (kernel bindings):\n" + "\n".join(lines[ka:kb]) +
-            f"\n\nengine.mojo lines {ia+1}-{ib} (target region `{region}`):\n" + "\n".join(lines[ia:ib]))
+    tbl = bindings(src_dir)
+    if not tbl.strip():
+        raise SystemExit("loop-propose: no kernel binding table found; refusing to prompt blind")
+    return (tbl + f"\nengine.mojo lines {ia+1}-{ib} (target region `{region}`):\n"
+            + "\n".join(lines[ia:ib]))
 
 
 def profile_shares(path):
@@ -123,7 +142,7 @@ def main():
     prompt = (f"Engine source commit in this gguf: {meta['baro.kernel.commit']}\n"
               f"GPU time per decode run, by sub-block (BARO_PROFILE=1):\n{prof_txt}\n"
               f"Target region: `{region}` (largest share).\n\n"
-              + slice_region((out / "src/engine.mojo").read_text(), region))
+              + slice_region((out / "src/engine.mojo").read_text(), region, out / "src"))
     # Tag-delimited, deliberately NOT diff-shaped: the old `===== f =====` banner
     # taught iter-001 cand-2 to answer in banners instead of a unified diff, and
     # the gate discarded it unparsed (receipt: parse / "no diff fence").
