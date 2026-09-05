@@ -14,7 +14,8 @@ comptime M = 512
 comptime N = 512
 comptime K = 512
 comptime ITERS = 200
-comptime WARMUP_SECONDS = 10.0
+comptime WARMUP_SECONDS = 3.0
+comptime MEASURE_SECONDS = 2.0
 comptime OPB = 0
 
 
@@ -72,13 +73,19 @@ def main() raises:
                 baro.gemm_f16(M, N, K, pa, pb, pc)
         baro.sync()
     var t0 = perf_counter_ns()
-    for _ in range(ITERS):
-        comptime if OPB == 1:
-            baro.gemm_f16_nt(M, N, K, pa, pb, pc)
-        else:
-            baro.gemm_f16(M, N, K, pa, pb, pc)
-    baro.sync()
-    var ms = Float64(perf_counter_ns() - t0) / 1.0e6 / Float64(ITERS)
+    var n_iters = 0
+    while True:
+        for _ in range(ITERS):
+            comptime if OPB == 1:
+                baro.gemm_f16_nt(M, N, K, pa, pb, pc)
+            else:
+                baro.gemm_f16(M, N, K, pa, pb, pc)
+        baro.sync()
+        n_iters += ITERS
+        if Float64(perf_counter_ns() - t0) / 1.0e9 >= MEASURE_SECONDS:
+            break
+    var measured_s = Float64(perf_counter_ns() - t0) / 1.0e9
+    var ms = measured_s * 1.0e3 / Float64(n_iters)
     ctx.enqueue_copy(dst_buf=ch, src_buf=cd)
     ctx.synchronize()
     var err = check(ah, bh, ch)
@@ -92,6 +99,6 @@ def main() raises:
     out += '"algo_chosen": ' + String(external_call["amarbaro_algo_chosen", Int32](baro._ctx)) + ", "
     out += '"splitk": ' + String(external_call["amarbaro_splitk", Int32](baro._ctx)) + ", "
     out += '"wgm": ' + String(external_call["amarbaro_wgm", Int32](baro._ctx)) + ", "
-    out += '"iters": ' + String(ITERS) + ', "warmup_s": ' + String(WARMUP_SECONDS) + ', "opb": ' + String(OPB) + ', '
+    out += '"iters": ' + String(n_iters) + ', "measured_s": ' + String(measured_s) + ', "warmup_s": ' + String(WARMUP_SECONDS) + ', "opb": ' + String(OPB) + ', '
     out += '"dtype": "float16", "c_dtype": "float16", "gate": "err<=1.0: fp16 C, |sum|<=4096 has ulp 2"}'
     print(out)

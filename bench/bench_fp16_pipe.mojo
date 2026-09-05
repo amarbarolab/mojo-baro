@@ -16,8 +16,9 @@ from matmul_wmma_pipe import amar_matmul_wmma_pipe, BLK_M, BLK_N, BLK_K, NTHREAD
 comptime M = 512
 comptime N = 512
 comptime K = 512
-comptime ITERS = 2000
+comptime ITERS = 200
 comptime WARMUP_SECONDS = 3.0
+comptime MEASURE_SECONDS = 2.0
 
 comptime a_layout = row_major[M, K]()
 comptime b_layout = row_major[N, K]() if TB == 1 else row_major[K, N]()
@@ -102,12 +103,18 @@ def main() raises:
         ctx.synchronize()
 
     var t0 = perf_counter_ns()
-    for _ in range(ITERS):
-        ctx.enqueue_function[kernel](
-            A, B, C, Int32(M), Int32(N), Int32(K), grid_dim=GRID, block_dim=NT
-        )
-    ctx.synchronize()
-    var ms = Float64(perf_counter_ns() - t0) / 1.0e6 / Float64(ITERS)
+    var n_iters = 0
+    while True:
+        for _ in range(ITERS):
+            ctx.enqueue_function[kernel](
+                A, B, C, Int32(M), Int32(N), Int32(K), grid_dim=GRID, block_dim=NT
+            )
+        ctx.synchronize()
+        n_iters += ITERS
+        if Float64(perf_counter_ns() - t0) / 1.0e9 >= MEASURE_SECONDS:
+            break
+    var measured_s = Float64(perf_counter_ns() - t0) / 1.0e9
+    var ms = measured_s * 1.0e3 / Float64(n_iters)
 
     ctx.enqueue_copy(dst_buf=ch, src_buf=cd)
     ctx.synchronize()
@@ -120,7 +127,7 @@ def main() raises:
     out += '"gflops": ' + String(FLOPS / (ms * 1.0e6)) + ", "
     out += '"correct": ' + ("true" if err < 0.01 else "false") + ", "
     out += '"max_err": ' + String(err) + ", "
-    out += '"iters": ' + String(ITERS) + ', "warmup_s": ' + String(WARMUP_SECONDS) + ', "pgr": ' + String(PGR) + ', "lb": ' + String(LB) + ', "abl": ' + String(ABL) + ', "prio": ' + String(PRIO) + ', "tb": ' + String(TB) + ', "hoist": ' + String(HOIST) + ', "sgb": ' + String(SGB) + ', "tile": 16, "dtype": "float16", '
+    out += '"iters": ' + String(n_iters) + ', "measured_s": ' + String(measured_s) + ', "warmup_s": ' + String(WARMUP_SECONDS) + ', "pgr": ' + String(PGR) + ', "lb": ' + String(LB) + ', "abl": ' + String(ABL) + ', "prio": ' + String(PRIO) + ', "tb": ' + String(TB) + ', "hoist": ' + String(HOIST) + ', "sgb": ' + String(SGB) + ', "tile": 16, "dtype": "float16", '
     out += '"blk": [' + String(BM) + ", " + String(BN) + ", " + String(BLK_K) + "], "
     out += '"warps": [' + String(WM) + ", " + String(WN) + "], "
     out += '"wtile": [' + String(TM) + ", " + String(TN) + "], "
