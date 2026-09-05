@@ -323,6 +323,9 @@ def main() raises:
     print("BARO_DRAFT_Q4:", draft_q4)
     var dot3 = getenv("BARO_DOT", "0") == "1"
     print("BARO_DOT:", dot3)
+    var mega = getenv("BARO_MEGA", "0") == "1"
+    print("BARO_MEGA:", mega)
+    var pf5 = getenv("BARO_PROFILE", "0") == "5"
     var e = len(off) - (1 if have_q4_draft else 0) - 15
 
     # --- load pack into one device buffer -----------------------------------
@@ -480,6 +483,19 @@ def main() raises:
     ctx.enqueue_memset(kc32_d, 0)
     ctx.enqueue_memset(vc32_d, 0)
     ctx.synchronize()
+    var off_h = ctx.enqueue_create_host_buffer[DType.int64](512)
+    ctx.synchronize()
+    for i in range(512):
+        off_h[i] = Int64(off[i]) if i < len(off) else 0
+    var off_d = ctx.enqueue_create_buffer[DType.int64](512)
+    ctx.enqueue_copy(dst_buf=off_d, src_buf=off_h)
+    var araw_d = ctx.enqueue_create_buffer[f32](MROWS * NH_V)
+    var braw_d = ctx.enqueue_create_buffer[f32](MROWS * NH_V)
+    var ctr_d = ctx.enqueue_create_buffer[DType.uint32](3)
+    var prof_d = ctx.enqueue_create_buffer[DType.int64](16 * N_LAYERS + 4)
+    ctx.enqueue_memset(ctr_d, 0)
+    ctx.enqueue_memset(prof_d, 0)
+    ctx.synchronize()
     var ConvStateAll = TileTensor(convstate_d, csall_layout)
     var SStateAll = TileTensor(sstate_d, ssall_layout)
 
@@ -596,7 +612,22 @@ def main() raises:
         var w = 1
         var ssm_i = 0
         var att_i = 0
-        for layer in range(N_LAYERS):
+        var use_mega = mega and m == 1 and not win_spec and pos + 1 >= len(prompt)
+        if use_mega:
+            ctx.enqueue_function[mega_token_k](
+                wbuf.unsafe_ptr(), TileTensor(off_d, off_layout), Xm, CurBm,
+                TileTensor(resb_d, xm_layout), TileTensor(qkv_d, qfm_layout), TileTensor(z_d, xm_layout),
+                TileTensor(araw_d, g32m_layout), TileTensor(braw_d, g32m_layout),
+                TileTensor(eg_d, g32m_layout), TileTensor(beta_d, g32m_layout),
+                TileTensor(conv_d, convm_layout), TileTensor(so_d, om_layout), ConvStateAll, SStateAll,
+                TileTensor(qf_d, qfm_layout), TileTensor(k_d, kvm_flat), TileTensor(v_d, kvm_flat),
+                TileTensor(q_d, qm_layout), TileTensor(gate_d, xflat_layout), TileTensor(ao_d, qm_layout),
+                kc_d.unsafe_ptr(), vc_d.unsafe_ptr(),
+                TileTensor(p_ffn_d, c_ffn), TileTensor(p_ffn2_d, c_ffn), TileTensor(fgb_d, ffnm_layout),
+                TileTensor(ctr_d, ctr_layout), prof_d.unsafe_ptr(),
+                Int32(ring), Int32(SLOTS), Int32(pos), grid_dim=MEGA_G, block_dim=ROW_THREADS,
+            )
+        for layer in range(0 if use_mega else N_LAYERS):
             if prof:
                 ctx.synchronize()
                 tp = perf_counter_ns()
@@ -824,6 +855,8 @@ def main() raises:
                 pf_ffn += Int(now - tp)
                 tp = now
 
+        if use_mega:
+            w = 1 + N_SSM * 10 + N_ATT * 7 + N_LAYERS * 4
         # -- head --
         if prof:
             ctx.synchronize()
@@ -888,6 +921,24 @@ def main() raises:
     ctx.synchronize()
     var dt = Float64(perf_counter_ns() - t0) / 1e9
     print("host_enqueue_s:", t_host, " gpu_total_s:", dt)
+    if pf5:
+        var ph = ctx.enqueue_create_host_buffer[DType.int64](16 * N_LAYERS + 4)
+        ctx.enqueue_copy(dst_buf=ph, src_buf=prof_d)
+        var fl = ctx.enqueue_create_host_buffer[DType.uint32](3)
+        ctx.enqueue_copy(dst_buf=fl, src_buf=ctr_d)
+        ctx.synchronize()
+        var sub_ssm = 0.0
+        var sub_att = 0.0
+        var ffn_us = 0.0
+        for layer in range(N_LAYERS):
+            var a = Float64(ph[16 * layer + 7] - ph[16 * layer]) / 100.0
+            var b = Float64(ph[16 * layer + 11] - ph[16 * layer + 7]) / 100.0
+            if is_attn(layer):
+                sub_att += a
+            else:
+                sub_ssm += a
+            ffn_us += b
+        print("mega profile (last token, us): ssm sub-blocks", sub_ssm, " attn sub-blocks", sub_att, " ffn", ffn_us, " total", Float64(ph[16 * (N_LAYERS - 1) + 11] - ph[0]) / 100.0, " fail", fl[2])
     if prof:
         var tot = Float64(pf_att + pf_ssm + pf_ffn + pf_head)
         print("profile: attn", Float64(pf_att) / 1e9, Float64(pf_att) / tot)

@@ -14,6 +14,7 @@ from ssm import (
     amar_ssm_reduce_gates, amar_ssm_conv, amar_ssm_qk_l2norm,
     amar_ssm_delta_step, amar_ssm_gated_out_bf16, amar_cast_bf16, CONV, NH_V, SSTATE,
 )
+from mega import amar_mega_token, MEGA_G
 from attn import (
     amar_head_rmsnorm, amar_attn_decode, amar_gate_mul_cast, amar_qgate_split, amar_rope_yarn, amar_kv_append,
     HD, NQH, NKVH,
@@ -117,6 +118,17 @@ comptime c_h = row_major[1, H]()
 comptime c_kv = row_major[1, KV]()
 comptime c_32 = row_major[1, NH_V]()
 comptime c_ffn = row_major[1, FFN]()
+
+comptime off_layout = row_major[512]()
+comptime ctr_layout = row_major[3]()
+comptime mega_token_k = amar_mega_token[
+    type_of(xm_layout), type_of(xm_layout),
+    type_of(qfm_layout), type_of(g32m_layout), type_of(convm_layout), type_of(om_layout),
+    type_of(csall_layout), type_of(ssall_layout),
+    type_of(qfm_layout), type_of(kvm_flat), type_of(qm_layout), type_of(xflat_layout),
+    type_of(c_ffn), type_of(ffnm_layout), type_of(off_layout), type_of(ctr_layout),
+    TMAX, N_LAYERS,
+]
 
 comptime B2 = 2
 comptime B4 = 4
