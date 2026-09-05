@@ -168,6 +168,43 @@ transaction-count win and adding address-computation overhead on top.
 Per the T2 ablation rule, reverted; `kernels/matmul_ternary.mojo`
 q2b3row is back to its T1 form (26 scalar `Q[row, i]` loads).
 
+### L2 receipt: ABLATED -- geometric no-op made worse by refactor overhead
+
+q2b3's block/lane geometry defeats this lever before it can help: at
+K=4096, `nb = K // B3_BLOCK = 32 == WARP_SIZE`, so each lane owns exactly
+ONE block total (the per-lane `while b < nb: ... b += WARP_SIZE` loop body
+runs once). There is nothing to prefetch AHEAD of -- a lane with one block
+has no next block. Any `UNROLL >= 2` therefore routes every lane through
+the tail (single-block) path, identical in behavior to the T1 kernel,
+just now calling a factored-out `decode_block(...)` closure instead of
+inlined code (verified: with `UNROLL=2`, `b + UNROLL*WARP_SIZE <= nb` is
+`lane + 64 <= 32`, false for every lane 0-31).
+
+Measured anyway (`UNROLL=2`, so the down shape's parity check in
+`test_ternary_gemm` -- K=12288, nb=96 -- does exercise the unrolled branch
+once per lane, proving the refactor itself is bit-correct on both shapes):
+
+| arm | T1 baseline median | L2 median | delta |
+|---|---|---|---|
+| q2b3row | 44.10 us | 50.20 us | **+13.8%** |
+| tq1row/tq2row/q8row (untouched) | -- | within 1% of T1 | noise |
+
+Correctness held (`test_ternary_gemm` PASS, both shapes, both MR). The
+regression is pure closure/function-call overhead on the dead-for-gate
+`decode_block` factoring -- no prefetch ever fires for this shape, so
+100% of the delta is overhead, not a real load-latency-hiding trade.
+Reverted per the T2 ablation rule; `kernels/matmul_ternary.mojo`,
+`kernels/test_ternary_gemm.mojo`, and `bench/bench_coldcache_ternary.mojo`
+are all back to their T1 form (`git diff --stat` on the three files is
+empty against `main`... against the L1-ablation commit, confirmed clean).
+
+This is the same root cause L3 (chunk striding) exists to fix: L3's own
+prediction is "0% gate" for exactly this reason (nb == WARP_SIZE exactly
+means there is no room to spread work more finely without changing the
+per-lane unit from whole-block to sub-block). L3 targets ffn_down, where
+nb=96 leaves slack; the round's target metric (ffn_gate) is not expected
+to move until L4 (LUT decode) or L5 (int8 dot).
+
 ## Fork
 
 (placeholder for lane C)
