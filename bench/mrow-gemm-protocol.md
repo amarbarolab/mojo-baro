@@ -279,3 +279,27 @@ closed, no further dot wiring without a new preregistration.
 
 Non-bit-exact change (int8 dot replaces bf16 FMA on m>=3 trunk windows):
 identity gates above are the guard; arm A (m=1) is untouched by construction.
+
+### M3-dot run record and verdict (2026-09-05, `b892a25`, .work/dot-race5-*, .work/mtp-dot{0,1})
+
+Arms on `.work/engine-pack-q8d`, `BARO_DRAFT_Q4=1`, `BARO_DOT:` read back in
+every log. Race: 5 interleaved pairs, k=4. Sweep: `bench/mtp-prompts.sh`, k=2,
+20 prompts, arm-per-flag.
+
+| item | prediction | measured | verdict |
+|---|---|---|---|
+| race k=4 median | 152-165 | dot=1 **158.1** (dot=0 arm: 147.3; +7.3%), identity 5/5 | HOLDS |
+| 20-prompt k=2 median | 103-108, land >= 104.2 AND >= 18/20 | **102.93** (dot=0 arm: 103.68), identity **16/20** (p04/p09/p13/p20) | **LAND RULE FAILS, both legs** |
+| prefill_s longest (p17, 59 tok) | drops >= 20% | 0.305 -> 0.241, **-21%** | HOLDS |
+| acceptance | within 2 points | 0.6918 -> 0.6860 | HOLDS |
+
+Falsifier (k=2 < 104.18 AND race < 152) does NOT fire: the int8-dot path is
+real at m >= 5 and in prefill, but at the shipping config (k=2, spec windows
+m=3) its GEMM win does not cover two quantize launches per layer plus the
+identity cost of non-bit-exact m=3 verify windows.
+
+**Verdict: `BARO_DOT` stays default 0.** Code remains as a preregistered
+opt-in. If a k >= 3 config or prefill wall time ever matters, the next
+preregistration should test threshold m >= 4 (k=2 spec windows back to
+bit-exact bf16, prefill/race keep the dot win); not run now because the
+shipping config gains nothing from it.
