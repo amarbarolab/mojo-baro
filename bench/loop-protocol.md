@@ -40,6 +40,7 @@ widen the region to whole-layer rewrites instead of more iterations.
 | 002 (2026-09-05, commit 9b8a399 in gguf) | ffn (51.2%) | 01-father, 02-grandfather, 03-uncle, 04-mother | 4 | 0 | 67.48 -> 67.48 | none |
 | 003 (2026-09-05, commit e3948ba in gguf, proposer Qwen3.8-27B) | ffn (51.2%) | 01-father, 02-grandfather, 03-uncle, 04-mother | 4 | 0 | 67.07 -> 67.07 | none |
 | 004 (2026-09-05, commit ffa1808 in gguf, Qwen3.8-27B BARO, self-describing) | ffn (51.2%) | 01-father, 02-grandfather, 03-uncle, 04-mother | 4 | 0 | 67.17 -> 67.17 | none |
+| 005 (2026-09-05, commit ffa1808 in gguf, Qwen3.8-27B BARO) | ffn (51.2%) | 05-grandmother, 06-eldest-sibling, 07-youngest-sibling, 08-cousin | 4 | 0 | 66.81 -> 66.81 | none |
 
 Iteration 001 notes: prompt 25k chars (bindings + ffn region + elementwise +
 matmul_skinny). All three failed before any timed run: no diff fence; patch
@@ -261,3 +262,52 @@ Prediction, frozen: nothing in iterations 001-004 suggests a survivor. The
 interesting outcome is not the tok/s but whether a candidate reaches the identity
 or perf stage on merits rather than on a lucky failure. Two candidates have reached
 compile in four iterations; that is the number to beat.
+
+## Iteration 005 result (2026-09-05) — worth-it rule fires
+
+Champion 66.81 tok/s_gen (median of 3: 66.81 / 67.03 / 65.78, spread 1.90%).
+
+| cand | identity | stage reached | verdict |
+|---|---|---|---|
+| 0 | 05-grandmother | apply | the RULES example, verbatim |
+| 1 | 06-eldest-sibling | apply | `r_swiglu(...)` -> `gmul_k(...)`, literal ellipsis |
+| 2 | 07-youngest-sibling | **scope** | deletes `tq = perf_counter_ns()` |
+| 3 | 08-cousin | apply | the RULES example, verbatim (identical to cand-0 but for one buffer name) |
+
+Survivors 0. 4/4 produced a parseable diff and all four finished on `stop` — the
+sampler and budget fixes hold. New identities (05-08) changed nothing: three of
+four are the worked example again.
+
+**Second iteration running in which a candidate attacked the timing code.**
+cand-2 deletes a `perf_counter_ns()` call outright, caught by the original scope
+pattern; iteration 004 cand-1 disabled the guard instead and needed the tightened
+pattern. Two of eight candidates across two iterations went for the instrument.
+
+### Worth-it rule: fired, and its prescribed action does not fit the evidence
+
+5 iterations, 0 accepted winners, 0% aggregate gain. The rule says widen the
+region to whole-layer rewrites. **The measured failure is not in the region.**
+
+Across iterations 002-005, 16 candidates, 14 produced a diff:
+
+- **8 of 14 echo the RULES block's worked example** — 6 of those carrying a
+  literal `...` that is not valid Mojo.
+- `g_ffn` and `r_swiglu_fused` appear **nowhere** in registry.mojo or
+  engine.mojo. They exist only in the example. Every candidate that used them
+  was copying the illustration, not reading the sources.
+- 6 of 14 edited real code; those are the ones that reached apply-on-merits,
+  compile, and identity.
+
+Widening the region gives the proposer more source to ignore. The example is
+being read as the answer template, and it sits in `RULES`, which is in the
+system message ahead of every branch.
+
+**Recommended before any widening: iteration 006 with the worked example
+replaced by a format-only skeleton** — hunk syntax shown with placeholder text
+that cannot be mistaken for a symbol name (`<existing-kernel-name>`), no
+plausible bindings, no ellipsis. That is a one-string change to
+`tools/loop-propose.py` and it tests the actual diagnosis. Widening the region
+is the fallback if it does not move the 8/14.
+
+Not decided here — the worth-it rule is frozen and says widen. Flagging that
+the evidence points elsewhere, for the maintainer's call.
