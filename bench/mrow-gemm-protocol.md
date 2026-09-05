@@ -217,3 +217,39 @@ Consequences, by the rule frozen above:
   weight streamed once per window; the engine's A operand is 2 rows of a live
   activation rather than a fixed fixture. That is a bench-vs-engine
   reconciliation, not an optimisation.
+
+### Correction after the diagnostic audit (2026-09-05, `ee30176`)
+
+The measurement above stands; **the verdict I drew from it does not.** Two
+errors, both mine:
+
+1. **The "1.06-1.11x in the engine vs 1.04x in the bench" discrepancy was
+   never established.** M0's own repeat pairs, in `.work/briefs/status-mrowB.md`
+   lines 33 and 40-41, are 88.370/91.551 (ratio 1.036) and 80.791/91.501
+   (ratio **1.133**): the m=2 time is stable while the m=1 denominator moves
+   8 us between repeats. 1.04 is one draw from that pair, not a kernel
+   constant, and the engine's 1.06-1.11 sits inside the range. I compared a
+   number against a baseline that had already contradicted itself in the same
+   file.
+2. **`gemm_down` is not the same shape as gate/up** — N=4096/K=12288 against
+   N=12288/K=4096 - so quoting its 1.11 beside the others as one "row scaling"
+   figure compares two shapes as if they were one.
+
+Also wrong in framing: I reported "+0.83 ms/window" as a loss against an
+implicit 1.0x ideal. Per useful row the ffn sub-block at m=2 costs 0.54x its
+m=1 self. M0's own per-row series is 88.3 / 46.1 / 28.2 / 25.2 us for
+m = 1/2/4/8: weight amortisation already wins. **Multi-row batching is not
+falsified.** What limits it is that speculative decode must minimise time per
+*accepted* token, so rejected rows can erase the throughput gain - a width
+constraint, not a dead direction.
+
+What survives from the run: the ffn elementwise stages are not where the m=2
+window cost goes (`swiglu` 1.03, rmsnorm + r_add +0.028 ms/window together),
+so the fused-swiglu idea remains not worth writing. Everything I said about a
+bench-vs-engine kernel discrepancy, and the claim that the 115-120 tok/s
+ceiling is unsupported, is **withdrawn**: neither was established by this
+measurement.
+
+The discriminating measurement, per the audit: interleaved m=1/m=2 pairs from
+one binary, engine layouts, all three FFN shapes, device timestamps beside host
+wall time, with clocks and spread recorded.
