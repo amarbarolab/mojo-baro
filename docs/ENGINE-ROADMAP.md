@@ -12,17 +12,25 @@ fp16 variant (halves B traffic, doubles its roof).
 
 ## Gap inventory vs llama.cpp
 
-| Layer | llama.cpp | mojo-baro today |
-|---|---|---|
-| Weight loading | GGUF mmap + every quant format | nothing |
-| Tokenizer | own BPE/SPM impl | nothing |
-| Elementwise kernels | RMSNorm, RoPE, SwiGLU, softmax | nothing |
-| Attention | flash-decode style, GQA | nothing |
-| KV cache | paged, quantized cache | nothing |
-| Forward pass | graph per arch family | nothing |
-| Sampling | full menu | nothing |
-| Server | OpenAI-compatible HTTP | empty `serve/src` |
-| GEMM decode M=8 | ~roofline via quants | **1.49x over vendor fp32** |
+**The "nothing" column below is the 2026-09-01 state and is now historical.**
+Current state is in the right-hand column, updated 2026-09-05.
+
+| Layer | llama.cpp | mojo-baro 2026-09-01 | mojo-baro today |
+|---|---|---|---|
+| Weight loading | GGUF mmap + every quant format | nothing | GGUF v3 parser + `engine-pack.py` (bf16/q8/q4-draft); q8 pack bit-equal to `llama-quantize` Q8_0 |
+| Tokenizer | own BPE/SPM impl | nothing | still none — packs carry pre-tokenized prompts (deliberate non-goal) |
+| Elementwise kernels | RMSNorm, RoPE, SwiGLU, softmax | nothing | all present in `kernels/elementwise.mojo`, <=1e-6 vs fp64 host refs |
+| Attention | flash-decode style, GQA | nothing | GQA decode path + hybrid SSM sub-block (`attn.mojo`, `ssm.mojo`) |
+| KV cache | paged, quantized cache | nothing | contiguous f16 cache + (k+1)-slot ring for MTP rollback; not paged, not quantized |
+| Forward pass | graph per arch family | nothing | full Qwythos-9B decode, token-identical to llama.cpp 64/64 |
+| Sampling | full menu | nothing | greedy/argmax only |
+| Server | OpenAI-compatible HTTP | empty `serve/src` | still empty — no HTTP front |
+| Prefill | batched, causal-mask | n/a | **M=1 only; the main unbuilt item** (M5-PLAN 3) |
+| GEMM decode M=8 | ~roofline via quants | **1.49x over vendor fp32** | q8 wave-per-row `amar_matmul_skinny_q8row`, 855 GB/s |
+| Decode tok/s | 74.1 no-spec / 123.5 MTP (20-prompt) | 25.5 | **68.8 no-spec / 100.7 MTP (20-prompt)** |
+
+Note the fp32/fp16 framing in the section above is two quantisations out of
+date: the engine is **q8-only** since `c3752e7`. fp16 was never the endpoint.
 
 ## Build order — each milestone has a hard verify
 

@@ -67,12 +67,27 @@ the ffn shape (62.6 us per 100 MB-equivalent stream). Decode: **68.8 tok/s_gen**
 Q8_0 no-spec bar 74.1. The bf16 pack path (41.7 tok/s) is gone from the
 engine; its numbers stay in `bench/q8-protocol.md`.
 
-**MTP speculative decode (`BARO_SPEC=1`, k=4 via `BARO_SPEC_K` or
-`spec-k.txt`): 127.96 tok/s_gen** (median 4, spread 0.3%), 1.89x over the
-no-spec arm (67.77), 64/64 on every run, acceptance 50/53 on the 5-token
-prompt. Draft = `blk.32` head; rows verified in one m=k+1 trunk window,
-SSM/conv state in a (k+1)-slot ring so rollback is free. llama.cpp MTP bar
-109.8, ours 1.17x. Protocol and bug log: `bench/mtp-protocol.md`.
+**MTP speculative decode (`BARO_SPEC=1`; default k=2 via `BARO_SPEC_K` or
+`spec-k.txt`).** Draft = `blk.32` head; rows verified in one m=k+1 trunk
+window, SSM/conv state in a (k+1)-slot ring so rollback is free.
+
+Headline is the **20-prompt median**, per `bench/PROTOCOL-RULES.md` P4 —
+a single-prompt speculative number is an instrument receipt, never a verdict:
+
+| set | ours | llama.cpp Q8_0 | ratio |
+|---|---|---|---|
+| **20 real prompts (median, k=2)** | **100.7** | **123.5** | **0.78x** |
+| 5-token race prompt (k=4) | 145.6 | 109.8 | 1.33x |
+
+So: ahead on the preregistered race prompt, **behind on real text**. Both
+engines' speculative output matches their own greedy output on the race
+prompt; on the 20-prompt set ours matches on 20/20, llama.cpp's on 16/20.
+
+The earlier headline of **127.96 tok/s_gen (1.89x over 67.77, acceptance
+50/53)** was measured on the 5-token race prompt alone and is superseded —
+that prompt's repetitive tail inflates acceptance to ~94%. Kept here only so
+the number is recognisable when it turns up in older notes.
+Protocol, k sweep and bug log: `bench/mtp-protocol.md` Result 2.
 
 Weight-native wave-per-row is the fastest measured stream on this card
 (qingming-gfx1100-gemv 917 GB/s fp32; ours 856 bf16 / 855 q8). The earlier

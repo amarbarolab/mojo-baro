@@ -7,6 +7,15 @@ before touching anything. Board: `~/Brain/mojo-baro/whiteboard.md`.
 
 ## State you inherit (all verified 2026-09-01)
 
+> **SUPERSEDED 2026-09-05 — read this box before trusting anything below.**
+> The engine is q8-only and does **68.8 tok/s_gen** no-spec (`c3752e7`),
+> **69.69** rebuilt from inside the gguf (`tools/gguf-closure.sh`, 64/64).
+> MTP is landed and defaults to k=2: **100.7 median over the 20-prompt set**,
+> 145.6 on the single race prompt. Work items 1, 4 and 5 below are DONE;
+> item 2 is FALSIFIED. Only items 3 and 6 are still live.
+> Current truth: `docs/BASELINE.md`, `README.md`, and the ranked plan in
+> `~/Brain/mojo-baro/2026-09-05-engine-next-milestone.md`.
+
 - `serve/engine.mojo` decodes Qwythos-9B **token-identical to llama.cpp**
   (16/16 greedy, prompt "The capital of France is") at **25.5 tok/s**.
 - Regression gate (run after EVERY change, non-negotiable):
@@ -39,28 +48,33 @@ before touching anything. Board: `~/Brain/mojo-baro/whiteboard.md`.
 
 ## Work items, in order
 
-1. **Measure the bar**: llama-server GPU tok/s (its /metrics + a timed
+1. **[DONE 2026-09-01, verdict `6b99693`]** **Measure the bar**: GPU tok/s (its /metrics + a timed
    /completion, greedy, with and without MTP if feasible). Preregister the
    comparison protocol first (bench/coldcache-protocol.md style, frozen by
    commit) — every perf claim in this repo is preregistered or it is noise.
-2. **Launch-count reduction** (biggest lever, target ~2x): the engine issues
+2. **[FALSIFIED 2026-09-04 — DO NOT ATTEMPT]** The round closed at stage 0
+   (`bench/launch-fusion-protocol.md`): 646 launches/token, measured launch
+   floor 2.57 us, so the whole ceiling is **6.9%** of a 24 ms token, not the
+   ~2x claimed here. S0 fired before a fusion kernel was written; the ~20% gap
+   to the HBM roof is NOT the launch floor. Original text follows, for record
+   only. ~~**Launch-count reduction** (biggest lever, target ~2x)~~: the engine issues
    ~20 launches/layer at M=1. Fuse: reduce+cast pairs, gates_k into the
    alpha/beta reduce, amar_rmsnorm+cast, split/norm/rope chains. Consider one
    fused "layer prologue" and "layer epilogue" kernel. Keep each fusion
    behind the token-identity gate.
-3. **Prefill batching**: process the prompt with M=n_prompt GEMMs (skinny
+3. **[STILL LIVE — the main unbuilt item]** **Prefill batching**: process the prompt with M=n_prompt GEMMs (skinny
    handles M<=8; batch larger prompts in chunks of 8). Attention prefill
    needs a causal-mask variant of amar_attn_decode.
-4. **q8b weight path** end-to-end (kernels exist, parity 9.2e-4): halves the
+4. **[DONE 2026-09-04 `c3752e7` — 41.7 -> 68.8 tok/s_gen, +65%, 64/64]** **q8b weight path** end-to-end (kernels exist, parity 9.2e-4): halves the
    bandwidth ceiling (~50 -> ~100 tok/s roof). Quantize the pack, add a
    `--q8` engine mode. Token identity may legitimately drift under quant —
    define and preregister an acceptance gate first (e.g. greedy match on
    >=90% tokens + a perplexity spot-check), never hand-wave it.
-5. **MTP** (blk.32 nextn tensors, `nextn_predict_layers=1`): the model's
+5. **[DONE 2026-09-04 `058dd28`/`41d0361`; k=2 is the default]** **MTP** (blk.32 nextn tensors, `nextn_predict_layers=1`): the model's
    built-in draft head; ~2x on top. Needs a llama.cpp source read for the
    eh_proj wiring (the sonnet research-agent pattern in the Brain notes
    worked well; file:line receipts mandatory).
-6. **Cold-cache GEMM efficiency** (54% vs vendor 85% of HBM peak):
+6. **[STILL LIVE]** **Cold-cache GEMM efficiency** (54% vs vendor 85% of HBM peak):
    multi-column/thread + wider loads on the B-layout skinny;
    `bench/bench_coldcache.mojo` is the instrument.
 
