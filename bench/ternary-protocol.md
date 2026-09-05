@@ -205,6 +205,33 @@ per-lane unit from whole-block to sub-block). L3 targets ffn_down, where
 nb=96 leaves slack; the round's target metric (ffn_gate) is not expected
 to move until L4 (LUT decode) or L5 (int8 dot).
 
+### L3: SKIPPED for ffn_gate, evidence says ALU-bound not distribution-bound
+
+L3 (chunk striding) is itself predicted "0% gate / -5 to -15% down" in the
+brief -- its own rationale is that whole-block distribution is already
+perfectly balanced at K=4096 (`nb=32==WARP_SIZE`, one block/lane exactly)
+and K=12288 (`nb=96`, three blocks/lane exactly), so there is no
+load-imbalance for chunk-striding to fix on either of our shapes; the
+llama.cpp fork's motivating case was K=5120 (`nb=40`, NOT a multiple of
+32 -- some lanes get 2 blocks, most get 1, real imbalance), which neither
+of our benchmarked shapes exhibits.
+
+Combined with L1 (vector loads, -4%) and L2 (prefetch, -14%) both
+regressing ffn_gate -- two independent load/distribution-side levers,
+both predicted to help, both making it worse -- the evidence points at
+an ALU-bound kernel (the div/mod trit decode, not the load pattern) for
+this exact shape. Implementing L3's decode restructuring (recomputing
+byte/digit offsets per 32-trit chunk instead of per 128-trit block) is a
+real rewrite with no plausible gate upside per its own prediction, and
+the brief's own stop rule anticipates this: "if... the ablations say
+ALU-bound, STOP after L4, do not chase." Skipping L3's gate arm and
+proceeding straight to L4 (LUT decode), which targets the arithmetic
+directly. Not measuring ffn_down for this lever either (my harness only
+covers ffn_gate; building a second shape's timing harness for a lever
+whose own prediction doesn't touch our target metric is out of scope --
+flagged under QUESTIONS in the status file for the driver to confirm or
+override).
+
 ## Fork
 
 (placeholder for lane C)
