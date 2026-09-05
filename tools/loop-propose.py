@@ -32,7 +32,26 @@ shown (paths relative to the source dir, e.g. `--- a/engine.mojo`). Rules:
 - Output must stay bit-identical: the gate compares 64 greedy tokens.
 - Do not change timing, printing, or profiling code.
 - End with one line `PREDICT: <signed percent>` = your predicted change in tok/s_gen.
-Reply with a short rationale (<= 8 lines), then the diff in a ```diff fence, then PREDICT."""
+- Every symbol you reference must already exist in the sources shown. If your
+  change needs a new kernel, you must write its full body in the same diff.
+- Source files are given inside <file path="..."> tags. That is INPUT framing.
+  Never use it in your answer -- your diff must use `--- a/<path>` / `+++ b/<path>`
+  headers and @@ hunks, or it is discarded unparsed.
+
+Output format, exactly:
+
+<= 8 lines of rationale, then
+
+```diff
+--- a/engine.mojo
++++ b/engine.mojo
+@@ -470,7 +470,7 @@
+             ctx.enqueue_function[g_ffn](CurB2, Wfg, Pg, ...)
+-            ctx.enqueue_function[r_swiglu](Pg, Pu, FgB2, ...)
++            ctx.enqueue_function[r_swiglu_fused](Pg, Pu, FgB2, ...)
+```
+
+then one line `PREDICT: <signed percent>`."""
 
 
 def identities():
@@ -65,8 +84,14 @@ def profile_shares(path):
 
 
 def ask(endpoint, prompt, identity_line):
-    body = {"messages": [{"role": "system", "content": RULES + "\n\nFraming for this attempt: " + identity_line},
-                         {"role": "user", "content": prompt}],
+    # RULES + corpus go in the system message and are IDENTICAL across branches,
+    # so the ~25k-char prefix is prefilled once and reused (cache_prompt). The
+    # identity varies only in the trailing user turn. Putting the framing first
+    # diverges the prefix and forces a full re-prefill per branch (~26 min each
+    # at 4.4 t/s) -- and buys nothing: each branch still sees only its own framing.
+    body = {"messages": [{"role": "system", "content": RULES + "\n\n" + prompt},
+                         {"role": "user", "content": "Framing for this attempt: " + identity_line
+                          + "\n\nPropose your one change now, in the output format given."}],
             "temperature": 0.6, "max_tokens": 4096, "cache_prompt": True}
     req = urllib.request.Request(endpoint + "/v1/chat/completions", data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})
@@ -99,8 +124,11 @@ def main():
               f"GPU time per decode run, by sub-block (BARO_PROFILE=1):\n{prof_txt}\n"
               f"Target region: `{region}` (largest share).\n\n"
               + slice_region((out / "src/engine.mojo").read_text(), region))
+    # Tag-delimited, deliberately NOT diff-shaped: the old `===== f =====` banner
+    # taught iter-001 cand-2 to answer in banners instead of a unified diff, and
+    # the gate discarded it unparsed (receipt: parse / "no diff fence").
     for f in KFILES[region]:
-        prompt += f"\n\n===== {f} =====\n" + (out / "src" / f).read_text()
+        prompt += f'\n\n<file path="{f}">\n' + (out / "src" / f).read_text() + f'\n</file>'
     (out / "prompt.md").write_text(prompt)
     ids = identities()[a.start:a.start + a.n]
     print(f"region={region} prompt_chars={len(prompt)} identities={[i[0] for i in ids]}", flush=True)
