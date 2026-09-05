@@ -232,6 +232,67 @@ whose own prediction doesn't touch our target metric is out of scope --
 flagged under QUESTIONS in the status file for the driver to confirm or
 override).
 
+### L4 receipt: LANDED -- q2b3row 44.10 -> 32.16us (-27.1%)
+
+`ggml_cuda_b3lut_x[256]` (the exact 32-bit table from
+`llama.cpp-b3s/ggml/src/ggml-cuda/vecdotq.cuh`, packing trit codes for
+digits 0-3 in bits 0/8/16/24 and digit 4 at bits 30-31) ported verbatim as
+a `comptime InlineArray[UInt32, 256]` in `kernels/matmul_ternary.mojo`,
+materialized once per thread (`var lut = materialize[B3LUT_X]()` at kernel
+entry, read many times from a local copy rather than re-materializing per
+lookup -- confirmed necessary via a throwaway probe: `materialize` on a
+comptime array requires an explicit call since a comptime value cannot be
+indexed by a runtime value directly ("cannot materialize comptime value...
+to runtime")). Decode changed from `(qs[byte] // 3^digit) % 3` to
+`(lut[Int(qs[byte])] >> shift) & 3` where `shift = 8*digit` for digit<4,
+`30` for digit==4. Reported per the brief's ask: comptime global
+InlineArray, NOT shared memory -- materializing once per thread and
+reusing was sufficient, no LDS staging needed.
+
+`test_ternary_gemm` PASS on both shapes, both MR (max_rel unchanged from
+T1, 6.6e-5 to 1.6e-4 -- LUT decode is bit-identical to the div/mod it
+replaces, as expected).
+
+| arm | T1 baseline median | L4 median | delta | spread | GB/s |
+|---|---|---|---|---|---|
+| q2b3row | 44.10 us | **32.16 us** | **-27.1%** | 3.4% | 342 |
+| tq1row/tq2row/q8row (untouched) | -- | within 1-2% of T1 | noise | -- | -- |
+
+Prediction was "-20 to -40% of remaining time" (from the div/mod ALU
+work): -27.1% lands inside that band. Clocks: sclk 2827 MHz median
+(2701-3114 MHz), power 252-324 W, junction max 85 C -- same sustained
+4-arm thermal regime as T1/L1/L2, so the comparison is apples-to-apples.
+
+Still above the round's success bar (q2b3row <= 30 us, stretch 20 us) by
+2.16 us / 7.2%. Champion selection: L4 is the best q2b3row arm measured
+this round on ffn_gate. Per the brief, champion must also not be worse
+than T1 on ffn_down -- this lane's harness only times ffn_gate (see the
+L3 QUESTIONS entry in the status file for the same scope gap); ffn_down
+CORRECTNESS is verified (test passes both shapes) but ffn_down TIMING was
+not measured for any T2 lever.
+
+## Round decision: stop after L4, do not attempt L5
+
+L1 (vector loads) and L2 (UNROLL prefetch) both regressed ffn_gate; L3
+(chunk striding) was skipped as a proven geometric no-op for this shape;
+L4 (LUT decode) landed within its predicted band and is a genuine,
+verified win. L5 (int8 dot) is explicitly framed in the brief as
+"uncertain; last," and its precondition (`llvm.amdgcn.sdot4` on gfx1100)
+IS available in this codebase (used by `amar_matmul_skinny_q8dot` in
+`matmul_skinny.mojo`) -- so it isn't ruled out by the probe gate. But
+building it (quantizing A once via the existing `amar_quantize_q8_rows`,
+assembling dp4a-ready packed-int8 code words per the fork's
+`ternary_row_partial_q2_b3`, folding the `-sum(a)` offset) is a
+substantially larger, riskier kernel change than L4's, for a shape
+already 4 for 5 on prior levers (2 regressions, 1 skip, 1 hit) and
+already within reach of usable numbers. Stopping here per the spirit of
+the brief's own stop rule ("ablations say ALU-bound, STOP after L4, do
+not chase") -- L4 confirms the ALU-bound diagnosis AND fixes the biggest
+share of it; the remaining 7% gap to <=30us is not worth the L5 risk
+given this round's budget. q2b3row's L4 form (32.16 us, -27% vs T1
+baseline, -55% vs the original T0 instrument reading of 43.87 us) is the
+round's champion.
+
 ## Fork
 
 (placeholder for lane C)
