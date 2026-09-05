@@ -14,10 +14,14 @@ before touching anything. Board: `~/Brain/mojo-baro/whiteboard.md`.
   (`prompt-tokens.txt` beside it). Engine pack = `.work/engine-pack/`
   (built FROM the BARO gguf; `-orig` sibling from the original file).
 - Self-describing model: `~/Models/qwythos-9b-claude-mythos-5-1m-mtp-bf16/
-  Qwythos-9B-Claude-Mythos-5-1M-MTP-BF16-BARO.gguf` embeds all kernel +
-  engine sources (9 `baro.kernel.*` KVs). **Re-embed after any kernel/engine
-  change** (`tools/gguf-embed.py`; delete the old BARO file first) or the
-  model ships stale kernels — that bug already happened once.
+  Qwythos-9B-Claude-Mythos-5-1M-MTP-BF16-BARO-9b8a399.gguf` embeds all kernel +
+  engine sources (11 `baro.kernel.src.*` KVs). Closure verified 2026-09-05:
+  `tools/gguf-closure.sh` builds shim + engine from the file's own sources,
+  PASS 64/64 at 69.69 tok/s_gen. **Re-embed after any kernel/engine change**
+  (`tools/gguf-embed.py`) or the model ships stale kernels — that bug already
+  happened once, and the pre-`9b8a399` file sat 78 commits stale.
+  **`serve/registry.mojo` MUST be in the file list**: `engine.mojo` does
+  `from registry import *`, so omitting it makes the closure fail to compile.
 - Key traps already paid for: gdn v-head h pairs with k-head **h % 16**
   (ggml_repeat tiles); q/k L2-norm not RMS; state decays BEFORE the delta
   error term; yarn ext_factor=1 validated; head_dim 256, contiguous q|gate.
