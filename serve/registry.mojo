@@ -4,10 +4,11 @@ from layout import TileTensor, TensorLayout, row_major
 
 from elementwise import (
     amar_rmsnorm, amar_rmsnorm_cast, amar_embed_lookup_pos, amar_argmax_pos, amar_tok_copy,
+    amar_quantize_q8_rows,
 )
 from matmul_skinny import (
     amar_matmul_skinny_q8row, amar_matmul_skinny_q4row, amar_skinny_reduce, amar_skinny_reduce_add,
-    amar_skinny_reduce_swiglu_bf16, SM, SPLITK, ROW_WAVES, ROW_THREADS,
+    amar_skinny_reduce_swiglu_bf16, amar_matmul_skinny_q8dot, SM, SPLITK, ROW_WAVES, ROW_THREADS,
 )
 from ssm import (
     amar_ssm_reduce_gates, amar_ssm_conv, amar_ssm_qk_l2norm,
@@ -31,6 +32,8 @@ comptime GEN_N = 64
 
 comptime bf16 = DType.bfloat16
 comptime f32 = DType.float32
+comptime f16 = DType.float16
+comptime i8 = DType.int8
 
 comptime MROWS = SM
 comptime KMAX = SM
@@ -49,6 +52,10 @@ comptime qm_layout = row_major[MROWS * NQH, HD]()
 comptime kvm_layout = row_major[MROWS * NKVH, HD]()
 comptime kvm_flat = row_major[MROWS, KV]()
 comptime ffnm_layout = row_major[MROWS, FFN]()
+comptime aqm_h = row_major[MROWS, H]()
+comptime asm_h = row_major[MROWS, H // 32]()
+comptime aqm_ffn = row_major[MROWS, FFN]()
+comptime asm_ffn = row_major[MROWS, FFN // 32]()
 comptime vm_layout = row_major[MROWS, VOCAB]()
 comptime ffn_layout = row_major[FFN]()
 comptime qf_layout = row_major[QF]()
@@ -224,6 +231,49 @@ def gemm_q8[
     else:
         ctx.enqueue_function[amar_matmul_skinny_q8row[4, SM, AL, QL, SL, PL]](
             A, Wq, Ws, P, Int32(m), Int32(n), Int32(k),
+            grid_dim=ceildiv(n, ROW_WAVES), block_dim=ROW_THREADS,
+        )
+
+
+def quant_rows[
+    AL: TensorLayout, AQL: TensorLayout, ASL: TensorLayout
+](
+    ctx: DeviceContext,
+    A: TileTensor[bf16, AL, MutAnyOrigin],
+    Aq: TileTensor[i8, AQL, MutAnyOrigin],
+    As: TileTensor[f16, ASL, MutAnyOrigin],
+    m: Int, k: Int,
+) raises:
+    ctx.enqueue_function[amar_quantize_q8_rows[AL, AQL, ASL]](
+        A, Aq, As, Int32(m), Int32(k), grid_dim=(m, k // 32), block_dim=32,
+    )
+
+
+def gemm_q8dot[
+    AQL: TensorLayout, ASL: TensorLayout,
+    QL: TensorLayout, SL: TensorLayout, PL: TensorLayout
+](
+    ctx: DeviceContext,
+    Aq: TileTensor[i8, AQL, MutAnyOrigin],
+    As: TileTensor[f16, ASL, MutAnyOrigin],
+    Wq: TileTensor[i8, QL, MutAnyOrigin],
+    Ws: TileTensor[f16, SL, MutAnyOrigin],
+    P: TileTensor[f32, PL, MutAnyOrigin],
+    m: Int, n: Int, k: Int,
+) raises:
+    if m == 3:
+        ctx.enqueue_function[amar_matmul_skinny_q8dot[4, 3, AQL, ASL, QL, SL, PL]](
+            Aq, As, Wq, Ws, P, Int32(m), Int32(n), Int32(k),
+            grid_dim=ceildiv(n, ROW_WAVES), block_dim=ROW_THREADS,
+        )
+    elif m <= 5:
+        ctx.enqueue_function[amar_matmul_skinny_q8dot[4, 5, AQL, ASL, QL, SL, PL]](
+            Aq, As, Wq, Ws, P, Int32(m), Int32(n), Int32(k),
+            grid_dim=ceildiv(n, ROW_WAVES), block_dim=ROW_THREADS,
+        )
+    else:
+        ctx.enqueue_function[amar_matmul_skinny_q8dot[4, SM, AQL, ASL, QL, SL, PL]](
+            Aq, As, Wq, Ws, P, Int32(m), Int32(n), Int32(k),
             grid_dim=ceildiv(n, ROW_WAVES), block_dim=ROW_THREADS,
         )
 

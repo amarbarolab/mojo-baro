@@ -253,3 +253,29 @@ measurement.
 The discriminating measurement, per the audit: interleaved m=1/m=2 pairs from
 one binary, engine layouts, all three FFN shapes, device timestamps beside host
 wall time, with clocks and spread recorded.
+
+## M3-dot frozen (2026-09-05, before any run; code + this block in one pre-run commit)
+
+Scope: trunk FFN gate/up/down only, opt-in `BARO_DOT=1`, windows with m >= 3
+(k=2 spec windows are m=3, race k=4 windows m=5, prefill m up to 8). Draft
+layer, attn/qkv/z/head GEMMs stay q8row. Engine prints `BARO_DOT:` (P1
+read-back). Cost added per SSM/attn layer at m >= 3: two
+`amar_quantize_q8_rows` launches (m x K bf16 read, m x K int8 + m x K/32 f16
+written -- noise next to 42 MB of weights).
+
+Baseline to beat: 20-prompt k=2 `BARO_DRAFT_Q4=1` median **104.18**
+(`draft-q4-protocol.md`); race k=4 145.6; both on `.work/engine-pack-q8d`.
+
+| item | prediction | land rule |
+|---|---|---|
+| race prompt k=4, dot=1 vs dot=0 | 145.6 -> 152-165 (m=5 windows; bench MR=4: dot 1.14x vs bf16 1.25-1.39x, MR=8: 1.45x vs 2.3-2.46x) | `GENERATED` identical to dot=0 arm on race prompt |
+| 20-prompt k=2 median, dot=1 | 104.18 -> 103-108 (weak: dot MR=2 was par with bf16; m=3 interpolates a small win) | >= 104.2 AND >= 18/20 per-prompt identity vs arm A |
+| prefill_s, longest prompt (59 tok) | drops >= 20% (prefill windows m=8) | recorded |
+| acceptance | within 2 points of dot=0 (trunk logits move at m>=3; drafts unchanged) | recorded |
+
+Falsifier: k=2 median < 104.18 AND race < 152 -> FFN-only dot wiring loses to
+its quantize launches at engine shapes; `BARO_DOT` stays default 0, item
+closed, no further dot wiring without a new preregistration.
+
+Non-bit-exact change (int8 dot replaces bf16 FMA on m>=3 trunk windows):
+identity gates above are the guard; arm A (m=1) is untouched by construction.

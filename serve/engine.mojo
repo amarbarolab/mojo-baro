@@ -321,6 +321,8 @@ def main() raises:
                 raise Error("unknown pack dtype " + dt)
     var draft_q4 = getenv("BARO_DRAFT_Q4", "0") == "1" and have_q4_draft
     print("BARO_DRAFT_Q4:", draft_q4)
+    var dot3 = getenv("BARO_DOT", "0") == "1"
+    print("BARO_DOT:", dot3)
     var e = len(off) - (1 if have_q4_draft else 0) - 15
 
     # --- load pack into one device buffer -----------------------------------
@@ -445,6 +447,8 @@ def main() raises:
     var v_d = ctx.enqueue_create_buffer[f32](MROWS * KV)
     var ao_d = ctx.enqueue_create_buffer[f32](MROWS * NQH * HD)
     var fgb_d = ctx.enqueue_create_buffer[bf16](MROWS * FFN)
+    var aq_d = ctx.enqueue_create_buffer[DType.int8](MROWS * FFN)
+    var asc_d = ctx.enqueue_create_buffer[DType.float16](MROWS * (FFN // 32))
     var logits_d = ctx.enqueue_create_buffer[f32](MROWS * VOCAB)
     var toks_d = ctx.enqueue_create_buffer[DType.int32](TMAX)
     var hn_d = ctx.enqueue_create_buffer[f32](MROWS * H)
@@ -767,13 +771,23 @@ def main() raises:
             var Pu = TileTensor(p_ffn2_d, p_ffn)
             var Ph2 = TileTensor(p_h_d, p_h)
             var FgBm = TileTensor(fgb_d, ffnm_layout)
-            gemm_q8(ctx, CurBm, Wfgq, Wfgs, Pg, m, FFN, H)
+            var AqH = TileTensor(aq_d, aqm_h)
+            var AsH = TileTensor(asc_d, asm_h)
+            var use_dot = dot3 and m >= 3
+            if use_dot:
+                quant_rows(ctx, CurBm, AqH, AsH, m, H)
+                gemm_q8dot(ctx, AqH, AsH, Wfgq, Wfgs, Pg, m, FFN, H)
+            else:
+                gemm_q8(ctx, CurBm, Wfgq, Wfgs, Pg, m, FFN, H)
             if pf4:
                 ctx.synchronize()
                 var nw = perf_counter_ns()
                 fc[1] += Int(nw - tq)
                 tq = nw
-            gemm_q8(ctx, CurBm, Wfuq, Wfus, Pu, m, FFN, H)
+            if use_dot:
+                gemm_q8dot(ctx, AqH, AsH, Wfuq, Wfus, Pu, m, FFN, H)
+            else:
+                gemm_q8(ctx, CurBm, Wfuq, Wfus, Pu, m, FFN, H)
             if pf4:
                 ctx.synchronize()
                 var nw = perf_counter_ns()
@@ -785,7 +799,13 @@ def main() raises:
                 var nw = perf_counter_ns()
                 fc[3] += Int(nw - tq)
                 tq = nw
-            gemm_q8(ctx, FgBm, Wfdq, Wfds, Ph2, m, H, FFN)
+            if use_dot:
+                var AqF = TileTensor(aq_d, aqm_ffn)
+                var AsF = TileTensor(asc_d, asm_ffn)
+                quant_rows(ctx, FgBm, AqF, AsF, m, FFN)
+                gemm_q8dot(ctx, AqF, AsF, Wfdq, Wfds, Ph2, m, H, FFN)
+            else:
+                gemm_q8(ctx, FgBm, Wfdq, Wfds, Ph2, m, H, FFN)
             if pf4:
                 ctx.synchronize()
                 var nw = perf_counter_ns()
