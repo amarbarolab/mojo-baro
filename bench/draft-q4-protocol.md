@@ -25,3 +25,54 @@ head when the pack has the q4 entry; the trunk never does.
 ## Result
 
 Not yet run.
+
+## M4 landed on the 20-prompt set — 2026-09-05
+
+The M4 result (`a81242a`) was measured on one race prompt. This is its P4
+verdict: `bench/mtp-prompts.sh` over all 20 prompts of `bench/mtp-prompts/`,
+k=2, arm-per-flag, on a pack rebuilt for the purpose.
+
+**The q4 draft head was inert on the live pack.** `.work/engine-pack-q8` was
+built without `--q4-draft`, so `have_q4_draft` was false and `BARO_DRAFT_Q4=1`
+silently decayed to the q8 head — a P1 inert parameter, visible only because
+the engine prints `BARO_DRAFT_Q4:` and that line is now readable (see below).
+Rebuilt as `.work/engine-pack-q8d` with
+`tools/engine-pack.py MODEL.gguf .work/engine-pack-q8d --q8 --q4-draft`:
+443 entries, 10.52 GiB, trailing `output.weight.q4draft q4` present.
+
+| arm | median tok/s_gen (20 prompts) | drafted | accepted | acceptance |
+|---|---|---|---|---|
+| no spec (A) | 67.32 / 67.61 | — | — | — |
+| k=2, `BARO_DRAFT_Q4=0` | **102.53** | 1054 | 737 | 0.6992 |
+| k=2, `BARO_DRAFT_Q4=1` | **104.18** | 1061 | 734 | 0.6918 |
+
+**+1.61%**, faster on 19 of 20 prompts, spread across prompts 88.4-127.4.
+Greedy identity PASS on all 40 speculative runs (arm B `GENERATED` equals
+arm A's, per prompt).
+
+Acceptance moved as the protocol warned it might: 0.6992 -> 0.6918, i.e. the
+q4 draft head is a slightly worse drafter. It still wins because the head is
+cheaper by more than the lost acceptance costs. The single-prompt figure that
+motivated the item (+2.1%) overstated it; the 20-prompt verdict is +1.61%.
+
+Left as an env flag rather than made default: the default pack
+(`.work/engine-pack-q8`) has no q4 entry, so flipping the default would only
+change behaviour for packs built with `--q4-draft`, and that choice belongs
+with the pack, not the binary.
+
+### Instrument bug found and fixed while taking these receipts
+
+`gpu-wait run` printed nothing before the job's first several lines: the
+waiting-room daemon's `op_logs` follow mode initialised its file offsets to the
+current size, so output written before the client attached was skipped. The
+engine's `BARO_DRAFT_Q4:` and `loading pack:` lines - the read-back for the
+parameter under test - were being dropped while the rest of the run looked
+complete. For a fast job it lost everything.
+
+Fixed in gpuwaitingroom `6e8ef0c` (follow replays from 0; `gpu-wait logs
+--follow` keeps tail-then-follow via `since_end`; regression test verified
+failing before the fix), daemon reinstalled and restarted. **Receipts taken
+through `gpu-wait run` before 2026-09-05 09:10 may be missing their first
+lines** - not wrong, but incomplete. Where a run's parameter read-back matters,
+redirect the engine's stdout to a file inside the job rather than trusting the
+stream.
