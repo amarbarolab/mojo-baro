@@ -38,6 +38,7 @@ widen the region to whole-layer rewrites instead of more iterations.
 |---|---|---|---|---|---|---|
 | 001 (2026-09-01, commit 7833260) | ffn (52%) | 18-skeptic, 19-builder, 20-stranger | 3 | 0 | 41.3 -> 41.3 | none |
 | 002 (2026-09-05, commit 9b8a399 in gguf) | ffn (51.2%) | 01-father, 02-grandfather, 03-uncle, 04-mother | 4 | 0 | 67.48 -> 67.48 | none |
+| 003 (2026-09-05, commit e3948ba in gguf, proposer Qwen3.8-27B) | ffn (51.2%) | 01-father, 02-grandfather, 03-uncle, 04-mother | 4 | 0 | 67.07 -> 67.07 | none |
 
 Iteration 001 notes: prompt 25k chars (bindings + ffn region + elementwise +
 matmul_skinny). All three failed before any timed run: no diff fence; patch
@@ -116,3 +117,56 @@ proposer clears the ladder, or whether every proposer fails at the same place.
 
 Not a champion measurement. The engine's champion tok/s is measured from the
 gguf's own sources in the same session as the gate, after the server stops.
+
+## Iteration 003 result (2026-09-05)
+
+Champion measured in-session from the gguf's own sources
+(`tools/gguf-closure.sh`, commit e3948ba, 64/64 PASS): 66.90 / 67.24 / 67.07
+-> **median 67.07 tok/s_gen, spread 0.51%**.
+
+| cand | identity | stage reached | verdict |
+|---|---|---|---|
+| 0 | 01-father | apply | context does not exist in engine.mojo |
+| 1 | 02-grandfather | **identity** | compiled and ran; first token 279, expected 11751 |
+| 2 | 03-uncle | apply | context does not exist in engine.mojo |
+| 3 | 04-mother | parse | no diff fence (budget exhausted at 12288 tokens) |
+
+Survivors 0. **But cand-1 is the first candidate in this loop's history to get
+past `apply`** — it compiled, ran, and was rejected by the token-identity gate
+on its output. Iterations 001 and 002 put 0/7 candidates that far. The gate
+amendment did what it was written to do.
+
+What the proposer actually produced, which is the finding: cand-0 and cand-2
+**echoed the RULES block's worked example back**, ellipses and all
+(`ctx.enqueue_function[g_ffn](CurB2, Wfg, Pg, ...)` is example text, not code
+in this engine), so their context matched nothing. cand-1 wrote real code from
+the region — and replaced the residual `r_add` with a second `r_swiglu` call,
+deleting the residual. All three emitted `PREDICT: 0`; none claimed a speedup.
+
+**Two harness defects were found and fixed before this result counted**, and
+both had to be fixed before anything about the proposer was measurable:
+
+1. The first run returned 4/4 empty. `ask()` read `message.content` only, and
+   llama.cpp serves a reasoning model's thinking in `message.reasoning_content`
+   — every branch burned its 4096-token budget thinking and the harness threw
+   the text away, logging it as `diff=NO`, which is indistinguishable from a
+   proposer with nothing to say (`67b456d`).
+2. The second run collapsed into degenerate repetition: one branch produced 567
+   lines of which 19 were unique, a single line repeated 287 times. The server
+   was running llama.cpp sampler defaults (top_k 40, repeat-penalty off), not
+   Qwen3's documented `temp 0.6 / top_p 0.95 / top_k 20 / min_p 0`. With those
+   set plus `presence_penalty 1.0`, three of four branches finished on `stop`
+   in ~2.1-2.6k tokens instead of running to the budget wall.
+
+Both void runs are kept at `.work/loop/003-void-harness/` and
+`.work/loop/003-void-sampler/`. Neither measured the proposer; a sampler
+default is not a capability.
+
+Verdict on the proposer swap: a 27B in place of the 9B **cleared the format**
+(3/4 parseable diffs vs 4/4 in iteration 002) but did not do the engineering —
+two of three answers were the prompt's own example, and the fourth branch still
+collapsed. Proposer size was not the bottleneck the previous two iterations
+implied it might be.
+
+Worth-it rule status: 3 iterations, 0 survivors, 0% aggregate gain. Two more
+before the rule forces widening the region.
