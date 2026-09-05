@@ -155,3 +155,51 @@ Stronger result than the rule asks for: the whole SSM sub-block costs only
 1.07x per window at m=2 while doing twice the rows. The m=2 loss is not in the
 SSM sub-block at all, which is what item 2 assumed and this probe now
 supports rather than merely permits.
+
+## Re-run — same day, clean GPU, HEAD 4510aa7
+
+`coios-embed.service` (the resident bge-m3 embedding server) was disabled and
+its waiting-room job cancelled, removing the one disclosed deviation from the
+first run record. GPU before: 1.43 GB used, 18 W, 47 C, 3% busy, no other job
+in the queue.
+
+P1 gap from the first run also closed: each arm's script rebuilds the engine
+and prints `build exit: 0` plus `sha256sum .work/engine` in the same command as
+the run. Both arms, all six runs: `ed178a7bad2a05c38263f732ac78d07bb531c9d4e5ec157d8c1c189338264274`.
+Arm identity re-read per file — three runs with `BARO_SPEC: False`, three with
+`BARO_SPEC: True` + `accepted 32`.
+
+Delta-stage kept runs: A 45.182 / 43.950 ms (spread 2.8%), B 33.398 / 32.721 ms
+(2.1%).
+
+| stage | A (m=1) | B (m=2) | B/A | B/A, contaminated run |
+|---|---|---|---|---|
+| gemm4+reduce2 | 3.0430 | 3.4353 | 1.13 | 0.94 |
+| rgates | 0.6722 | 0.8896 | 1.32 | 1.35 |
+| conv | 0.4564 | 0.4819 | 1.06 | 1.06 |
+| l2 | 0.4403 | 0.4648 | 1.06 | 1.06 |
+| **delta** | **0.7074** | **1.0331** | **1.46** | 1.47 |
+| gated | 0.4465 | 0.4686 | 1.05 | 1.08 |
+| out_gemm+add | 1.1368 | 1.1885 | 1.05 | 1.05 |
+| total (profiled, serialized) | 6.9026 | 7.9617 | 1.15 | 1.07 |
+
+`S_delta(m=2)` = 0.130, `d` = 1.460. **Verdict unchanged**: prediction 1 stays
+falsified, the decision rule still reads **recoverable**, item 2 keeps its
+115-120 tok/s ceiling. These are the numbers to cite; the first run record is
+kept for the contrast below.
+
+### What the resident embedding server was doing to the numbers
+
+It moved exactly one stage and only in the m=1 arm: `gemm4+reduce2` at m=1 was
+3.6094 ms/win contaminated vs 3.0430 clean, **+18.6%**. The four q8 GEMMs are
+the only bandwidth-bound stage in the sub-block, so an idle-but-resident model
+holding ~1.1 GB and its share of Infinity Cache lands there and nowhere else —
+`conv`, `l2`, `gated` and `out_gemm+add` reproduce to within 3%.
+
+The distortion inflated the m=1 baseline, which made the m=2 sub-block look
+*cheaper* than it is: total B/A 1.07 contaminated vs 1.15 clean. It flattered
+the arm under test. Nothing here was load-bearing for the verdict, since `d`
+and `S_delta` both moved <1%, but a contaminated baseline biasing toward the
+conclusion is the failure mode P1 exists to catch, and it was caught by
+re-running rather than by the spread gate — both contaminated arms passed
+their spread gates comfortably.
