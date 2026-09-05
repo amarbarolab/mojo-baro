@@ -170,3 +170,28 @@ implied it might be.
 
 Worth-it rule status: 3 iterations, 0 survivors, 0% aggregate gain. Two more
 before the rule forces widening the region.
+
+## Iteration 004 preregistration (2026-09-05) — the 27B carries its own kernels
+
+Iteration 003 broke the self-describing premise on purpose: the model proposing
+the rewrite was not the model carrying the sources. This closes it.
+
+`Qwen3.8-27B-OBLITERATED.Q4_K_M-BARO-ffa1808.gguf` — the engine and kernel
+sources at ffa1808 embedded into the 27B's own gguf (`tools/gguf-embed.py`,
++14 KV, +134 KB, tensor data byte-identical, new file, source untouched). The
+same file is both the source of the sources and the proposer, so the loop's
+premise holds for this model: it is rewriting the kernels inside itself.
+
+Bake verified before the run, two ways:
+- **closure**: engine rebuilt from the gguf's own `baro.kernel.src.*` KVs,
+  shim included, **64/64 greedy tokens PASS** (`tools/gguf-closure.sh`).
+- **serving**: llama.cpp loads the baked file and ignores the new keys;
+  sampler read back from `/props` (P1).
+
+Champion measured in-session from those same embedded sources: 67.17 / 66.99 /
+67.85 -> **median 67.17 tok/s_gen, spread 1.27%**.
+
+Held from iteration 003 so the only variable is self-description: region `ffn`,
+identities 01-04, `--max-tokens 12288`, Qwen3 sampler
+(`temp 0.6 / top_p 0.95 / top_k 20 / min_p 0`, `repeat_penalty 1.05`,
+`presence_penalty 1.0`).
