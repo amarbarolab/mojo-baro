@@ -56,16 +56,23 @@ on the branch, receipt in `docs/BASELINE.md`.
 ## Stage 0: fixed-grid GEMM cost + occupancy (S, `bench/bench_mega_gemm.mojo`)
 
 Cold-cache protocol (`coldcache-protocol.md`: W >= 96 MB rotated). q8row m=1
-block-strided at G in {96, 192, 288, 384} vs native `ceildiv(N, 8)` grid, shapes
+block-strided at G in {96, 144, 192} (see occupancy receipt) vs native `ceildiv(N, 8)` grid, shapes
 (N x K): 4096x4096, 8192x4096, 12288x4096, 4096x12288. Receipt: us per
 shape per G, ratio to native, clock via `clock-probe.sh`.
 
 Occupancy receipt: a kernel containing the q8row body + the delta_step body
 (no barrier logic needed), built with `mojo build --emit=asm`; read
 `.vgpr_count` / `.sgpr_count` / `.lds_size` from the code-object metadata;
-resident blocks = floor(1536 / (vgprs x 8 waves)) x 48 CUs, cross-checked by
-running `bench_gridbar` with that kernel's phases at G and G+48 (the second
-must deadlock -> timeout, proving the ceiling).
+resident blocks (wave64, 8 waves/block) = floor(768 / vgprs_granule8) waves per
+SIMD x 4 SIMD / 8 waves = blocks per CU, x 96 CUs. Cross-check with
+`bench/bench_mega_occ.mojo <G>` (q8row phase + barrier), whose barrier has a
+bounded spin (`SPIN_LIMIT`) and a fail word: an overshoot prints
+`NOT-RESIDENT` and returns. **NEVER launch an unbounded grid barrier past the
+computed ceiling: a deadlocked barrier is not a timeout, it is a gfx ring
+hang -> MODE1 reset -> every GL client on the desktop dies (2026-09-05 23:25,
+`mega_occ_probe 240`, hard reboot).** Receipt 2026-09-05: vgpr 182 -> 4
+waves/SIMD -> 2 blocks/CU -> 192; probe: 96/144/192 complete, 216
+NOT-RESIDENT. Stage 0 G set is therefore {96, 144, 192}; 288/384 are out.
 
 ## Stage 1: one ssm layer as a persistent kernel (L, `kernels/mega.mojo`)
 
