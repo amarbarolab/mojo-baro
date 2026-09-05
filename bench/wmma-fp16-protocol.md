@@ -640,3 +640,48 @@ the right denominator, and puts their kernel at ~1.00 of the practical
 per-clock ceiling where we are at 0.939. Their sustained clock is
 unpublished, so 438.7 is a floor on their per-clock figure, not a point
 estimate. Next round reads that kernel before proposing a lever.
+
+### RETRACTION (2026-09-05) -- Round 8's falsification of Round 7 was itself invalid
+
+Everything above under "Round 8 result, D1 baseline arm" and "Round 8 result,
+D1.1 and D1.2" was measured at 4096^3. At fp16 with three square buffers that
+is W = 3 x 4096^2 x 2 = **100.7 MB against a 96 MB Infinity Cache**, i.e. the
+regime `CLAUDE.md` and `bench/coldcache-protocol.md` both declare invalid
+("single-buffer GEMM timings at W >= 96 MB are invalid, IC contamination";
+coldcache records an 8x swing from the same cause). 4096^3 is the only size in
+the ten-size sweep that crosses the line, and it crosses it by 4.7% -- so
+whether the working set partially fits depends on how much IC the desktop
+holds at that moment. This box runs 14 graphics clients on renderD128
+(kwin_wayland, plasmashell, Xwayland, vivaldi, zed, 6x ghostty).
+
+Measured both modes, each tight, hours apart on a byte-identical binary:
+
+| window | 4096^3 median | spread | sclk_med | FLOP/clk/CU |
+|---|---|---|---|---|
+| 05:33 | 99224 | 0.44% | 2525 | 409.3 |
+| 07:12 | 91333 | 0.87% | 2600 | 366.0 |
+
+**Round 7 is reproduced, not falsified.** It recorded 89-91k and 358
+FLOP/clk/CU at 4096^3; the honest re-measurement is 91333 and 366.0. The
+"champion is 0.791 R, not 0.71 R" claim, the 0.939-per-clock figure, and the
+re-decomposition to 15.8% clock + 6.1% issue all came from the favourable IC
+draw and are withdrawn.
+
+What survives: the four harness defects were real and their fixes are
+independently verified (`78ba961`) -- 0.28 s timed window, spread printed but
+never gated, warm-up samples polluting `sclk_med`, single-sample sweep. Fixing
+the noise is what made the invalid number look trustworthy enough to build on.
+
+D1's three arms were all at 4096^3 and are therefore not quotable. They were
+internally consistent (FLOP/clk/CU 409.3/409.5/409.8, one IC mode held across
+the 4-minute window), so "watts do not buy clock" is probably right, but it
+must be re-run at a valid size before it is cited.
+
+**Valid reference, 3584^3 (W = 77.1 MB, IC-resident), 4-round interleaved
+median, spread 1.88%:** 105539 GFLOP/s, 400.7 FLOP/clk/CU at 2745 MHz =
+**0.842 R**, gap 8.5% clock + 8.1% issue. Check: 0.919 per clock x 0.915
+clock = 0.841.
+
+Rule going forward: no fp16 square-GEMM arm at 4096^3. Use 3584^3 as the
+large-size arm, or move to the cold-cache multi-buffer harness. Any protocol
+that names 4096^3 as an arm is naming an invalid instrument.

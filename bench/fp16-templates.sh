@@ -18,10 +18,10 @@ python3 - <<'PY'
 import json
 w={j["m"]:j for j in map(json.loads,open(".work/fp16-tpl_wmma.jsonl"))}
 l={j["m"]:j for j in map(json.loads,open(".work/fp16-tpl_lt.jsonl"))}
-print(f"{'size':>5} | {'ours gflops':>11} {'ok':>5} {'max_err':>9} {'iters':>5} {'warm':>5} {'pgr':>3} {'lb':>2} {'blk':>12} {'warps':>6} {'wtile':>6} {'grid':>8} | {'hipBLASLt':>10} {'iters':>5} {'warm':>5} {'ok':>5} {'max_err':>8} {'algo':>4} {'splitk':>6} | {'ratio':>6}")
+print(f"{'size':>5} | {'ours gflops':>11} {'ok':>5} {'max_err':>9} {'iters':>5} {'warm':>5} {'pgr':>3} {'lb':>2} {'blk':>12} {'warps':>6} {'wtile':>6} {'grid':>8} {'spr%':>5} | {'hipBLASLt':>10} {'spr%':>5} {'iters':>5} {'warm':>5} {'ok':>5} {'max_err':>8} {'algo':>4} {'splitk':>6} | {'ratio':>6}")
 for s in sorted(w):
     a,b=w[s],l[s]
-    print(f"{s:>5} | {a['gflops']:>11.0f} {str(a['correct']):>5} {a['max_err']:>9.2e} {a['iters']:>5} {a['warmup_s']:>5.0f} {a['pgr']:>3} {a['lb']:>2} {str(a['blk']):>12} {str(a['warps']):>6} {str(a['wtile']):>6} {str(a['grid']):>8} | {b['gflops']:>10.0f} {b['iters']:>5} {b['warmup_s']:>5.0f} {str(b['correct']):>5} {b['max_err']:>8.2e} {b['algo_chosen']:>4} {b['splitk']:>6} | {a['gflops']/b['gflops']:>6.3f}")
+    print(f"{s:>5} | {a['gflops']:>11.0f} {str(a['correct']):>5} {a['max_err']:>9.2e} {a['iters']:>5} {a['warmup_s']:>5.0f} {a['pgr']:>3} {a['lb']:>2} {str(a['blk']):>12} {str(a['warps']):>6} {str(a['wtile']):>6} {str(a['grid']):>8} {a.get('spread',0)*100:>5.2f} | {b['gflops']:>10.0f} {b.get('spread',0)*100:>5.2f} {b['iters']:>5} {b['warmup_s']:>5.0f} {str(b['correct']):>5} {b['max_err']:>8.2e} {b['algo_chosen']:>4} {b['splitk']:>6} | {a['gflops']/b['gflops']:>6.3f}")
 bad=[s for s in w if not w[s]['correct']]+[s for s in l if not l[s]['correct']]
 print("ALL CORRECT" if not bad else f"INCORRECT at {bad}")
 PY
