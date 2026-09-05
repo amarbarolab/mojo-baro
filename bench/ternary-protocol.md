@@ -89,7 +89,43 @@ Spread > 5% voids the arm.
 
 ## T1 baseline result
 
-(recorded in a second commit, after this protocol lands)
+Clean run, GPU idle before start (`gpu-wait list` -> `(no jobs)`), through
+`bench/clock-probe.sh` + `gpu-wait run --priority 90`.
+
+`grid_dim=1536 block_dim=256 ROW_WAVES=8 MR=1` (read back from the binary's
+own print, matching `ceildiv(N, ROW_WAVES)` and `ROW_THREADS` for N=12288).
+
+Correctness (fp64 host reference, same run):
+
+| arm | max_rel | abs/maxref | correct |
+|---|---|---|---|
+| q8row | 9.44e-05 | 1.15e-07 | true |
+| q2b3row | 6.90e-05 | 7.28e-08 | true |
+| tq1row | 6.71e-05 | 7.94e-08 | true |
+| tq2row | 6.71e-05 | 7.94e-08 | true |
+
+Timing (10 reps, us):
+
+| arm | min | max | spread | GB/s (median) | prediction | land |
+|---|---|---|---|---|---|---|
+| q8row (control) | 71.32 | 72.39 | 1.5% | 746 | -- (see P1 receipt above) | -- |
+| q2b3row | 44.02 | 44.30 | 0.6% | 250 | 40-120, likely slower than q8row | in range; **beats q8row**, reasoning note wrong |
+| tq1row | 53.56 | 53.88 | 0.6% | 197 | 30-80 | in range |
+| tq2row | 45.81 | 46.30 | 1.1% | 282 | 20-45 | **misses ceiling by 2.3%** (46.05 vs 45) |
+
+Clocks (`bench/clock-probe.sh`, whole 4-arm run): sclk 2830 MHz median
+(2781-3018 MHz range), power 269-293 W, junction max 85 C. Sustained
+4-arm x 10-rep load runs the card warmer than an isolated q8row-only
+run (3064-3069 MHz median in the P1 receipt above); this is read back
+and disclosed per P1, and is the reason this run's q8row control
+(71.68 us median) sits a bit above the isolated control runs
+(69-70.85 us) rather than a regression from this run itself.
+
+Falsifier check: q2b3row (44.10 us median) is well above the 25 us
+falsifier threshold -- decode is NOT free, proceed to T2.
+
+Bytes moved (read back from the binary, matches the index-derived byte
+counts above): q8=53,477,376 q2b3=11,010,048 tq1=10,616,832 tq2=12,976,128.
 
 ## Fork
 
