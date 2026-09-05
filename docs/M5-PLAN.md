@@ -62,9 +62,7 @@ before touching anything. Board: `~/Brain/mojo-baro/whiteboard.md`.
    alpha/beta reduce, amar_rmsnorm+cast, split/norm/rope chains. Consider one
    fused "layer prologue" and "layer epilogue" kernel. Keep each fusion
    behind the token-identity gate.
-3. **[STILL LIVE — the main unbuilt item]** **Prefill batching**: process the prompt with M=n_prompt GEMMs (skinny
-   handles M<=8; batch larger prompts in chunks of 8). Attention prefill
-   needs a causal-mask variant of amar_attn_decode.
+3. **[PARTLY IMPLEMENTED — audited 2026-09-05]** **Prefill batching**: the engine already batches prompt projections in chunks of up to 8, and `amar_attn_decode` uses `T=t_len+row` for causal attention within each chunk. Remaining work is a measured prefill throughput/TTFT improvement, including tiled attention for longer prompts. Registry `TMAX=128` sizes the current KV/token allocation; attention's `MAX_T=1024` is only score-buffer capacity. See [engine diagnostic audit](ENGINE-DIAGNOSTIC-AUDIT.md#5-prefill-already-uses-chunks-and-causal-attention).
 4. **[DONE 2026-09-04 `c3752e7` — 41.7 -> 68.8 tok/s_gen, +65%, 64/64]** **q8b weight path** end-to-end (kernels exist, parity 9.2e-4): halves the
    bandwidth ceiling (~50 -> ~100 tok/s roof). Quantize the pack, add a
    `--q8` engine mode. Token identity may legitimately drift under quant —
