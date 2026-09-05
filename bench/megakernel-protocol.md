@@ -74,6 +74,27 @@ hang -> MODE1 reset -> every GL client on the desktop dies (2026-09-05 23:25,
 waves/SIMD -> 2 blocks/CU -> 192; probe: 96/144/192 complete, 216
 NOT-RESIDENT. Stage 0 G set is therefore {96, 144, 192}; 288/384 are out.
 
+
+### Stage 0 receipt (2026-09-05 23:40, `ce3576d`+grid edit, `.work/mega-stage0.log`)
+
+Arm: 290 W cap, -100 mV, engine-pack-q8 blk.0, NBUF=8 rotation, ITERS=200, 5 reps;
+clock-probe sclk med 2802 (2694-3122) MHz, power 281-346 W, Tj 74 C. All G
+bit-exact vs native (0 mismatches).
+
+| shape (NxK) | native us | G=96 | G=144 | G=192 | best/native |
+|---|---|---|---|---|---|
+| 12288x4096 | 71.8 | 64.3 | 64.3 | 64.7 | 0.895 |
+| 4096x12288 | 77.4 | 65.3 | 68.6 | 74.8 | 0.845 |
+| 8192x4096 | 47.0 | 44.6 | 44.2 | 44.7 | 0.941 |
+| 4096x4096 | 27.9 | 24.3 | 24.2 | 24.5 | 0.868 |
+
+**S0a does not fire**: the fixed grid is 5-16% FASTER than the native
+`ceildiv(N,8)` launch at G=96 on every shape (one block per CU, no tail
+wave); G=192 is worst but still <= native. Best resident G for the
+megakernel = 96. This is a gain the frozen prediction assumed to be 0, so
+the stage-2 ceiling is +8-12% from launches PLUS the GEMM-phase gain; the
+frozen numbers stand as the land rule regardless. -> stage 1.
+
 ## Stage 1: one ssm layer as a persistent kernel (L, `kernels/mega.mojo`)
 
 Hoist `matmul_skinny_q8row`, `ssm_*`, `rmsnorm_cast`, `residual_add` bodies
