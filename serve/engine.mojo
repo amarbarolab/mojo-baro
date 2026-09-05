@@ -468,6 +468,11 @@ def main() raises:
     var Embd = tens_bf16(ctx, wbuf, off[0], VOCAB * H, emb_layout)
 
     var n_total = len(prompt) + GEN_N
+    if n_total > TMAX:
+        raise Error(
+            "prompt+generation exceeds TMAX: " + String(len(prompt)) + " + "
+            + String(GEN_N) + " > " + String(TMAX)
+        )
     var toks_h = ctx.enqueue_create_host_buffer[DType.int32](TMAX)
     ctx.synchronize()
     for i in range(TMAX):
