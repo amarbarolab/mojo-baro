@@ -596,3 +596,47 @@ Not yet re-checked: every fp16 number in `docs/BASELINE.md` and the Round
 all first-build losses of 3-28%, mostly larger than the noise, so they
 probably stand -- but the ten-size table and the R fraction quoted there are
 now suspect and need a re-run on the fixed harness before being quoted.
+
+**Round 8 result, D1.1 and D1.2 -- both rejected, D1 closed** (2026-09-05,
+`.work/d1-{290,350,402}W.log`; arms at commits `9b8a399` / `9220868` /
+`9220868`, same prebuilt binary `.work/fp16_d1b_4096` mtime 05:33:42
+throughout, so the two unrelated commits that landed mid-round -- `3e1892f`,
+`9220868`, both `tools/loop-*` and `docs/M5-PLAN.md` -- cannot have moved
+these numbers). Cap read back from sysfs before every arm; `lactd` restarted
+between arms; `voltage_offset` -100 mV at every rung.
+
+| cap | median | min..max | vs 290 W | sclk_med | FLOP/clk/CU | R | junction |
+|---|---|---|---|---|---|---|---|
+| 290 W | 99224 | 98976..99413 | -- | 2525 | 409.3 | 0.791 | 75-79 C |
+| 350 W | 101931 | 101066..102504 | +2.73% | 2593 | 409.5 | 0.813 | 83-89 C |
+| 402 W | 102257 | 101839..102772 | +3.06% | 2600 | 409.8 | 0.815 | 81-88 C |
+
+D1.1 needed >= +5%: got +2.73%, rejected (ranges ARE disjoint from 290 W and
+FLOP/clk/CU is flat, so the arm is valid and the effect is real -- just far
+below threshold). D1.2 needed >= +10%: got +3.06%, and against 350 W it is
++0.32% with overlapping ranges, i.e. the last 52 W bought nothing.
+
+FLOP/clk/CU across the three arms is 409.3 / 409.5 / 409.8. The predicted
+mechanism was exactly right -- pure clock scaling, nothing else moved -- and
+the prediction was still wrong, because the clock barely responds to watts:
++21% budget bought +2.7% clock, and +39% bought +3.0%. The clock plateaus at
+~2600 MHz.
+
+**The finding is the falsification, not the +3%.** The 15.8% clock deficit
+is NOT power-limited. R's 3.0 GHz comes from `wmma_peak`, which moves no
+memory; the GEMM's own traffic holds the card at ~2600 MHz and no wattage
+lifts it. Round 7 saw this from the other side ("every traffic cut raised the
+clock") -- D1 confirms it directly. Decision D1 is answered NO. Do not
+re-race the power cap, and do not quote a raised cap as an operating point:
++2.7% for +60 W and +10 C junction is not worth leaving the validated
+290 W / -100 mV config.
+
+Remaining 0.185 R = ~13% traffic-induced clock (five Round 7 levers, all
+lost more per clock than they gained) + 6.1% issue. The issue half is the
+live one: `adelj88/rocm_wmma_gemm` reports 78.80 TFLOP/s fp16 at 4096^3 on a
+7900 GRE (80 CU, 2245 MHz boost) = ~438.7 FLOP/clk/CU, against our measured
+roofline of 436. Two independent efforts landing on ~437 corroborates R as
+the right denominator, and puts their kernel at ~1.00 of the practical
+per-clock ceiling where we are at 0.939. Their sustained clock is
+unpublished, so 438.7 is a floor on their per-clock figure, not a point
+estimate. Next round reads that kernel before proposing a lever.
