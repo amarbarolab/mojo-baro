@@ -54,3 +54,27 @@ kernel's), measure before wiring.
 Folding the draft path (`blk32_forward`, ~4.6 ms/window, 2 x 1 GB head
 reads) -- separate freeze; MR > 3; the q8dot m>=3 FFN kernel (`BARO_DOT`,
 closed in `mrow-gemm-protocol.md`).
+
+## W1/W2 receipt (2026-09-06 01:20) -- CLOSED at W2
+
+W1 PASSES: `amar_mega_token[MR=3]` bit-identical to the launch sequence at
+m=3 (X, conv windows, ssm states, KV cache, 3 argmax rows, f32 final-norm
+rows), `kernels/test_mega_block.mojo` runs m=1 and m=3.
+
+W2 FAILS the stop rule: ref prompt k=2 spec, `BARO_MEGA_WIN=1` 121.0 vs
+launch 122.2 tok/s_gen (-1%); synthetic 4-layer window m=3 mega 1.10x the
+launch time (m=1: 0.87x). Per-phase: the GEMM phases scale 1.5-1.6x from
+m=1 to m=3 inside the persistent kernel where the native `q8row[4,3]`
+scales ~1.15x (M0 receipt). Cause is occupancy, not spills: the persistent
+kernel runs 1 block/CU = 2 waves/SIMD (256-VGPR budget forced by the delta
+phase's 128-register column); at m=1 the loop is bandwidth-bound and does
+not care, at m=3 it is FMA/latency-bound and half the native occupancy
+cannot hide the load latency. Tried: runtime row loop in delta (spills
+457 -> 185, no speedup); software-pipelined dot loop (spills 92/244, 4%
+SLOWER at both m). Not tried (separate freeze): shrink the delta phase to
+<= 128 VGPRs so G=192 (2 blocks/CU) becomes resident; that is the only
+lever that changes the occupancy.
+
+Kept: the MR-generic kernel (m=1 path unchanged, spills 84 -> 77), the m=3
+kernel gate, and the engine window path behind `BARO_MEGA_WIN=1`
+(default 0). `BARO_MEGA=1` stays the default for m=1 decode.

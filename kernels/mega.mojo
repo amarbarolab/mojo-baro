@@ -19,40 +19,21 @@ comptime f32 = DType.float32
 comptime bf16 = DType.bfloat16
 comptime i8 = DType.int8
 comptime f16 = DType.float16
+comptime u8 = DType.uint8
+comptime i32 = DType.int32
+comptime i64 = DType.int64
 comptime MEGA_G = 96
 comptime SPIN_LIMIT = 1 << 22
 comptime QV = 16
 comptime UNROLL = 4
-comptime u8 = DType.uint8
-comptime i64 = DType.int64
 comptime H = 4096
 comptime FFN = 12288
 comptime QF = 2 * H
 comptime KV = NKVH * HD
 comptime N_LAYERS = 32
 comptime VOCAB = 248320
-comptime i32 = DType.int32
 comptime ATT_SCALE = Float32(0.0625)
 comptime RMS_EPS = Float32(1e-6)
-comptime q_h_qf = row_major[QF, H]()
-comptime s_h_qf = row_major[QF, H // 32]()
-comptime q_h_h = row_major[H, H]()
-comptime s_h_h = row_major[H, H // 32]()
-comptime q_h_kv = row_major[KV, H]()
-comptime s_h_kv = row_major[KV, H // 32]()
-comptime q_h_32 = row_major[NH_V, H]()
-comptime s_h_32 = row_major[NH_V, H // 32]()
-comptime q_h_ffn = row_major[FFN, H]()
-comptime s_h_ffn = row_major[FFN, H // 32]()
-comptime q_ffn_h = row_major[H, FFN]()
-comptime s_ffn_h = row_major[H, FFN // 32]()
-comptime q_conv_h = row_major[CONV, H]()
-comptime s_conv_h = row_major[CONV, H // 32]()
-comptime h_layout = row_major[H]()
-comptime hd_layout = row_major[HD]()
-comptime cw_layout = row_major[CONV, 4]()
-comptime g32_layout = row_major[NH_V]()
-comptime n128_layout = row_major[SSTATE]()
 
 
 @always_inline
@@ -88,17 +69,17 @@ def stamp(prof: MutPointer[Scalar[i64], MutAnyOrigin], idx: Int):
 
 @always_inline
 def q8_row_dot[
-    ALayout: TensorLayout, QLayout: TensorLayout, SLayout: TensorLayout
+    MR: Int, ALayout: TensorLayout, QLayout: TensorLayout, SLayout: TensorLayout
 ](
     A: TileTensor[bf16, ALayout, MutAnyOrigin],
     Q: TileTensor[i8, QLayout, MutAnyOrigin],
     S: TileTensor[f16, SLayout, MutAnyOrigin],
-    row: Int, lane: Int, K: Int,
-) -> Float32:
+    row: Int, lane: Int, K: Int, M: Int,
+) -> InlineArray[Float32, MR]:
     comptime STEP = WARP_SIZE * QV
     var Qv = Q.vectorize[1, QV]()
     var Av = A.vectorize[1, QV]()
-    var acc = SIMD[f32, QV](0)
+    var acc = InlineArray[SIMD[f32, QV], MR](fill=SIMD[f32, QV](0))
     var kk = 0
     while kk + UNROLL * STEP <= K:
         var qs = InlineArray[SIMD[i8, QV], UNROLL](uninitialized=True)
@@ -110,20 +91,114 @@ def q8_row_dot[
         comptime for u in range(UNROLL):
             var kb = kk + u * STEP
             var w = qs[u].cast[f32]() * ds[u].cast[f32]()
-            var a = rebind[SIMD[bf16, QV]](Av[0, kb // QV + lane]).cast[f32]()
-            acc += w * a
+            comptime for r in range(MR):
+                if r < M:
+                    var a = rebind[SIMD[bf16, QV]](Av[r, kb // QV + lane]).cast[f32]()
+                    acc[r] += w * a
         kk += UNROLL * STEP
     while kk < K:
         var q = rebind[SIMD[i8, QV]](Qv[row, kk // QV + lane]).cast[f32]()
         var d = rebind[Scalar[f16]](S[row, (kk + lane * QV) // 32]).cast[f32]()
-        var a = rebind[SIMD[bf16, QV]](Av[0, kk // QV + lane]).cast[f32]()
-        acc += (q * d) * a
+        var w = q * d
+        comptime for r in range(MR):
+            if r < M:
+                var a = rebind[SIMD[bf16, QV]](Av[r, kk // QV + lane]).cast[f32]()
+                acc[r] += w * a
         kk += STEP
-    return warp.sum(acc.reduce_add())
+    var out = InlineArray[Float32, MR](fill=0)
+    comptime for r in range(MR):
+        if r < M:
+            out[r] = warp.sum(acc[r].reduce_add())
+    return out^
+
+
+@always_inline
+def rmsc_phase[
+    XL: TensorLayout, GL: TensorLayout, CBL: TensorLayout
+](
+    mut X: TileTensor[f32, XL, MutAnyOrigin],
+    Gn: TileTensor[f32, GL, MutAnyOrigin],
+    mut CurB: TileTensor[bf16, CBL, MutAnyOrigin],
+    M: Int,
+):
+    comptime assert X.flat_rank == 2 and CurB.flat_rank == 2 and Gn.flat_rank == 1
+    var tid = Int(thread_idx.x)
+    var lane = Int(lane_id())
+    var wave = tid // WARP_SIZE
+    var sums = stack_allocation[f32, address_space = AddressSpace.SHARED](
+        row_major[EW_THREADS // WARP_SIZE]()
+    )
+    for r in range(M):
+        var partial: Float32 = 0
+        if tid < EW_THREADS:
+            var i = tid
+            while i < H:
+                var v = rebind[Scalar[f32]](X[r, i])
+                partial += v * v
+                i += EW_THREADS
+            var wsum = warp.sum(partial)
+            if lane == 0:
+                sums[wave] = rebind[sums.ElementType](wsum)
+        barrier()
+        if tid < EW_THREADS:
+            var total: Float32 = 0
+            comptime for w in range(EW_THREADS // WARP_SIZE):
+                total += rebind[Scalar[f32]](sums[w])
+            var scale = rsqrt(total / Float32(H) + RMS_EPS)
+            var i = Int(block_idx.x) * EW_THREADS + tid
+            while i < H:
+                CurB[r, i] = rebind[CurB.ElementType](
+                    (rebind[Scalar[f32]](X[r, i]) * scale * rebind[Scalar[f32]](Gn[i])).cast[bf16]()
+                )
+                i += Int(grid_dim.x) * EW_THREADS
+        barrier()
+
+
+@always_inline
+def rms_f32_phase[
+    XL: TensorLayout, GL: TensorLayout
+](
+    mut X: TileTensor[f32, XL, MutAnyOrigin],
+    Gn: TileTensor[f32, GL, MutAnyOrigin],
+    mut O: TileTensor[f32, XL, MutAnyOrigin],
+    M: Int,
+):
+    comptime assert X.flat_rank == 2 and O.flat_rank == 2 and Gn.flat_rank == 1
+    var tid = Int(thread_idx.x)
+    var lane = Int(lane_id())
+    var wave = tid // WARP_SIZE
+    var sums = stack_allocation[f32, address_space = AddressSpace.SHARED](
+        row_major[EW_THREADS // WARP_SIZE]()
+    )
+    for r in range(M):
+        var partial: Float32 = 0
+        if tid < EW_THREADS:
+            var i = tid
+            while i < H:
+                var v = rebind[Scalar[f32]](X[r, i])
+                partial += v * v
+                i += EW_THREADS
+            var wsum = warp.sum(partial)
+            if lane == 0:
+                sums[wave] = rebind[sums.ElementType](wsum)
+        barrier()
+        if tid < EW_THREADS:
+            var total: Float32 = 0
+            comptime for w in range(EW_THREADS // WARP_SIZE):
+                total += rebind[Scalar[f32]](sums[w])
+            var scale = rsqrt(total / Float32(H) + RMS_EPS)
+            var i = Int(block_idx.x) * EW_THREADS + tid
+            while i < H:
+                O[r, i] = rebind[O.ElementType](
+                    rebind[Scalar[f32]](X[r, i]) * scale * rebind[Scalar[f32]](Gn[i])
+                )
+                i += Int(grid_dim.x) * EW_THREADS
+        barrier()
 
 
 @always_inline
 def ssm_phases[
+    MR: Int,
     XL: TensorLayout, GL: TensorLayout, CBL: TensorLayout,
     QqL: TensorLayout, QsL: TensorLayout,
     HqL: TensorLayout, HsL: TensorLayout,
@@ -156,12 +231,14 @@ def ssm_phases[
     mut ConvState: TileTensor[f32, CsL, MutAnyOrigin],
     mut SAll: TileTensor[f32, SsL, MutAnyOrigin],
     mut Ctr: TileTensor[u32, CtrL, MutAnyOrigin],
-    ring: Int32, ssm_i: Int32, slots: Int32,
+    ring: Int32, ssm_i: Int32, slots: Int32, M: Int,
     prof: MutPointer[Scalar[i64], MutAnyOrigin], pbase: Int,
 ) -> Bool:
     comptime assert X.flat_rank == 2 and CurB.flat_rank == 2 and Qkvm.flat_rank == 2
     comptime assert Conv.flat_rank == 2 and So.flat_rank == 3 and Eg.flat_rank == 2
     comptime assert ConvState.flat_rank == 4 and SAll.flat_rank == 5
+    comptime assert Zm.flat_rank == 2 and Araw.flat_rank == 2 and Braw.flat_rank == 2 and Beta.flat_rank == 2
+    comptime assert ResB.flat_rank == 2 and Cw.flat_rank == 2 and Nw.flat_rank == 1 and SsmA.flat_rank == 1 and DtB.flat_rank == 1
     comptime G_QKV = CONV // ROW_WAVES
     comptime G_Z = H // ROW_WAVES
     comptime G_AB = NH_V // ROW_WAVES
@@ -178,8 +255,6 @@ def ssm_phases[
     var si = Int(ssm_i)
     var sl = Int(slots)
     var rg = Int(ring)
-    var rs = rg % sl
-    var ws = (rg + 1) % sl
     var sums = stack_allocation[f32, address_space = AddressSpace.SHARED](
         row_major[EW_THREADS // WARP_SIZE]()
     )
@@ -188,7 +263,7 @@ def ssm_phases[
     )
 
     stamp(prof, pbase + 12)
-    rmsc_phase(X, Gn, CurB)
+    rmsc_phase(X, Gn, CurB, M)
     if not grid_barrier(ctr, gen, fail):
         return False
     stamp(prof, pbase + 1)
@@ -197,24 +272,32 @@ def ssm_phases[
     while g < G_ALL:
         if g < G_QKV:
             var row = g * ROW_WAVES + wave
-            var t = q8_row_dot(CurB, Wqkvq, Wqkvs, row, lane, H)
+            var t = q8_row_dot[MR](CurB, Wqkvq, Wqkvs, row, lane, H, M)
             if lane == 0:
-                Qkvm[0, row] = rebind[Qkvm.ElementType](t)
+                comptime for r in range(MR):
+                    if r < M:
+                        Qkvm[r, row] = rebind[Qkvm.ElementType](t[r])
         elif g < G_QKV + G_Z:
             var row = (g - G_QKV) * ROW_WAVES + wave
-            var t = q8_row_dot(CurB, Wzq, Wzs, row, lane, H)
+            var t = q8_row_dot[MR](CurB, Wzq, Wzs, row, lane, H, M)
             if lane == 0:
-                Zm[0, row] = rebind[Zm.ElementType](t)
+                comptime for r in range(MR):
+                    if r < M:
+                        Zm[r, row] = rebind[Zm.ElementType](t[r])
         elif g < G_QKV + G_Z + G_AB:
             var row = (g - G_QKV - G_Z) * ROW_WAVES + wave
-            var t = q8_row_dot(CurB, Waq, Was, row, lane, H)
+            var t = q8_row_dot[MR](CurB, Waq, Was, row, lane, H, M)
             if lane == 0:
-                Araw[0, row] = rebind[Araw.ElementType](t)
+                comptime for r in range(MR):
+                    if r < M:
+                        Araw[r, row] = rebind[Araw.ElementType](t[r])
         else:
             var row = (g - G_QKV - G_Z - G_AB) * ROW_WAVES + wave
-            var t = q8_row_dot(CurB, Wbq, Wbs, row, lane, H)
+            var t = q8_row_dot[MR](CurB, Wbq, Wbs, row, lane, H, M)
             if lane == 0:
-                Braw[0, row] = rebind[Braw.ElementType](t)
+                comptime for r in range(MR):
+                    if r < M:
+                        Braw[r, row] = rebind[Braw.ElementType](t[r])
         g += nblk
     if not grid_barrier(ctr, gen, fail):
         return False
@@ -222,26 +305,32 @@ def ssm_phases[
 
     if bid == 0 and tid < NH_V:
         var h = tid
-        var braw = rebind[Scalar[f32]](Braw[0, h])
-        Beta[0, h] = rebind[Beta.ElementType](1 / (1 + exp(-braw)))
-        var asum = rebind[Scalar[f32]](Araw[0, h]) + rebind[Scalar[f32]](DtB[h])
-        var sp = log1p(exp(asum))
-        Eg[0, h] = rebind[Eg.ElementType](exp(sp * rebind[Scalar[f32]](SsmA[h])))
+        var sa = rebind[Scalar[f32]](SsmA[h])
+        var db = rebind[Scalar[f32]](DtB[h])
+        for r in range(M):
+            var braw = rebind[Scalar[f32]](Braw[r, h])
+            Beta[r, h] = rebind[Beta.ElementType](1 / (1 + exp(-braw)))
+            var asum = rebind[Scalar[f32]](Araw[r, h]) + db
+            var sp = log1p(exp(asum))
+            Eg[r, h] = rebind[Eg.ElementType](exp(sp * sa))
     var c = bid * ROW_THREADS + tid
     while c < CONV:
         var cw0 = rebind[Scalar[f32]](Cw[c, 0])
         var cw1 = rebind[Scalar[f32]](Cw[c, 1])
         var cw2 = rebind[Scalar[f32]](Cw[c, 2])
         var cw3 = rebind[Scalar[f32]](Cw[c, 3])
-        var w0 = rebind[Scalar[f32]](ConvState[rs, si, 0, c])
-        var w1 = rebind[Scalar[f32]](ConvState[rs, si, 1, c])
-        var w2 = rebind[Scalar[f32]](ConvState[rs, si, 2, c])
-        var w3 = rebind[Scalar[f32]](Qkvm[0, c])
-        var acc = w0 * cw0 + w1 * cw1 + w2 * cw2 + w3 * cw3
-        Conv[0, c] = rebind[Conv.ElementType](acc / (1 + exp(-acc)))
-        ConvState[ws, si, 0, c] = rebind[ConvState.ElementType](w1)
-        ConvState[ws, si, 1, c] = rebind[ConvState.ElementType](w2)
-        ConvState[ws, si, 2, c] = rebind[ConvState.ElementType](w3)
+        for r in range(M):
+            var rs = (rg + r) % sl
+            var ws = (rg + r + 1) % sl
+            var w0 = rebind[Scalar[f32]](ConvState[rs, si, 0, c])
+            var w1 = rebind[Scalar[f32]](ConvState[rs, si, 1, c])
+            var w2 = rebind[Scalar[f32]](ConvState[rs, si, 2, c])
+            var w3 = rebind[Scalar[f32]](Qkvm[r, c])
+            var acc = w0 * cw0 + w1 * cw1 + w2 * cw2 + w3 * cw3
+            Conv[r, c] = rebind[Conv.ElementType](acc / (1 + exp(-acc)))
+            ConvState[ws, si, 0, c] = rebind[ConvState.ElementType](w1)
+            ConvState[ws, si, 1, c] = rebind[ConvState.ElementType](w2)
+            ConvState[ws, si, 2, c] = rebind[ConvState.ElementType](w3)
         c += nblk * ROW_THREADS
     if not grid_barrier(ctr, gen, fail):
         return False
@@ -250,21 +339,23 @@ def ssm_phases[
     if bid < NH_V:
         var head = bid
         var base = head * SSTATE
-        var v: Float32 = 0
-        if tid < SSTATE:
-            v = rebind[Scalar[f32]](Conv[0, base + tid])
-            var ssq = warp.sum(v * v)
-            if lane == 0:
-                sums[wave] = rebind[sums.ElementType](ssq)
-        barrier()
-        if tid < SSTATE:
-            var total: Float32 = 0
-            comptime for w in range(SSTATE // WARP_SIZE):
-                total += rebind[Scalar[f32]](sums[w])
-            var inv = rsqrt(total + SSM_EPS)
-            if head < NH_K:
-                inv = inv / sqrt(Float32(SSTATE))
-            Conv[0, base + tid] = rebind[Conv.ElementType](v * inv)
+        for r in range(M):
+            var v: Float32 = 0
+            if tid < SSTATE:
+                v = rebind[Scalar[f32]](Conv[r, base + tid])
+                var ssq = warp.sum(v * v)
+                if lane == 0:
+                    sums[wave] = rebind[sums.ElementType](ssq)
+            barrier()
+            if tid < SSTATE:
+                var total: Float32 = 0
+                comptime for w in range(SSTATE // WARP_SIZE):
+                    total += rebind[Scalar[f32]](sums[w])
+                var inv = rsqrt(total + SSM_EPS)
+                if head < NH_K:
+                    inv = inv / sqrt(Float32(SSTATE))
+                Conv[r, base + tid] = rebind[Conv.ElementType](v * inv)
+            barrier()
     if not grid_barrier(ctr, gen, fail):
         return False
     stamp(prof, pbase + 4)
@@ -273,27 +364,31 @@ def ssm_phases[
         var h = bid
         var j = tid
         var kh = h % NH_K
-        if j < SSTATE:
-            kq[0, j] = rebind[kq.ElementType](Conv[0, kh * SSTATE + j])
-            kq[1, j] = rebind[kq.ElementType](Conv[0, KDIM + kh * SSTATE + j])
-        barrier()
-        if j < SSTATE:
-            var eg = rebind[Scalar[f32]](Eg[0, h])
-            var beta = rebind[Scalar[f32]](Beta[0, h])
-            var vj = rebind[Scalar[f32]](Conv[0, 2 * KDIM + h * SSTATE + j])
-            var col = SIMD[f32, SSTATE]()
-            comptime for i in range(SSTATE):
-                col[i] = rebind[Scalar[f32]](SAll[rs, si, h, i, j])
-            var sk: Float32 = 0
-            comptime for i in range(SSTATE):
-                sk += col[i] * eg * rebind[Scalar[f32]](kq[1, i])
-            var d = (vj - sk) * beta
-            var o: Float32 = 0
-            comptime for i in range(SSTATE):
-                var s = col[i] * eg + rebind[Scalar[f32]](kq[1, i]) * d
-                SAll[ws, si, h, i, j] = rebind[SAll.ElementType](s)
-                o += s * rebind[Scalar[f32]](kq[0, i])
-            So[0, h, j] = rebind[So.ElementType](o)
+        for r in range(M):
+            var rs = (rg + r) % sl
+            var ws = (rg + r + 1) % sl
+            if j < SSTATE:
+                kq[0, j] = rebind[kq.ElementType](Conv[r, kh * SSTATE + j])
+                kq[1, j] = rebind[kq.ElementType](Conv[r, KDIM + kh * SSTATE + j])
+            barrier()
+            if j < SSTATE:
+                var eg = rebind[Scalar[f32]](Eg[r, h])
+                var beta = rebind[Scalar[f32]](Beta[r, h])
+                var vj = rebind[Scalar[f32]](Conv[r, 2 * KDIM + h * SSTATE + j])
+                var col = SIMD[f32, SSTATE]()
+                comptime for i in range(SSTATE):
+                    col[i] = rebind[Scalar[f32]](SAll[rs, si, h, i, j])
+                var sk: Float32 = 0
+                comptime for i in range(SSTATE):
+                    sk += col[i] * eg * rebind[Scalar[f32]](kq[1, i])
+                var d = (vj - sk) * beta
+                var o: Float32 = 0
+                comptime for i in range(SSTATE):
+                    var s = col[i] * eg + rebind[Scalar[f32]](kq[1, i]) * d
+                    SAll[ws, si, h, i, j] = rebind[SAll.ElementType](s)
+                    o += s * rebind[Scalar[f32]](kq[0, i])
+                So[r, h, j] = rebind[So.ElementType](o)
+            barrier()
     if not grid_barrier(ctr, gen, fail):
         return False
     stamp(prof, pbase + 5)
@@ -301,22 +396,27 @@ def ssm_phases[
     if bid < NH_V:
         var h = bid
         var j = tid
-        var v: Float32 = 0
+        var nwj: Float32 = 0
         if j < SSTATE:
-            v = rebind[Scalar[f32]](So[0, h, j])
-            var ssq = warp.sum(v * v)
-            if lane == 0:
-                sums[wave] = rebind[sums.ElementType](ssq)
-        barrier()
-        if j < SSTATE:
-            var total: Float32 = 0
-            comptime for w in range(SSTATE // WARP_SIZE):
-                total += rebind[Scalar[f32]](sums[w])
-            var scale = rsqrt(total / Float32(SSTATE) + SSM_EPS)
-            var z = rebind[Scalar[f32]](Zm[0, h * SSTATE + j])
-            ResB[0, h * SSTATE + j] = rebind[ResB.ElementType](
-                (v * scale * rebind[Scalar[f32]](Nw[j]) * (z / (1 + exp(-z)))).cast[bf16]()
-            )
+            nwj = rebind[Scalar[f32]](Nw[j])
+        for r in range(M):
+            var v: Float32 = 0
+            if j < SSTATE:
+                v = rebind[Scalar[f32]](So[r, h, j])
+                var ssq = warp.sum(v * v)
+                if lane == 0:
+                    sums[wave] = rebind[sums.ElementType](ssq)
+            barrier()
+            if j < SSTATE:
+                var total: Float32 = 0
+                comptime for w in range(SSTATE // WARP_SIZE):
+                    total += rebind[Scalar[f32]](sums[w])
+                var scale = rsqrt(total / Float32(SSTATE) + SSM_EPS)
+                var z = rebind[Scalar[f32]](Zm[r, h * SSTATE + j])
+                ResB[r, h * SSTATE + j] = rebind[ResB.ElementType](
+                    (v * scale * nwj * (z / (1 + exp(-z)))).cast[bf16]()
+                )
+            barrier()
     if not grid_barrier(ctr, gen, fail):
         return False
     stamp(prof, pbase + 6)
@@ -324,54 +424,18 @@ def ssm_phases[
     g = bid
     while g < G_OUT:
         var row = g * ROW_WAVES + wave
-        var t = q8_row_dot(ResB, Wsoutq, Wsouts, row, lane, H)
+        var t = q8_row_dot[MR](ResB, Wsoutq, Wsouts, row, lane, H, M)
         if lane == 0:
-            X[0, row] = rebind[X.ElementType](rebind[Scalar[f32]](X[0, row]) + t)
+            comptime for r in range(MR):
+                if r < M:
+                    X[r, row] = rebind[X.ElementType](rebind[Scalar[f32]](X[r, row]) + t[r])
         g += nblk
     return True
 
 
 @always_inline
-def rmsc_phase[
-    XL: TensorLayout, GL: TensorLayout, CBL: TensorLayout
-](
-    mut X: TileTensor[f32, XL, MutAnyOrigin],
-    Gn: TileTensor[f32, GL, MutAnyOrigin],
-    mut CurB: TileTensor[bf16, CBL, MutAnyOrigin],
-):
-    comptime assert X.flat_rank == 2 and CurB.flat_rank == 2 and Gn.flat_rank == 1
-    var tid = Int(thread_idx.x)
-    var lane = Int(lane_id())
-    var wave = tid // WARP_SIZE
-    var sums = stack_allocation[f32, address_space = AddressSpace.SHARED](
-        row_major[EW_THREADS // WARP_SIZE]()
-    )
-    var partial: Float32 = 0
-    if tid < EW_THREADS:
-        var i = tid
-        while i < H:
-            var v = rebind[Scalar[f32]](X[0, i])
-            partial += v * v
-            i += EW_THREADS
-        var wsum = warp.sum(partial)
-        if lane == 0:
-            sums[wave] = rebind[sums.ElementType](wsum)
-    barrier()
-    if tid < EW_THREADS:
-        var total: Float32 = 0
-        comptime for w in range(EW_THREADS // WARP_SIZE):
-            total += rebind[Scalar[f32]](sums[w])
-        var scale = rsqrt(total / Float32(H) + RMS_EPS)
-        var i = Int(block_idx.x) * EW_THREADS + tid
-        while i < H:
-            CurB[0, i] = rebind[CurB.ElementType](
-                (rebind[Scalar[f32]](X[0, i]) * scale * rebind[Scalar[f32]](Gn[i])).cast[bf16]()
-            )
-            i += Int(grid_dim.x) * EW_THREADS
-
-
-@always_inline
 def ffn_phases[
+    MR: Int,
     XL: TensorLayout, GL: TensorLayout, CBL: TensorLayout,
     GqL: TensorLayout, GsL: TensorLayout, DqL: TensorLayout, DsL: TensorLayout,
     PL: TensorLayout, FBL: TensorLayout, CtrL: TensorLayout,
@@ -386,6 +450,7 @@ def ffn_phases[
     mut Pu: TileTensor[f32, PL, MutAnyOrigin],
     mut FgB: TileTensor[bf16, FBL, MutAnyOrigin],
     mut Ctr: TileTensor[u32, CtrL, MutAnyOrigin],
+    M: Int,
     prof: MutPointer[Scalar[i64], MutAnyOrigin], pbase: Int,
 ) -> Bool:
     comptime assert X.flat_rank == 2 and CurB.flat_rank == 2 and Gn.flat_rank == 1
@@ -400,7 +465,7 @@ def ffn_phases[
     var gen = Ctr.ptr.unsafe_offset(1)
     var fail = Ctr.ptr.unsafe_offset(2)
 
-    rmsc_phase(X, Gn, CurB)
+    rmsc_phase(X, Gn, CurB, M)
     if not grid_barrier(ctr, gen, fail):
         return False
     stamp(prof, pbase + 1)
@@ -409,25 +474,31 @@ def ffn_phases[
     while g < 2 * G_F:
         if g < G_F:
             var row = g * ROW_WAVES + wave
-            var t = q8_row_dot(CurB, Wgq, Wgs, row, lane, H)
+            var t = q8_row_dot[MR](CurB, Wgq, Wgs, row, lane, H, M)
             if lane == 0:
-                Pg[0, row] = rebind[Pg.ElementType](t)
+                comptime for r in range(MR):
+                    if r < M:
+                        Pg[r, row] = rebind[Pg.ElementType](t[r])
         else:
             var row = (g - G_F) * ROW_WAVES + wave
-            var t = q8_row_dot(CurB, Wuq, Wus, row, lane, H)
+            var t = q8_row_dot[MR](CurB, Wuq, Wus, row, lane, H, M)
             if lane == 0:
-                Pu[0, row] = rebind[Pu.ElementType](t)
+                comptime for r in range(MR):
+                    if r < M:
+                        Pu[r, row] = rebind[Pu.ElementType](t[r])
         g += nblk
     if not grid_barrier(ctr, gen, fail):
         return False
     stamp(prof, pbase + 2)
 
     var c = bid * ROW_THREADS + tid
-    while c < FFN:
-        var gg = rebind[Scalar[f32]](Pg[0, c])
-        var u = rebind[Scalar[f32]](Pu[0, c])
+    while c < M * FFN:
+        var r = c // FFN
+        var cc = c % FFN
+        var gg = rebind[Scalar[f32]](Pg[r, cc])
+        var u = rebind[Scalar[f32]](Pu[r, cc])
         var silu = gg / (1 + exp(-gg))
-        FgB[0, c] = rebind[FgB.ElementType]((silu * u).cast[bf16]())
+        FgB[r, cc] = rebind[FgB.ElementType]((silu * u).cast[bf16]())
         c += nblk * ROW_THREADS
     if not grid_barrier(ctr, gen, fail):
         return False
@@ -436,9 +507,11 @@ def ffn_phases[
     g = bid
     while g < H // ROW_WAVES:
         var row = g * ROW_WAVES + wave
-        var t = q8_row_dot(FgB, Wdq, Wds, row, lane, FFN)
+        var t = q8_row_dot[MR](FgB, Wdq, Wds, row, lane, FFN, M)
         if lane == 0:
-            X[0, row] = rebind[X.ElementType](rebind[Scalar[f32]](X[0, row]) + t)
+            comptime for r in range(MR):
+                if r < M:
+                    X[r, row] = rebind[X.ElementType](rebind[Scalar[f32]](X[r, row]) + t[r])
         g += nblk
     return True
 
@@ -455,6 +528,7 @@ def rope_cs(j: Int, pos: Int) -> SIMD[f32, 2]:
 
 @always_inline
 def attn_phases[
+    MR: Int,
     XL: TensorLayout, GL: TensorLayout, CBL: TensorLayout,
     QqL: TensorLayout, QsL: TensorLayout, KqL: TensorLayout, KsL: TensorLayout,
     HqL: TensorLayout, HsL: TensorLayout, HdL: TensorLayout,
@@ -480,13 +554,14 @@ def attn_phases[
     mut Kc: TileTensor[f32, CacheL, MutAnyOrigin],
     mut Vc: TileTensor[f32, CacheL, MutAnyOrigin],
     mut Ctr: TileTensor[u32, CtrL, MutAnyOrigin],
-    pos: Int,
+    pos: Int, M: Int,
     prof: MutPointer[Scalar[i64], MutAnyOrigin], pbase: Int,
 ) -> Bool:
     comptime assert X.flat_rank == 2 and CurB.flat_rank == 2 and Gn.flat_rank == 1
     comptime assert Qfm.flat_rank == 2 and Kflat.flat_rank == 2 and Vflat.flat_rank == 2
     comptime assert Q.flat_rank == 2 and Ao.flat_rank == 2 and Gate.flat_rank == 1 and AoB.flat_rank == 2
     comptime assert Kc.flat_rank == 3 and Vc.flat_rank == 3 and Qn.flat_rank == 1 and Kn.flat_rank == 1
+    comptime assert MR * (NQH + NKVH) <= MEGA_G
     comptime G_Q = QF // ROW_WAVES
     comptime G_KV = KV // ROW_WAVES
     var tid = Int(thread_idx.x)
@@ -507,7 +582,7 @@ def attn_phases[
         row_major[MAX_T]()
     )
 
-    rmsc_phase(X, Gn, CurB)
+    rmsc_phase(X, Gn, CurB, M)
     if not grid_barrier(ctr, gen, fail):
         return False
     stamp(prof, pbase + 1)
@@ -516,30 +591,38 @@ def attn_phases[
     while g < G_Q + 2 * G_KV:
         if g < G_Q:
             var row = g * ROW_WAVES + wave
-            var t = q8_row_dot(CurB, Wqq, Wqs, row, lane, H)
+            var t = q8_row_dot[MR](CurB, Wqq, Wqs, row, lane, H, M)
             if lane == 0:
-                Qfm[0, row] = rebind[Qfm.ElementType](t)
+                comptime for r in range(MR):
+                    if r < M:
+                        Qfm[r, row] = rebind[Qfm.ElementType](t[r])
         elif g < G_Q + G_KV:
             var row = (g - G_Q) * ROW_WAVES + wave
-            var t = q8_row_dot(CurB, Wkq, Wks, row, lane, H)
+            var t = q8_row_dot[MR](CurB, Wkq, Wks, row, lane, H, M)
             if lane == 0:
-                Kflat[0, row] = rebind[Kflat.ElementType](t)
+                comptime for r in range(MR):
+                    if r < M:
+                        Kflat[r, row] = rebind[Kflat.ElementType](t[r])
         else:
             var row = (g - G_Q - G_KV) * ROW_WAVES + wave
-            var t = q8_row_dot(CurB, Wvq, Wvs, row, lane, H)
+            var t = q8_row_dot[MR](CurB, Wvq, Wvs, row, lane, H, M)
             if lane == 0:
-                Vflat[0, row] = rebind[Vflat.ElementType](t)
+                comptime for r in range(MR):
+                    if r < M:
+                        Vflat[r, row] = rebind[Vflat.ElementType](t[r])
         g += nblk
     if not grid_barrier(ctr, gen, fail):
         return False
     stamp(prof, pbase + 2)
 
-    if bid < NQH:
-        var h = bid
+    if bid < M * NQH:
+        var r = bid // NQH
+        var h = bid % NQH
+        var qrow = r * NQH + h
         var v: Float32 = 0
         if tid < HD:
-            v = rebind[Scalar[f32]](Qfm[0, h * 2 * HD + tid])
-            Gate[h * HD + tid] = rebind[Gate.ElementType](Qfm[0, h * 2 * HD + HD + tid])
+            v = rebind[Scalar[f32]](Qfm[r, h * 2 * HD + tid])
+            Gate[r * NQH * HD + h * HD + tid] = rebind[Gate.ElementType](Qfm[r, h * 2 * HD + HD + tid])
             var ssq = warp.sum(v * v)
             if lane == 0:
                 sums[wave] = rebind[sums.ElementType](ssq)
@@ -548,21 +631,23 @@ def attn_phases[
             var total: Float32 = 0
             comptime for w in range(HD // WARP_SIZE):
                 total += rebind[Scalar[f32]](sums[w])
-            Q[h, tid] = rebind[Q.ElementType](
+            Q[qrow, tid] = rebind[Q.ElementType](
                 v * rsqrt(total / Float32(HD) + RMS_EPS) * rebind[Scalar[f32]](Qn[tid])
             )
         barrier()
         if tid < NROT // 2:
-            var cs = rope_cs(tid, pos)
-            var x0 = rebind[Scalar[f32]](Q[h, tid])
-            var x1 = rebind[Scalar[f32]](Q[h, tid + NROT // 2])
-            Q[h, tid] = rebind[Q.ElementType](x0 * cs[0] - x1 * cs[1])
-            Q[h, tid + NROT // 2] = rebind[Q.ElementType](x0 * cs[1] + x1 * cs[0])
-    elif bid < NQH + NKVH:
-        var h = bid - NQH
+            var cs = rope_cs(tid, pos + r)
+            var x0 = rebind[Scalar[f32]](Q[qrow, tid])
+            var x1 = rebind[Scalar[f32]](Q[qrow, tid + NROT // 2])
+            Q[qrow, tid] = rebind[Q.ElementType](x0 * cs[0] - x1 * cs[1])
+            Q[qrow, tid + NROT // 2] = rebind[Q.ElementType](x0 * cs[1] + x1 * cs[0])
+    elif bid < M * NQH + M * NKVH:
+        var b = bid - M * NQH
+        var r = b // NKVH
+        var h = b % NKVH
         var v: Float32 = 0
         if tid < HD:
-            v = rebind[Scalar[f32]](Kflat[0, h * HD + tid])
+            v = rebind[Scalar[f32]](Kflat[r, h * HD + tid])
             var ssq = warp.sum(v * v)
             if lane == 0:
                 sums[wave] = rebind[sums.ElementType](ssq)
@@ -571,30 +656,32 @@ def attn_phases[
             var total: Float32 = 0
             comptime for w in range(HD // WARP_SIZE):
                 total += rebind[Scalar[f32]](sums[w])
-            Kflat[0, h * HD + tid] = rebind[Kflat.ElementType](
+            Kflat[r, h * HD + tid] = rebind[Kflat.ElementType](
                 v * rsqrt(total / Float32(HD) + RMS_EPS) * rebind[Scalar[f32]](Kn[tid])
             )
         barrier()
         if tid < NROT // 2:
-            var cs = rope_cs(tid, pos)
-            var x0 = rebind[Scalar[f32]](Kflat[0, h * HD + tid])
-            var x1 = rebind[Scalar[f32]](Kflat[0, h * HD + tid + NROT // 2])
-            Kflat[0, h * HD + tid] = rebind[Kflat.ElementType](x0 * cs[0] - x1 * cs[1])
-            Kflat[0, h * HD + tid + NROT // 2] = rebind[Kflat.ElementType](x0 * cs[1] + x1 * cs[0])
+            var cs = rope_cs(tid, pos + r)
+            var x0 = rebind[Scalar[f32]](Kflat[r, h * HD + tid])
+            var x1 = rebind[Scalar[f32]](Kflat[r, h * HD + tid + NROT // 2])
+            Kflat[r, h * HD + tid] = rebind[Kflat.ElementType](x0 * cs[0] - x1 * cs[1])
+            Kflat[r, h * HD + tid + NROT // 2] = rebind[Kflat.ElementType](x0 * cs[1] + x1 * cs[0])
         barrier()
         if tid < HD:
-            Kc[h, pos, tid] = rebind[Kc.ElementType](Kflat[0, h * HD + tid])
-            Vc[h, pos, tid] = rebind[Vc.ElementType](Vflat[0, h * HD + tid])
+            Kc[h, pos + r, tid] = rebind[Kc.ElementType](Kflat[r, h * HD + tid])
+            Vc[h, pos + r, tid] = rebind[Vc.ElementType](Vflat[r, h * HD + tid])
     if not grid_barrier(ctr, gen, fail):
         return False
     stamp(prof, pbase + 3)
 
-    if bid < NQH:
-        var h = bid
+    if bid < M * NQH:
+        var r = bid // NQH
+        var h = bid % NQH
+        var qrow = r * NQH + h
         var kvh = h // (NQH // NKVH)
-        var T = pos + 1
+        var T = pos + 1 + r
         if tid < HD:
-            qs[tid] = rebind[qs.ElementType](Q[h, tid])
+            qs[tid] = rebind[qs.ElementType](Q[qrow, tid])
         barrier()
         var local_max = Float32(-3.4e38)
         if tid < HD:
@@ -647,15 +734,15 @@ def attn_phases[
             var o: Float32 = 0
             for tt in range(T):
                 o += rebind[Scalar[f32]](scores[tt]) * rebind[Scalar[f32]](Vc[kvh, tt, tid])
-            Ao[h, tid] = rebind[Ao.ElementType](o * inv)
+            Ao[qrow, tid] = rebind[Ao.ElementType](o * inv)
     if not grid_barrier(ctr, gen, fail):
         return False
     stamp(prof, pbase + 4)
 
     var i = bid * ROW_THREADS + tid
-    while i < H:
+    while i < M * H:
         var gg = rebind[Scalar[f32]](Gate[i])
-        AoB[0, i] = rebind[AoB.ElementType](
+        AoB[i // H, i % H] = rebind[AoB.ElementType](
             (rebind[Scalar[f32]](Ao[i // HD, i % HD]) * (1 / (1 + exp(-gg)))).cast[bf16]()
         )
         i += nblk * ROW_THREADS
@@ -666,9 +753,11 @@ def attn_phases[
     g = bid
     while g < H // ROW_WAVES:
         var row = g * ROW_WAVES + wave
-        var t = q8_row_dot(AoB, Woq, Wos, row, lane, H)
+        var t = q8_row_dot[MR](AoB, Woq, Wos, row, lane, H, M)
         if lane == 0:
-            X[0, row] = rebind[X.ElementType](rebind[Scalar[f32]](X[0, row]) + t)
+            comptime for r in range(MR):
+                if r < M:
+                    X[r, row] = rebind[X.ElementType](rebind[Scalar[f32]](X[r, row]) + t[r])
         g += nblk
     return True
 
@@ -695,11 +784,12 @@ def wf2[N: Int, M: Int](wbuf: MutPointer[Scalar[u8], MutAnyOrigin], o: Int) -> T
 
 @__llvm_metadata(`rocdl.flat_work_group_size`=StaticTuple[Int32, 1](Int32(ROW_THREADS)))
 def amar_mega_token[
+    MR: Int,
     XL: TensorLayout, CBL: TensorLayout,
     QkvL: TensorLayout, G32mL: TensorLayout, ConvL: TensorLayout, OmL: TensorLayout,
     CsL: TensorLayout, SsL: TensorLayout,
     QfL: TensorLayout, KvfL: TensorLayout, QmL: TensorLayout, GfL: TensorLayout,
-    PfL: TensorLayout, FbL: TensorLayout, OffL: TensorLayout, CtrL: TensorLayout, TkL: TensorLayout,
+    PfL: TensorLayout, FbL: TensorLayout, OffL: TensorLayout, CtrL: TensorLayout, TkL: TensorLayout, DkL: TensorLayout,
     TM: Int, NL: Int,
 ](
     wbuf: MutPointer[Scalar[u8], MutAnyOrigin],
@@ -732,11 +822,15 @@ def amar_mega_token[
     prof: MutPointer[Scalar[i64], MutAnyOrigin],
     dbg: MutPointer[Scalar[f32], MutAnyOrigin],
     Toks: TileTensor[i32, TkL, MutAnyOrigin],
+    Dtok: TileTensor[i32, DkL, MutAnyOrigin],
+    Hn: TileTensor[f32, XL, MutAnyOrigin],
     hmax: MutPointer[Scalar[f32], MutAnyOrigin],
     hidx: MutPointer[Scalar[i32], MutAnyOrigin],
-    ring: Int32, slots: Int32, pos: Int32, dump: Int32, fold_head: Int32,
+    ring: Int32, slots: Int32, pos: Int32, m: Int32, dump: Int32, fold_head: Int32,
 ):
-    comptime assert off.flat_rank == 1 and Toks.flat_rank == 1
+    comptime assert off.flat_rank == 1 and Toks.flat_rank == 1 and Dtok.flat_rank == 1 and Hn.flat_rank == 2
+    comptime cache_layout = row_major[NKVH, TM, HD]()
+    comptime ATT32 = NKVH * TM * HD
     var X_ = X
     var CurB_ = CurB
     var ResB_ = ResB
@@ -760,8 +854,10 @@ def amar_mega_token[
     var Pu_ = Pu
     var FgB_ = FgB
     var Ctr_ = Ctr
-    comptime cache_layout = row_major[NKVH, TM, HD]()
-    comptime ATT32 = NKVH * TM * HD
+    var Toks_ = Toks
+    var Dtok_ = Dtok
+    var Hn_ = Hn
+    var M = Int(m)
     var fail = Ctr_.ptr.unsafe_offset(2)
     if Atomic[u32, scope="agent"].load[ordering=Ordering.ACQUIRE](fail) != 0:
         return
@@ -781,14 +877,14 @@ def amar_mega_token[
             var o6 = Int(rebind[Scalar[i64]](off[w + 6]))
             var Kc = TileTensor(kc + att_i * ATT32, cache_layout)
             var Vc = TileTensor(vc + att_i * ATT32, cache_layout)
-            if not attn_phases(
+            if not attn_phases[MR](
                 X_, wf[H](wbuf, o0), CurB_,
                 wq[QF, H](wbuf, o1), ws[QF, H](wbuf, o1),
                 wq[KV, H](wbuf, o2), ws[KV, H](wbuf, o2),
                 wq[KV, H](wbuf, o3), ws[KV, H](wbuf, o3),
                 wf[HD](wbuf, o4), wf[HD](wbuf, o5),
                 wq[H, H](wbuf, o6), ws[H, H](wbuf, o6),
-                Qfm_, Kflat_, Vflat_, Q_, Gate_, Ao_, ResB_, Kc, Vc, Ctr_, p, prof, 16 * layer,
+                Qfm_, Kflat_, Vflat_, Q_, Gate_, Ao_, ResB_, Kc, Vc, Ctr_, p, M, prof, 16 * layer,
             ):
                 return
             att_i += 1
@@ -803,7 +899,7 @@ def amar_mega_token[
             var o7 = Int(rebind[Scalar[i64]](off[w + 7]))
             var o8 = Int(rebind[Scalar[i64]](off[w + 8]))
             var o9 = Int(rebind[Scalar[i64]](off[w + 9]))
-            if not ssm_phases(
+            if not ssm_phases[MR](
                 X_, wf[H](wbuf, o0), CurB_,
                 wq[CONV, H](wbuf, o1), ws[CONV, H](wbuf, o1),
                 wq[H, H](wbuf, o2), ws[H, H](wbuf, o2),
@@ -812,7 +908,7 @@ def amar_mega_token[
                 wf2[CONV, 4](wbuf, o5), wf[NH_V](wbuf, o6), wf[NH_V](wbuf, o7), wf[SSTATE](wbuf, o8),
                 wq[H, H](wbuf, o9), ws[H, H](wbuf, o9),
                 Qkvm_, Zm_, Araw_, Braw_, Eg_, Beta_, Conv_, So_, ResB_, ConvState_, SAll_, Ctr_,
-                ring, Int32(ssm_i), slots, prof, 16 * layer,
+                ring, Int32(ssm_i), slots, M, prof, 16 * layer,
             ):
                 return
             ssm_i += 1
@@ -831,12 +927,12 @@ def amar_mega_token[
         var f1 = Int(rebind[Scalar[i64]](off[w + 1]))
         var f2 = Int(rebind[Scalar[i64]](off[w + 2]))
         var f3 = Int(rebind[Scalar[i64]](off[w + 3]))
-        if not ffn_phases(
+        if not ffn_phases[MR](
             X_, wf[H](wbuf, f0), CurB_,
             wq[FFN, H](wbuf, f1), ws[FFN, H](wbuf, f1),
             wq[FFN, H](wbuf, f2), ws[FFN, H](wbuf, f2),
             wq[H, FFN](wbuf, f3), ws[H, FFN](wbuf, f3),
-            Pg_, Pu_, FgB_, Ctr_, prof, 16 * layer + 7,
+            Pg_, Pu_, FgB_, Ctr_, M, prof, 16 * layer + 7,
         ):
             return
         w += 4
@@ -851,12 +947,13 @@ def amar_mega_token[
     if fold_head == 0:
         return
     stamp(prof, 16 * NL)
-    var Toks_ = Toks
     var ctrh = Ctr_.ptr
     var genh = Ctr_.ptr.unsafe_offset(1)
     var ho0 = Int(rebind[Scalar[i64]](off[w]))
     var ho1 = Int(rebind[Scalar[i64]](off[w + 1]))
-    rmsc_phase(X_, wf[H](wbuf, ho0), CurB_)
+    if fold_head == 2:
+        rms_f32_phase(X_, wf[H](wbuf, ho0), Hn_, M)
+    rmsc_phase(X_, wf[H](wbuf, ho0), CurB_, M)
     if not grid_barrier(ctrh, genh, fail):
         return
     stamp(prof, 16 * NL + 1)
@@ -867,44 +964,53 @@ def amar_mega_token[
     var wave = tid // WARP_SIZE
     var bid = Int(block_idx.x)
     var nblk = Int(grid_dim.x)
-    var bv = Float32(-3.4e38)
-    var bi: Int32 = 0
+    var bv = InlineArray[Float32, MR](fill=Float32(-3.4e38))
+    var bi = InlineArray[Int32, MR](fill=Int32(0))
     var g = bid
     while g < VOCAB // ROW_WAVES:
         var row = g * ROW_WAVES + wave
-        var t = q8_row_dot(CurB_, Whq, Whs, row, lane, H)
-        if t > bv or (t == bv and Int32(row) < bi):
-            bv = t
-            bi = Int32(row)
+        var t = q8_row_dot[MR](CurB_, Whq, Whs, row, lane, H, M)
+        comptime for r in range(MR):
+            if r < M:
+                if t[r] > bv[r] or (t[r] == bv[r] and Int32(row) < bi[r]):
+                    bv[r] = t[r]
+                    bi[r] = Int32(row)
         g += nblk
-    var wv = stack_allocation[f32, address_space = AddressSpace.SHARED](row_major[ROW_WAVES]())
-    var wi = stack_allocation[i32, address_space = AddressSpace.SHARED](row_major[ROW_WAVES]())
+    var wv = stack_allocation[f32, address_space = AddressSpace.SHARED](row_major[MR, ROW_WAVES]())
+    var wi = stack_allocation[i32, address_space = AddressSpace.SHARED](row_major[MR, ROW_WAVES]())
     if lane == 0:
-        wv[wave] = rebind[wv.ElementType](bv)
-        wi[wave] = rebind[wi.ElementType](bi)
+        comptime for r in range(MR):
+            wv[r, wave] = rebind[wv.ElementType](bv[r])
+            wi[r, wave] = rebind[wi.ElementType](bi[r])
     barrier()
     if tid == 0:
-        var pv = Float32(-3.4e38)
-        var pi: Int32 = 0
-        comptime for k in range(ROW_WAVES):
-            var v = rebind[Scalar[f32]](wv[k])
-            var ix = rebind[Scalar[i32]](wi[k])
-            if v > pv or (v == pv and ix < pi):
-                pv = v
-                pi = ix
-        hmax[bid] = pv
-        hidx[bid] = pi
+        comptime for r in range(MR):
+            var pv = Float32(-3.4e38)
+            var pi: Int32 = 0
+            comptime for k in range(ROW_WAVES):
+                var v = rebind[Scalar[f32]](wv[r, k])
+                var ix = rebind[Scalar[i32]](wi[r, k])
+                if v > pv or (v == pv and ix < pi):
+                    pv = v
+                    pi = ix
+            hmax[r * nblk + bid] = pv
+            hidx[r * nblk + bid] = pi
     if not grid_barrier(ctrh, genh, fail):
         return
     stamp(prof, 16 * NL + 2)
     if bid == 0 and tid == 0:
-        var fv = Float32(-3.4e38)
-        var fi: Int32 = 0
-        for k in range(nblk):
-            var v = hmax[k]
-            var ix = hidx[k]
-            if v > fv or (v == fv and ix < fi):
-                fv = v
-                fi = ix
-        Toks_[p + 1] = rebind[Toks_.ElementType](fi)
+        comptime for r in range(MR):
+            if r < M:
+                var fv = Float32(-3.4e38)
+                var fi: Int32 = 0
+                for k in range(nblk):
+                    var v = hmax[r * nblk + k]
+                    var ix = hidx[r * nblk + k]
+                    if v > fv or (v == fv and ix < fi):
+                        fv = v
+                        fi = ix
+                if fold_head == 2:
+                    Dtok_[r] = rebind[Dtok_.ElementType](fi)
+                else:
+                    Toks_[p + 1] = rebind[Toks_.ElementType](fi)
     stamp(prof, 16 * NL + 3)

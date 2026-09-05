@@ -120,13 +120,23 @@ comptime c_32 = row_major[1, NH_V]()
 comptime c_ffn = row_major[1, FFN]()
 
 comptime off_layout = row_major[512]()
+comptime pf_sm = row_major[SM, FFN]()
 comptime ctr_layout = row_major[3]()
 comptime mega_token_k = amar_mega_token[
-    type_of(xm_layout), type_of(xm_layout),
+    1, type_of(xm_layout), type_of(xm_layout),
     type_of(qfm_layout), type_of(g32m_layout), type_of(convm_layout), type_of(om_layout),
     type_of(csall_layout), type_of(ssall_layout),
     type_of(qfm_layout), type_of(kvm_flat), type_of(qm_layout), type_of(xflat_layout),
-    type_of(c_ffn), type_of(ffnm_layout), type_of(off_layout), type_of(ctr_layout), type_of(toks_layout),
+    type_of(pf_sm), type_of(ffnm_layout), type_of(off_layout), type_of(ctr_layout), type_of(toks_layout), type_of(dtok_layout),
+    TMAX, N_LAYERS,
+]
+comptime MEGA_MR = 3
+comptime mega_win_k = amar_mega_token[
+    MEGA_MR, type_of(xm_layout), type_of(xm_layout),
+    type_of(qfm_layout), type_of(g32m_layout), type_of(convm_layout), type_of(om_layout),
+    type_of(csall_layout), type_of(ssall_layout),
+    type_of(qfm_layout), type_of(kvm_flat), type_of(qm_layout), type_of(xflat_layout),
+    type_of(pf_sm), type_of(ffnm_layout), type_of(off_layout), type_of(ctr_layout), type_of(toks_layout), type_of(dtok_layout),
     TMAX, N_LAYERS,
 ]
 

@@ -325,6 +325,8 @@ def main() raises:
     print("BARO_DOT:", dot3)
     var mega = getenv("BARO_MEGA", "1") == "1"
     print("BARO_MEGA:", mega)
+    var mega_win = getenv("BARO_MEGA_WIN", "0") == "1"
+    print("BARO_MEGA_WIN:", mega_win)
     var pf5 = getenv("BARO_PROFILE", "0") == "5"
     var dump_path = getenv("BARO_DUMP", "")
     var dump = dump_path != ""
@@ -498,8 +500,8 @@ def main() raises:
     ctx.enqueue_memset(ctr_d, 0)
     ctx.enqueue_memset(prof_d, 0)
     var dbg_d = ctx.enqueue_create_buffer[f32](2 * N_LAYERS * H)
-    var hmax_d = ctx.enqueue_create_buffer[f32](MEGA_G)
-    var hidx_d = ctx.enqueue_create_buffer[DType.int32](MEGA_G)
+    var hmax_d = ctx.enqueue_create_buffer[f32](MEGA_MR * MEGA_G)
+    var hidx_d = ctx.enqueue_create_buffer[DType.int32](MEGA_MR * MEGA_G)
     var dump_h = ctx.enqueue_create_host_buffer[f32](GEN_N * 2 * N_LAYERS * H)
     var n_dumped = 0
     ctx.synchronize()
@@ -620,22 +622,41 @@ def main() raises:
         var ssm_i = 0
         var att_i = 0
         var use_mega = mega and m == 1 and not win_spec and pos + 1 >= len(prompt)
-        if use_mega:
-            ctx.enqueue_function[mega_token_k](
-                wbuf.unsafe_ptr(), TileTensor(off_d, off_layout), Xm, CurBm,
-                TileTensor(resb_d, xm_layout), TileTensor(qkv_d, qfm_layout), TileTensor(z_d, xm_layout),
-                TileTensor(araw_d, g32m_layout), TileTensor(braw_d, g32m_layout),
-                TileTensor(eg_d, g32m_layout), TileTensor(beta_d, g32m_layout),
-                TileTensor(conv_d, convm_layout), TileTensor(so_d, om_layout), ConvStateAll, SStateAll,
-                TileTensor(qf_d, qfm_layout), TileTensor(k_d, kvm_flat), TileTensor(v_d, kvm_flat),
-                TileTensor(q_d, qm_layout), TileTensor(gate_d, xflat_layout), TileTensor(ao_d, qm_layout),
-                kc_d.unsafe_ptr(), vc_d.unsafe_ptr(),
-                TileTensor(p_ffn_d, c_ffn), TileTensor(p_ffn2_d, c_ffn), TileTensor(fgb_d, ffnm_layout),
-                TileTensor(ctr_d, ctr_layout), prof_d.unsafe_ptr(), dbg_d.unsafe_ptr(),
-                Toks, hmax_d.unsafe_ptr(), hidx_d.unsafe_ptr(),
-                Int32(ring), Int32(SLOTS), Int32(pos), Int32(1 if dump else 0), Int32(1), grid_dim=MEGA_G, block_dim=ROW_THREADS,
-            )
-        for layer in range(0 if use_mega else N_LAYERS):
+        var use_mega_win = mega_win and win_spec and m == MEGA_MR
+        if use_mega or use_mega_win:
+            var Hnm0 = TileTensor(hn_d, xm_layout)
+            var Dtok0 = TileTensor(dtok_d, dtok_layout)
+            if use_mega:
+                ctx.enqueue_function[mega_token_k](
+                    wbuf.unsafe_ptr(), TileTensor(off_d, off_layout), Xm, CurBm,
+                    TileTensor(resb_d, xm_layout), TileTensor(qkv_d, qfm_layout), TileTensor(z_d, xm_layout),
+                    TileTensor(araw_d, g32m_layout), TileTensor(braw_d, g32m_layout),
+                    TileTensor(eg_d, g32m_layout), TileTensor(beta_d, g32m_layout),
+                    TileTensor(conv_d, convm_layout), TileTensor(so_d, om_layout), ConvStateAll, SStateAll,
+                    TileTensor(qf_d, qfm_layout), TileTensor(k_d, kvm_flat), TileTensor(v_d, kvm_flat),
+                    TileTensor(q_d, qm_layout), TileTensor(gate_d, xflat_layout), TileTensor(ao_d, qm_layout),
+                    kc_d.unsafe_ptr(), vc_d.unsafe_ptr(),
+                    TileTensor(p_ffn_d, pf_sm), TileTensor(p_ffn2_d, pf_sm), TileTensor(fgb_d, ffnm_layout),
+                    TileTensor(ctr_d, ctr_layout), prof_d.unsafe_ptr(), dbg_d.unsafe_ptr(),
+                    Toks, Dtok0, Hnm0, hmax_d.unsafe_ptr(), hidx_d.unsafe_ptr(),
+                    Int32(ring), Int32(SLOTS), Int32(pos), Int32(1), Int32(1 if dump else 0), Int32(1), grid_dim=MEGA_G, block_dim=ROW_THREADS,
+                )
+            else:
+                ctx.enqueue_function[mega_win_k](
+                    wbuf.unsafe_ptr(), TileTensor(off_d, off_layout), Xm, CurBm,
+                    TileTensor(resb_d, xm_layout), TileTensor(qkv_d, qfm_layout), TileTensor(z_d, xm_layout),
+                    TileTensor(araw_d, g32m_layout), TileTensor(braw_d, g32m_layout),
+                    TileTensor(eg_d, g32m_layout), TileTensor(beta_d, g32m_layout),
+                    TileTensor(conv_d, convm_layout), TileTensor(so_d, om_layout), ConvStateAll, SStateAll,
+                    TileTensor(qf_d, qfm_layout), TileTensor(k_d, kvm_flat), TileTensor(v_d, kvm_flat),
+                    TileTensor(q_d, qm_layout), TileTensor(gate_d, xflat_layout), TileTensor(ao_d, qm_layout),
+                    kc_d.unsafe_ptr(), vc_d.unsafe_ptr(),
+                    TileTensor(p_ffn_d, pf_sm), TileTensor(p_ffn2_d, pf_sm), TileTensor(fgb_d, ffnm_layout),
+                    TileTensor(ctr_d, ctr_layout), prof_d.unsafe_ptr(), dbg_d.unsafe_ptr(),
+                    Toks, Dtok0, Hnm0, hmax_d.unsafe_ptr(), hidx_d.unsafe_ptr(),
+                    Int32(ring), Int32(SLOTS), Int32(pos), Int32(m), Int32(0), Int32(2), grid_dim=MEGA_G, block_dim=ROW_THREADS,
+                )
+        for layer in range(0 if (use_mega or use_mega_win) else N_LAYERS):
             if prof:
                 ctx.synchronize()
                 tp = perf_counter_ns()
@@ -867,7 +888,7 @@ def main() raises:
                 pf_ffn += Int(now - tp)
                 tp = now
 
-        if use_mega:
+        if use_mega or use_mega_win:
             w = 1 + N_SSM * 10 + N_ATT * 7 + N_LAYERS * 4
         if dump and m == 1 and pos + 1 >= len(prompt) and n_dumped < GEN_N:
             ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, dump_h.unsafe_ptr() + n_dumped * 2 * N_LAYERS * H, 2 * N_LAYERS * H, owning=False), src_buf=dbg_d)
@@ -879,13 +900,13 @@ def main() raises:
         # f32 copy of the post-final-norm hidden state (pre-LM-head): row r is
         # h(pos + r), what the MTP draft head pairs with token pos + r + 1.
         var Hnm = TileTensor(hn_d, xm_layout)
-        if not use_mega:
+        if not (use_mega or use_mega_win):
             ctx.enqueue_function[rms_m](
                 Xm, tens_f32(ctx, wbuf, off[w], H, h_layout), Hnm,
                 Int32(H), Float32(1e-6), grid_dim=m, block_dim=256,
             )
         if pos + m >= len(prompt):
-            if not use_mega:
+            if not (use_mega or use_mega_win):
                 ctx.enqueue_function[rmsc_k](
                     Xm, tens_f32(ctx, wbuf, off[w], H, h_layout), CurBm,
                     Int32(H), Float32(1e-6), grid_dim=m, block_dim=256,
@@ -898,7 +919,8 @@ def main() raises:
                 pass
             elif win_spec:
                 var Dtok = TileTensor(dtok_d, dtok_layout)
-                ctx.enqueue_function[argmax_d](Logitsm, Dtok, Int32(VOCAB), Int32(0), grid_dim=m, block_dim=256)
+                if not use_mega_win:
+                    ctx.enqueue_function[argmax_d](Logitsm, Dtok, Int32(VOCAB), Int32(0), grid_dim=m, block_dim=256)
                 var t_acc = 0
                 if pf3:
                     ctx.synchronize()
