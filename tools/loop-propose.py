@@ -102,7 +102,7 @@ def profile_shares(path):
     return shares
 
 
-def ask(endpoint, prompt, identity_line):
+def ask(endpoint, prompt, identity_line, max_tokens=4096):
     # RULES + corpus go in the system message and are IDENTICAL across branches,
     # so the ~25k-char prefix is prefilled once and reused (cache_prompt). The
     # identity varies only in the trailing user turn. Putting the framing first
@@ -111,11 +111,23 @@ def ask(endpoint, prompt, identity_line):
     body = {"messages": [{"role": "system", "content": RULES + "\n\n" + prompt},
                          {"role": "user", "content": "Framing for this attempt: " + identity_line
                           + "\n\nPropose your one change now, in the output format given."}],
-            "temperature": 0.6, "max_tokens": 4096, "cache_prompt": True}
+            "temperature": 0.6, "max_tokens": max_tokens, "cache_prompt": True}
     req = urllib.request.Request(endpoint + "/v1/chat/completions", data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=1800) as r:
-        return json.load(r)["choices"][0]["message"]["content"]
+    with urllib.request.urlopen(req, timeout=3600) as r:
+        d = json.load(r)
+    ch = d["choices"][0]
+    msg = ch["message"]
+    # A reasoning model served with --reasoning-format deepseek puts its thinking
+    # in reasoning_content and leaves content empty until it stops thinking. Read
+    # content, fall back to the thinking, and hand the caller the finish reason
+    # and token counts -- iteration 003's first run recorded 4/4 "no diff" when
+    # what actually happened was that every branch burned its whole budget
+    # thinking and the harness dropped the text.
+    text = msg.get("content") or ""
+    if not text.strip():
+        text = msg.get("reasoning_content") or ""
+    return text, ch.get("finish_reason"), d.get("usage", {})
 
 
 def main():
@@ -126,6 +138,8 @@ def main():
     ap.add_argument("--profile", default=".work/profile-run.log")
     ap.add_argument("--endpoint", default="http://127.0.0.1:8083")
     ap.add_argument("--start", type=int, default=0, help="first identity index")
+    ap.add_argument("--max-tokens", type=int, default=4096,
+                    help="answer budget per branch; a reasoning model needs room to think AND answer")
     a = ap.parse_args()
     out = ROOT / ".work/loop" / a.iter
     (out / "src").mkdir(parents=True, exist_ok=True)
@@ -154,7 +168,7 @@ def main():
     ids = identities()[a.start:a.start + a.n]
     print(f"region={region} prompt_chars={len(prompt)} identities={[i[0] for i in ids]}", flush=True)
     for i, (name, line) in enumerate(ids):
-        raw = ask(a.endpoint, prompt, line)
+        raw, finish, usage = ask(a.endpoint, prompt, line, a.max_tokens)
         (out / f"cand-{i}.raw.md").write_text(f"identity: {name}\n\n" + raw)
         body = re.sub(r"<think>.*?</think>", "", raw, flags=re.S)
         m = re.search(r"```diff\n(.*?)```", body, flags=re.S)
@@ -162,7 +176,11 @@ def main():
         (out / f"cand-{i}.diff").write_text(m.group(1) if m else "")
         (out / f"cand-{i}.predict").write_text((p.group(1) if p else "none") + "\n")
         print(f"cand-{i} [{name}] diff={'yes' if m else 'NO'} lines={m.group(1).count(chr(10)) if m else 0} "
-              f"predict={p.group(1) if p else 'none'}", flush=True)
+              f"predict={p.group(1) if p else 'none'} finish={finish} "
+              f"completion_tok={usage.get('completion_tokens')}", flush=True)
+        if finish == "length":
+            print(f"  cand-{i}: budget exhausted at {a.max_tokens} tokens -- "
+                  f"no diff here is a harness result, not a proposer result", flush=True)
 
 
 if __name__ == "__main__":
