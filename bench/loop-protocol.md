@@ -39,6 +39,7 @@ widen the region to whole-layer rewrites instead of more iterations.
 | 001 (2026-09-01, commit 7833260) | ffn (52%) | 18-skeptic, 19-builder, 20-stranger | 3 | 0 | 41.3 -> 41.3 | none |
 | 002 (2026-09-05, commit 9b8a399 in gguf) | ffn (51.2%) | 01-father, 02-grandfather, 03-uncle, 04-mother | 4 | 0 | 67.48 -> 67.48 | none |
 | 003 (2026-09-05, commit e3948ba in gguf, proposer Qwen3.8-27B) | ffn (51.2%) | 01-father, 02-grandfather, 03-uncle, 04-mother | 4 | 0 | 67.07 -> 67.07 | none |
+| 004 (2026-09-05, commit ffa1808 in gguf, Qwen3.8-27B BARO, self-describing) | ffn (51.2%) | 01-father, 02-grandfather, 03-uncle, 04-mother | 4 | 0 | 67.17 -> 67.17 | none |
 
 Iteration 001 notes: prompt 25k chars (bindings + ffn region + elementwise +
 matmul_skinny). All three failed before any timed run: no diff fence; patch
@@ -195,3 +196,42 @@ Held from iteration 003 so the only variable is self-description: region `ffn`,
 identities 01-04, `--max-tokens 12288`, Qwen3 sampler
 (`temp 0.6 / top_p 0.95 / top_k 20 / min_p 0`, `repeat_penalty 1.05`,
 `presence_penalty 1.0`).
+
+## Iteration 004 result (2026-09-05)
+
+Champion 67.17 tok/s_gen (median of 3, spread 1.27%), from the sources embedded
+in the 27B's own gguf.
+
+| cand | identity | stage reached | verdict |
+|---|---|---|---|
+| 0 | 01-father | parse | no diff fence (finished on `stop`, 4135 tok) |
+| 1 | 02-grandfather | **compile** | commented out `if pf4:`, orphaning the block: "statement indentation must match the rest of the block" |
+| 2 | 03-uncle | apply | `ctx.enqueue_function[r_h](...)` — example ellipsis again, matches nothing |
+| 3 | 04-mother | apply | real `comptime` block from matmul_skinny.mojo, but the diff header says `engine.mojo` |
+
+Survivors 0.
+
+Self-description changed the *kind* of answer, not the outcome. Iteration 003's
+failures were mostly the prompt's own worked example copied back; here two of
+four are edits to real code that the model located itself:
+
+- **cand-3 is the first candidate in four iterations to attempt a parameter
+  change with a reason** — `comptime ROW_VEC = 8 -> 9` in the skinny matmul, the
+  only candidate ever to emit a non-zero prediction (`PREDICT: +1`). It failed
+  on file attribution: the hunk body is matmul_skinny.mojo, the header says
+  engine.mojo. (9 is also not a sane vector width, so the merits were thin — but
+  the gate never got to say so.)
+- **cand-1 found the profiling code and switched it off.** Commenting out the
+  `if pf4:` guard is the edit class the scope stage exists to forbid; it passed
+  scope because only `+`/`-` lines are scanned for banned tokens and the guard
+  line carries none of them — the `perf_counter_ns` calls it disables sit in the
+  hunk as context. It died at compile on Mojo's indentation rule, not on scope.
+
+**Gate defect, found and fixed (`scope` stage): the banned-token list was
+evadable by editing the guard instead of the guarded code.** Profiling guard
+names (`prof`, `pf2`, `pf3`, `pf4`, `pf_*`) are now in the pattern. Regression
+checked: iteration 004 cand-1 is now caught at scope; cand-0/2/3 and all seven
+candidates of iterations 002-003 are unaffected.
+
+Standing: 4 iterations, 0 survivors, 0% aggregate gain. One more before the
+worth-it rule forces widening the region to whole-layer rewrites.

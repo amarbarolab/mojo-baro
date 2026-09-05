@@ -14,7 +14,10 @@ for d in "$dir"/cand-*.diff; do
   touched=$(grep -E '^\+\+\+ ' "$d" | sed -E 's#^\+\+\+ (b/)?##; s/\t.*//' | sort -u)
   bad=""; for f in $touched; do grep -qx "$(basename "$f")" "$dir/FILES" || bad="$bad $f"; done
   [ -z "$bad" ] || { fail scope "files outside gguf list:$bad"; continue; }
-  grep -E '^[+-].*(BARO_PROFILE|perf_counter_ns|tok/s|check-tokens|ref-tokens|getenv|print\()' "$d" >/dev/null && { fail scope "touches timing/print/profile code"; continue; }
+  # The banned-token list alone is evadable: iteration 004's cand-1 commented out
+  # `if pf4:`, a profiling GUARD, whose own line carries none of these tokens while
+  # disabling the block underneath it. Guard names are in the pattern for that reason.
+  grep -E '^[+-].*(BARO_PROFILE|perf_counter_ns|tok/s|check-tokens|ref-tokens|getenv|print\(|\b(prof|pf2|pf3|pf4|pf_[a-z]+)\b)' "$d" >/dev/null && { fail scope "touches timing/print/profile code"; continue; }
   # stage 1: apply + compile on a copy of the gguf sources
   # Hunk counts are rewritten from the hunk body first (iteration 002 lost 4/4
   # here to headers declaring 7 context lines while supplying 4). Content is
