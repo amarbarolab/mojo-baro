@@ -87,3 +87,71 @@ Prediction on the outcome itself, so it is falsifiable: **mixed**, with
 It does not measure whether a different recurrence formulation (chunked scan,
 associative scan over rows) would beat the sequential floor. That is a
 separate item; this one only prices the floor as the kernel is written.
+
+## Run record — 2026-09-05, HEAD f37815b (clean tree)
+
+Binary: `.work/engine`, built this session from the same tree
+(`./.venv/bin/mojo build serve/engine.mojo -I kernels -o .work/engine`, exit 0);
+the only commit between build and run is this protocol file. Disclosed
+deviation from P1's "rebuilt in the same command as the run".
+
+Instrument: `gpu-wait run --priority 90 --vram 12`,
+`MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_SIZE_PERCENT=10`, GPU at 42 C / 31 W /
+2.97 GB used before the first run — the CoiOS bge-m3 embedding llama-server is
+resident and idle throughout, in both arms (disclosed above).
+
+Receipts read back from stdout:
+
+| | arm A | arm B |
+|---|---|---|
+| `BARO_SPEC` | False | True |
+| `spec k` | 2 (unused, spec off) | 1 |
+| `prompt tokens` | 5 | 5 |
+| `tokens` | 64 | 64 |
+| `mtp:` | absent | `drafted 32 accepted 32 k 1` |
+| windows normalized by | 63 | 32 |
+
+`accepted 32 / drafted 32` on this prompt means arm B is 32 windows of m=2
+exactly, so the per-window normalization is measured, not assumed.
+
+3 runs per arm, first dropped, median of 2. Delta-stage kept runs:
+A 43.457 / 45.264 ms, B 33.751 / 32.480 ms — spread 4.1% and 3.9%, inside the
+5% gate.
+
+Per-window SSM stage time (ms), and the ratio:
+
+| stage | A (m=1) | B (m=2) | B/A |
+|---|---|---|---|
+| gemm4+reduce2 | 3.6094 | 3.4014 | 0.94 |
+| rgates | 0.6662 | 0.8974 | 1.35 |
+| conv | 0.4575 | 0.4866 | 1.06 |
+| l2 | 0.4398 | 0.4646 | 1.06 |
+| **delta** | **0.7041** | **1.0349** | **1.47** |
+| gated | 0.4415 | 0.4751 | 1.08 |
+| out_gemm+add | 1.1357 | 1.1937 | 1.05 |
+| total (profiled, serialized) | 7.4543 | 7.9537 | 1.07 |
+
+`S_delta(m=2)` = 0.130, `d` = 1.47.
+
+### Verdict
+
+**Prediction 1 is FALSIFIED.** `d` = 1.47, not >= 1.8. The row loop is
+sequential in program order but not in cost: the state columns are loaded
+into registers once per head and row r+1 reuses them, so the second row adds
+arithmetic and the second state write, not a second state read. The floor is
+lower than the recurrence's structure suggested.
+
+Prediction 2 holds except for `rgates` (1.35 vs the <=1.2 stated). `rgates`
+launches `grid_dim=1, block_dim=NH_V=32` — a single wave; at that size the
+number is launch overhead, not work, and it should not have been given a
+tight band. Prediction 3 holds (delta share 0.094 -> 0.130).
+
+The outcome prediction ("mixed, `S_delta` in 0.20-0.35, `d` near 2.0") is also
+wrong. By the frozen decision rule, `S_delta` = 0.130 <= 0.20 is
+**recoverable**: milestone item 2 keeps its 115-120 tok/s ceiling and proceeds
+as written.
+
+Stronger result than the rule asks for: the whole SSM sub-block costs only
+1.07x per window at m=2 while doing twice the rows. The m=2 loss is not in the
+SSM sub-block at all, which is what item 2 assumed and this probe now
+supports rather than merely permits.
