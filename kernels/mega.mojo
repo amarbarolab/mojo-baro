@@ -271,40 +271,35 @@ def ssm_phases[
     stamp(prof, pbase + 1)
 
     g = bid
-    while g < G_QKV:
-        var row = g * ROW_WAVES + wave
-        var t = q8_row_dot[MR](CurB, Wqkvq, Wqkvs, row, lane, H, M)
-        if lane == 0:
-            comptime for r in range(MR):
-                if r < M:
-                    Qkvm[r, row] = rebind[Qkvm.ElementType](t[r])
-        g += nblk
-    g = bid
-    while g < G_Z:
-        var row = g * ROW_WAVES + wave
-        var t = q8_row_dot[MR](CurB, Wzq, Wzs, row, lane, H, M)
-        if lane == 0:
-            comptime for r in range(MR):
-                if r < M:
-                    Zm[r, row] = rebind[Zm.ElementType](t[r])
-        g += nblk
-    g = bid
-    while g < G_AB:
-        var row = g * ROW_WAVES + wave
-        var t = q8_row_dot[MR](CurB, Waq, Was, row, lane, H, M)
-        if lane == 0:
-            comptime for r in range(MR):
-                if r < M:
-                    Araw[r, row] = rebind[Araw.ElementType](t[r])
-        g += nblk
-    g = bid
-    while g < G_AB:
-        var row = g * ROW_WAVES + wave
-        var t = q8_row_dot[MR](CurB, Wbq, Wbs, row, lane, H, M)
-        if lane == 0:
-            comptime for r in range(MR):
-                if r < M:
-                    Braw[r, row] = rebind[Braw.ElementType](t[r])
+    while g < G_QKV + G_Z + G_AB + G_AB:
+        if g < G_QKV:
+            var row = g * ROW_WAVES + wave
+            var t = q8_row_dot[MR](CurB, Wqkvq, Wqkvs, row, lane, H, M)
+            if lane == 0:
+                comptime for r in range(MR):
+                    if r < M:
+                        Qkvm[r, row] = rebind[Qkvm.ElementType](t[r])
+        elif g < G_QKV + G_Z:
+            var row = (g - (G_QKV)) * ROW_WAVES + wave
+            var t = q8_row_dot[MR](CurB, Wzq, Wzs, row, lane, H, M)
+            if lane == 0:
+                comptime for r in range(MR):
+                    if r < M:
+                        Zm[r, row] = rebind[Zm.ElementType](t[r])
+        elif g < G_QKV + G_Z + G_AB:
+            var row = (g - (G_QKV + G_Z)) * ROW_WAVES + wave
+            var t = q8_row_dot[MR](CurB, Waq, Was, row, lane, H, M)
+            if lane == 0:
+                comptime for r in range(MR):
+                    if r < M:
+                        Araw[r, row] = rebind[Araw.ElementType](t[r])
+        else:
+            var row = (g - (G_QKV + G_Z + G_AB)) * ROW_WAVES + wave
+            var t = q8_row_dot[MR](CurB, Wbq, Wbs, row, lane, H, M)
+            if lane == 0:
+                comptime for r in range(MR):
+                    if r < M:
+                        Braw[r, row] = rebind[Braw.ElementType](t[r])
         g += nblk
     if not grid_barrier(ctr, gen, fail):
         return False
@@ -502,22 +497,21 @@ def ffn_phases[
     stamp(prof, pbase + 1)
 
     g = bid
-    while g < G_F:
-        var row = g * ROW_WAVES + wave
-        var t = q8_row_dot[MR](CurB, Wgq, Wgs, row, lane, H, M)
-        if lane == 0:
-            comptime for r in range(MR):
-                if r < M:
-                    Pg[r, row] = rebind[Pg.ElementType](t[r])
-        g += nblk
-    g = bid
-    while g < G_F:
-        var row = g * ROW_WAVES + wave
-        var t = q8_row_dot[MR](CurB, Wuq, Wus, row, lane, H, M)
-        if lane == 0:
-            comptime for r in range(MR):
-                if r < M:
-                    Pu[r, row] = rebind[Pu.ElementType](t[r])
+    while g < G_F + G_F:
+        if g < G_F:
+            var row = g * ROW_WAVES + wave
+            var t = q8_row_dot[MR](CurB, Wgq, Wgs, row, lane, H, M)
+            if lane == 0:
+                comptime for r in range(MR):
+                    if r < M:
+                        Pg[r, row] = rebind[Pg.ElementType](t[r])
+        else:
+            var row = (g - (G_F)) * ROW_WAVES + wave
+            var t = q8_row_dot[MR](CurB, Wuq, Wus, row, lane, H, M)
+            if lane == 0:
+                comptime for r in range(MR):
+                    if r < M:
+                        Pu[r, row] = rebind[Pu.ElementType](t[r])
         g += nblk
     if not grid_barrier(ctr, gen, fail):
         return False
@@ -621,31 +615,28 @@ def attn_phases[
     stamp(prof, pbase + 1)
 
     g = bid
-    while g < G_Q:
-        var row = g * ROW_WAVES + wave
-        var t = q8_row_dot[MR](CurB, Wqq, Wqs, row, lane, H, M)
-        if lane == 0:
-            comptime for r in range(MR):
-                if r < M:
-                    Qfm[r, row] = rebind[Qfm.ElementType](t[r])
-        g += nblk
-    g = bid
-    while g < G_KV:
-        var row = g * ROW_WAVES + wave
-        var t = q8_row_dot[MR](CurB, Wkq, Wks, row, lane, H, M)
-        if lane == 0:
-            comptime for r in range(MR):
-                if r < M:
-                    Kflat[r, row] = rebind[Kflat.ElementType](t[r])
-        g += nblk
-    g = bid
-    while g < G_KV:
-        var row = g * ROW_WAVES + wave
-        var t = q8_row_dot[MR](CurB, Wvq, Wvs, row, lane, H, M)
-        if lane == 0:
-            comptime for r in range(MR):
-                if r < M:
-                    Vflat[r, row] = rebind[Vflat.ElementType](t[r])
+    while g < G_Q + G_KV + G_KV:
+        if g < G_Q:
+            var row = g * ROW_WAVES + wave
+            var t = q8_row_dot[MR](CurB, Wqq, Wqs, row, lane, H, M)
+            if lane == 0:
+                comptime for r in range(MR):
+                    if r < M:
+                        Qfm[r, row] = rebind[Qfm.ElementType](t[r])
+        elif g < G_Q + G_KV:
+            var row = (g - (G_Q)) * ROW_WAVES + wave
+            var t = q8_row_dot[MR](CurB, Wkq, Wks, row, lane, H, M)
+            if lane == 0:
+                comptime for r in range(MR):
+                    if r < M:
+                        Kflat[r, row] = rebind[Kflat.ElementType](t[r])
+        else:
+            var row = (g - (G_Q + G_KV)) * ROW_WAVES + wave
+            var t = q8_row_dot[MR](CurB, Wvq, Wvs, row, lane, H, M)
+            if lane == 0:
+                comptime for r in range(MR):
+                    if r < M:
+                        Vflat[r, row] = rebind[Vflat.ElementType](t[r])
         g += nblk
     if not grid_barrier(ctr, gen, fail):
         return False
