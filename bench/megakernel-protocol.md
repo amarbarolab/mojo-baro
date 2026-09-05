@@ -103,6 +103,26 @@ into inline device functions (kernel files stay comment-free per CLAUDE.md);
 bit-exact vs the launch sequence on random inputs, layer time at G vs the
 14-launch sequence (device events).
 
+### Stage 1 receipt (2026-09-05 23:49, `kernels/mega.mojo` + `kernels/test_mega_block.mojo`)
+
+`amar_mega_ssm_layer`: 7 phases (rmsc | qkv,z,a,b GEMMs | rgates+conv | l2 |
+delta | gated | out-GEMM+add), 6 grid barriers, G=96 x 512 threads. GEMM
+phases write their destinations directly (NSPLIT=1 reduce collapsed); the
+head phases map head -> block 0..31 on threads 0..127 with the original
+wave-sum order. ISA: vgpr 192 (spill 121, delta_step's), sgpr 87, LDS 1 KB
+-> 1 block/CU at 512 threads, G=96 resident, S0b does not fire.
+
+| gate | result |
+|---|---|
+| residual X (4096) | 0 mismatches |
+| conv window (2 slots x 3 x 8192) | 0 mismatches |
+| ssm state (2 x 32 x 128 x 128) | 0 mismatches |
+| layer time, 200 iters, synthetic q8 weights | launch(14) 120.8 us, mega 87.1 us, **0.72x** |
+
+Per-layer saving 33.7 us x 24 ssm layers = 0.81 ms/token from the ssm
+sub-blocks alone (14 launches x 2.43 us = 34 us predicted; measured 33.7,
+so barrier cost is hidden under the fixed-grid GEMM gain). -> stage 2.
+
 ## Stage 2: per-token kernel (L-XL)
 
 Add attn phases (`attn.mojo` bodies), ffn, embed, head-norm; device-side
