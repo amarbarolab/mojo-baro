@@ -8,12 +8,14 @@ greedy token ids.
 
 Parity target: byte-identical token ids vs llama.cpp on the same GGUF.
 """
+from std.ffi import c_ssize_t, external_call
 from std.math import ceildiv
 from std.memory import memcpy
 from std.os import getenv
 from std.sys import has_accelerator
 from std.time import perf_counter_ns
 
+from max.algorithm import parallelize
 from max.gpu.host import DeviceContext, DeviceBuffer
 from layout import TileTensor, TensorLayout, row_major
 from registry import *
@@ -325,23 +327,38 @@ def main() raises:
     print("loading pack:", total, "bytes")
     var wbuf = ctx.enqueue_create_buffer[DType.uint8](total)
     comptime CHUNK = 1 << 28
+    comptime RSPLIT = 4
     var stage0 = ctx.enqueue_create_host_buffer[DType.uint8](CHUNK)
     var stage1 = ctx.enqueue_create_host_buffer[DType.uint8](CHUNK)
     ctx.synchronize()
     var t_load = perf_counter_ns()
     with open(PACK, "r") as f:
+        var fd = f._get_raw_fd()
         var done = 0
         var flip = False
         while done < total:
             var want = min(CHUNK, total - done)
             var stage = stage1 if flip else stage0
-            var sp = Span(unsafe_ptr=stage.unsafe_ptr(), length=want)
-            var got = 0
-            while got < want:
-                var n = f.read(sp[got:want])
-                if n == 0:
+            var sptr = stage.unsafe_ptr()
+            var rerr = List[Int64](unsafe_uninit_length=RSPLIT)
+            var rerr_ptr = rerr.unsafe_ptr()
+            def rchunk(t: Int) {imm fd, imm want, imm done, imm sptr, imm rerr_ptr}:
+                var lo = want * t // RSPLIT
+                var hi = want * (t + 1) // RSPLIT
+                var got = lo
+                while got < hi:
+                    var n = external_call["pread", c_ssize_t](
+                        fd, sptr.unsafe_offset(got), hi - got, Int64(done + got)
+                    )
+                    if n <= 0:
+                        rerr_ptr[t] = 1
+                        return
+                    got += Int(n)
+                rerr_ptr[t] = 0
+            parallelize(rchunk, RSPLIT)
+            for t in range(RSPLIT):
+                if rerr[t] != 0:
                     raise Error("short read")
-                got += n
             # The in-flight copy sources the OTHER stage: sync only after this
             # read has overlapped it, and always before this stage is enqueued.
             ctx.synchronize()
