@@ -100,3 +100,32 @@ kernel (<= 1.3x of m=1 instead of 1.6x); window 26.0 -> <= 24 ms =
 W2's (>= +6%, 20/20 identity, spread < 5%). Close < +3%. Receipt must show
 the window kernel at <= 192 VGPRs with scratch ops near `load_b128` at or
 below the m=1 kernel's (14).
+
+### W3 receipt (2026-09-06 02:40) -- CLOSED, prediction falsified
+
+`amar_mega_window[MR=3]` (no flat-work-group hint -> 192-VGPR cap) with the
+state column reloaded from L2 in 32-wide chunks: **192 VGPRs, 1 spill,
+bit-identical at m=3** (the reload had to be written in the native
+kernel's exact contraction form -- one `col*eg` multiply, then
+`fma(t,kq1,sk)`, `fma(kq1,d,t)`, `fma(s,kq0,o)` -- 1061 FMAs / 346 muls /
+0 adds in the native ISA; the plain `a*b*c + sk` spelling differed at 1 ulp).
+Delta phase at m=3: 25.6 us (register column: 35).
+
+But the lever was not occupancy. Measured on the synthetic 4-layer window,
+ffn gate+up GEMM pair at m=3: 256-cap kernel G=96 **214 us**; 192-cap
+kernel G=96 **270 us** (less ILP under the cap); 192-cap G=192 **225 us**
+(2 blocks/CU recovers part, and G=192 has zero residency slack on a desktop
+GPU -- it hit NOT-RESIDENT once in a 110-launch loop). Native cold m=3
+layer GEMMs scale ~1.5x from m=1 (launch-path total 3180 -> 4025 us); the
+megakernel's scale 1.6x. Per-row serialization inside a persistent wave
+(load -> wait -> 3x FMA work -> next row) is the cost; native overlaps
+rows across 24 resident waves. A cross-row weight prefetch fixes it on
+paper and is register-infeasible here (token 77 -> 209 spills, window
+9 -> 2022). Head at m=3: native 1.22x, megakernel 1.65x (+300 us); moving
+the head back to native launches for the window did not rescue it: engine
+k=2 spec 110.9 vs 127.5 tok/s_gen.
+
+Kept: chunked-reload delta for MR>1 (kernels/mega.mojo), the window entry
+point behind `BARO_MEGA_WIN=1` (default 0, layers-only, native head),
+the m=3 kernel gate. `BARO_MEGA=1` (m=1) unchanged. Multi-row windows stay
+on the launch path; the megakernel is an m=1 device.

@@ -20,7 +20,7 @@ from elementwise import amar_rmsnorm_cast, amar_rmsnorm, amar_argmax_pos
 from matmul_skinny import amar_matmul_skinny_q8row, amar_skinny_reduce, amar_skinny_reduce_add, amar_skinny_reduce_swiglu_bf16, ROW_WAVES, ROW_THREADS, SM, SPLITK
 from ssm import amar_ssm_reduce_gates, amar_ssm_conv, amar_ssm_qk_l2norm, amar_ssm_delta_step, amar_ssm_gated_out_bf16, CONV, NH_V, SSTATE
 from attn import amar_head_rmsnorm, amar_attn_decode, amar_gate_mul_cast, amar_qgate_split, amar_rope_yarn, amar_kv_append, HD, NQH, NKVH
-from mega import amar_mega_token, MEGA_G, H, FFN, QF, KV, VOCAB
+from mega import amar_mega_token, amar_mega_window, MEGA_G, MEGA_G_WIN, H, FFN, QF, KV, VOCAB
 
 comptime NL = 4
 comptime N_SSM_T = 3
@@ -139,6 +139,30 @@ def diff(ctx: DeviceContext, name: String, a: DeviceBuffer[f32], b: DeviceBuffer
             if d > maxd:
                 maxd = d
     print(name, " mismatches:", bad, "/", n, " max|d|=", maxd, " sample:", ha[0], ha[1], ha[n - 1])
+    if bad > 0 and name == "ssm states":
+        var big = 0
+        var shown = 0
+        var per_slot: List[Int] = [0, 0, 0, 0]
+        var per_j_lo = 0
+        var per_i_lo = 0
+        for idx in range(n):
+            var d = abs(ha[idx] - hb[idx])
+            if d > 1.0:
+                big += 1
+                var j = idx % SSTATE
+                var i = (idx // SSTATE) % SSTATE
+                var h = (idx // (SSTATE * SSTATE)) % NH_V
+                var si = (idx // (SSTATE * SSTATE * NH_V)) % N_SSM_T
+                var slot = idx // (SSTATE * SSTATE * NH_V * N_SSM_T)
+                per_slot[slot] += 1
+                if j < 64:
+                    per_j_lo += 1
+                if i < 64:
+                    per_i_lo += 1
+                if shown < 6:
+                    print("    big diff at slot", slot, "si", si, "h", h, "i", i, "j", j, " launch", ha[idx], " mega", hb[idx])
+                    shown += 1
+        print("    big (>1.0) diffs:", big, " per slot:", per_slot[0], per_slot[1], per_slot[2], per_slot[3], " j<64:", per_j_lo, " i<64:", per_i_lo)
     return bad
 
 
@@ -203,7 +227,16 @@ def run_case[MRT: Int](ctx: DeviceContext, mut wbuf: DeviceBuffer[u8], mut offd:
     comptime append_k = amar_kv_append[type_of(cache_layout), type_of(kvm_layout)]
     comptime att_k = amar_attn_decode[type_of(qm_layout), type_of(cache_layout), type_of(qm_layout)]
     comptime gmul_k = amar_gate_mul_cast[type_of(xflat_layout), type_of(xflat_layout), type_of(xflat_layout)]
+    comptime GW = MEGA_G if MRT == 1 else MEGA_G_WIN
     comptime mega_k = amar_mega_token[
+        MRT, XL, XL,
+        type_of(convm_layout), type_of(g32m_layout), type_of(convm_layout), type_of(om_layout),
+        type_of(csall_layout), type_of(ssall_layout),
+        type_of(qfm_layout), type_of(kvm_flat), type_of(qm_layout), type_of(xflat_layout),
+        type_of(pf_sm), type_of(ffnm_layout), type_of(off_layout), type_of(ctr_layout), type_of(toks_layout), type_of(dtok_layout),
+        TM, NL,
+    ]
+    comptime mega_w = amar_mega_window[
         MRT, XL, XL,
         type_of(convm_layout), type_of(g32m_layout), type_of(convm_layout), type_of(om_layout),
         type_of(csall_layout), type_of(ssall_layout),
@@ -270,8 +303,8 @@ def run_case[MRT: Int](ctx: DeviceContext, mut wbuf: DeviceBuffer[u8], mut offd:
     var toksM_d = ctx.enqueue_create_buffer[i32](64)
     var dtokL_d = ctx.enqueue_create_buffer[i32](9)
     var dtokM_d = ctx.enqueue_create_buffer[i32](9)
-    var hmax_d = ctx.enqueue_create_buffer[f32](MRT * MEGA_G)
-    var hidx_d = ctx.enqueue_create_buffer[i32](MRT * MEGA_G)
+    var hmax_d = ctx.enqueue_create_buffer[f32](MRT * MEGA_G_WIN)
+    var hidx_d = ctx.enqueue_create_buffer[i32](MRT * MEGA_G_WIN)
     ctx.enqueue_memset(p_qf_d, 0)
     ctx.enqueue_memset(p_kv_d, 0)
     ctx.enqueue_memset(p_h_d, 0)
@@ -395,13 +428,22 @@ def run_case[MRT: Int](ctx: DeviceContext, mut wbuf: DeviceBuffer[u8], mut offd:
 
     @parameter
     def mega_path(ring: Int) raises:
-        ctx.enqueue_function[mega_k](
-            wbuf.unsafe_ptr(), Off, XM_, CurB, ResB, Qkvm, Zm, Araw, Braw, Eg, Beta, Conv, So, CsM, SsM,
-            Qfm, Kflat, Vflat, Q, Gate, Ao, kcM.unsafe_ptr(), vcM.unsafe_ptr(), Pg1, Pu1, FgB, Ctr, prof_d.unsafe_ptr(), dbg_d.unsafe_ptr(),
-            ToksM, DtokM, HnM, hmax_d.unsafe_ptr(), hidx_d.unsafe_ptr(),
-            Int32(ring), Int32(SLOTS), Int32(POS), Int32(M), Int32(0), Int32(1 if MRT == 1 else 2),
-            grid_dim=MEGA_G, block_dim=ROW_THREADS,
-        )
+        comptime if MRT == 1:
+            ctx.enqueue_function[mega_k](
+                wbuf.unsafe_ptr(), Off, XM_, CurB, ResB, Qkvm, Zm, Araw, Braw, Eg, Beta, Conv, So, CsM, SsM,
+                Qfm, Kflat, Vflat, Q, Gate, Ao, kcM.unsafe_ptr(), vcM.unsafe_ptr(), Pg1, Pu1, FgB, Ctr, prof_d.unsafe_ptr(), dbg_d.unsafe_ptr(),
+                ToksM, DtokM, HnM, hmax_d.unsafe_ptr(), hidx_d.unsafe_ptr(),
+                Int32(ring), Int32(SLOTS), Int32(POS), Int32(M), Int32(0), Int32(1),
+                grid_dim=MEGA_G, block_dim=ROW_THREADS,
+            )
+        else:
+            ctx.enqueue_function[mega_w](
+                wbuf.unsafe_ptr(), Off, XM_, CurB, ResB, Qkvm, Zm, Araw, Braw, Eg, Beta, Conv, So, CsM, SsM,
+                Qfm, Kflat, Vflat, Q, Gate, Ao, kcM.unsafe_ptr(), vcM.unsafe_ptr(), Pg1, Pu1, FgB, Ctr, prof_d.unsafe_ptr(), dbg_d.unsafe_ptr(),
+                ToksM, DtokM, HnM, hmax_d.unsafe_ptr(), hidx_d.unsafe_ptr(),
+                Int32(ring), Int32(SLOTS), Int32(POS), Int32(M), Int32(0), Int32(2),
+                grid_dim=MEGA_G_WIN, block_dim=ROW_THREADS,
+            )
 
     launch_path(0)
     ctx.synchronize()
@@ -441,6 +483,49 @@ def run_case[MRT: Int](ctx: DeviceContext, mut wbuf: DeviceBuffer[u8], mut offd:
         print("FAIL: megakernel token differs from launch path at m =", M)
         return 1
     print("PASS: per-token megakernel (4 layers + head) bit-identical to the launch path at m =", M)
+    var wl = 1 + 10 + 4
+    ctx.enqueue_function[rmsc_k](XL_, tf(ctx, wbuf, off[wl], H, h_layout), CurB, Int32(H), Float32(1e-6), grid_dim=M, block_dim=256)
+    ctx.synchronize()
+    var t_50_438 = perf_counter_ns()
+    for _ in range(50):
+        ctx.enqueue_function[rmsc_k](XL_, tf(ctx, wbuf, off[wl], H, h_layout), CurB, Int32(H), Float32(1e-6), grid_dim=M, block_dim=256)
+    ctx.synchronize()
+    print("  native rmsc m =", M, ":", Float64(perf_counter_ns() - t_50_438) / 1e3 / 50.0, "us")
+    ctx.enqueue_function[g_conv](CurB, tq(ctx, wbuf, off[wl + 1], CONV * H, q_conv_h), ts(ctx, wbuf, off[wl + 1], CONV * H, s_conv_h), Pq, Int32(M), Int32(CONV), Int32(H), grid_dim=ceildiv(CONV, ROW_WAVES), block_dim=ROW_THREADS)
+    ctx.synchronize()
+    var t_20_180 = perf_counter_ns()
+    for _ in range(20):
+        ctx.enqueue_function[g_conv](CurB, tq(ctx, wbuf, off[wl + 1], CONV * H, q_conv_h), ts(ctx, wbuf, off[wl + 1], CONV * H, s_conv_h), Pq, Int32(M), Int32(CONV), Int32(H), grid_dim=ceildiv(CONV, ROW_WAVES), block_dim=ROW_THREADS)
+    ctx.synchronize()
+    print("  native qkv-gemm 8192x4096 m =", M, ":", Float64(perf_counter_ns() - t_20_180) / 1e3 / 20.0, "us")
+    ctx.enqueue_function[delta_k](SsL, Conv, Eg, Beta, So, Int32(0), Int32(1), Int32(SLOTS), grid_dim=NH_V, block_dim=SSTATE)
+    ctx.synchronize()
+    var t_50_166 = perf_counter_ns()
+    for _ in range(50):
+        ctx.enqueue_function[delta_k](SsL, Conv, Eg, Beta, So, Int32(0), Int32(1), Int32(SLOTS), grid_dim=NH_V, block_dim=SSTATE)
+    ctx.synchronize()
+    print("  native delta m =", M, ":", Float64(perf_counter_ns() - t_50_166) / 1e3 / 50.0, "us")
+    ctx.enqueue_function[g_ffn](CurB, tq(ctx, wbuf, off[wl + 11], FFN * H, q_h_ffn), ts(ctx, wbuf, off[wl + 11], FFN * H, s_h_ffn), Pg, Int32(M), Int32(FFN), Int32(H), grid_dim=ceildiv(FFN, ROW_WAVES), block_dim=ROW_THREADS)
+    ctx.synchronize()
+    var t_20_222 = perf_counter_ns()
+    for _ in range(20):
+        ctx.enqueue_function[g_ffn](CurB, tq(ctx, wbuf, off[wl + 11], FFN * H, q_h_ffn), ts(ctx, wbuf, off[wl + 11], FFN * H, s_h_ffn), Pg, Int32(M), Int32(FFN), Int32(H), grid_dim=ceildiv(FFN, ROW_WAVES), block_dim=ROW_THREADS)
+    ctx.synchronize()
+    print("  native ffn gate 12288x4096 m =", M, ":", Float64(perf_counter_ns() - t_20_222) / 1e3 / 20.0, "us")
+    ctx.enqueue_function[g_down](FgB, tq(ctx, wbuf, off[wl + 13], H * FFN, q_ffn_h), ts(ctx, wbuf, off[wl + 13], H * FFN, s_ffn_h), Ph, Int32(M), Int32(H), Int32(FFN), grid_dim=ceildiv(H, ROW_WAVES), block_dim=ROW_THREADS)
+    ctx.synchronize()
+    var t_20_437 = perf_counter_ns()
+    for _ in range(20):
+        ctx.enqueue_function[g_down](FgB, tq(ctx, wbuf, off[wl + 13], H * FFN, q_ffn_h), ts(ctx, wbuf, off[wl + 13], H * FFN, s_ffn_h), Ph, Int32(M), Int32(H), Int32(FFN), grid_dim=ceildiv(H, ROW_WAVES), block_dim=ROW_THREADS)
+    ctx.synchronize()
+    print("  native ffn down 4096x12288 m =", M, ":", Float64(perf_counter_ns() - t_20_437) / 1e3 / 20.0, "us")
+    ctx.enqueue_function[g_head](CurB, tq(ctx, wbuf, off[len(off) - 1], VOCAB * H, q_h_v), ts(ctx, wbuf, off[len(off) - 1], VOCAB * H, s_h_v), Pv, Int32(M), Int32(VOCAB), Int32(H), grid_dim=ceildiv(VOCAB, ROW_WAVES), block_dim=ROW_THREADS)
+    ctx.synchronize()
+    var t_10_148 = perf_counter_ns()
+    for _ in range(10):
+        ctx.enqueue_function[g_head](CurB, tq(ctx, wbuf, off[len(off) - 1], VOCAB * H, q_h_v), ts(ctx, wbuf, off[len(off) - 1], VOCAB * H, s_h_v), Pv, Int32(M), Int32(VOCAB), Int32(H), grid_dim=ceildiv(VOCAB, ROW_WAVES), block_dim=ROW_THREADS)
+    ctx.synchronize()
+    print("  native head 248320x4096 m =", M, ":", Float64(perf_counter_ns() - t_10_148) / 1e3 / 10.0, "us")
 
     for it in range(10):
         launch_path(it % SLOTS)
@@ -477,7 +562,7 @@ def run_case[MRT: Int](ctx: DeviceContext, mut wbuf: DeviceBuffer[u8], mut offd:
             line += " | head: rmsc " + String(Float64(ph[16 * NL + 1] - ph[16 * NL]) / 100.0) + " gemm+argmax " + String(Float64(ph[16 * NL + 2] - ph[16 * NL + 1]) / 100.0) + " final " + String(Float64(ph[16 * NL + 3] - ph[16 * NL + 2]) / 100.0)
         line += " | sub " + String(Float64(ph[16 * layer + 7] - ph[16 * layer]) / 100.0) + " ffn " + String(Float64(ph[16 * layer + 11] - ph[16 * layer + 7]) / 100.0)
         print(line)
-    print("m =", M, " 4-layer+head us/window: launch=", us_launch, " mega(G=", MEGA_G, ")=", us_mega, " ratio=", us_mega / us_launch, " fail=", flag[2])
+    print("m =", M, " 4-layer+head us/window: launch=", us_launch, " mega(G=", GW, ")=", us_mega, " ratio=", us_mega / us_launch, " fail=", flag[2])
     return 0
 
 

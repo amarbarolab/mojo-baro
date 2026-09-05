@@ -1,7 +1,7 @@
 from std.atomic import Atomic, Ordering
 from std.gpu import block_idx, grid_dim, lane_id, thread_idx, WARP_SIZE
 from std.gpu.primitives import warp
-from std.math import cos, exp, log, log1p, rsqrt, sin
+from std.math import cos, exp, fma, log, log1p, rsqrt, sin
 from std.math import sqrt
 from std.sys import llvm_intrinsic
 from std.utils import StaticTuple
@@ -23,6 +23,7 @@ comptime u8 = DType.uint8
 comptime i32 = DType.int32
 comptime i64 = DType.int64
 comptime MEGA_G = 96
+comptime MEGA_G_WIN = 96
 comptime SPIN_LIMIT = 1 << 22
 comptime QV = 16
 comptime UNROLL = 4
@@ -114,7 +115,7 @@ def q8_row_dot[
 
 @always_inline
 def rmsc_phase[
-    XL: TensorLayout, GL: TensorLayout, CBL: TensorLayout
+    MR: Int, XL: TensorLayout, GL: TensorLayout, CBL: TensorLayout
 ](
     mut X: TileTensor[f32, XL, MutAnyOrigin],
     Gn: TileTensor[f32, GL, MutAnyOrigin],
@@ -252,6 +253,7 @@ def ssm_phases[
     var ctr = Ctr.ptr
     var gen = Ctr.ptr.unsafe_offset(1)
     var fail = Ctr.ptr.unsafe_offset(2)
+    var g = 0
     var si = Int(ssm_i)
     var sl = Int(slots)
     var rg = Int(ring)
@@ -263,41 +265,46 @@ def ssm_phases[
     )
 
     stamp(prof, pbase + 12)
-    rmsc_phase(X, Gn, CurB, M)
+    rmsc_phase[MR](X, Gn, CurB, M)
     if not grid_barrier(ctr, gen, fail):
         return False
     stamp(prof, pbase + 1)
 
-    var g = bid
-    while g < G_ALL:
-        if g < G_QKV:
-            var row = g * ROW_WAVES + wave
-            var t = q8_row_dot[MR](CurB, Wqkvq, Wqkvs, row, lane, H, M)
-            if lane == 0:
-                comptime for r in range(MR):
-                    if r < M:
-                        Qkvm[r, row] = rebind[Qkvm.ElementType](t[r])
-        elif g < G_QKV + G_Z:
-            var row = (g - G_QKV) * ROW_WAVES + wave
-            var t = q8_row_dot[MR](CurB, Wzq, Wzs, row, lane, H, M)
-            if lane == 0:
-                comptime for r in range(MR):
-                    if r < M:
-                        Zm[r, row] = rebind[Zm.ElementType](t[r])
-        elif g < G_QKV + G_Z + G_AB:
-            var row = (g - G_QKV - G_Z) * ROW_WAVES + wave
-            var t = q8_row_dot[MR](CurB, Waq, Was, row, lane, H, M)
-            if lane == 0:
-                comptime for r in range(MR):
-                    if r < M:
-                        Araw[r, row] = rebind[Araw.ElementType](t[r])
-        else:
-            var row = (g - G_QKV - G_Z - G_AB) * ROW_WAVES + wave
-            var t = q8_row_dot[MR](CurB, Wbq, Wbs, row, lane, H, M)
-            if lane == 0:
-                comptime for r in range(MR):
-                    if r < M:
-                        Braw[r, row] = rebind[Braw.ElementType](t[r])
+    g = bid
+    while g < G_QKV:
+        var row = g * ROW_WAVES + wave
+        var t = q8_row_dot[MR](CurB, Wqkvq, Wqkvs, row, lane, H, M)
+        if lane == 0:
+            comptime for r in range(MR):
+                if r < M:
+                    Qkvm[r, row] = rebind[Qkvm.ElementType](t[r])
+        g += nblk
+    g = bid
+    while g < G_Z:
+        var row = g * ROW_WAVES + wave
+        var t = q8_row_dot[MR](CurB, Wzq, Wzs, row, lane, H, M)
+        if lane == 0:
+            comptime for r in range(MR):
+                if r < M:
+                    Zm[r, row] = rebind[Zm.ElementType](t[r])
+        g += nblk
+    g = bid
+    while g < G_AB:
+        var row = g * ROW_WAVES + wave
+        var t = q8_row_dot[MR](CurB, Waq, Was, row, lane, H, M)
+        if lane == 0:
+            comptime for r in range(MR):
+                if r < M:
+                    Araw[r, row] = rebind[Araw.ElementType](t[r])
+        g += nblk
+    g = bid
+    while g < G_AB:
+        var row = g * ROW_WAVES + wave
+        var t = q8_row_dot[MR](CurB, Wbq, Wbs, row, lane, H, M)
+        if lane == 0:
+            comptime for r in range(MR):
+                if r < M:
+                    Braw[r, row] = rebind[Braw.ElementType](t[r])
         g += nblk
     if not grid_barrier(ctr, gen, fail):
         return False
@@ -375,19 +382,42 @@ def ssm_phases[
                 var eg = rebind[Scalar[f32]](Eg[r, h])
                 var beta = rebind[Scalar[f32]](Beta[r, h])
                 var vj = rebind[Scalar[f32]](Conv[r, 2 * KDIM + h * SSTATE + j])
-                var col = SIMD[f32, SSTATE]()
-                comptime for i in range(SSTATE):
-                    col[i] = rebind[Scalar[f32]](SAll[rs, si, h, i, j])
-                var sk: Float32 = 0
-                comptime for i in range(SSTATE):
-                    sk += col[i] * eg * rebind[Scalar[f32]](kq[1, i])
-                var d = (vj - sk) * beta
-                var o: Float32 = 0
-                comptime for i in range(SSTATE):
-                    var s = col[i] * eg + rebind[Scalar[f32]](kq[1, i]) * d
-                    SAll[ws, si, h, i, j] = rebind[SAll.ElementType](s)
-                    o += s * rebind[Scalar[f32]](kq[0, i])
-                So[r, h, j] = rebind[So.ElementType](o)
+                comptime if MR == 1:
+                    var col = SIMD[f32, SSTATE]()
+                    comptime for i in range(SSTATE):
+                        col[i] = rebind[Scalar[f32]](SAll[rs, si, h, i, j])
+                    var sk: Float32 = 0
+                    comptime for i in range(SSTATE):
+                        sk += col[i] * eg * rebind[Scalar[f32]](kq[1, i])
+                    var d = (vj - sk) * beta
+                    var o: Float32 = 0
+                    comptime for i in range(SSTATE):
+                        var s = col[i] * eg + rebind[Scalar[f32]](kq[1, i]) * d
+                        SAll[ws, si, h, i, j] = rebind[SAll.ElementType](s)
+                        o += s * rebind[Scalar[f32]](kq[0, i])
+                    So[r, h, j] = rebind[So.ElementType](o)
+                else:
+                    comptime CHK = 32
+                    var sk: Float32 = 0
+                    for c in range(SSTATE // CHK):
+                        var col = InlineArray[Float32, CHK](uninitialized=True)
+                        comptime for ii in range(CHK):
+                            col[ii] = rebind[Scalar[f32]](SAll[rs, si, h, c * CHK + ii, j])
+                        comptime for ii in range(CHK):
+                            var t = col[ii] * eg
+                            sk = fma(t, rebind[Scalar[f32]](kq[1, c * CHK + ii]), sk)
+                    var d = (vj - sk) * beta
+                    var o: Float32 = 0
+                    for c in range(SSTATE // CHK):
+                        var col = InlineArray[Float32, CHK](uninitialized=True)
+                        comptime for ii in range(CHK):
+                            col[ii] = rebind[Scalar[f32]](SAll[rs, si, h, c * CHK + ii, j])
+                        comptime for ii in range(CHK):
+                            var t = col[ii] * eg
+                            var s = fma(rebind[Scalar[f32]](kq[1, c * CHK + ii]), d, t)
+                            SAll[ws, si, h, c * CHK + ii, j] = rebind[SAll.ElementType](s)
+                            o = fma(s, rebind[Scalar[f32]](kq[0, c * CHK + ii]), o)
+                    So[r, h, j] = rebind[So.ElementType](o)
             barrier()
     if not grid_barrier(ctr, gen, fail):
         return False
@@ -464,28 +494,30 @@ def ffn_phases[
     var ctr = Ctr.ptr
     var gen = Ctr.ptr.unsafe_offset(1)
     var fail = Ctr.ptr.unsafe_offset(2)
+    var g = 0
 
-    rmsc_phase(X, Gn, CurB, M)
+    rmsc_phase[MR](X, Gn, CurB, M)
     if not grid_barrier(ctr, gen, fail):
         return False
     stamp(prof, pbase + 1)
 
-    var g = bid
-    while g < 2 * G_F:
-        if g < G_F:
-            var row = g * ROW_WAVES + wave
-            var t = q8_row_dot[MR](CurB, Wgq, Wgs, row, lane, H, M)
-            if lane == 0:
-                comptime for r in range(MR):
-                    if r < M:
-                        Pg[r, row] = rebind[Pg.ElementType](t[r])
-        else:
-            var row = (g - G_F) * ROW_WAVES + wave
-            var t = q8_row_dot[MR](CurB, Wuq, Wus, row, lane, H, M)
-            if lane == 0:
-                comptime for r in range(MR):
-                    if r < M:
-                        Pu[r, row] = rebind[Pu.ElementType](t[r])
+    g = bid
+    while g < G_F:
+        var row = g * ROW_WAVES + wave
+        var t = q8_row_dot[MR](CurB, Wgq, Wgs, row, lane, H, M)
+        if lane == 0:
+            comptime for r in range(MR):
+                if r < M:
+                    Pg[r, row] = rebind[Pg.ElementType](t[r])
+        g += nblk
+    g = bid
+    while g < G_F:
+        var row = g * ROW_WAVES + wave
+        var t = q8_row_dot[MR](CurB, Wuq, Wus, row, lane, H, M)
+        if lane == 0:
+            comptime for r in range(MR):
+                if r < M:
+                    Pu[r, row] = rebind[Pu.ElementType](t[r])
         g += nblk
     if not grid_barrier(ctr, gen, fail):
         return False
@@ -572,6 +604,7 @@ def attn_phases[
     var ctr = Ctr.ptr
     var gen = Ctr.ptr.unsafe_offset(1)
     var fail = Ctr.ptr.unsafe_offset(2)
+    var g = 0
     var sums = stack_allocation[f32, address_space = AddressSpace.SHARED](
         row_major[HD // WARP_SIZE]()
     )
@@ -582,34 +615,37 @@ def attn_phases[
         row_major[MAX_T]()
     )
 
-    rmsc_phase(X, Gn, CurB, M)
+    rmsc_phase[MR](X, Gn, CurB, M)
     if not grid_barrier(ctr, gen, fail):
         return False
     stamp(prof, pbase + 1)
 
-    var g = bid
-    while g < G_Q + 2 * G_KV:
-        if g < G_Q:
-            var row = g * ROW_WAVES + wave
-            var t = q8_row_dot[MR](CurB, Wqq, Wqs, row, lane, H, M)
-            if lane == 0:
-                comptime for r in range(MR):
-                    if r < M:
-                        Qfm[r, row] = rebind[Qfm.ElementType](t[r])
-        elif g < G_Q + G_KV:
-            var row = (g - G_Q) * ROW_WAVES + wave
-            var t = q8_row_dot[MR](CurB, Wkq, Wks, row, lane, H, M)
-            if lane == 0:
-                comptime for r in range(MR):
-                    if r < M:
-                        Kflat[r, row] = rebind[Kflat.ElementType](t[r])
-        else:
-            var row = (g - G_Q - G_KV) * ROW_WAVES + wave
-            var t = q8_row_dot[MR](CurB, Wvq, Wvs, row, lane, H, M)
-            if lane == 0:
-                comptime for r in range(MR):
-                    if r < M:
-                        Vflat[r, row] = rebind[Vflat.ElementType](t[r])
+    g = bid
+    while g < G_Q:
+        var row = g * ROW_WAVES + wave
+        var t = q8_row_dot[MR](CurB, Wqq, Wqs, row, lane, H, M)
+        if lane == 0:
+            comptime for r in range(MR):
+                if r < M:
+                    Qfm[r, row] = rebind[Qfm.ElementType](t[r])
+        g += nblk
+    g = bid
+    while g < G_KV:
+        var row = g * ROW_WAVES + wave
+        var t = q8_row_dot[MR](CurB, Wkq, Wks, row, lane, H, M)
+        if lane == 0:
+            comptime for r in range(MR):
+                if r < M:
+                    Kflat[r, row] = rebind[Kflat.ElementType](t[r])
+        g += nblk
+    g = bid
+    while g < G_KV:
+        var row = g * ROW_WAVES + wave
+        var t = q8_row_dot[MR](CurB, Wvq, Wvs, row, lane, H, M)
+        if lane == 0:
+            comptime for r in range(MR):
+                if r < M:
+                    Vflat[r, row] = rebind[Vflat.ElementType](t[r])
         g += nblk
     if not grid_barrier(ctr, gen, fail):
         return False
@@ -782,8 +818,8 @@ def wf2[N: Int, M: Int](wbuf: MutPointer[Scalar[u8], MutAnyOrigin], o: Int) -> T
     return TileTensor((wbuf + o).unsafe_bitcast[Scalar[f32]](), row_major[N, M]())
 
 
-@__llvm_metadata(`rocdl.flat_work_group_size`=StaticTuple[Int32, 1](Int32(ROW_THREADS)))
-def amar_mega_token[
+@always_inline
+def mega_body[
     MR: Int,
     XL: TensorLayout, CBL: TensorLayout,
     QkvL: TensorLayout, G32mL: TensorLayout, ConvL: TensorLayout, OmL: TensorLayout,
@@ -953,7 +989,7 @@ def amar_mega_token[
     var ho1 = Int(rebind[Scalar[i64]](off[w + 1]))
     if fold_head == 2:
         rms_f32_phase(X_, wf[H](wbuf, ho0), Hn_, M)
-    rmsc_phase(X_, wf[H](wbuf, ho0), CurB_, M)
+    rmsc_phase[MR](X_, wf[H](wbuf, ho0), CurB_, M)
     if not grid_barrier(ctrh, genh, fail):
         return
     stamp(prof, 16 * NL + 1)
@@ -1014,3 +1050,100 @@ def amar_mega_token[
                 else:
                     Toks_[p + 1] = rebind[Toks_.ElementType](fi)
     stamp(prof, 16 * NL + 3)
+
+
+@__llvm_metadata(`rocdl.flat_work_group_size`=StaticTuple[Int32, 1](Int32(ROW_THREADS)))
+def amar_mega_token[
+    MR: Int,
+    XL: TensorLayout, CBL: TensorLayout,
+    QkvL: TensorLayout, G32mL: TensorLayout, ConvL: TensorLayout, OmL: TensorLayout,
+    CsL: TensorLayout, SsL: TensorLayout,
+    QfL: TensorLayout, KvfL: TensorLayout, QmL: TensorLayout, GfL: TensorLayout,
+    PfL: TensorLayout, FbL: TensorLayout, OffL: TensorLayout, CtrL: TensorLayout, TkL: TensorLayout, DkL: TensorLayout,
+    TM: Int, NL: Int,
+](
+    wbuf: MutPointer[Scalar[u8], MutAnyOrigin],
+    off: TileTensor[i64, OffL, MutAnyOrigin],
+    X: TileTensor[f32, XL, MutAnyOrigin],
+    CurB: TileTensor[bf16, CBL, MutAnyOrigin],
+    ResB: TileTensor[bf16, CBL, MutAnyOrigin],
+    Qkvm: TileTensor[f32, QkvL, MutAnyOrigin],
+    Zm: TileTensor[f32, XL, MutAnyOrigin],
+    Araw: TileTensor[f32, G32mL, MutAnyOrigin],
+    Braw: TileTensor[f32, G32mL, MutAnyOrigin],
+    Eg: TileTensor[f32, G32mL, MutAnyOrigin],
+    Beta: TileTensor[f32, G32mL, MutAnyOrigin],
+    Conv: TileTensor[f32, ConvL, MutAnyOrigin],
+    So: TileTensor[f32, OmL, MutAnyOrigin],
+    ConvState: TileTensor[f32, CsL, MutAnyOrigin],
+    SAll: TileTensor[f32, SsL, MutAnyOrigin],
+    Qfm: TileTensor[f32, QfL, MutAnyOrigin],
+    Kflat: TileTensor[f32, KvfL, MutAnyOrigin],
+    Vflat: TileTensor[f32, KvfL, MutAnyOrigin],
+    Q: TileTensor[f32, QmL, MutAnyOrigin],
+    Gate: TileTensor[f32, GfL, MutAnyOrigin],
+    Ao: TileTensor[f32, QmL, MutAnyOrigin],
+    kc: MutPointer[Scalar[f32], MutAnyOrigin],
+    vc: MutPointer[Scalar[f32], MutAnyOrigin],
+    Pg: TileTensor[f32, PfL, MutAnyOrigin],
+    Pu: TileTensor[f32, PfL, MutAnyOrigin],
+    FgB: TileTensor[bf16, FbL, MutAnyOrigin],
+    Ctr: TileTensor[u32, CtrL, MutAnyOrigin],
+    prof: MutPointer[Scalar[i64], MutAnyOrigin],
+    dbg: MutPointer[Scalar[f32], MutAnyOrigin],
+    Toks: TileTensor[i32, TkL, MutAnyOrigin],
+    Dtok: TileTensor[i32, DkL, MutAnyOrigin],
+    Hn: TileTensor[f32, XL, MutAnyOrigin],
+    hmax: MutPointer[Scalar[f32], MutAnyOrigin],
+    hidx: MutPointer[Scalar[i32], MutAnyOrigin],
+    ring: Int32, slots: Int32, pos: Int32, m: Int32, dump: Int32, fold_head: Int32,
+):
+    mega_body[MR, XL, CBL, QkvL, G32mL, ConvL, OmL, CsL, SsL, QfL, KvfL, QmL, GfL, PfL, FbL, OffL, CtrL, TkL, DkL, TM, NL](wbuf, off, X, CurB, ResB, Qkvm, Zm, Araw, Braw, Eg, Beta, Conv, So, ConvState, SAll, Qfm, Kflat, Vflat, Q, Gate, Ao, kc, vc, Pg, Pu, FgB, Ctr, prof, dbg, Toks, Dtok, Hn, hmax, hidx, ring, slots, pos, m, dump, fold_head)
+
+
+def amar_mega_window[
+    MR: Int,
+    XL: TensorLayout, CBL: TensorLayout,
+    QkvL: TensorLayout, G32mL: TensorLayout, ConvL: TensorLayout, OmL: TensorLayout,
+    CsL: TensorLayout, SsL: TensorLayout,
+    QfL: TensorLayout, KvfL: TensorLayout, QmL: TensorLayout, GfL: TensorLayout,
+    PfL: TensorLayout, FbL: TensorLayout, OffL: TensorLayout, CtrL: TensorLayout, TkL: TensorLayout, DkL: TensorLayout,
+    TM: Int, NL: Int,
+](
+    wbuf: MutPointer[Scalar[u8], MutAnyOrigin],
+    off: TileTensor[i64, OffL, MutAnyOrigin],
+    X: TileTensor[f32, XL, MutAnyOrigin],
+    CurB: TileTensor[bf16, CBL, MutAnyOrigin],
+    ResB: TileTensor[bf16, CBL, MutAnyOrigin],
+    Qkvm: TileTensor[f32, QkvL, MutAnyOrigin],
+    Zm: TileTensor[f32, XL, MutAnyOrigin],
+    Araw: TileTensor[f32, G32mL, MutAnyOrigin],
+    Braw: TileTensor[f32, G32mL, MutAnyOrigin],
+    Eg: TileTensor[f32, G32mL, MutAnyOrigin],
+    Beta: TileTensor[f32, G32mL, MutAnyOrigin],
+    Conv: TileTensor[f32, ConvL, MutAnyOrigin],
+    So: TileTensor[f32, OmL, MutAnyOrigin],
+    ConvState: TileTensor[f32, CsL, MutAnyOrigin],
+    SAll: TileTensor[f32, SsL, MutAnyOrigin],
+    Qfm: TileTensor[f32, QfL, MutAnyOrigin],
+    Kflat: TileTensor[f32, KvfL, MutAnyOrigin],
+    Vflat: TileTensor[f32, KvfL, MutAnyOrigin],
+    Q: TileTensor[f32, QmL, MutAnyOrigin],
+    Gate: TileTensor[f32, GfL, MutAnyOrigin],
+    Ao: TileTensor[f32, QmL, MutAnyOrigin],
+    kc: MutPointer[Scalar[f32], MutAnyOrigin],
+    vc: MutPointer[Scalar[f32], MutAnyOrigin],
+    Pg: TileTensor[f32, PfL, MutAnyOrigin],
+    Pu: TileTensor[f32, PfL, MutAnyOrigin],
+    FgB: TileTensor[bf16, FbL, MutAnyOrigin],
+    Ctr: TileTensor[u32, CtrL, MutAnyOrigin],
+    prof: MutPointer[Scalar[i64], MutAnyOrigin],
+    dbg: MutPointer[Scalar[f32], MutAnyOrigin],
+    Toks: TileTensor[i32, TkL, MutAnyOrigin],
+    Dtok: TileTensor[i32, DkL, MutAnyOrigin],
+    Hn: TileTensor[f32, XL, MutAnyOrigin],
+    hmax: MutPointer[Scalar[f32], MutAnyOrigin],
+    hidx: MutPointer[Scalar[i32], MutAnyOrigin],
+    ring: Int32, slots: Int32, pos: Int32, m: Int32, dump: Int32, fold_head: Int32,
+):
+    mega_body[MR, XL, CBL, QkvL, G32mL, ConvL, OmL, CsL, SsL, QfL, KvfL, QmL, GfL, PfL, FbL, OffL, CtrL, TkL, DkL, TM, NL](wbuf, off, X, CurB, ResB, Qkvm, Zm, Araw, Braw, Eg, Beta, Conv, So, ConvState, SAll, Qfm, Kflat, Vflat, Q, Gate, Ao, kc, vc, Pg, Pu, FgB, Ctr, prof, dbg, Toks, Dtok, Hn, hmax, hidx, ring, slots, pos, m, dump, fold_head)

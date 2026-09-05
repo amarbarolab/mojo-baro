@@ -14,7 +14,7 @@ from ssm import (
     amar_ssm_reduce_gates, amar_ssm_conv, amar_ssm_qk_l2norm,
     amar_ssm_delta_step, amar_ssm_gated_out_bf16, amar_cast_bf16, CONV, NH_V, SSTATE,
 )
-from mega import amar_mega_token, MEGA_G
+from mega import amar_mega_token, amar_mega_window, MEGA_G, MEGA_G_WIN
 from attn import (
     amar_head_rmsnorm, amar_attn_decode, amar_gate_mul_cast, amar_qgate_split, amar_rope_yarn, amar_kv_append,
     HD, NQH, NKVH,
@@ -131,7 +131,7 @@ comptime mega_token_k = amar_mega_token[
     TMAX, N_LAYERS,
 ]
 comptime MEGA_MR = 3
-comptime mega_win_k = amar_mega_token[
+comptime mega_win_k = amar_mega_window[
     MEGA_MR, type_of(xm_layout), type_of(xm_layout),
     type_of(qfm_layout), type_of(g32m_layout), type_of(convm_layout), type_of(om_layout),
     type_of(csall_layout), type_of(ssall_layout),
