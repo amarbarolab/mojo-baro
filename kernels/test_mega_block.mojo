@@ -316,6 +316,7 @@ def main() raises:
     var p_ffn2_d = ctx.enqueue_create_buffer[f32](SPLITK * SM * FFN)
     var ctr_d = ctx.enqueue_create_buffer[u32](3)
     var prof_d = ctx.enqueue_create_buffer[i64](16 * NL + 4)
+    var dbg_d = ctx.enqueue_create_buffer[f32](2 * NL * H)
     ctx.enqueue_memset(prof_d, 0)
     ctx.enqueue_memset(p_qf_d, 0)
     ctx.enqueue_memset(p_kv_d, 0)
@@ -421,7 +422,7 @@ def main() raises:
     def mega_path(ring: Int) raises:
         ctx.enqueue_function[mega_k](
             wbuf.unsafe_ptr(), Off, XM_, CurB, ResB, Qkvm, Zm, Araw, Braw, Eg, Beta, Conv, So, CsM, SsM,
-            Qfm, Kflat, Vflat, Q, Gate, Ao, kcM.unsafe_ptr(), vcM.unsafe_ptr(), Pg1, Pu1, FgB, Ctr, prof_d.unsafe_ptr(), prof_d.unsafe_ptr().unsafe_bitcast[Scalar[f32]](),
+            Qfm, Kflat, Vflat, Q, Gate, Ao, kcM.unsafe_ptr(), vcM.unsafe_ptr(), Pg1, Pu1, FgB, Ctr, prof_d.unsafe_ptr(), dbg_d.unsafe_ptr(),
             Int32(ring), Int32(SLOTS), Int32(POS), Int32(0), grid_dim=MEGA_G, block_dim=ROW_THREADS,
         )
 

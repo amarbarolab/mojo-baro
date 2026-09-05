@@ -135,6 +135,43 @@ the prediction table. Profile receipt: `BARO_PROFILE` per-phase device
 timestamps (block 0 thread 0 writes `clock64` at each barrier) so the
 post-mortem says which phases moved.
 
+### Stage 2 receipt (2026-09-06 00:24, `b2e3cb4` + `d9468e1`, `bench/mega-prompts.sh`, `.work/mega-p4-run2/`)
+
+`amar_mega_token` (`kernels/mega.mojo`): all 32 layers of one decode token in
+one launch, G=96 x 512 threads, ~305 bounded grid barriers/token; weights
+addressed on device from the pack offset table; `flat_work_group_size=512`
+lifts the VGPR cap to 256 (spills 244 -> 113; the cap of 192 had the GEMM hot
+loops spilling, 1.09x SLOWER than launches before it). Head + embed stay as
+launches (3 launches/token). Engine switch `BARO_MEGA=1` (m=1, no spec,
+decode only; prefill and MTP keep the launch path).
+
+Arm: 290 W cap, -100 mV, engine-pack-q8, 20 prompts x 64 tokens, A and M
+interleaved per prompt, one stint; sclk med 3040 MHz, Tj 73 C.
+
+| arm | median tok/s_gen | spread | identity |
+|---|---|---|---|
+| A `BARO_MEGA=0` | 67.08 | 2.9% | ref |
+| M `BARO_MEGA=1` | **79.45** | 1.3% | **20/20 GENERATED equal** |
+
+**+18.4%, S2 LANDS** (rule: >= +6%, spread < 5%, baseline re-run same stint).
+Device profile (`BARO_PROFILE=5`, last token): ssm sub-blocks 3.06 ms, attn
+1.04 ms, ffn 6.81 ms, layers total 10.9 ms vs 14.5 ms/token before.
+
+First 20-prompt run had 1/20 identity FAIL (p01, token 21): an unrolled
+rmsnorm sum-of-squares let the backend contract FMA differently from
+`amar_rmsnorm_cast`; 1 ulp in the scale once in 64 tokens. Reverted to the
+loop form (`d9468e1`), bit-identical over 64 tokens x 64 dump points
+(`BARO_DUMP`). Lesson in `m.ledger/mojo-baro.md` 2026-09-06: same order is
+not same result; keep the expression form.
+
+`kernels/test_mega_block.mojo` (4-layer synthetic pack, bit-identical X /
+conv / ssm state / KV cache) is the kernel gate; the 20-prompt identity run
+is the engine gate. Per-phase receipt (4 synthetic layers, cold pack):
+ssm GEMM phase 67-77 us, delta 16, out-GEMM tail 29; ffn gate+up 130-140,
+down 68-72; rmsc ~2-3 us x2; attention 60 (GEMMs) + 22 (att). The GEMM
+phases sit at their stage-0 fixed-grid numbers, so the remaining headroom
+is the head fold (stage 3) and the ffn GEMMs themselves, not the barriers.
+
 ## Stage 3: fold LM head + argmax; MR > 1 (M, only if S2 lands)
 
 Head GEMM as a phase (VOCAB rows block-strided, 31040 row-groups), argmax via
