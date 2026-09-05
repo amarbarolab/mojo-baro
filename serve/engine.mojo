@@ -325,24 +325,34 @@ def main() raises:
     print("loading pack:", total, "bytes")
     var wbuf = ctx.enqueue_create_buffer[DType.uint8](total)
     comptime CHUNK = 1 << 28
-    var stage = ctx.enqueue_create_host_buffer[DType.uint8](CHUNK)
+    var stage0 = ctx.enqueue_create_host_buffer[DType.uint8](CHUNK)
+    var stage1 = ctx.enqueue_create_host_buffer[DType.uint8](CHUNK)
     ctx.synchronize()
     var t_load = perf_counter_ns()
     with open(PACK, "r") as f:
         var done = 0
+        var flip = False
         while done < total:
             var want = min(CHUNK, total - done)
-            var data = f.read_bytes(want)
-            if len(data) != want:
-                raise Error("short read")
+            var stage = stage1 if flip else stage0
+            var sp = Span(unsafe_ptr=stage.unsafe_ptr(), length=want)
+            var got = 0
+            while got < want:
+                var n = f.read(sp[got:want])
+                if n == 0:
+                    raise Error("short read")
+                got += n
+            # The in-flight copy sources the OTHER stage: sync only after this
+            # read has overlapped it, and always before this stage is enqueued.
+            ctx.synchronize()
             var dslice = DeviceBuffer[DType.uint8](
                 ctx, wbuf.unsafe_ptr() + done, want, owning=False
             )
-            var hslice = ctx.enqueue_create_host_buffer[DType.uint8](want) if want != CHUNK else stage
-            memcpy(dest=hslice.unsafe_ptr(), src=data.unsafe_ptr(), count=want)
+            var hslice = stage.create_sub_buffer[DType.uint8](0, want) if want != CHUNK else stage
             ctx.enqueue_copy(dst_buf=dslice, src_buf=hslice)
-            ctx.synchronize()
             done += want
+            flip = not flip
+    ctx.synchronize()
     print("pack loaded in", Float64(perf_counter_ns() - t_load) / 1e9, "s")
 
     # --- prompt --------------------------------------------------------------
