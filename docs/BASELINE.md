@@ -336,3 +336,17 @@ FLOP/clk/CU at 3.0 GHz (`bench/bench_wmma_peak.mojo`). The pipe kernel at
 hipBLASLt is 0.65 R at 2.9 GHz. The gap is 13% clock (energy per FLOP)
 and 19% issue. Five levers were raced in Round 7 and none kept; details
 and receipts in `bench/wmma-fp16-protocol.md`.
+
+## Megakernel decode path (default since 2026-09-06, `BARO_MEGA=1`)
+
+Decode at m=1 without spec runs as ONE persistent launch per token
+(`kernels/mega.mojo::amar_mega_token`, G=96 x 512 threads, bounded grid
+barriers): all 32 layers + final norm + head GEMM + argmax. Prefill (m>1) and
+the MTP window keep the launch path; `BARO_MEGA=0` restores it everywhere
+(parity reference). Gate: `tools/mega-gate.sh` (build, kernel parity test,
+run-tests, identity on every runnable pack with spec on/off, ref tokens,
+3-run perf). Receipt 2026-09-06: launch 67.13 -> mega 81.98 tok/s_gen
+(+22%), spread < 0.5%, all identities equal; `BARO_PROFILE=5` prints the
+per-sub-block device profile, `BARO_DUMP=path` dumps X per layer for both
+arms. Round receipts: `bench/megakernel-protocol.md`.
+

@@ -323,7 +323,7 @@ def main() raises:
     print("BARO_DRAFT_Q4:", draft_q4)
     var dot3 = getenv("BARO_DOT", "0") == "1"
     print("BARO_DOT:", dot3)
-    var mega = getenv("BARO_MEGA", "0") == "1"
+    var mega = getenv("BARO_MEGA", "1") == "1"
     print("BARO_MEGA:", mega)
     var pf5 = getenv("BARO_PROFILE", "0") == "5"
     var dump_path = getenv("BARO_DUMP", "")
