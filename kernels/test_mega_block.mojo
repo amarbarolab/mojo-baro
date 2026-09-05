@@ -421,8 +421,8 @@ def main() raises:
     def mega_path(ring: Int) raises:
         ctx.enqueue_function[mega_k](
             wbuf.unsafe_ptr(), Off, XM_, CurB, ResB, Qkvm, Zm, Araw, Braw, Eg, Beta, Conv, So, CsM, SsM,
-            Qfm, Kflat, Vflat, Q, Gate, Ao, kcM.unsafe_ptr(), vcM.unsafe_ptr(), Pg1, Pu1, FgB, Ctr, prof_d.unsafe_ptr(),
-            Int32(ring), Int32(SLOTS), Int32(POS), grid_dim=MEGA_G, block_dim=ROW_THREADS,
+            Qfm, Kflat, Vflat, Q, Gate, Ao, kcM.unsafe_ptr(), vcM.unsafe_ptr(), Pg1, Pu1, FgB, Ctr, prof_d.unsafe_ptr(), prof_d.unsafe_ptr().unsafe_bitcast[Scalar[f32]](),
+            Int32(ring), Int32(SLOTS), Int32(POS), Int32(0), grid_dim=MEGA_G, block_dim=ROW_THREADS,
         )
 
     launch_path(0)

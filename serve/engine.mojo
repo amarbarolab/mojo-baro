@@ -326,6 +326,8 @@ def main() raises:
     var mega = getenv("BARO_MEGA", "0") == "1"
     print("BARO_MEGA:", mega)
     var pf5 = getenv("BARO_PROFILE", "0") == "5"
+    var dump_path = getenv("BARO_DUMP", "")
+    var dump = dump_path != ""
     var e = len(off) - (1 if have_q4_draft else 0) - 15
 
     # --- load pack into one device buffer -----------------------------------
@@ -495,6 +497,9 @@ def main() raises:
     var prof_d = ctx.enqueue_create_buffer[DType.int64](16 * N_LAYERS + 4)
     ctx.enqueue_memset(ctr_d, 0)
     ctx.enqueue_memset(prof_d, 0)
+    var dbg_d = ctx.enqueue_create_buffer[f32](2 * N_LAYERS * H)
+    var dump_h = ctx.enqueue_create_host_buffer[f32](GEN_N * 2 * N_LAYERS * H)
+    var n_dumped = 0
     ctx.synchronize()
     var ConvStateAll = TileTensor(convstate_d, csall_layout)
     var SStateAll = TileTensor(sstate_d, ssall_layout)
@@ -624,8 +629,8 @@ def main() raises:
                 TileTensor(q_d, qm_layout), TileTensor(gate_d, xflat_layout), TileTensor(ao_d, qm_layout),
                 kc_d.unsafe_ptr(), vc_d.unsafe_ptr(),
                 TileTensor(p_ffn_d, c_ffn), TileTensor(p_ffn2_d, c_ffn), TileTensor(fgb_d, ffnm_layout),
-                TileTensor(ctr_d, ctr_layout), prof_d.unsafe_ptr(),
-                Int32(ring), Int32(SLOTS), Int32(pos), grid_dim=MEGA_G, block_dim=ROW_THREADS,
+                TileTensor(ctr_d, ctr_layout), prof_d.unsafe_ptr(), dbg_d.unsafe_ptr(),
+                Int32(ring), Int32(SLOTS), Int32(pos), Int32(1 if dump else 0), grid_dim=MEGA_G, block_dim=ROW_THREADS,
             )
         for layer in range(0 if use_mega else N_LAYERS):
             if prof:
@@ -779,6 +784,8 @@ def main() raises:
                         pc[6] += Int(now - tq)
                 tp = now
                 tq = now
+            if dump and m == 1 and pos + 1 >= len(prompt):
+                ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, dbg_d.unsafe_ptr() + (2 * layer) * H, H, owning=False), src_buf=DeviceBuffer[f32](ctx, x_d.unsafe_ptr(), H, owning=False))
             # -- ffn sub-block --
             if pf4:
                 ctx.synchronize()
@@ -849,6 +856,8 @@ def main() raises:
                 fc[5] += Int(nw - tq)
                 tq = nw
             w += 4
+            if dump and m == 1 and pos + 1 >= len(prompt):
+                ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, dbg_d.unsafe_ptr() + (2 * layer + 1) * H, H, owning=False), src_buf=DeviceBuffer[f32](ctx, x_d.unsafe_ptr(), H, owning=False))
             if prof:
                 ctx.synchronize()
                 var now = perf_counter_ns()
@@ -857,6 +866,9 @@ def main() raises:
 
         if use_mega:
             w = 1 + N_SSM * 10 + N_ATT * 7 + N_LAYERS * 4
+        if dump and m == 1 and pos + 1 >= len(prompt) and n_dumped < GEN_N:
+            ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, dump_h.unsafe_ptr() + n_dumped * 2 * N_LAYERS * H, 2 * N_LAYERS * H, owning=False), src_buf=dbg_d)
+            n_dumped += 1
         # -- head --
         if prof:
             ctx.synchronize()
@@ -921,6 +933,12 @@ def main() raises:
     ctx.synchronize()
     var dt = Float64(perf_counter_ns() - t0) / 1e9
     print("host_enqueue_s:", t_host, " gpu_total_s:", dt)
+    if dump:
+        ctx.synchronize()
+        with open(dump_path, "w") as f:
+            var dpp = dump_h.unsafe_ptr().unsafe_bitcast[UInt8]()
+            f.write_bytes(Span[UInt8](unsafe_ptr=dpp, length=n_dumped * 2 * N_LAYERS * H * 4))
+        print("dumped", n_dumped, "tokens x", N_LAYERS, "layers to", dump_path)
     if pf5:
         var ph = ctx.enqueue_create_host_buffer[DType.int64](16 * N_LAYERS + 4)
         ctx.enqueue_copy(dst_buf=ph, src_buf=prof_d)

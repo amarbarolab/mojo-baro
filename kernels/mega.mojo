@@ -346,11 +346,11 @@ def rmsc_phase[
     )
     var partial: Float32 = 0
     if tid < EW_THREADS:
-        var xs = InlineArray[Float32, H // EW_THREADS](uninitialized=True)
-        comptime for k in range(H // EW_THREADS):
-            xs[k] = rebind[Scalar[f32]](X[0, tid + k * EW_THREADS])
-        comptime for k in range(H // EW_THREADS):
-            partial += xs[k] * xs[k]
+        var i = tid
+        while i < H:
+            var v = rebind[Scalar[f32]](X[0, i])
+            partial += v * v
+            i += EW_THREADS
         var wsum = warp.sum(partial)
         if lane == 0:
             sums[wave] = rebind[sums.ElementType](wsum)
@@ -728,7 +728,8 @@ def amar_mega_token[
     FgB: TileTensor[bf16, FbL, MutAnyOrigin],
     Ctr: TileTensor[u32, CtrL, MutAnyOrigin],
     prof: MutPointer[Scalar[i64], MutAnyOrigin],
-    ring: Int32, slots: Int32, pos: Int32,
+    dbg: MutPointer[Scalar[f32], MutAnyOrigin],
+    ring: Int32, slots: Int32, pos: Int32, dump: Int32,
 ):
     comptime assert off.flat_rank == 1
     var X_ = X
@@ -816,6 +817,11 @@ def amar_mega_token[
         if not grid_barrier(ctr, gen, fail):
             return
         stamp(prof, 16 * layer + 7)
+        if dump != 0 and block_idx.x == 0:
+            var i = Int(thread_idx.x)
+            while i < H:
+                dbg[(2 * layer) * H + i] = rebind[Scalar[f32]](X_[0, i])
+                i += ROW_THREADS
         var f0 = Int(rebind[Scalar[i64]](off[w]))
         var f1 = Int(rebind[Scalar[i64]](off[w + 1]))
         var f2 = Int(rebind[Scalar[i64]](off[w + 2]))
@@ -832,3 +838,8 @@ def amar_mega_token[
         if not grid_barrier(ctr, gen, fail):
             return
         stamp(prof, 16 * layer + 11)
+        if dump != 0 and block_idx.x == 0:
+            var i = Int(thread_idx.x)
+            while i < H:
+                dbg[(2 * layer + 1) * H + i] = rebind[Scalar[f32]](X_[0, i])
+                i += ROW_THREADS
