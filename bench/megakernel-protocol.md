@@ -179,6 +179,25 @@ per-block partials + last-block reduce; 1 launch/token. MR > 1 for the MTP
 window mirrors `gemm_q8`'s dispatch (comptime MR) -- separate prediction,
 separate freeze, because the m>1 kernels have different occupancy.
 
+### Stage 3 receipt (2026-09-06 00:52, `082a58e`, `results/mega-stage3/`)
+
+Final norm + head GEMM (VOCAB=248320 rows block-strided) + argmax folded
+into `amar_mega_token`: **1 launch per decode token** (embed stays a launch
+before it). Argmax: per-wave running best with the `amar_argmax_pos` tie
+rule (max value, lowest index), per-block partials, block 0 reduces.
+Logits are not materialized on the mega path; MTP/spec keep the launch
+path. Kernel gate: argmax token equal, all state bit-identical.
+
+| arm | median tok/s_gen | spread | identity |
+|---|---|---|---|
+| A `BARO_MEGA=0` | 67.62 | 2.6% | ref |
+| M `BARO_MEGA=1` | **81.88** | 1.2% | **20/20** |
+
+**+21.1% vs the launch path** (stage 2 was +18.4%). Device profile, last
+token: ssm 3.10 ms, attn 1.06, ffn 6.66, head 1.21 (the 1.02 GB q8 head
+read at ~840 GB/s -- bandwidth floor), total 12.05 ms; MR>1 for the MTP
+window is a separate freeze. Arm: 290 W / -100 mV, sclk med 3040.
+
 ## Not in this round
 
 q4/q8dot weights, prefill, MTP verify width, hipLaunchCooperativeKernel (0.1
