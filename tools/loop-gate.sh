@@ -16,9 +16,23 @@ for d in "$dir"/cand-*.diff; do
   [ -z "$bad" ] || { fail scope "files outside gguf list:$bad"; continue; }
   grep -E '^[+-].*(BARO_PROFILE|perf_counter_ns|tok/s|check-tokens|ref-tokens|getenv|print\()' "$d" >/dev/null && { fail scope "touches timing/print/profile code"; continue; }
   # stage 1: apply + compile on a copy of the gguf sources
+  # Hunk counts are rewritten from the hunk body first (iteration 002 lost 4/4
+  # here to headers declaring 7 context lines while supplying 4). Content is
+  # untouched, so a hunk describing nonexistent code still fails -- at compile,
+  # where it belongs. apply_mode goes in the receipt: a fuzzy apply is recorded,
+  # never silent.
   cp -r "$dir/src" "$work/src"
-  patch -p1 -d "$work/src" --dry-run -s < "$d" >/dev/null 2>&1 || patch -p0 -d "$work/src" --dry-run -s < "$d" >/dev/null 2>&1 || { fail apply "patch does not apply"; continue; }
-  patch -p1 -d "$work/src" -s < "$d" >/dev/null 2>&1 || patch -p0 -d "$work/src" -s < "$d" >/dev/null 2>&1
+  python3 tools/diff-normalise.py "$d" "$work/norm.diff" > "$work/normalise.log" 2>&1 || { fail apply "diff-normalise failed"; continue; }
+  nfix=$(grep -c '^line ' "$work/normalise.log")
+  mode=""
+  for try in "-p1|" "-p0|" "-p1|-l --fuzz=3" "-p0|-l --fuzz=3"; do
+    strip=${try%%|*}; extra=${try#*|}
+    if patch $strip $extra -d "$work/src" --dry-run -s < "$work/norm.diff" >/dev/null 2>&1; then
+      patch $strip $extra -d "$work/src" -s < "$work/norm.diff" >/dev/null 2>&1
+      mode="$strip${extra:+ $extra}"; break
+    fi
+  done
+  [ -n "$mode" ] || { fail apply "patch does not apply (hunks renumbered: $nfix)"; continue; }
   ./.venv/bin/mojo build "$work/src/engine.mojo" -I "$work/src" -o "$work/engine" > "$work/build.log" 2>&1 || { fail compile "$(grep -m1 error: "$work/build.log" | cut -c1-160)"; continue; }
   # stage 2: token identity at 64
   ./"$work/engine" > "$work/run0.log" 2>&1 || { fail run "engine exited $?"; continue; }
@@ -49,7 +63,7 @@ print(f"code_objects={n} bad={bad}")
 sys.exit(1 if bad or n==0 else 0)
 PY
   [ $? = 0 ] || { fail isa "scratch or spills"; continue; }
-  echo "{\"cand\":\"$c\",\"stage\":\"all\",\"result\":\"PASS\",\"predict_pct\":\"$pred\",\"tokps\":[${t[0]},${t[1]},${t[2]}],\"median\":$med,\"champion\":$champ,\"spread\":$spread}" > "$r"
+  echo "{\"cand\":\"$c\",\"stage\":\"all\",\"result\":\"PASS\",\"predict_pct\":\"$pred\",\"tokps\":[${t[0]},${t[1]},${t[2]}],\"median\":$med,\"champion\":$champ,\"spread\":$spread,\"apply_mode\":\"$mode\",\"hunks_renumbered\":$nfix}" > "$r"
   echo "$c: PASS median $med vs $champ (predict $pred%)"; { echo "## $c  median $med vs champion $champ (predict $pred%)"; echo '```diff'; cat "$d"; echo '```'; } >> "$dir/SURVIVORS.md"
 done
 echo "survivors: $(grep -c '^## ' "$dir/SURVIVORS.md")"

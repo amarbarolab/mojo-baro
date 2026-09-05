@@ -79,3 +79,40 @@ its merits. Counting hunk lines is not the skill under test.
 
 Worth-it rule status: 2 iterations, 0 survivors, 0% aggregate gain. Three more
 iterations before the rule forces widening the region.
+
+## Gate amendment (2026-09-05, before iteration 003)
+
+Iteration 002's `apply` stage is relaxed, deliberately and on the record.
+
+`tools/diff-normalise.py` rewrites each `@@` header's line counts from the hunk
+body before `patch` sees it, and the apply ladder gains a fuzzy tier
+(`-p1`, `-p0`, `-p1 -l --fuzz=3`, `-p0 -l --fuzz=3`). The receipt records
+`apply_mode` and `hunks_renumbered`, so a diff that only applied after
+renumbering or with fuzz says so in its own receipt.
+
+What this does NOT relax: content, order, and the +/-/context class of every
+line are untouched, and line numbers are left alone (`patch` locates a hunk by
+context and reports an offset). A hunk whose context does not match the file
+still fails. Checked against iteration 002's four dead candidates: 3/4 now
+apply and go on to be judged at compile and perf; cand-1 still fails, because
+its context genuinely does not match engine.mojo at 470. The fix is
+discriminating, not permissive.
+
+Rationale: counting hunk lines is not the skill under test. The gate exists to
+find out whether a proposed kernel change is correct and faster.
+
+## Iteration 003 preregistration (2026-09-05)
+
+**The variable is the proposer, and only the proposer.** Region `ffn`,
+identities 01-04, gguf `...-BARO-e3948ba.gguf` — the same configuration as
+iteration 002, so the comparison is proposer-to-proposer.
+
+Proposer: Qwen3.8-27B-OBLITERATED Q4_K_M (16.9 GB, llama.cpp build 10665,
+`-c 20480 -ctk q8_0 -ctv q8_0`, port 8083) instead of Qwythos-9B. This breaks
+the self-describing premise on purpose for one iteration: the model rewriting
+the kernels is not the model that carries them. It answers the question
+iterations 001 and 002 both raised and neither could test — whether a stronger
+proposer clears the ladder, or whether every proposer fails at the same place.
+
+Not a champion measurement. The engine's champion tok/s is measured from the
+gguf's own sources in the same session as the gate, after the server stops.
