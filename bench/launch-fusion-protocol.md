@@ -111,3 +111,25 @@ still costs 16 us, so stage 1 would have saved ~8 us x 24 layers = 0.2 ms
 not per-launch floor. Remaining candidates are per-kernel tail/ramp inside the
 GEMM launches (SPLITK partial + reduce pairs), which is a GEMM-shape question,
 and the bytes lever (q8).
+
+## Stage 2 receipt (2026-09-05, `bench/bench_gridbar.mojo`, run out of order: S0 closed the round at 41.7 tok/s; re-opened because the q8 pack moved decode to 68.8 tok/s, 14.5 ms/token, where 646 launches x 2.4 us = 10.8%)
+
+Hand-rolled atomic barrier (agent-scope fetch_add + generation word, s_sleep
+spin), no cooperative launch. HIP reference (`~/AMDHQ/.work/megakernel/gridsync_spike.hip`)
+in the same session: cg::grid_group.sync 0.51/0.66/0.75/1.01 us at 96/192/288/384
+blocks, atomic 0.67/0.77/1.05/1.07 -- hipLaunchCooperativeKernel is supported
+on gfx1100 but buys ~0.1 us; not needed.
+
+| arm | Mojo us |
+|---|---|
+| launch floor g96 b256 | 2.43 |
+| barrier grid 96 | 0.60 |
+| barrier grid 192 | 0.75 |
+| barrier grid 288 | 1.06 |
+| barrier grid 384 | 1.10 |
+
+**S2 does not fire: barrier at 96..384 blocks is 0.25-0.45x the launch floor.**
+A persistent per-token kernel is feasible from Mojo with `std.atomic` alone.
+Ceiling at 68.8 tok/s: 646 launches x (2.43 - ~0.7) us = 1.1 ms of 14.5 = 7.7%
+from launch cost alone; tail/ramp between kernels is on top and unmeasured.
+The megakernel is its own preregistered round (XL, not this file).
