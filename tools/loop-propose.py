@@ -135,7 +135,9 @@ def main():
     (out / "FILES").write_text("\n".join(files) + "\n")
     (out / "meta.json").write_text(json.dumps({k: v for k, v in meta.items() if k.startswith("baro.")}, indent=1))
     for f in files:
-        (out / "src" / f).write_text(meta[f"baro.kernel.src.{f}"])
+        dst = out / "src" / f
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_text(meta[f"baro.kernel.src.{f}"])
     shares = profile_shares(a.profile)
     region = a.region if a.region != "auto" else max(shares, key=lambda k: shares[k][1])
     prof_txt = "\n".join(f"  {k}: {v[0]*1000:.1f} ms  ({v[1]*100:.1f}%)" for k, v in shares.items())
