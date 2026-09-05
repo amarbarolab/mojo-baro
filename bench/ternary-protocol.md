@@ -127,6 +127,47 @@ falsifier threshold -- decode is NOT free, proceed to T2.
 Bytes moved (read back from the binary, matches the index-derived byte
 counts above): q8=53,477,376 q2b3=11,010,048 tq1=10,616,832 tq2=12,976,128.
 
+## T2 kernel round
+
+| lever | change | frozen prediction |
+|---|---|---|
+| L1 vector loads | q2b3: load the 26 payload bytes as 6x 4-byte + 1x 2-byte vector loads (stride 26 is 2-aligned, not 16-aligned -- pack unchanged); tq1/tq2 unchanged | q2b3 -30 to -50% |
+| L2 UNROLL | prefetch UNROLL blocks of payload+scale before the FMA loop, as q8row's qs[u]/ds[u] | -10 to -25% on top |
+| L3 chunk striding | q2b3: lanes own 32-trit chunks instead of whole blocks; measure both shapes | 0% gate / -5 to -15% down |
+| L4 LUT decode | 256-entry table decode, port of ggml_cuda_b3lut_x | -20 to -40% of remaining time |
+| L5 int8 dot | only if gfx1100 exposes a 4x int8 dot; else skip | uncertain; last |
+
+### L1 receipt: ABLATED -- regressed 4%, not the predicted -30 to -50%
+
+Implementation: `Q.ptr` (TileTensor's raw base pointer -- confirmed via a
+throwaway probe kernel that `TileTensor.__getattr_param__` only supports
+`ptr`, not `unsafe_ptr()`) plus `MutPointer.unsafe_load[width=N](byte_off)`
+for absolute, possibly-2-byte-aligned-only byte offsets -- this DOES
+compile and run correctly (unaligned 4-byte loads at odd-block offsets
+gave bit-correct results on both K=4096 and K=12288 shapes, `test_ternary_gemm`
+PASS). But it is slower, not faster:
+
+| arm | T1 baseline median | L1 median | delta | spread |
+|---|---|---|---|---|
+| q2b3row | 44.10 us | 45.88 us | **+4.0%** | 2.5% |
+| tq1row (unchanged, control) | 53.78 us | 53.75 us | -0.1% (noise) | 0.9% |
+| tq2row (unchanged, control) | 46.05 us | 46.13 us | +0.2% (noise) | 1.5% |
+| q8row (unchanged, control) | 71.68 us | 71.72 us | +0.1% (noise) | 1.5% |
+
+The three untouched arms sit within their own run-to-run noise of the T1
+baseline (clocks: sclk 2835 MHz median, 2530-3044 MHz range, power
+100-317 W, junction max 84 C -- comparable thermal state to T1), so the
+q2b3row regression is real and attributable to the code change, not
+environment drift. Reading the raw pointer directly bypasses whatever
+the TileTensor library's own scalar-index path (`Q[row, i]`) does for
+byte-level global loads on this shape/hardware -- plausibly the unaligned
+4-byte load decomposes into multiple sub-word memory ops on gfx1100
+(RDNA3 requires natural alignment for wide global loads; misaligned
+`global_load_b32` either faults or the compiler splits it), erasing any
+transaction-count win and adding address-computation overhead on top.
+Per the T2 ablation rule, reverted; `kernels/matmul_ternary.mojo`
+q2b3row is back to its T1 form (26 scalar `Q[row, i]` loads).
+
 ## Fork
 
 (placeholder for lane C)
