@@ -16,8 +16,8 @@ from matmul_wmma_pipe import amar_matmul_wmma_pipe, BLK_M, BLK_N, BLK_K, NTHREAD
 comptime M = 512
 comptime N = 512
 comptime K = 512
-comptime ITERS = 200
-comptime WARMUP_SECONDS = 10.0
+comptime ITERS = 2000
+comptime WARMUP_SECONDS = 3.0
 
 comptime a_layout = row_major[M, K]()
 comptime b_layout = row_major[N, K]() if TB == 1 else row_major[K, N]()

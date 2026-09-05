@@ -557,3 +557,42 @@ Not a shippable arm either way: a raised cap is machine state, not repo
 state. A pass makes D1 a documented operating point for benchmarking, and
 every fp16 number in `docs/BASELINE.md` stays quoted at 290 W unless the maintainer
 decides otherwise.
+
+**Round 8 result, D1 baseline arm -- the harness, not the cap** (2026-09-05,
+`9b8a399`, `.work/d1-290W.log`). The 290 W baseline was run twice. First
+build (stock `ITERS = 200`, `WARMUP_SECONDS = 10.0`) gave median 98716 over
+5 rounds with samples 70413..99429 -- **29% spread**, which no rung could
+ever be disjoint from. P6 fired: fix the instrument before the arm.
+
+Cause: at 4096^3 one GEMM is 137 GFLOP, so 200 iterations is a **0.28 s
+timed window** inside an 11 s run, on the card that also drives the
+displays. One compositor burst owns the result; round 5's probe shows it
+(`busy 23/35 samples`, power 47-331 W, sclk 1328..3307). Second defect, same
+cause: `sclk_med` is sampled across the whole run, so at a 10 s warm-up and
+a 0.28 s measured region the clock on every Round 6/7 receipt describes the
+warm-up, not the arm.
+
+Fix: `ITERS = 2000`, `WARMUP_SECONDS = 3.0` (~2.8 s timed inside ~6 s).
+Now the defaults in `bench/bench_fp16_pipe.mojo`. Re-run at 290 W:
+
+| | median | min..max | spread | sclk_med | FLOP/clk/CU |
+|---|---|---|---|---|---|
+| stock harness | 98716 | 70413..99429 | 29% | 2493-2512 | 294-412 |
+| fixed harness | **99224** | 98976..99413 | **0.44%** | 2525 | **409.3** |
+
+**This falsifies the Round 7 gap decomposition.** Champion is **0.791 R, not
+0.71 R**; 0.939 per clock, not 0.82. Round 7's 89-91k was a noisy median
+dragged down by dropouts. Re-decomposed: 15.8% clock (2525 vs 3000 MHz) and
+**6.1% issue**, against the 13% / 19% on record. Check: 0.939 x 2525/3000 =
+0.790.
+
+Consequence for the plan: the issue half of the gap was mostly measurement
+noise, so a 4x4-at-64x128 round is chasing 6%, not 19%. Three quarters of
+what is left is clock, which is exactly what D1 tests. Rungs 350 W / 402 W
+are unrun -- setting the cap needs root and is the maintainer's to apply.
+
+Not yet re-checked: every fp16 number in `docs/BASELINE.md` and the Round
+6/7 lever verdicts were taken on the stock harness. The five rejections were
+all first-build losses of 3-28%, mostly larger than the noise, so they
+probably stand -- but the ten-size table and the R fraction quoted there are
+now suspect and need a re-run on the fixed harness before being quoted.
