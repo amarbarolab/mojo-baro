@@ -235,3 +235,29 @@ candidates of iterations 002-003 are unaffected.
 
 Standing: 4 iterations, 0 survivors, 0% aggregate gain. One more before the
 worth-it rule forces widening the region to whole-layer rewrites.
+
+## Iteration 005 preregistration (2026-09-05) — last before the worth-it rule fires
+
+Configuration held at iteration 004: `Qwen3.8-27B-OBLITERATED.Q4_K_M-BARO-ffa1808.gguf`
+as both source of the sources and proposer, region `ffn`, `--max-tokens 12288`,
+Qwen3 sampler (`temp 0.6 / top_p 0.95 / top_k 20 / min_p 0`, `repeat_penalty 1.05`,
+`presence_penalty 1.0`), read back from `/props` before the run.
+
+**Changed: identities 05-08** (05-grandmother, 06-eldest-sibling,
+07-youngest-sibling, 08-cousin) instead of 01-04. Iterations 002, 003 and 004 all
+ran 01-04; a fourth pass over the same four framings re-samples one prior at
+temperature rather than taking a new look, which is the failure mode the identity
+set exists to avoid.
+
+**Gate as fixed.** Both amendments are live for the first full iteration:
+`tools/diff-normalise.py` + the fuzzy apply tier (hunk arithmetic is not the skill
+under test), and the tightened `scope` pattern carrying the profiling guard names
+that iteration 004 cand-1 walked through.
+
+Champion re-measured in-session from the gguf's embedded sources before the gate,
+as every iteration.
+
+Prediction, frozen: nothing in iterations 001-004 suggests a survivor. The
+interesting outcome is not the tok/s but whether a candidate reaches the identity
+or perf stage on merits rather than on a lucky failure. Two candidates have reached
+compile in four iterations; that is the number to beat.
