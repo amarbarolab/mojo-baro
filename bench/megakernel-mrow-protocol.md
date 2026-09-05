@@ -78,3 +78,25 @@ lever that changes the occupancy.
 Kept: the MR-generic kernel (m=1 path unchanged, spills 84 -> 77), the m=3
 kernel gate, and the engine window path behind `BARO_MEGA_WIN=1`
 (default 0). `BARO_MEGA=1` stays the default for m=1 decode.
+
+## W3 (frozen 2026-09-06 01:35): delta under the 192-VGPR line, G=192 for the window kernel
+
+Measured before writing: native `q8row[4,MR]` = 116-124 VGPRs, 0 spills
+(3 blocks/CU); `delta_step` = 192 VGPRs, 81-235 spills; the MR=3 megakernel
+at the 256 cap = 185 spills, 1 block/CU. Residency ceiling receipt
+(stage 0): vgpr <= 192 -> 2 blocks/CU -> G=192 resident.
+
+Shape: `amar_mega_window[MR=3]` = the same body as `amar_mega_token`
+WITHOUT the `flat_work_group_size` hint (LLVM's default cap is 192), launched
+at G=192; its delta phase reloads the state column S[:, j] from L2 in the
+second pass instead of holding 128 registers (same per-i arithmetic order,
+memory unchanged between passes -> bit-identical; +2 MB L2 reads/layer).
+The m=1 kernel keeps the register column and G=96 (stage-0: G=96 is the
+best m=1 grid).
+
+Prediction: at 2 blocks/CU the m=3 GEMM phases scale like the native
+kernel (<= 1.3x of m=1 instead of 1.6x); window 26.0 -> <= 24 ms =
+**+6..10%** on the k=2 20-prompt median (102.4 -> 108.5..112.6). Land rule =
+W2's (>= +6%, 20/20 identity, spread < 5%). Close < +3%. Receipt must show
+the window kernel at <= 192 VGPRs with scratch ops near `load_b128` at or
+below the m=1 kernel's (14).
