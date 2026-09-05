@@ -171,3 +171,49 @@ split-K partials directly instead of round-tripping `Pg`/`Pu` through memory,
 and the ceiling stays 115-120. If instead the GEMMs carry the increase, the
 1.04x kernel-level row scaling measured in M0 does not survive in the engine
 and item 2 is re-scoped to that discrepancy before any kernel is written.
+
+### Run record and verdict (2026-09-05, HEAD 99ca57a)
+
+Instrument as frozen. Each arm rebuilt the engine in the same command and
+printed `build exit: 0` + sha256 (`6e604da2…` across all six runs). Arm
+identity read back per file: three `BARO_SPEC: False`, three `BARO_SPEC: True`
+with `accepted 32`. Pack: `.work/engine-pack-q8d` (`.work/engine-pack-q8` had
+been removed from `.work/` by then; both arms used the same pack and
+`BARO_DRAFT_Q4` was unset, so the draft head is q8 in both). GPU exclusive.
+`gemm_gate` kept runs: A 172.06 / 186.00 ms, B 101.45 / 98.63 ms.
+
+| stage | A (m=1) ms/win | B (m=2) ms/win | B/A | Δ ms/win |
+|---|---|---|---|---|
+| rmsnorm | 0.8077 | 0.8218 | 1.02 | +0.014 |
+| gemm_gate | 2.8417 | 3.1264 | 1.10 | **+0.285** |
+| gemm_up | 2.8853 | 3.0516 | 1.06 | **+0.166** |
+| swiglu | 0.5753 | 0.5947 | 1.03 | +0.019 |
+| gemm_down | 2.9882 | 3.3191 | 1.11 | **+0.331** |
+| r_add | 0.5721 | 0.5858 | 1.02 | +0.014 |
+| total | 10.6704 | 11.4993 | 1.08 | +0.829 |
+
+**Item 2's premise is falsified.** The three GEMMs carry **+0.78 ms of the
++0.83 ms** — 94% of the ffn window loss. `swiglu` scales 1.03, not the >= 1.7
+predicted, and is the third-smallest absolute contributor; predictions 2 and 3
+are both wrong. Predictions 1 and 4 hold: no GEMM exceeds 1.15, and
+rmsnorm + r_add together add 0.028 ms.
+
+The +0.93 ms this protocol attributed to "per-row elementwise, launches,
+staging" is none of those things. It is the q8row GEMM's own row scaling,
+which is 1.06-1.11 in the engine against the 1.04 measured cold-cache at the
+same ffn shape in M0. Small per call, but there are three of them per layer.
+
+Consequences, by the rule frozen above:
+
+- The planned fix (a fused swiglu consuming the split-K partials directly)
+  would target 0.019 ms/window. It is not worth writing.
+- **The 115-120 tok/s ceiling for item 2 is not supported** and should not be
+  quoted. Item 1 cleared the SSM, this clears the ffn elementwise; what is left
+  is GEMM row scaling, and no window rework moves it.
+- Item 2 is re-scoped to one question before any kernel is written: why does
+  `amar_matmul_skinny_q8row[4, 2]` cost 1.06-1.11x its m=1 self in the engine
+  when the same kernel at the same shape costs 1.04x in the cold-cache bench?
+  Candidates: the bench's NBUF=8 rotation is a different cache regime from a
+  weight streamed once per window; the engine's A operand is 2 rows of a live
+  activation rather than a fixed fixture. That is a bench-vs-engine
+  reconciliation, not an optimisation.
