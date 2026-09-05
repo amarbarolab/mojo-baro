@@ -512,3 +512,48 @@ no sweep. What the round established, with receipts:
 - The levers left are not knobs: a different LDS swizzle for a
   transposed tile, a 4x4 tile at a smaller block, or a raised power cap
   (Decision D1, OS-level, not taken). Each is a new preregistered round.
+
+### Round 8, lever D1 power cap -- frozen BEFORE running (2026-09-05, f424d66)
+
+Round 7 decomposed the 0.29 R gap into 13% clock and 19% issue, and showed
+the WMMA units alone hold 3.0 GHz at the 290 W cap while the champion GEMM
+falls to 2.6 GHz. D1 tests the clock half directly: give the card more watts
+and let the existing kernel take the clock it already wants. No kernel
+change, no rebuild between arms -- the same binary runs at every rung.
+
+Arm-defining parameter is `power1_cap` on card1 (`0x744c`; card0 `0x164e` is
+the Raphael iGPU, never probe it). `lactd` owns the cap and re-asserts
+`/etc/lact/config.yaml` every 5 s, so a direct sysfs write is reverted
+mid-run and would produce a clean, tight-spread, inert-parameter number
+(P1). The cap is therefore set in the LACT config, daemon restarted, and
+read back from
+`/sys/class/drm/card1/device/hwmon/hwmon*/power1_cap` into the run log
+before every arm. `voltage_offset` stays -100 mV at every rung: that is the
+validated value, and -125 mV is the known cause of the 2026-06-30..07-09
+MODE1 reset cascade. Junction is watched via clock-probe; abort a rung at
+110 C.
+
+Rungs, in order, 5 rounds each interleaved under `flock .work/gpu.lock` with
+`PROBE=1`: 290 W (baseline, re-measured in this thermal window, not quoted
+from Round 7), 350 W, 402 W (`power1_cap_max`). Restore 290 W after.
+
+Model being tested: the champion is clock-limited by package power, and
+FLOP/clk/CU is fixed by the issue pattern. If that is right, gflops rises
+in proportion to sclk_med and FLOP/clk/CU stays flat.
+
+| id | change | prediction | accept |
+|---|---|---|---|
+| D1.1 | `power_cap: 350.0` | sclk_med 2.6 -> 2.75-2.9 GHz, +6-11% gflops at 4096^3, FLOP/clk/CU flat within 2% | >= +5% median disjoint from the 290 W range AND FLOP/clk/CU within 2% |
+| D1.2 | `power_cap: 402.0` | sclk_med -> 2.9-3.0 GHz, +12-15% gflops, i.e. 0.79-0.82 R | >= +10% median disjoint AND FLOP/clk/CU within 2% |
+
+Falsifiers, stated now: FLOP/clk/CU rising with the cap means the arms are
+not clock-scaling and something else moved -- void the round, do not keep
+the number. Clock not moving at all when the readback confirms the new cap
+means the 2.6 GHz is not power-limited and the Round 7 energy model is
+wrong; that outcome kills the clock half of the gap and leaves only the
+19% issue, which is a bigger finding than the win would have been.
+
+Not a shippable arm either way: a raised cap is machine state, not repo
+state. A pass makes D1 a documented operating point for benchmarking, and
+every fp16 number in `docs/BASELINE.md` stays quoted at 290 W unless the maintainer
+decides otherwise.
