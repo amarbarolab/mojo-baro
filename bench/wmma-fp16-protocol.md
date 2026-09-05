@@ -685,3 +685,31 @@ clock = 0.841.
 Rule going forward: no fp16 square-GEMM arm at 4096^3. Use 3584^3 as the
 large-size arm, or move to the cold-cache multi-buffer harness. Any protocol
 that names 4096^3 as an arm is naming an invalid instrument.
+
+**Round 8 rerun, baseline arm at the valid size** (2026-09-05, `457e1e3`,
+`.work/d1r-3584-290W.log`). 3584^3, W = 77.1 MB, IC-resident. Cap 290 W read
+back from sysfs, `voltage_offset` -100 mV, no KFD compute PIDs, 1233 MB VRAM
+held (desktop only). 5 rounds, `SKIP_S` receipts:
+
+| median | min..max | spread | sclk_med | FLOP/clk/CU | power | junction |
+|---|---|---|---|---|---|---|
+| **105888** | 105639..106093 | **0.43%** | 2747 | **400.8** | 285-296 W | 79-82 C |
+
+= **0.844 R**, 0.919 per clock, clock 0.916 of the 3.0 GHz WMMA-only figure.
+Check: 0.919 x 0.916 = 0.842. Gap decomposes 8.4% clock + 8.1% issue -- the
+two halves are the same size, which is not what either Round 7 (13/19) or the
+retracted Round 8 (15.8/6.1) claimed, both of which were read off the invalid
+4096^3 point.
+
+Two observations that matter for the remaining rungs. Package power sits at
+285-296 W against a 290 W cap, so at this size the card IS pinned to the cap
+and a rerun of D1.1/D1.2 here is a meaningful test rather than a repeat.
+And 3584^3 holds 2747 MHz where 4096^3 holds 2600 MHz on the same binary:
+the IC-resident working set moves less HBM traffic and therefore clocks
+higher, which is the traffic-limits-clock mechanism showing up directly in
+the size sweep rather than in an ablation.
+
+Remaining: D1.1 (350 W) and D1.2 (402 W) at 3584^3, each needing a root cap
+change. Thresholds carry over unchanged from the original preregistration,
+now against a 105639..106093 baseline: D1.1 >= +5% disjoint, D1.2 >= +10%
+disjoint, FLOP/clk/CU within 2% of 400.8 or the arm is void.
