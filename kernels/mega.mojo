@@ -11,7 +11,7 @@ from max.gpu.sync import barrier
 from layout import TileTensor, TensorLayout, row_major, stack_allocation
 
 from elementwise import EW_THREADS
-from matmul_skinny import ROW_WAVES, ROW_THREADS, bf16x16_to_f32
+from matmul_skinny import ROW_WAVES, ROW_THREADS, q4_dot_blocks
 from ssm import CONV, KDIM, NH_K, NH_V, SSTATE, SSM_EPS
 from attn import HD, NQH, NKVH, MAX_T, NROT, YARN_LOW, YARN_HIGH, FREQ_BASE, FREQ_SCALE, MSCALE
 
@@ -81,51 +81,7 @@ def q8_row_dot[
     var Av = A.vectorize[1, QV]()
     var acc = InlineArray[SIMD[f32, QV], MR](fill=SIMD[f32, QV](0))
     comptime if Q4:
-        comptime STEP4 = WARP_SIZE
-        comptime UNROLL4 = 2
-        var Qb = Q.vectorize[1, QV]()
-        var nb = K // 32
-        var kk = 0
-        while kk + UNROLL4 * STEP4 <= nb:
-            var bytes_u = InlineArray[SIMD[u8, QV], UNROLL4](uninitialized=True)
-            var ds = InlineArray[Scalar[f16], UNROLL4](uninitialized=True)
-            comptime for u in range(UNROLL4):
-                var blk = kk + u * STEP4 + lane
-                bytes_u[u] = rebind[SIMD[u8, QV]](Qb[row, blk])
-                ds[u] = rebind[Scalar[f16]](S[row, blk])
-            comptime for u in range(UNROLL4):
-                var blk = kk + u * STEP4 + lane
-                var d = ds[u].cast[f32]()
-                var w32 = bitcast[u32, 4](bytes_u[u])
-                var lo = bitcast[u8, QV](w32 & 0x0F0F0F0F).cast[f32]()
-                var hi = bitcast[u8, QV]((w32 >> 4) & 0x0F0F0F0F).cast[f32]()
-                var dv = SIMD[f32, QV](d)
-                var m8d = SIMD[f32, QV](d * -8)
-                var wlo = fma(lo, dv, m8d)
-                var whi = fma(hi, dv, m8d)
-                comptime for r in range(MR):
-                    if r < M:
-                        var a_lo = bf16x16_to_f32(rebind[SIMD[bf16, QV]](Av[r, blk * 2]))
-                        var a_hi = bf16x16_to_f32(rebind[SIMD[bf16, QV]](Av[r, blk * 2 + 1]))
-                        acc[r] = fma(wlo, a_lo, fma(whi, a_hi, acc[r]))
-            kk += UNROLL4 * STEP4
-        while kk < nb:
-            var blk = kk + lane
-            var bytes1 = rebind[SIMD[u8, QV]](Qb[row, blk])
-            var d = rebind[Scalar[f16]](S[row, blk]).cast[f32]()
-            var w32 = bitcast[u32, 4](bytes1)
-            var lo = bitcast[u8, QV](w32 & 0x0F0F0F0F).cast[f32]()
-            var hi = bitcast[u8, QV]((w32 >> 4) & 0x0F0F0F0F).cast[f32]()
-            var dv = SIMD[f32, QV](d)
-            var m8d = SIMD[f32, QV](d * -8)
-            var wlo = fma(lo, dv, m8d)
-            var whi = fma(hi, dv, m8d)
-            comptime for r in range(MR):
-                if r < M:
-                    var a_lo = bf16x16_to_f32(rebind[SIMD[bf16, QV]](Av[r, blk * 2]))
-                    var a_hi = bf16x16_to_f32(rebind[SIMD[bf16, QV]](Av[r, blk * 2 + 1]))
-                    acc[r] = fma(wlo, a_lo, fma(whi, a_hi, acc[r]))
-            kk += STEP4
+        return q4_dot_blocks[MR, 2](A, rebind[TileTensor[u8, QLayout, MutAnyOrigin]](Q), S, row, lane, 0, K // 32, M)
     else:
         comptime STEP = WARP_SIZE * QV
         var Qv = Q.vectorize[1, QV]()

@@ -403,53 +403,34 @@ def bf16x16_to_f32(a: SIMD[DType.bfloat16, 16]) -> SIMD[dtype, 16]:
     return lo.interleave(hi)
 
 
-def amar_matmul_skinny_q4rowb[
-    UNROLL: Int, MR: Int,
-    ALayout: TensorLayout, QLayout: TensorLayout, SLayout: TensorLayout,
-    PLayout: TensorLayout
+@always_inline
+def q4_dot_blocks[
+    MR: Int, UNROLL: Int, ALayout: TensorLayout, QLayout: TensorLayout, SLayout: TensorLayout
 ](
     A: TileTensor[DType.bfloat16, ALayout, MutAnyOrigin],
     Q: TileTensor[DType.uint8, QLayout, MutAnyOrigin],
     S: TileTensor[DType.float16, SLayout, MutAnyOrigin],
-    Cp: TileTensor[dtype, PLayout, MutAnyOrigin],
-    m: Int32,
-    n: Int32,
-    k_dim: Int32,
-):
-    # Same contract and bit-identical results as amar_matmul_skinny_q4row
-    # (bench/q4-alu-protocol.md A1): nibbles are masked as u32 so each byte
-    # converts with one v_cvt_f32_ubyteN, the -8 is folded into the scale as
-    # fma(nib, d, -8d) (one rounding of the same real number), the bf16 A
-    # unpack is a shift or a mask per element, the accumulate chain is the
-    # q4row one.
-    comptime assert A.flat_rank == 2 and Q.flat_rank == 2
-    comptime assert S.flat_rank == 2 and Cp.flat_rank == 3
-
-    var M = Int(m)
-    var N = Int(n)
-    var K = Int(k_dim)
-    var lane = Int(lane_id())
-    var row = Int(block_idx.x) * ROW_WAVES + Int(thread_idx.x) // WARP_SIZE
-    if row >= N:
-        return
-
+    row: Int, lane: Int, kb0: Int, kb1: Int, M: Int,
+) -> InlineArray[Float32, MR]:
+    # One Q4_0 row-dot body over the 32-element blocks [kb0, kb1), shared by
+    # amar_matmul_skinny_q4rowb and the megakernel so both paths contract
+    # identically: nibbles masked as u32 (one v_cvt_f32_ubyteN per byte), -8
+    # folded into the scale as fma(nib, d, -8d) (one rounding of the same real
+    # number as (nib-8)*d), bf16 A unpacked by shift/mask, and the explicit
+    # fma chain acc = fma(wlo, a_lo, fma(whi, a_hi, acc)).
     comptime QV = 16
     comptime STEP = WARP_SIZE
     var Qb = Q.vectorize[1, QV]()
     var Av = A.vectorize[1, QV]()
     var acc = InlineArray[SIMD[dtype, QV], MR](fill=SIMD[dtype, QV](0))
-
-    var nb = K // 32
-    var kk = 0
-    while kk + UNROLL * STEP <= nb:
+    var kk = kb0
+    while kk + UNROLL * STEP <= kb1:
         var bytes_u = InlineArray[SIMD[DType.uint8, QV], UNROLL](uninitialized=True)
         var ds = InlineArray[Scalar[DType.float16], UNROLL](uninitialized=True)
-
         comptime for u in range(UNROLL):
             var blk = kk + u * STEP + lane
             bytes_u[u] = rebind[SIMD[DType.uint8, QV]](Qb[row, blk])
             ds[u] = rebind[Scalar[DType.float16]](S[row, blk])
-
         comptime for u in range(UNROLL):
             var blk = kk + u * STEP + lane
             var d = ds[u].cast[dtype]()
@@ -466,7 +447,7 @@ def amar_matmul_skinny_q4rowb[
                     var a_hi = bf16x16_to_f32(rebind[SIMD[DType.bfloat16, QV]](Av[r, blk * 2 + 1]))
                     acc[r] = fma(wlo, a_lo, fma(whi, a_hi, acc[r]))
         kk += UNROLL * STEP
-    while kk < nb:
+    while kk < kb1:
         var blk = kk + lane
         var bytes1 = rebind[SIMD[DType.uint8, QV]](Qb[row, blk])
         var d = rebind[Scalar[DType.float16]](S[row, blk]).cast[dtype]()
@@ -483,12 +464,49 @@ def amar_matmul_skinny_q4rowb[
                 var a_hi = bf16x16_to_f32(rebind[SIMD[DType.bfloat16, QV]](Av[r, blk * 2 + 1]))
                 acc[r] = fma(wlo, a_lo, fma(whi, a_hi, acc[r]))
         kk += STEP
-
+    var out = InlineArray[Float32, MR](fill=0)
     comptime for r in range(MR):
         if r < M:
-            var total = warp.sum(acc[r].reduce_add())
+            out[r] = warp.sum(acc[r].reduce_add())
+    return out^
+
+
+def amar_matmul_skinny_q4rowb[
+    UNROLL: Int, MR: Int,
+    ALayout: TensorLayout, QLayout: TensorLayout, SLayout: TensorLayout,
+    PLayout: TensorLayout, KSPLIT: Int = 1
+](
+    A: TileTensor[DType.bfloat16, ALayout, MutAnyOrigin],
+    Q: TileTensor[DType.uint8, QLayout, MutAnyOrigin],
+    S: TileTensor[DType.float16, SLayout, MutAnyOrigin],
+    Cp: TileTensor[dtype, PLayout, MutAnyOrigin],
+    m: Int32,
+    n: Int32,
+    k_dim: Int32,
+):
+    # Same contract as amar_matmul_skinny_q4row (bench/q4-alu-protocol.md A1),
+    # body in q4_dot_blocks. KSPLIT > 1 (bench/q4-splitk-protocol.md): work
+    # item = (row, part), K split into KSPLIT ranges of 32-blocks, partial
+    # written to Cp[part, r, row]; amar_skinny_reduce_add[.., KSPLIT] sums
+    # them as (0 + p0) + p1 + ... before the residual add.
+    comptime assert A.flat_rank == 2 and Q.flat_rank == 2
+    comptime assert S.flat_rank == 2 and Cp.flat_rank == 3
+
+    var M = Int(m)
+    var N = Int(n)
+    var K = Int(k_dim)
+    var lane = Int(lane_id())
+    var item = Int(block_idx.x) * ROW_WAVES + Int(thread_idx.x) // WARP_SIZE
+    if item >= N * KSPLIT:
+        return
+    var row = item // KSPLIT
+    var part = item % KSPLIT
+    var nb = K // 32
+    var t = q4_dot_blocks[MR, UNROLL](A, Q, S, row, lane, part * (nb // KSPLIT), (part + 1) * (nb // KSPLIT), M)
+    comptime for r in range(MR):
+        if r < M:
             if lane == 0:
-                Cp[0, r, row] = rebind[Cp.ElementType](total)
+                Cp[part, r, row] = rebind[Cp.ElementType](t[r])
 
 
 def amar_matmul_skinny_q8dot[
