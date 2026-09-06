@@ -1,0 +1,149 @@
+# Tokenizer — text in, text out, bit-equal to llama.cpp
+
+The engine reads token ids and prints token ids. This layer turns text into
+those ids and back, built from nothing but the GGUF's own metadata, and is
+gated on producing exactly the ids llama.cpp produces on the same file.
+
+| | |
+|---|---|
+| builder | `tools/gguf-tokenizer.py MODEL.gguf OUTDIR [OUTDIR ...]` |
+| gate | `.venv/bin/python tools/test_tokenizer.py [--pack DIR] [--gguf FILE]` |
+| CLI | `tools/baro-tokenize encode\|decode\|prompt\|info` |
+| runtime | HF `tokenizers` (Python dev dep; the Rust crate for the server) |
+
+## Files next to a pack
+
+```
+.work/engine-pack-q4/
+  pack.bin, index.txt        weights (tools/engine-pack.py)
+  prompt-tokens.txt          the prompt the engine reads (ids, one per line)
+  ref-tokens-64.txt          greedy reference for tools/check-tokens.sh
+  tokenizer.json             HF tokenizers serialization, ~9.8 MB
+  tokenizer-meta.json        ids, flags, special tokens, chat template
+```
+
+`tokenizer.json` is the standard HF format, loadable by the Python package
+and the Rust crate without transformers. `tokenizer-meta.json`:
+
+| field | Qwythos-9B value | from GGUF key |
+|---|---|---|
+| `model`, `pre` | `gpt2`, `qwen35` | `tokenizer.ggml.model`, `.pre` |
+| `vocab_size`, `n_merges` | 248320, 247587 | `tokenizer.ggml.tokens`, `.merges` |
+| `bos_token_id` / `bos_token` | null (none) | `tokenizer.ggml.bos_token_id` |
+| `eos_token_id` / `eos_token` | 248046 `<\|im_end\|>` | `tokenizer.ggml.eos_token_id` |
+| `pad_token_id` / `pad_token` | 248044 `<\|endoftext\|>` | `tokenizer.ggml.padding_token_id` |
+| `add_bos`, `add_eos` | false, false | `tokenizer.ggml.add_bos_token`, `.add_eos_token` (absent = false, as llama.cpp) |
+| `special_tokens` | 27 control tokens (`<\|im_start\|>` 248045, ...) | `token_type == 3` |
+| `added_tokens` | 6 (`<think>`, `</think>`, `<tool_call>`, ...) | `token_type == 4` |
+| `chat_template` | the Jinja string | `tokenizer.chat_template` |
+| `source_gguf`, `built` | provenance | |
+
+Every pack of this model family carries the same tokenizer (the metadata hash
+is identical across the BF16, Q8_0 and Q4_0 GGUFs), so one build serves all
+packs; the builder takes several OUTDIRs for that reason.
+
+## How the tokenizer is assembled
+
+Only `tokenizer.ggml.model == "gpt2"` (byte-level BPE) is supported:
+
+- **vocab**: the GGUF token strings verbatim, id = array index. They are
+  already byte-level (`Ġ` for space, `Ċ` for newline); the 243 `[PAD...]`
+  entries of type UNUSED stay in the vocab so ids are dense and any id decodes.
+- **merges**: `tokenizer.ggml.merges` verbatim, `"a b"` strings.
+- **pre-tokenizer**: `Split(regex, isolated)` then `ByteLevel(use_regex=false)`,
+  with the regex llama.cpp assigns to the recorded `pre` type
+  (`src/llama-vocab.cpp`). `qwen2` is the Qwen2 pattern; `qwen35` is the same
+  with `\p{M}` (combining marks) added to the letter runs. Any other `pre`
+  aborts the build rather than guess.
+- **no normalizer**: llama.cpp does not NFC-normalize BPE input, so neither do
+  we (HF's Qwen `tokenizer.json` does; that is a deliberate divergence from HF
+  to stay equal to llama.cpp — the NFD case in the hard set checks it).
+- **added tokens**: CONTROL types are special (skipped by decode by default),
+  USER_DEFINED types are plain added tokens. Both are matched in the raw
+  text before BPE, which is llama.cpp's default `parse_special = true`
+  behaviour (`llama-tokenize` without `--no-parse-special`).
+- **no BOS**: nothing is prepended; `add_bos` is honoured by the CLI if a
+  future GGUF sets it.
+- **decoder**: `ByteLevel`; `decode(encode(x)) == x` for any valid UTF-8 text.
+
+## Gate
+
+```
+.venv/bin/python tools/test_tokenizer.py            # default --pack .work/engine-pack-q4
+```
+
+1. every `bench/mtp-prompts/*.txt` (checked equal to `prompts.json`) encodes
+   to its `.tokens` file, the llama.cpp reference used by every MTP number;
+2. a hard set (NFD accents, Cyrillic/Greek/Arabic/Hebrew/Devanagari/Thai,
+   Chinese/Japanese/Korean, emoji with ZWJ/flags/skin tones, tabs and
+   4-space code, CRLF, NBSP/ZWJ, long whitespace runs, numbers, URLs, JSON,
+   markdown, every special-token family, look-alike non-tokens, the pack's
+   rendered chat template, control characters, the empty string) encodes to
+   what `~/llama.cpp/build/bin/llama-tokenize -m <source_gguf> --ids -p TEXT`
+   prints (`""` is refused by llama-tokenize; with `add_bos=false` the
+   reference is `[]`);
+3. `decode(encode(x), skip_special_tokens=False) == x` on all of the above.
+
+Exit code is non-zero on any mismatch. It needs the GGUF (path from
+`tokenizer-meta.json`, override `--gguf`) and the llama.cpp build, so it is
+**not** in `tools/ci-checks.sh`; run it by hand after rebuilding a pack or
+touching the builder. `--dump FILE` writes every case's ids for diffing.
+
+## CLI
+
+```
+tools/baro-tokenize encode "Water boils at 100 degrees"      # ids, one per line
+tools/baro-tokenize encode --chat --system "Be brief." "2+2?" # chat template applied
+tools/baro-tokenize encode -o /path/prompt-tokens.txt - < file.txt
+tools/baro-tokenize prompt --chat "What is 2+2?"             # writes <pack>/prompt-tokens.txt
+tools/baro-tokenize decode - < .work/engine-pack-q4/ref-tokens-64.txt
+tools/baro-tokenize decode --keep-special 248045 846 198
+tools/baro-tokenize info
+```
+
+`--pack DIR` (or `BARO_PACK`) selects the pack; default `.work/engine-pack-q4`.
+The script re-executes itself under `.venv/bin/python` when the invoking
+interpreter lacks `tokenizers`. `--chat` wraps TEXT as one user turn and
+appends the generation prompt (`<|im_start|>assistant\n<think>\n` for this
+template; pass `enable_thinking` yourself via a custom messages list in
+Python if you need the no-think form).
+
+## Engine contract
+
+The engine has no text path. It reads `<pack>/prompt-tokens.txt` (override
+with `BARO_PROMPT=/path`), decimal ids separated by any non-digit byte, one
+per line by convention, and prints the generated ids on the `GENERATED:`
+line. `baro-tokenize prompt` writes that file; `baro-tokenize decode` reads
+the `GENERATED:` ids back (paste them, or `grep GENERATED: run.log | cut -d: -f2 |
+tools/baro-tokenize decode -`).
+
+## Server: loading in Rust
+
+The `tokenizers` crate reads the same file:
+
+```rust
+use tokenizers::Tokenizer;
+let tok = Tokenizer::from_file(format!("{pack}/tokenizer.json"))?;
+let ids: Vec<u32> = tok.encode(text, false)?.get_ids().to_vec(); // add_special_tokens=false; no post-processor anyway
+let text = tok.decode(&ids, /*skip_special_tokens=*/ true)?;
+```
+
+- The pattern uses `\p{M}` and a look-ahead, so keep the crate's default
+  `onig` regex feature (the `fancy-regex` alternative also handles both).
+- Merges are `"a b"` strings, accepted by every crate version; no token
+  contains a literal space (byte-level), so the split is unambiguous.
+- EOS to stop on, the pad id and the chat template come from
+  `tokenizer-meta.json`; render the template with a Jinja engine
+  (`minijinja`) providing `raise_exception`, `strftime_now` and `tojson`,
+  and pass `messages`, `add_generation_prompt`, `bos_token`/`eos_token`
+  as the Python side does in `render_chat`.
+- `decode` with `skip_special_tokens=true` drops the 27 control tokens but
+  keeps `<think>`/`<tool_call>` text, matching HF semantics for Qwen.
+
+## Residual risk
+
+Identity is proven on 61 cases against this llama.cpp build (`ca3d5a3e1`,
+2026-08-28). The one known class that can still diverge is Unicode table
+version skew between llama.cpp's `unicode-data.cpp` and Oniguruma for code
+points assigned after either was generated; add such a string to `HARD_SET`
+and the gate decides.

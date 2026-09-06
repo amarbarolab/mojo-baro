@@ -101,6 +101,17 @@ llama.cpp on the same file, verified by `tools/check-tokens.sh` against a
 reference token-id array. It is a correctness vehicle for the kernels, not a
 product — no server, no batching, no sampler beyond greedy.
 
+### Tokenizer
+
+Text in, text out, bit-equal to llama.cpp: `tools/gguf-tokenizer.py` builds an
+HF `tokenizers` byte-level BPE (`<pack>/tokenizer.json` + `tokenizer-meta.json`)
+from the GGUF metadata alone, and `tools/test_tokenizer.py` gates it — the 20
+`bench/mtp-prompts/` token files plus a 41-case hard set (unicode, CJK, emoji,
+code, whitespace, special tokens, chat template) against `llama-tokenize`, and
+`decode(encode(x)) == x`. `tools/baro-tokenize` encodes/decodes/applies the
+chat template and writes the `prompt-tokens.txt` the engine reads. Contract and
+Rust loading notes: `docs/TOKENIZER.md`.
+
 ### Throughput against llama.cpp
 
 The engine reports two numbers, and only one of them is comparable to anything.
