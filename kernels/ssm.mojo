@@ -285,3 +285,177 @@ def amar_ssm_gated_out_bf16[
             ).cast[DType.bfloat16]()
         )
         barrier()
+
+
+def amar_ssm_gates_rows[
+    RLayout: TensorLayout, GLayout: TensorLayout, DLayout: TensorLayout
+](
+    AlphaRaw: TileTensor[f32, RLayout, MutAnyOrigin],
+    BetaRaw: TileTensor[f32, RLayout, MutAnyOrigin],
+    EgOut: TileTensor[f32, GLayout, MutAnyOrigin],
+    BetaOut: TileTensor[f32, GLayout, MutAnyOrigin],
+    SsmA: TileTensor[f32, DLayout, MutAnyOrigin],
+    DtBias: TileTensor[f32, DLayout, MutAnyOrigin],
+    m: Int32,
+):
+    comptime assert AlphaRaw.flat_rank == 2 and BetaRaw.flat_rank == 2
+    comptime assert EgOut.flat_rank == 2 and BetaOut.flat_rank == 2
+    comptime assert SsmA.flat_rank == 1 and DtBias.flat_rank == 1
+    var gid = Int(global_idx.x)
+    if gid >= Int(m) * NH_V:
+        return
+    var r = gid // NH_V
+    var h = gid % NH_V
+    var braw = rebind[Scalar[f32]](BetaRaw[r, h])
+    BetaOut[r, h] = rebind[BetaOut.ElementType](1 / (1 + exp(-braw)))
+    var asum = rebind[Scalar[f32]](AlphaRaw[r, h]) + rebind[Scalar[f32]](DtBias[h])
+    var sp = log1p(exp(asum))
+    EgOut[r, h] = rebind[EgOut.ElementType](exp(sp * rebind[Scalar[f32]](SsmA[h])))
+
+
+def amar_ssm_conv_chunk[
+    QLayout: TensorLayout, SLayout: TensorLayout, WLayout: TensorLayout,
+    OLayout: TensorLayout
+](
+    Qkv: TileTensor[f32, QLayout, MutAnyOrigin],
+    ConvState: TileTensor[f32, SLayout, MutAnyOrigin],
+    ConvW: TileTensor[f32, WLayout, MutAnyOrigin],
+    Out: TileTensor[f32, OLayout, MutAnyOrigin],
+    ring: Int32, ssm_i: Int32, slots: Int32, m: Int32,
+):
+    comptime assert Qkv.flat_rank == 2 and ConvState.flat_rank == 4
+    comptime assert ConvW.flat_rank == 2 and Out.flat_rank == 2
+    var c = global_idx.x
+    if c >= CONV:
+        return
+    var si = Int(ssm_i)
+    var rs = Int(ring) % Int(slots)
+    var ws = (Int(ring) + Int(m)) % Int(slots)
+    var cw0 = rebind[Scalar[f32]](ConvW[c, 0])
+    var cw1 = rebind[Scalar[f32]](ConvW[c, 1])
+    var cw2 = rebind[Scalar[f32]](ConvW[c, 2])
+    var cw3 = rebind[Scalar[f32]](ConvW[c, 3])
+    var w0 = rebind[Scalar[f32]](ConvState[rs, si, 0, c])
+    var w1 = rebind[Scalar[f32]](ConvState[rs, si, 1, c])
+    var w2 = rebind[Scalar[f32]](ConvState[rs, si, 2, c])
+    for r in range(Int(m)):
+        var w3 = rebind[Scalar[f32]](Qkv[r, c])
+        var acc = w0 * cw0 + w1 * cw1 + w2 * cw2 + w3 * cw3
+        Out[r, c] = rebind[Out.ElementType](acc / (1 + exp(-acc)))
+        w0 = w1
+        w1 = w2
+        w2 = w3
+    ConvState[ws, si, 0, c] = rebind[ConvState.ElementType](w0)
+    ConvState[ws, si, 1, c] = rebind[ConvState.ElementType](w1)
+    ConvState[ws, si, 2, c] = rebind[ConvState.ElementType](w2)
+
+
+def amar_ssm_qk_l2norm_rows[
+    XLayout: TensorLayout
+](
+    X: TileTensor[f32, XLayout, MutAnyOrigin],
+    m: Int32,
+):
+    comptime assert X.flat_rank == 2
+    var head = block_idx.x
+    var r = Int(block_idx.y)
+    var tid = thread_idx.x
+    var base = head * SSTATE
+    var sums = stack_allocation[f32, address_space = AddressSpace.SHARED](
+        row_major[SSTATE // WARP_SIZE]()
+    )
+    var v = rebind[Scalar[f32]](X[r, base + tid])
+    var ssq = warp.sum(v * v)
+    if lane_id() == 0:
+        sums[tid // WARP_SIZE] = rebind[sums.ElementType](ssq)
+    barrier()
+    var total: Float32 = 0
+    comptime for w in range(SSTATE // WARP_SIZE):
+        total += rebind[Scalar[f32]](sums[w])
+    var inv = rsqrt(total + SSM_EPS)
+    if head < NH_K:
+        inv = inv / sqrt(Float32(SSTATE))
+    X[r, base + tid] = rebind[X.ElementType](v * inv)
+
+
+def amar_ssm_delta_chunk[
+    S0Layout: TensorLayout, CLayout: TensorLayout, GLayout: TensorLayout,
+    OLayout: TensorLayout
+](
+    SAll: TileTensor[f32, S0Layout, MutAnyOrigin],
+    ConvOut: TileTensor[f32, CLayout, MutAnyOrigin],
+    Eg: TileTensor[f32, GLayout, MutAnyOrigin],
+    Beta: TileTensor[f32, GLayout, MutAnyOrigin],
+    O: TileTensor[f32, OLayout, MutAnyOrigin],
+    ring: Int32, ssm_i: Int32, slots: Int32, m: Int32,
+):
+    comptime assert SAll.flat_rank == 5 and ConvOut.flat_rank == 2
+    comptime assert Eg.flat_rank == 2 and O.flat_rank == 3
+    var h = block_idx.x
+    var j = thread_idx.x
+    var kh = h % NH_K
+    var si = Int(ssm_i)
+    var rs = Int(ring) % Int(slots)
+    var ws = (Int(ring) + Int(m)) % Int(slots)
+
+    var kq = stack_allocation[f32, address_space = AddressSpace.SHARED](
+        row_major[2, SSTATE]()
+    )
+    var col = SIMD[f32, SSTATE]()
+    comptime for i in range(SSTATE):
+        col[i] = rebind[Scalar[f32]](SAll[rs, si, h, i, j])
+    for r in range(Int(m)):
+        kq[0, j] = rebind[kq.ElementType](ConvOut[r, kh * SSTATE + j])
+        kq[1, j] = rebind[kq.ElementType](ConvOut[r, KDIM + kh * SSTATE + j])
+        barrier()
+
+        var eg = rebind[Scalar[f32]](Eg[r, h])
+        var beta = rebind[Scalar[f32]](Beta[r, h])
+        var vj = rebind[Scalar[f32]](ConvOut[r, 2 * KDIM + h * SSTATE + j])
+
+        var sk: Float32 = 0
+        comptime for i in range(SSTATE):
+            sk += col[i] * eg * rebind[Scalar[f32]](kq[1, i])
+        var d = (vj - sk) * beta
+
+        var o: Float32 = 0
+        comptime for i in range(SSTATE):
+            var s = col[i] * eg + rebind[Scalar[f32]](kq[1, i]) * d
+            col[i] = s
+            o += s * rebind[Scalar[f32]](kq[0, i])
+        O[r, h, j] = rebind[O.ElementType](o)
+        barrier()
+    comptime for i in range(SSTATE):
+        SAll[ws, si, h, i, j] = rebind[SAll.ElementType](col[i])
+
+
+def amar_ssm_gated_out_rows_bf16[
+    OLayout: TensorLayout, ZLayout: TensorLayout, NLayout: TensorLayout,
+    RLayout: TensorLayout
+](
+    O: TileTensor[f32, OLayout, MutAnyOrigin],
+    Z: TileTensor[f32, ZLayout, MutAnyOrigin],
+    NormW: TileTensor[f32, NLayout, MutAnyOrigin],
+    Res: TileTensor[DType.bfloat16, RLayout, MutAnyOrigin],
+):
+    comptime assert O.flat_rank == 3 and Z.flat_rank == 2
+    comptime assert NormW.flat_rank == 1 and Res.flat_rank == 2
+    var h = block_idx.x
+    var r = Int(block_idx.y)
+    var j = thread_idx.x
+    var sums = stack_allocation[f32, address_space = AddressSpace.SHARED](
+        row_major[SSTATE // WARP_SIZE]()
+    )
+    var v = rebind[Scalar[f32]](O[r, h, j])
+    var ssq = warp.sum(v * v)
+    if lane_id() == 0:
+        sums[j // WARP_SIZE] = rebind[sums.ElementType](ssq)
+    barrier()
+    var total: Float32 = 0
+    comptime for w in range(SSTATE // WARP_SIZE):
+        total += rebind[Scalar[f32]](sums[w])
+    var scale = rsqrt(total / Float32(SSTATE) + SSM_EPS)
+    var z = rebind[Scalar[f32]](Z[r, h * SSTATE + j])
+    Res[r, h * SSTATE + j] = rebind[Res.ElementType](
+        (v * scale * rebind[Scalar[f32]](NormW[j]) * (z / (1 + exp(-z)))).cast[DType.bfloat16]()
+    )
