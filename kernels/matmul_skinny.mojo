@@ -3,7 +3,7 @@ from std.gpu import block_idx, global_idx, lane_id, thread_idx, WARP_SIZE
 from std.gpu.primitives import warp
 from std.memory import bitcast
 from std.sys.intrinsics import llvm_intrinsic
-from std.math import exp
+from std.math import exp, fma
 from max.gpu.memory import AddressSpace
 from max.gpu.sync import barrier
 from layout import TileTensor, TensorLayout, row_major, stack_allocation
@@ -373,7 +373,7 @@ def amar_matmul_skinny_q4row[
                 if r < M:
                     var a_lo = rebind[SIMD[DType.bfloat16, QV]](Av[r, blk * 2]).cast[dtype]()
                     var a_hi = rebind[SIMD[DType.bfloat16, QV]](Av[r, blk * 2 + 1]).cast[dtype]()
-                    acc[r] += wlo * a_lo + whi * a_hi
+                    acc[r] = fma(wlo, a_lo, fma(whi, a_hi, acc[r]))
         kk += UNROLL * STEP
     while kk < nb:
         var blk = kk + lane
@@ -385,7 +385,7 @@ def amar_matmul_skinny_q4row[
             if r < M:
                 var a_lo = rebind[SIMD[DType.bfloat16, QV]](Av[r, blk * 2]).cast[dtype]()
                 var a_hi = rebind[SIMD[DType.bfloat16, QV]](Av[r, blk * 2 + 1]).cast[dtype]()
-                acc[r] += wlo * a_lo + whi * a_hi
+                acc[r] = fma(wlo, a_lo, fma(whi, a_hi, acc[r]))
         kk += STEP
 
     comptime for r in range(MR):

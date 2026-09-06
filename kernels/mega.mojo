@@ -103,7 +103,7 @@ def q8_row_dot[
                     if r < M:
                         var a_lo = rebind[SIMD[bf16, QV]](Av[r, blk * 2]).cast[f32]()
                         var a_hi = rebind[SIMD[bf16, QV]](Av[r, blk * 2 + 1]).cast[f32]()
-                        acc[r] += wlo * a_lo + whi * a_hi
+                        acc[r] = fma(wlo, a_lo, fma(whi, a_hi, acc[r]))
             kk += UNROLL4 * STEP4
         while kk < nb:
             var blk = kk + lane
@@ -115,7 +115,7 @@ def q8_row_dot[
                 if r < M:
                     var a_lo = rebind[SIMD[bf16, QV]](Av[r, blk * 2]).cast[f32]()
                     var a_hi = rebind[SIMD[bf16, QV]](Av[r, blk * 2 + 1]).cast[f32]()
-                    acc[r] += wlo * a_lo + whi * a_hi
+                    acc[r] = fma(wlo, a_lo, fma(whi, a_hi, acc[r]))
             kk += STEP4
     else:
         comptime STEP = WARP_SIZE * QV
