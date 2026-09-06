@@ -17,10 +17,14 @@ does the prefill path change any generated token.
   nibbles, scale applied per 32-block on the accumulator; exact products),
   causal prefill attention with online softmax (`amar_attn_prefill`), SSM
   conv + delta recurrence batched per chunk (`amar_ssm_conv_chunk`,
-  `amar_ssm_delta_chunk`). The last `(L-1) mod 8` rows (8 when that is 0)
-  still go through the decode window path so the MTP draft sees the same
-  final window as before; the last prompt token still goes through the
-  megakernel.
+  `amar_ssm_delta_chunk`). v1 (R3): the last `(L-1) mod 8` rows (8 when
+  that is 0) still go through the decode window path so the MTP draft sees
+  the same final window as before. v2 (R4): every prompt row but the last
+  goes through the prefill path; the last chunk also writes the
+  post-final-norm hidden rows of that same window into `hn` and `pos_prev`
+  is set so the draft's process step sees the identical window. In both
+  the last prompt token still goes through the megakernel, so the first
+  generated token comes from the unchanged decode kernels.
 - **llama.cpp** — `llama-server` on `Qwythos-9B-Claude-Mythos-5-1M-MTP-Q4_0-pure.gguf`
   with the flags of `tools/llama-mtp-prompts.sh` (`-c 8192 -ngl 99 -fa on
   -b 2048 -ub 512 -t 8 -ctk q8_0 -ctv q8_0`), no speculation,
@@ -93,4 +97,157 @@ same session, within 1%; `bench/mtp-prompts/` identity 20/20 and
 
 ## Results
 
-(filled after the runs; see the lane report for the receipts)
+### R1. Baseline receipts (chunk8 arm), 2026-09-06
+
+Binary `.work/engine-base` (source of `751bc3c`, TMAX=128) and
+`.work/engine-tmax` (same source, TMAX=1088 / MAX_T=1088 only). Read-back
+per run: `pack q4 trunk: True`, `BARO_MEGA: True`, `prompt tokens: N`,
+`mega fail word: 0`. Identity: `tools/check-tokens.sh` on the default prompt
+PASS 64/64 for both binaries; decode `tok/s_gen` on the default prompt
+130.9 (tmax) — the TMAX raise moves nothing (20-prompt no-spec median with
+`engine-base`: 131.3, min 126.4, max 131.6; logs `.work/prefill-base/`).
+
+TTFT = `prefill_s`, 3 runs each (ms):
+
+| length | TMAX=128 | TMAX=1088 (chunk8) | predicted |
+|---|---|---|---|
+| 32 | 214.5 / 217.2 / 215.9 | 216.7 / 214.4 / 216.5 | 57 |
+| 128 | blocked | 831.5 / 834.2 / 833.2 | 200 |
+| 512 | blocked | 3306 / 3326 / 3333 | 780 |
+| 1024 | blocked | 6701 / 6675 / 6686 | 1550 |
+
+The chunk8 prediction was 4x optimistic: the m=8 window on the q4 row
+kernel costs ~50 ms, not ~12 ms (the q4rowb MR=8 instantiation streams the
+28 MB ffn weight in 293 us = 97 GB/s, R2 below; the m=1 figure of 59 us
+does not carry to MR=8). Logs `.work/prefill-tmax/`.
+
+### R2. Kernel arm, ffn shape (`bench/bench_prefill.mojo`, `.work/stage1.log`)
+
+N=12288, K=4096, Q4_0 `blk.0.ffn_gate.weight`, NBUF=8 rotation, ITERS=16,
+median of 5 (us per GEMM); grid/block echoed by the bench. Correctness
+gate (WMMA vs row loop rel < 1e-4 at every n): true.
+
+| n | wmma 16x256 | wmma 32x256 | wmma 64x128 | wmma 128x128 | rowloop q4rowb MR8 x n/8 | best wmma TFLOP/s | predicted wmma | predicted rowloop |
+|---|---|---|---|---|---|---|---|---|
+| 16 | 355 | 339 | 333 | 443 | 587 | 4.8 | 60 | 270 |
+| 32 | 656 | 548 | 533 | 535 | 1126 | 6.0 | - | - |
+| 64 | 1008 | 729 | 637 | 621 | 2242 | 10.4 | 130 | 1100 |
+| 128 | 2175 | 1384 | 1269 | 677 | 4480 | 19.0 | - | - |
+| 256 | 3862 | 2393 | 2137 | 1651 | 8937 | 15.6 | 500 | 4300 |
+| 512 | 6214 | 4499 | 4045 | 2597 | 17881 | 19.8 | - | - |
+| 1024 | 10297 | 7112 | 7473 | 4522 | 35934 | 22.8 | 1900 | 17000 |
+
+Verdict: WMMA wins at every n (1.8x at 16, 7.9x at 1024) — the direction of
+the prediction holds, the magnitude does not: the prefill kernel reaches
+22.8 TFLOP/s at n=1024 (predicted ~50) and only 85 GB/s of weight stream at
+n=16 (48 blocks for 12288 columns: too few waves in flight for a
+bandwidth-bound shape). The row loop is 2x slower than predicted for the
+same MR=8 reason as R1. Dispatch adopted from this table: 16x256 is never
+the best; 64x128 for n <= 64, 128x128 above.
+
+### R3. Engine v1 (prefill chunk C=1024, tail window on the decode path), 2026-09-06
+
+Binary `.work/engine` built from the integrated source (TMAX=1088, CP=1024,
+PF_MIN=16); `.work/stage2.log`, logs `.work/prefill-new/`. Read-back per
+run: `prompt tokens: N`, `TMAX: 1088  prefill chunk: 1024  prefill rows: R`
+(R = N-1 minus the tail window), `mega fail word: 0`, `tokens: 64`.
+`kernels/test_prefill.mojo` PASS in the same job (first line of the log).
+
+TTFT = `prefill_s`, 3 runs each (ms):
+
+| length | prefill rows | ours/prefill v1 | ours/chunk8 (R1) | llama.cpp Q4_0-pure `prompt_ms` | predicted prefill | predicted llama |
+|---|---|---|---|---|---|---|
+| 32 | 24 | 125.2 / 125.0 / 124.1 | 216 | 77.7 / 56.9 / 52.4 | 30 | 40 |
+| 128 | 120 | 185.3 / 183.1 / 184.3 | 833 | 73.3 / 73.4 / 73.3 | 55 | 80 |
+| 512 | 504 | 488.1 / 489.0 / 490.7 | 3326 | 165.5 / 167.5 / 166.8 | 170 | 250 |
+| 1024 | 1016 | 853.2 / 865.2 / 857.3 | 6686 | 315.3 / 313.8 / 315.1 | 330 | 500 |
+
+llama.cpp arm: `.work/run-llama-ttft.sh` (server flags as frozen, port
+8097), `.work/prefill-llama/props.json` (`n_ctx 8192, n_batch 2048,
+n_ubatch 512, flash_attn on`), per run `prompt_n == N`, `draft_n 0`,
+`.work/prefill-new/llama-ttft.txt`; ours was not running during the llama
+arm and vice versa.
+
+Verdict on the frozen predictions: direction right, magnitude wrong on
+both sides. ours/prefill is 1.7x (32) to 7.8x (1024) faster than chunk8 but
+2.6-4.2x slower than the predicted TTFT: (a) the GEMM reaches 22.8 not 50
+TFLOP/s (R2); (b) below 64 rows the path is weight-stream-bound and the
+kernel only reaches 85 GB/s of the 3.75 GB trunk (R2 n=16); (c) the tail
+window on the decode path (q4rowb MR=8, ~50 ms, R1) is paid by every
+prompt — 40% of the 32-token TTFT. llama.cpp is 2.3x faster than
+predicted at every length (its MMQ prompt path runs ~3300 tok/s here, not
+~2000). Net: ours/prefill v1 = 2.7x (1024) to 2.3x (32) slower than
+llama.cpp.
+
+Identity (`.work/stage2.log`): first generated token equals the chunk8
+arm at all four lengths (264 / 2469 / 16 / 3706); 64-token stream equals
+the chunk8 arm at all four lengths; default prompt 64/64 vs
+`ref-tokens-64.txt` (5 prompt tokens: below PF_MIN, the prefill path is not
+exercised by this gate).
+
+Decode (P4, 20 prompts, same session, `.work/prefill-new/decode.txt`):
+no-spec median 130.7 tok/s_gen (min 129.8, max 131.1) vs 131.3 before
+(-0.5%, within the 1% bound); spec k=2 median 151.6, `identity_B` 20/20.
+`identity_vs_base` (64-token stream vs `engine-base`) 17/20: p07-json
+(n=20, diverges at generated token 1), p12-rust (n=32, token 3), p15-bash
+(n=18, token 14) differ; every one of the 20 first tokens is unchanged.
+Nine of the 20 prompts have >= 17 tokens and take the prefill path; all
+three divergences are among those nine, the other six match 64/64. The
+prefill GEMM sums each row in a different order (WMMA 16-wide products,
+scale on the block accumulator) from `q4rowb`, so the token stream after
+a near-tie is not expected to be bit-identical; R4 settles whether these
+three are near-ties (numpy reference `tools/model-ref.py` on the same
+prompts, plus a chunk-size invariance check) or a defect.
+
+### R4. Engine v2 (every prompt row but the last through the prefill path; f32-cvt nibble dequant), 2026-09-06
+
+Two changes over v1, both in `.work/stage3.log` (logs `.work/prefill-v2/`):
+(1) the tail window no longer goes through the decode path — the last
+chunk writes the post-final-norm hidden rows of the last `(L-1) mod 8`
+rows (8 when 0) into `hn` and sets `pos_prev` so the MTP draft's process
+step sees exactly the window it saw before; (2) `f32x16_to_bf16_trunc` in
+`kernels/matmul_prefill.mojo`: the nibble goes uint8 -> f32 -> bf16 by
+`llvm.amdgcn.perm` truncation (exact for integers in [-8, 7] and
+[-128, 127]) instead of the int8 -> bf16 cast chain. Same read-back per run
+as R3 (`prefill rows: N-1` now).
+
+TTFT = `prefill_s`, 3 runs each (ms):
+
+| length | prefill rows | ours/prefill v2 | ours/prefill v1 (R3) | ours/chunk8 (R1) | llama.cpp (R3) | predicted prefill |
+|---|---|---|---|---|---|---|
+| 32 | 31 | 65.3 / 66.0 / 66.8 | 125 | 216 | 56.9 | 30 |
+| 128 | 127 | 124.7 / 124.6 / 124.3 | 184 | 833 | 73.3 | 55 |
+| 512 | 511 | 415.4 / 418.0 / 414.6 | 489 | 3326 | 166.8 | 170 |
+| 1024 | 1023 | 761.4 / 759.7 / 762.7 | 857 | 6686 | 315.1 | 330 |
+
+v2 vs chunk8: 3.3x (32) to 8.8x (1024). v2 vs llama.cpp: 1.16x slower at
+32, 1.7x at 128, 2.5x at 512, 2.4x at 1024 — the gap is the GEMM's 24.6
+TFLOP/s (kernel arm below) against llama.cpp's MMQ path.
+
+Kernel arm re-run with the f32-cvt dequant (`.work/prefill-v2/bench.txt`,
+same setup as R2, `correct: true`), us per GEMM, 128x128 config: n=128
+645 (R2 677), 256 1629 (1651), 512 2451 (2597), 1024 4183 (4522) = 24.6
+TFLOP/s (+8%); 64x128 at n=64 512 (637). At n=16 every config read
+435-470 this run against 333-443 in R2 — the n=16 shape is latency-bound
+and moves between sessions; it is not resolved by this round.
+
+Identity (`.work/stage3.log`): first token and 64-token stream equal the
+chunk8 arm at all four lengths; default prompt 64/64; `BARO_PREFILL=0` on
+p07-json and p12-rust reproduces `engine-base` 64/64 (the decode path is
+untouched); chunk-size invariance `BARO_PREFILL_C=16` vs 1024 on p12-rust
+(24 rows -> 16+8) and p1024 (64 chunks) 64/64 (chunk boundaries carry the
+conv/SSM/KV state exactly).
+
+Decode (P4, 20 prompts, `.work/prefill-v2/decode.txt`): no-spec median
+130.7 tok/s_gen (min 129.9, max 131.6) vs 131.3 before (-0.5%); spec k=2
+median 151.0, `identity_B` 20/20. `identity_vs_base` 18/20: p07-json
+(token 1) and p09-explain-gpu (token 37) differ; p12-rust and p15-bash,
+which differed in v1, match again in v2, and all 20 first tokens match.
+The numpy fp32 reference (`tools/model-ref.py decode`, run on the same
+prompt ids from `.work/ref-p07-json/`) sides with the prefill path on
+p07-json: reference `198 79871 763 328 760 8252 ...` == prefill v1/v2,
+while `engine-base` produced `198 220 328 2034 ...` — the divergence is a
+near-tie at generated token 1 that the decode path resolves the other
+way. The identity gate for a non-bit-exact path is therefore the
+model-ref agreement (as for the q8 and q4 rounds), plus first-token
+identity 20/20 and the 64-token identity on the four protocol prompts.
