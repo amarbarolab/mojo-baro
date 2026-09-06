@@ -5,8 +5,9 @@
 #   build      engine + kernel gate binary
 #   kernel     kernels/test_mega_block (4-layer synthetic pack, bit-identical, head argmax)
 #   tests      ./run-tests.sh (GEMM parity + kernel census)
-#   identity   every runnable pack (.work/engine-pack-q8, -q8d): mega == launch path
-#              GENERATED, no-spec and BARO_SPEC=1; q8 also vs ref-tokens-64
+#   identity   every runnable pack (.work/engine-pack-q8, -q8d, -q4): mega == launch path
+#              GENERATED, no-spec and BARO_SPEC=1; q8 vs ref-tokens-64, q4 vs its own
+#              ref-tokens-64 (numpy Q4_0 reference, tools/model-ref.py)
 #   perf       q8 no-spec: 3 runs each arm, median + spread
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -20,7 +21,7 @@ ok build "engine + test_mega_block"
 ok kernel "$(grep -oE 'ratio= [0-9.]+' "$out/kernel.log")"
 ./run-tests.sh > "$out/tests.log" 2>&1 || die tests "$(tail -1 "$out/tests.log")"
 ok tests "$(grep -E 'GEMM OK|orphans' "$out/tests.log" | tr '\n' ';')"
-for pack in .work/engine-pack-q8 .work/engine-pack-q8d; do
+for pack in .work/engine-pack-q8 .work/engine-pack-q8d .work/engine-pack-q4; do
   p=$(basename "$pack")
   [ -f "$pack/index.txt" ] || die identity "$p: no index.txt"
   for spec in 0 1; do
@@ -31,9 +32,10 @@ for pack in .work/engine-pack-q8 .work/engine-pack-q8d; do
     [ -n "$m" ] && [ "$a" = "$m" ] || die identity "$p spec=$spec: mega GENERATED differs from launch path"
     ok identity "$p spec=$spec mega==launch ($(grep -oE 'tok/s_gen: [0-9.]+' "$out/$p.spec$spec.mega1.log"))"
   done
-  if [ "$p" = engine-pack-q8 ]; then
-    tools/check-tokens.sh .work/engine-pack/ref-tokens-64.txt "$out/$p.spec0.mega1.log" > "$out/$p.ref.log" 2>&1 || die identity "$p vs ref-tokens-64: $(head -1 "$out/$p.ref.log")"
-    ok identity "$p vs ref-tokens-64"
+  ref=""; [ "$p" = engine-pack-q8 ] && ref=.work/engine-pack/ref-tokens-64.txt; [ "$p" = engine-pack-q4 ] && ref=$pack/ref-tokens-64.txt
+  if [ -n "$ref" ]; then
+    tools/check-tokens.sh "$ref" "$out/$p.spec0.mega1.log" > "$out/$p.ref.log" 2>&1 || die identity "$p vs $ref: $(head -1 "$out/$p.ref.log")"
+    ok identity "$p vs $(basename "$ref")"
   fi
 done
 t0=(); t1=()
