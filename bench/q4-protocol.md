@@ -53,9 +53,36 @@ honest. Q4_K_M is a follow-up round, not this one.
 Draft head stays q8 in this round (0.2 GB/token, not worth a second quant
 path); recorded as an asymmetry, not corrected.
 
-## Result
+## Result (2026-09-06, engine `003f1f6`, receipts `.work/q4-round.log`, `.work/ab-q4*/`, `.work/llama-q4pure*/`)
 
-Not yet run.
+**No-spec LANDS. k=2 misses its bar by 2.8%.**
+
+| stage | receipt |
+|---|---|
+| Q0 | PASS (`3744c8f`): `--q4` pack byte-equal to `llama-quantize --pure Q4_0` on blk 0/7/15/31 + head; 6.18 GiB |
+| Q1' | q4row 0.61x q8row time cold-cache (UNROLL 2/4/8: 58/56/53 us vs 88) |
+| Q2 | PASS (`003f1f6`): `test_mega_block` m=1 q4 0 mismatches; engine q4 pack mega == launch, spec 0 and 1; launch vs `tools/model-ref.py` Q4_0 64/64; **20/20 mega == launch on `bench/mtp-prompts/`** (launch 95.23, mega 114.76 tok/s_gen, 1.205x) |
+| Q3 no-spec | 20-prompt same-stint A/B, clock-probe 2877 MHz med, 290 W / -100 mV: **q8 80.83 (spread 1.2%) -> q4 115.02 (2.6%), 1.423x, faster 20/20** |
+| Q3 k=2 | **q8 102.29 -> q4 129.25, 1.264x, faster 20/20** (per-prompt spread 42%/36% = acceptance varies by prompt, same as every k=2 receipt); acceptance q8 69.9% -> q4 66.2% |
+| llama.cpp Q4_0-pure | ref prompt no-spec 110.0 (3 runs 109.4-110.0); mtp-prompts no-spec median **110.0** (spread 1.0%), MTP k=2 median **169.5** (spread 39%, identity 7/20, acc median 75.5%) |
+
+Land rule: no-spec >= 109 AND 64/64 AND 20/20 -> **met (115.02)**. k=2 >= 133 -> **not met (129.25)**.
+Prediction check: no-spec 115-140 -> 115.0 (bottom of the band); k=2 140-175 -> 129.3 (below the band: the
+window is not the trunk stream, cf. `bench/mrow-gemm-protocol.md` M0, and the q4 draft head already showed
+acceptance costs a point). Versus llama.cpp on the same 20 prompts: no-spec **1.05x ahead** (115.0 vs 110.0),
+k=2 **0.76x behind** (129.3 vs 169.5) - the MTP gap is unchanged in kind from `bench/mtp-protocol.md` Result 2.
+
+Deviation from the frozen Q2 form, logged: the addendum named the q4row arithmetic form
+`acc += wlo*a_lo + whi*a_hi` as the thing to copy. Copying it verbatim did NOT give identity: the
+per-element form (int nibble-8, cvt, one fma_mix product, fma accumulate) was already identical in
+both ISAs (read with `isa-loops` after decoding the VOP3 words the ROCm objdump rejects), and the
+divergence was the compiler reassociating the two-product accumulate differently inside the fused
+megakernel loop (1-2 ulp per sub-block, `tools/dump-diff.py`). Pinning the order on the megakernel
+side alone failed twice (either order). Fix = explicit `fma(wlo, a_lo, fma(whi, a_hi, acc))` in BOTH
+kernels (`kernels/matmul_skinny.mojo`, `kernels/mega.mojo`); the launch kernel therefore changed and
+was re-verified against model-ref. ISA after: q4 `amar_mega_token` vgpr 256, spill 72 (q8 77).
+
+Not done here (the maintainer's call): making the q4 pack the engine default (`BARO_PACK`), README tables.
 
 ## Addendum (frozen 2026-09-06, before any q4 trunk run): baselines moved, stages re-cut
 
