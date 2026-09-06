@@ -54,3 +54,32 @@ A1: q4rowb time 0.53-0.57x q8row (from 0.61x); GB/s-equivalent 800+. A3: **115.0
 needs A4 as well: A1-A3 alone cannot reach it (142 at q8-phase parity).
 Stop rules: A1 any bitwise difference -> the form is wrong, fix the form, never widen the check; A1
 time > 0.60x -> the ALU hypothesis is wrong, stop and re-profile (P6) before touching the megakernel.
+
+## Result (2026-09-06, `0afe310` A1, `1d55b75` A2; receipts `results/q4-alu/`)
+
+| stage | receipt |
+|---|---|
+| A1 | `amar_matmul_skinny_q4rowb` bitwise equal to q4row on 12288/12288 rows; 51.16 vs 56.50 us (0.905x), **0.58x q8row** (prediction 0.53-0.57, stop rule 0.60). ISA: `v_mov_b16` 0 (was 452 per loop), but only 6 `v_cvt_f32_ubyte{1,2,3}`: the compiler still extracts most nibbles by shift + `ubyte0` |
+| A2 | megakernel + launch dispatch on the b-form: `test_mega_block` q4 0 mismatches; engine mega == launch spec 0/1; 64/64 vs model-ref; 54 kernels / 0 orphans; VGPR 256, spills 77 (unchanged) |
+| A3 no-spec | same stint, clock 2977 MHz med, 290 W / -100 mV: **prev 113.36 (spread 3.5%) -> new 118.29 (3.1%), 1.043x, identity 20/20** |
+| A3 k=2 | **prev 127.62 -> new 143.06, 1.121x**, identity 20/20 (the launch path's m>1 window gained 95.5 -> 108 launch tok/s). The q4 round's k=2 bar (133) is now met |
+| per-phase, same stint, 2 runs each (`prof-cmp-*.log`) | ssm in-GEMM 1165 -> 1068 (-8%), ffn gate+up 2789 -> 2632 (-6%), ffn down 1551 -> 1606 (+3.5%), head 757 -> 690 (-9%), token 8626 -> 8331 us |
+| UNROLL 2 -> 4 in the megakernel q4 dot | **dead end**: spills 77 -> 583, 61.4 tok/s (0.515x), reverted. The 256-VGPR cap at 512 threads is the wall; bytes in flight per wave cannot grow by unrolling |
+
+**Verdict: below the frozen land (125), inside the close band (< 120): the A1-A3 stage closes at 118.3 (+4.3%).**
+The kernel change stays (faster, identity clean, k=2 +12%). Prediction check: 128-138 predicted, 118.3 measured -
+the hypothesis "the nibble path's instruction count is the loss" was only a third right: halving the VALU count per
+nibble bought 6-9% on the big phases, not the 20-25% the q8 rates implied. What remains is not ALU:
+
+q4 GEMM phases after A2 (same-stint profile): ssm in 640 GB/s (q8 785), ffn gate+up 689 (794), ffn down 566 (765),
+ssm out ~390 (498), attn o ~460 (578), head 829 (892). The N=4096-row phases (ssm out, attn o, ffn down = 2.35 ms of the
+8.33) sit at 0.7-0.75 of the wide phases' rate: 4096 rows over 1536 wave-slots = 2.67 rows per wave, a third of the
+waves run 3 rows while the rest idle after 2. Bytes in flight per wave at UNROLL 2 (2 x 16 B x 32 lanes = 1 KB, 16 KB per
+CU) is also half the q8 path's (32 KB per CU), and unrolling to fix it spills (above).
+
+Next freeze candidates, by size of the pool: (1) N=4096 phases: split K in 2 (or 3) so 8192-12288 half-rows spread evenly
+over the 1536 wave-slots, partials reduced in a fixed order on BOTH paths (the launch kernels already carry a
+`SPLITK` partial layout + `amar_skinny_reduce`); pool 2.35 ms at 0.72 -> 1.0 of the wide rate = -0.55 ms = **+7%**.
+(2) attention 306 us on 16 blocks (80 idle) and rmsc 260 us (64 x 4 us, barrier-latency bound): -0.25 ms = +3%.
+(3) GEMM at 855 GB/s needs more bytes in flight without VGPRs: b96 loads or LDS-staged weight prefetch; unquantified.
+All three together = ~147 tok/s; 150 is at the edge of everything landing.
