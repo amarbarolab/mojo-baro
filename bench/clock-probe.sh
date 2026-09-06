@@ -16,6 +16,7 @@
 # silently inert (P1).
 set -u; cd "$(dirname "$0")/.."
 SKIP_S=${SKIP_S:-3.5}
+CAP_W=$(awk '{printf "%d", $1/1e6}' /sys/class/drm/card1/device/hwmon/hwmon*/power1_cap 2>/dev/null | head -1)
 mkdir -p .work; SMI=.work/clock-probe-$(date +%Y%m%d-%H%M%S).log; : > "$SMI"
 ( while :; do
     l=$(rocm-smi -d 0 --showuse --showclocks --showpower --showtemp 2>/dev/null \
@@ -25,7 +26,7 @@ mkdir -p .work; SMI=.work/clock-probe-$(date +%Y%m%d-%H%M%S).log; : > "$SMI"
   done ) & S=$!
 "$@"; rc=$?
 kill $S 2>/dev/null; wait $S 2>/dev/null
-awk -F'|' -v f="$SMI" -v skip="$SKIP_S" '
+awk -F'|' -v f="$SMI" -v skip="$SKIP_S" -v cap="${CAP_W:-0}" '
   NR == 1 { t0 = $1 }
   { if ($1 - t0 < skip) { skipped++; next } }
   { u=s=p=t=""
@@ -35,9 +36,9 @@ awk -F'|' -v f="$SMI" -v skip="$SKIP_S" '
       if ($i ~ /Package Power/)  { sub(/.*: /, "", $i); p=$i+0 }
       if ($i ~ /junction/)       { sub(/.*: /, "", $i); t=$i+0 } }
     n++
-    if (u >= 90 && s > 0) { b++; sc[b]=s; if (p>pmax) pmax=p; if (pmin=="" || p<pmin) pmin=p; if (t>tmax) tmax=t } }
+    if (u >= 90 && s > 0) { b++; sc[b]=s; if (p>pmax) pmax=p; if (pmin=="" || p<pmin) pmin=p; if (t>tmax) tmax=t; if (cap>0 && p>cap) over++ } }
   END {
     if (!b) { printf "clock-probe: %d samples, none busy (GPU use >= 90%%) after skipping %d in first %ss -- %s\n", n, skipped+0, skip, f; exit }
     asort(sc)
-    printf "clock-probe: busy %d/%d samples (skipped %d in first %ss)  sclk min/med/max %d/%d/%d MHz  power %.0f-%.0f W  junction max %.0f C  -- %s\n", b, n, skipped+0, skip, sc[1], sc[int((b+1)/2)], sc[b], pmin, pmax, tmax, f }' "$SMI"
+    printf "clock-probe: busy %d/%d samples (skipped %d in first %ss)  sclk min/med/max %d/%d/%d MHz  power %.0f-%.0f W (cap %d W, %d busy samples above it: rocm-smi package power is instantaneous, the cap is a moving average)  junction max %.0f C  -- %s\n", b, n, skipped+0, skip, sc[1], sc[int((b+1)/2)], sc[b], pmin, pmax, cap, over+0, tmax, f }' "$SMI"
 exit $rc
