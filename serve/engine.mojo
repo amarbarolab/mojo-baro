@@ -304,7 +304,7 @@ def gemm_w[
 def main() raises:
     comptime assert has_accelerator(), "Requires a GPU"
     var ctx = DeviceContext()
-    var packdir = getenv("BARO_PACK", ".work/engine-pack-q8")
+    var packdir = getenv("BARO_PACK", ".work/engine-pack-q4")
     var PACK = packdir + "/pack.bin"
 
     # --- offset table from the pack index (tools/engine-pack.py order) ----
