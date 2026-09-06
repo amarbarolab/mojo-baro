@@ -48,3 +48,24 @@ producing tokens mid-sequence with no host-visible fail line: consistent with th
 receipt (a stolen CU slot trips the bounded barrier; the kernel returns early; the host reads zeros). Occupancy
 via the register cap is closed for the q4 path too, with numbers. The 1024-thread-block variant (32 waves per
 CU in one block, no residency risk) would need the same 192 cap and therefore the same spills; not pursued.
+
+## P1 / P2 result (2026-09-06, `results/mega-structural/p1*-round.log`)
+
+| build | LDS/block | spills | no-spec 20-prompt (same stint) | identity | notes |
+|---|---|---|---|---|---|
+| HEAD before (`930e012`) | 6.4 KB | 77 | 120.08 (spread 1.0%) | ref | |
+| P1 f32 staging (`7ac79e9`) | 55.6 KB | 88 | **127.58 (2.2%), 1.063x** | 20/20, 64/64 | ffn gate+up 2621 -> 2294, ffn down 1590 -> 1372, ssm in 1070 -> 1030, head =; **delta 392 -> 471**; the test's timing loop tripped the bounded barrier once at this LDS size (fail=1 on the q4 timing line, 0 mismatches) |
+| P1b mixed: f32 for K=4096 rows, bf16 for K=12288 (`shipped`) | 31.0 KB | 142 | **125.43 (2.3%)** vs P1 127.30 in its own stint (0.985x) | 20/20, 64/64, fail word 0 in 20/20 runs | delta 525; ffn down 1389 (the bf16 unpack returns on that phase and adds spills) |
+
+**LANDS: 120.1 -> 125.4 shipped (+4.5%, land >= 124), 127.6 available at 48 KB LDS with a residency caveat.**
+The mixed build is the default: a grid-barrier kernel that can be evicted from a CU by a compositor shader's
+LDS is not a shipping config on a desktop, and the engine did not tell anyone when it happened (it now prints
+`mega fail word` every run; `tools/mega-gate.sh` fails on it).
+Prediction check: +5-10% predicted, +6.3% (f32) / +4.5% (mixed) measured; the VALU part of the gain was real on the
+wide phases (the f32 form beat the bf16 form by 1.5% on the down phase alone), the VMEM part was the larger.
+
+Leads: (1) the delta phase moved 392 -> 219 (split-K build) -> 471 (P1) -> 525 (P1b) with its code unchanged:
+its time depends on the kernel's register allocation or LDS placement, and the 219 shows a 2% token gain
+exists in it. (2) spills 77 -> 142 in P1b: the down-phase unpack; a per-phase register budget is not available,
+but the bf16 read could be restructured (unpack 8 at a time). (3) attention on 16 blocks + rmsc barrier
+latency, ~0.25 ms, unchanged.
