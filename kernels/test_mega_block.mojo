@@ -229,7 +229,7 @@ def run_case[MRT: Int](ctx: DeviceContext, mut wbuf: DeviceBuffer[u8], mut offd:
     comptime gmul_k = amar_gate_mul_cast[type_of(xflat_layout), type_of(xflat_layout), type_of(xflat_layout)]
     comptime GW = MEGA_G if MRT == 1 else MEGA_G_WIN
     comptime mega_k = amar_mega_token[
-        MRT, True, XL, XL,
+        MRT, False, XL, XL,
         type_of(convm_layout), type_of(g32m_layout), type_of(convm_layout), type_of(om_layout),
         type_of(csall_layout), type_of(ssall_layout),
         type_of(qfm_layout), type_of(kvm_flat), type_of(qm_layout), type_of(xflat_layout),
@@ -570,7 +570,6 @@ def run_case[MRT: Int](ctx: DeviceContext, mut wbuf: DeviceBuffer[u8], mut offd:
         line += " tail " + String(Float64(ph[16 * layer + 11] - ph[16 * layer + 10]) / 100.0)
         if layer == NL - 1:
             line += " | head: rmsc " + String(Float64(ph[16 * NL + 1] - ph[16 * NL]) / 100.0) + " gemm+argmax " + String(Float64(ph[16 * NL + 2] - ph[16 * NL + 1]) / 100.0) + " final " + String(Float64(ph[16 * NL + 3] - ph[16 * NL + 2]) / 100.0)
-        line += " | gemm-own " + String(Float64(ph[16 * layer + 13] - ph[16 * layer + nph]) / 100.0) + " wait " + String(Float64(ph[16 * layer + 7] - ph[16 * layer + 13]) / 100.0) + " | down-own " + String(Float64(ph[16 * layer + 14] - ph[16 * layer + 10]) / 100.0) + " wait " + String(Float64(ph[16 * layer + 11] - ph[16 * layer + 14]) / 100.0)
         line += " | sub " + String(Float64(ph[16 * layer + 7] - ph[16 * layer]) / 100.0) + " ffn " + String(Float64(ph[16 * layer + 11] - ph[16 * layer + 7]) / 100.0)
         print(line)
     print("m =", M, " 4-layer+head us/window: launch=", us_launch, " mega(G=", GW, ")=", us_mega, " ratio=", us_mega / us_launch, " fail=", flag[2])

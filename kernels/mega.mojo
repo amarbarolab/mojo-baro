@@ -942,7 +942,6 @@ def mega_body[
             w += 10
         var ctr = Ctr_.ptr
         var gen = Ctr_.ptr.unsafe_offset(1)
-        stamp(prof, 16 * layer + 13)
         if not grid_barrier(ctr, gen, fail):
             return
         stamp(prof, 16 * layer + 7)
@@ -964,7 +963,6 @@ def mega_body[
         ):
             return
         w += 4
-        stamp(prof, 16 * layer + 14)
         if not grid_barrier(ctr, gen, fail):
             return
         stamp(prof, 16 * layer + 11)

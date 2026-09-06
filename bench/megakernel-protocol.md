@@ -218,7 +218,7 @@ block 0's loop time, `wait` = barrier wait after it (straggler + barrier).
 | ffn down (512 groups, K=12288) | 50.3 MB | own 65 + wait 3.5 | 770 | |
 | head (31040 groups, 323/block) | 1017 MB | 1208 | 842 | |
 | standalone wave-per-row q8row, cold (q8-protocol Q1b) | 100.7 MB | 118 | 855 | reference |
-| delta (reload, 32-chunk) | -- | 10.0 | -- | register column: 17.3; bit-exact |
+| delta (reload, 32-chunk) | -- | 10.0 | -- | register column: 17.3; bit-exact -- but NOT shipped for m=1, see below |
 
 Reading: the loop reaches the standalone stream rate only when a wave owns
 hundreds of rows (head, 842). With 5-32 rows per wave each phase pays its
@@ -232,3 +232,14 @@ work = 11% idle, fixable only by splitting rows, which breaks bit-exactness).
 Not frozen as a round: expected <= +4% for an L change; the head is at 842
 and the ffn at 710-770 is the realistic remaining target (+5% of the token
 if it reached the head's rate). G=192 / 192-cap ruled out (W3).
+
+**Reload delta in the m=1 kernel: measured and reverted (2026-09-06).** The
+synthetic 4-layer test said delta 17 -> 10 us and equal totals; the real
+pack, interleaved A/B x5 in one stint, said **80.94 -> 79.71 tok/s_gen
+(-1.5%)**: `BARO_PROFILE=5` shows ssm -30 us but **ffn +180 us** and attn
++30 us per token. The ffn phases never touch the delta; the kernel's whole
+register allocation moved (256 -> 234 VGPRs, 77 -> 0 spills) and the GEMM
+loops got a worse schedule. Rule: a whole-kernel change is judged on the
+real pack in one stint, never on the synthetic test alone; the spill count
+is not a fitness function. The m=1 kernel keeps the register column
+(`RELOAD=False`); the window kernel keeps the reload (it needs the 192 cap).

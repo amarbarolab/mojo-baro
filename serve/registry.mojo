@@ -123,7 +123,7 @@ comptime off_layout = row_major[512]()
 comptime pf_sm = row_major[SM, FFN]()
 comptime ctr_layout = row_major[3]()
 comptime mega_token_k = amar_mega_token[
-    1, True, type_of(xm_layout), type_of(xm_layout),
+    1, False, type_of(xm_layout), type_of(xm_layout),
     type_of(qfm_layout), type_of(g32m_layout), type_of(convm_layout), type_of(om_layout),
     type_of(csall_layout), type_of(ssall_layout),
     type_of(qfm_layout), type_of(kvm_flat), type_of(qm_layout), type_of(xflat_layout),
