@@ -26,10 +26,11 @@ if python3 -m py_compile $pyfiles 2>&1; then ok "$(echo "$pyfiles" | wc -l) file
 else bad "python syntax error"; fi
 
 step "shell scripts parse"
+shbad=0
 for f in $(git ls-files '*.sh'); do
-  bash -n "$f" 2>/dev/null || bad "$f"
+  bash -n "$f" 2>/dev/null || { bad "$f"; shbad=1; }
 done
-[ "$fails" = 0 ] && ok "$(git ls-files '*.sh' | wc -l) scripts"
+[ "$shbad" = 0 ] && ok "$(git ls-files '*.sh' | wc -l) scripts"
 
 step "issue templates are valid yaml"
 if python3 - <<'PY'
