@@ -7,7 +7,7 @@ from elementwise import (
     amar_quantize_q8_rows,
 )
 from matmul_skinny import (
-    amar_matmul_skinny_q8row, amar_matmul_skinny_q4row, amar_skinny_reduce, amar_skinny_reduce_add,
+    amar_matmul_skinny_q8row, amar_matmul_skinny_q4rowb, amar_skinny_reduce, amar_skinny_reduce_add,
     amar_skinny_reduce_swiglu_bf16, amar_matmul_skinny_q8dot, SM, SPLITK, ROW_WAVES, ROW_THREADS,
 )
 from ssm import (
@@ -319,27 +319,27 @@ def gemm_q4[
     m: Int, n: Int, k: Int,
 ) raises:
     if m == 1:
-        ctx.enqueue_function[amar_matmul_skinny_q4row[2, 1, AL, QL, SL, PL]](
+        ctx.enqueue_function[amar_matmul_skinny_q4rowb[2, 1, AL, QL, SL, PL]](
             A, Wq, Ws, P, Int32(m), Int32(n), Int32(k),
             grid_dim=ceildiv(n, ROW_WAVES), block_dim=ROW_THREADS,
         )
     elif m == 2:
-        ctx.enqueue_function[amar_matmul_skinny_q4row[2, 2, AL, QL, SL, PL]](
+        ctx.enqueue_function[amar_matmul_skinny_q4rowb[2, 2, AL, QL, SL, PL]](
             A, Wq, Ws, P, Int32(m), Int32(n), Int32(k),
             grid_dim=ceildiv(n, ROW_WAVES), block_dim=ROW_THREADS,
         )
     elif m == 3:
-        ctx.enqueue_function[amar_matmul_skinny_q4row[2, 3, AL, QL, SL, PL]](
+        ctx.enqueue_function[amar_matmul_skinny_q4rowb[2, 3, AL, QL, SL, PL]](
             A, Wq, Ws, P, Int32(m), Int32(n), Int32(k),
             grid_dim=ceildiv(n, ROW_WAVES), block_dim=ROW_THREADS,
         )
     elif m <= 5:
-        ctx.enqueue_function[amar_matmul_skinny_q4row[2, 5, AL, QL, SL, PL]](
+        ctx.enqueue_function[amar_matmul_skinny_q4rowb[2, 5, AL, QL, SL, PL]](
             A, Wq, Ws, P, Int32(m), Int32(n), Int32(k),
             grid_dim=ceildiv(n, ROW_WAVES), block_dim=ROW_THREADS,
         )
     else:
-        ctx.enqueue_function[amar_matmul_skinny_q4row[2, SM, AL, QL, SL, PL]](
+        ctx.enqueue_function[amar_matmul_skinny_q4rowb[2, SM, AL, QL, SL, PL]](
             A, Wq, Ws, P, Int32(m), Int32(n), Int32(k),
             grid_dim=ceildiv(n, ROW_WAVES), block_dim=ROW_THREADS,
         )
