@@ -28,6 +28,7 @@ for pack in .work/engine-pack-q8 .work/engine-pack-q8d .work/engine-pack-q4; do
     for arm in 0 1; do
       BARO_PACK="$pack" BARO_SPEC=$spec BARO_MEGA=$arm ./.work/engine > "$out/$p.spec$spec.mega$arm.log" 2>&1 || die identity "$p spec=$spec mega=$arm: engine exited $?"
     done
+    grep -q "mega fail word: 0" "$out/$p.spec$spec.mega1.log" || die identity "$p spec=$spec: grid-barrier fail word set (NOT-RESIDENT)"
     a=$(grep '^GENERATED' "$out/$p.spec$spec.mega0.log"); m=$(grep '^GENERATED' "$out/$p.spec$spec.mega1.log")
     [ -n "$m" ] && [ "$a" = "$m" ] || die identity "$p spec=$spec: mega GENERATED differs from launch path"
     ok identity "$p spec=$spec mega==launch ($(grep -oE 'tok/s_gen: [0-9.]+' "$out/$p.spec$spec.mega1.log"))"

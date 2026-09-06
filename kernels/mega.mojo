@@ -11,7 +11,7 @@ from max.gpu.sync import barrier
 from layout import TileTensor, TensorLayout, row_major, stack_allocation
 
 from elementwise import EW_THREADS
-from matmul_skinny import ROW_WAVES, ROW_THREADS, q4_dot_blocks
+from matmul_skinny import ROW_WAVES, ROW_THREADS, q4_dot_blocks, bf16x16_to_f32
 from ssm import CONV, KDIM, NH_K, NH_V, SSTATE, SSM_EPS
 from attn import HD, NQH, NKVH, MAX_T, NROT, YARN_LOW, YARN_HIGH, FREQ_BASE, FREQ_SCALE, MSCALE
 
@@ -118,7 +118,7 @@ def q8_row_dot[
 
 
 @always_inline
-def stage_a[CBL: TensorLayout, AfL: TensorLayout](
+def stage_a[CBL: TensorLayout, AfL: TensorLayout, BF: Bool = False](
     A: TileTensor[bf16, CBL, MutAnyOrigin],
     mut Af: TileTensor[f32, AfL, MutUntrackedOrigin, address_space = AddressSpace.SHARED],
     K: Int,
@@ -136,17 +136,23 @@ def stage_a[CBL: TensorLayout, AfL: TensorLayout](
     while t * 8 < K:
         var i0 = t * 8
         var blk = i0 // 32
-        var c = (i0 % 32) // 4
-        var v = rebind[SIMD[bf16, 8]](Av8[0, t]).cast[f32]()
-        Afv[c * nb + blk] = rebind[Afv.ElementType](v.slice[4, offset=0]())
-        Afv[(c + 1) * nb + blk] = rebind[Afv.ElementType](v.slice[4, offset=4]())
+        comptime if BF:
+            # K=FFN rows stay bf16 in LDS (24 KB budget): chunk of 8 elements
+            # c8 of block blk at vector index c8 * nb + blk, unpacked on read.
+            var c8 = (i0 % 32) // 8
+            Afv[c8 * nb + blk] = rebind[Afv.ElementType](bitcast[f32, 4](rebind[SIMD[bf16, 8]](Av8[0, t])))
+        else:
+            var c = (i0 % 32) // 4
+            var v = rebind[SIMD[bf16, 8]](Av8[0, t]).cast[f32]()
+            Afv[c * nb + blk] = rebind[Afv.ElementType](v.slice[4, offset=0]())
+            Afv[(c + 1) * nb + blk] = rebind[Afv.ElementType](v.slice[4, offset=4]())
         t += ROW_THREADS
     barrier()
 
 
 @always_inline
 def q4_dot_lds[
-    UNROLL: Int, AfL: TensorLayout, QLayout: TensorLayout, SLayout: TensorLayout
+    UNROLL: Int, BF: Bool, AfL: TensorLayout, QLayout: TensorLayout, SLayout: TensorLayout
 ](
     Af: TileTensor[f32, AfL, MutUntrackedOrigin, address_space = AddressSpace.SHARED],
     Q: TileTensor[u8, QLayout, MutAnyOrigin],
@@ -178,8 +184,14 @@ def q4_dot_lds[
             var m8d = SIMD[f32, QV](d * -8)
             var wlo = fma(lo, dv, m8d)
             var whi = fma(hi, dv, m8d)
-            var a_lo = rebind[SIMD[f32, 4]](Afv[0 * nb + blk]).join(rebind[SIMD[f32, 4]](Afv[1 * nb + blk])).join(rebind[SIMD[f32, 4]](Afv[2 * nb + blk]).join(rebind[SIMD[f32, 4]](Afv[3 * nb + blk])))
-            var a_hi = rebind[SIMD[f32, 4]](Afv[4 * nb + blk]).join(rebind[SIMD[f32, 4]](Afv[5 * nb + blk])).join(rebind[SIMD[f32, 4]](Afv[6 * nb + blk]).join(rebind[SIMD[f32, 4]](Afv[7 * nb + blk])))
+            var a_lo: SIMD[f32, 16]
+            var a_hi: SIMD[f32, 16]
+            comptime if BF:
+                a_lo = bf16x16_to_f32(bitcast[bf16, 8](rebind[SIMD[f32, 4]](Afv[0 * nb + blk])).join(bitcast[bf16, 8](rebind[SIMD[f32, 4]](Afv[1 * nb + blk]))))
+                a_hi = bf16x16_to_f32(bitcast[bf16, 8](rebind[SIMD[f32, 4]](Afv[2 * nb + blk])).join(bitcast[bf16, 8](rebind[SIMD[f32, 4]](Afv[3 * nb + blk]))))
+            else:
+                a_lo = rebind[SIMD[f32, 4]](Afv[0 * nb + blk]).join(rebind[SIMD[f32, 4]](Afv[1 * nb + blk])).join(rebind[SIMD[f32, 4]](Afv[2 * nb + blk]).join(rebind[SIMD[f32, 4]](Afv[3 * nb + blk])))
+                a_hi = rebind[SIMD[f32, 4]](Afv[4 * nb + blk]).join(rebind[SIMD[f32, 4]](Afv[5 * nb + blk])).join(rebind[SIMD[f32, 4]](Afv[6 * nb + blk]).join(rebind[SIMD[f32, 4]](Afv[7 * nb + blk])))
             acc = fma(wlo, a_lo, fma(whi, a_hi, acc))
         kk += UNROLL * STEP
     while kk < nb:
@@ -193,8 +205,14 @@ def q4_dot_lds[
         var m8d = SIMD[f32, QV](d * -8)
         var wlo = fma(lo, dv, m8d)
         var whi = fma(hi, dv, m8d)
-        var a_lo = rebind[SIMD[f32, 4]](Afv[0 * nb + blk]).join(rebind[SIMD[f32, 4]](Afv[1 * nb + blk])).join(rebind[SIMD[f32, 4]](Afv[2 * nb + blk]).join(rebind[SIMD[f32, 4]](Afv[3 * nb + blk])))
-        var a_hi = rebind[SIMD[f32, 4]](Afv[4 * nb + blk]).join(rebind[SIMD[f32, 4]](Afv[5 * nb + blk])).join(rebind[SIMD[f32, 4]](Afv[6 * nb + blk]).join(rebind[SIMD[f32, 4]](Afv[7 * nb + blk])))
+        var a_lo: SIMD[f32, 16]
+        var a_hi: SIMD[f32, 16]
+        comptime if BF:
+            a_lo = bf16x16_to_f32(bitcast[bf16, 8](rebind[SIMD[f32, 4]](Afv[0 * nb + blk])).join(bitcast[bf16, 8](rebind[SIMD[f32, 4]](Afv[1 * nb + blk]))))
+            a_hi = bf16x16_to_f32(bitcast[bf16, 8](rebind[SIMD[f32, 4]](Afv[2 * nb + blk])).join(bitcast[bf16, 8](rebind[SIMD[f32, 4]](Afv[3 * nb + blk]))))
+        else:
+            a_lo = rebind[SIMD[f32, 4]](Afv[0 * nb + blk]).join(rebind[SIMD[f32, 4]](Afv[1 * nb + blk])).join(rebind[SIMD[f32, 4]](Afv[2 * nb + blk]).join(rebind[SIMD[f32, 4]](Afv[3 * nb + blk])))
+            a_hi = rebind[SIMD[f32, 4]](Afv[4 * nb + blk]).join(rebind[SIMD[f32, 4]](Afv[5 * nb + blk])).join(rebind[SIMD[f32, 4]](Afv[6 * nb + blk]).join(rebind[SIMD[f32, 4]](Afv[7 * nb + blk])))
         acc = fma(wlo, a_lo, fma(whi, a_hi, acc))
         kk += STEP
     return warp.sum(acc.reduce_add())
@@ -202,7 +220,7 @@ def q4_dot_lds[
 
 @always_inline
 def row_dot_a[
-    MR: Int, Q4: Bool, LDSA: Bool,
+    MR: Int, Q4: Bool, LDSA: Bool, BF: Bool,
     ALayout: TensorLayout, AfL: TensorLayout, QLayout: TensorLayout, SLayout: TensorLayout
 ](
     A: TileTensor[bf16, ALayout, MutAnyOrigin],
@@ -213,7 +231,7 @@ def row_dot_a[
 ) -> InlineArray[Float32, MR]:
     comptime if LDSA:
         var out = InlineArray[Float32, MR](fill=0)
-        out[0] = q4_dot_lds[2](Af, rebind[TileTensor[u8, QLayout, MutAnyOrigin]](Q), S, row, lane, K // 32)
+        out[0] = q4_dot_lds[2, BF](Af, rebind[TileTensor[u8, QLayout, MutAnyOrigin]](Q), S, row, lane, K // 32)
         return out^
     else:
         return q8_row_dot[MR, Q4](A, Q, S, row, lane, K, M)
@@ -385,28 +403,28 @@ def ssm_phases[
     while g < G_QKV + G_Z + G_AB + G_AB:
         if g < G_QKV:
             var row = g * ROW_WAVES + wave
-            var t = row_dot_a[MR, Q4, LDSA](CurB, Af, Wqkvq, Wqkvs, row, lane, H, M)
+            var t = row_dot_a[MR, Q4, LDSA, False](CurB, Af, Wqkvq, Wqkvs, row, lane, H, M)
             if lane == 0:
                 comptime for r in range(MR):
                     if r < M:
                         Qkvm[r, row] = rebind[Qkvm.ElementType](t[r])
         elif g < G_QKV + G_Z:
             var row = (g - (G_QKV)) * ROW_WAVES + wave
-            var t = row_dot_a[MR, Q4, LDSA](CurB, Af, Wzq, Wzs, row, lane, H, M)
+            var t = row_dot_a[MR, Q4, LDSA, False](CurB, Af, Wzq, Wzs, row, lane, H, M)
             if lane == 0:
                 comptime for r in range(MR):
                     if r < M:
                         Zm[r, row] = rebind[Zm.ElementType](t[r])
         elif g < G_QKV + G_Z + G_AB:
             var row = (g - (G_QKV + G_Z)) * ROW_WAVES + wave
-            var t = row_dot_a[MR, Q4, LDSA](CurB, Af, Waq, Was, row, lane, H, M)
+            var t = row_dot_a[MR, Q4, LDSA, False](CurB, Af, Waq, Was, row, lane, H, M)
             if lane == 0:
                 comptime for r in range(MR):
                     if r < M:
                         Araw[r, row] = rebind[Araw.ElementType](t[r])
         else:
             var row = (g - (G_QKV + G_Z + G_AB)) * ROW_WAVES + wave
-            var t = row_dot_a[MR, Q4, LDSA](CurB, Af, Wbq, Wbs, row, lane, H, M)
+            var t = row_dot_a[MR, Q4, LDSA, False](CurB, Af, Wbq, Wbs, row, lane, H, M)
             if lane == 0:
                 comptime for r in range(MR):
                     if r < M:
@@ -562,7 +580,7 @@ def ssm_phases[
     g = bid
     while g < G_OUT:
         var row = g * ROW_WAVES + wave
-        var t = row_dot_a[MR, Q4, LDSA](ResB, Af, Wsoutq, Wsouts, row, lane, H, M)
+        var t = row_dot_a[MR, Q4, LDSA, False](ResB, Af, Wsoutq, Wsouts, row, lane, H, M)
         if lane == 0:
             comptime for r in range(MR):
                 if r < M:
@@ -618,14 +636,14 @@ def ffn_phases[
     while g < G_F + G_F:
         if g < G_F:
             var row = g * ROW_WAVES + wave
-            var t = row_dot_a[MR, Q4, LDSA](CurB, Af, Wgq, Wgs, row, lane, H, M)
+            var t = row_dot_a[MR, Q4, LDSA, False](CurB, Af, Wgq, Wgs, row, lane, H, M)
             if lane == 0:
                 comptime for r in range(MR):
                     if r < M:
                         Pg[r, row] = rebind[Pg.ElementType](t[r])
         else:
             var row = (g - (G_F)) * ROW_WAVES + wave
-            var t = row_dot_a[MR, Q4, LDSA](CurB, Af, Wuq, Wus, row, lane, H, M)
+            var t = row_dot_a[MR, Q4, LDSA, False](CurB, Af, Wuq, Wus, row, lane, H, M)
             if lane == 0:
                 comptime for r in range(MR):
                     if r < M:
@@ -649,11 +667,11 @@ def ffn_phases[
     stamp(prof, pbase + 3)
 
     comptime if LDSA:
-        stage_a(FgB, Af, FFN)
+        stage_a[BF=True](FgB, Af, FFN)
     g = bid
     while g < H // ROW_WAVES:
         var row = g * ROW_WAVES + wave
-        var t = row_dot_a[MR, Q4, LDSA](FgB, Af, Wdq, Wds, row, lane, FFN, M)
+        var t = row_dot_a[MR, Q4, LDSA, True](FgB, Af, Wdq, Wds, row, lane, FFN, M)
         if lane == 0:
             comptime for r in range(MR):
                 if r < M:
@@ -743,21 +761,21 @@ def attn_phases[
     while g < G_Q + G_KV + G_KV:
         if g < G_Q:
             var row = g * ROW_WAVES + wave
-            var t = row_dot_a[MR, Q4, LDSA](CurB, Af, Wqq, Wqs, row, lane, H, M)
+            var t = row_dot_a[MR, Q4, LDSA, False](CurB, Af, Wqq, Wqs, row, lane, H, M)
             if lane == 0:
                 comptime for r in range(MR):
                     if r < M:
                         Qfm[r, row] = rebind[Qfm.ElementType](t[r])
         elif g < G_Q + G_KV:
             var row = (g - (G_Q)) * ROW_WAVES + wave
-            var t = row_dot_a[MR, Q4, LDSA](CurB, Af, Wkq, Wks, row, lane, H, M)
+            var t = row_dot_a[MR, Q4, LDSA, False](CurB, Af, Wkq, Wks, row, lane, H, M)
             if lane == 0:
                 comptime for r in range(MR):
                     if r < M:
                         Kflat[r, row] = rebind[Kflat.ElementType](t[r])
         else:
             var row = (g - (G_Q + G_KV)) * ROW_WAVES + wave
-            var t = row_dot_a[MR, Q4, LDSA](CurB, Af, Wvq, Wvs, row, lane, H, M)
+            var t = row_dot_a[MR, Q4, LDSA, False](CurB, Af, Wvq, Wvs, row, lane, H, M)
             if lane == 0:
                 comptime for r in range(MR):
                     if r < M:
@@ -907,7 +925,7 @@ def attn_phases[
     g = bid
     while g < H // ROW_WAVES:
         var row = g * ROW_WAVES + wave
-        var t = row_dot_a[MR, Q4, LDSA](AoB, Af, Woq, Wos, row, lane, H, M)
+        var t = row_dot_a[MR, Q4, LDSA, False](AoB, Af, Woq, Wos, row, lane, H, M)
         if lane == 0:
             comptime for r in range(MR):
                 if r < M:
@@ -1012,7 +1030,7 @@ def mega_body[
     var Dtok_ = Dtok
     var Hn_ = Hn
     comptime LDSA = (MR == 1) and Q4
-    var Af = stack_allocation[f32, address_space = AddressSpace.SHARED](row_major[FFN if ((MR == 1) and Q4) else 4]())
+    var Af = stack_allocation[f32, address_space = AddressSpace.SHARED](row_major[(FFN // 2) if ((MR == 1) and Q4) else 4]())
     var M = Int(m)
     var fail = Ctr_.ptr.unsafe_offset(2)
     if Atomic[u32, scope="agent"].load[ordering=Ordering.ACQUIRE](fail) != 0:
@@ -1127,7 +1145,7 @@ def mega_body[
     var g = bid
     while g < VOCAB // ROW_WAVES:
         var row = g * ROW_WAVES + wave
-        var t = row_dot_a[MR, Q4, LDSA](CurB_, Af, Whq, Whs, row, lane, H, M)
+        var t = row_dot_a[MR, Q4, LDSA, False](CurB_, Af, Whq, Whs, row, lane, H, M)
         comptime for r in range(MR):
             if r < M:
                 if t[r] > bv[r] or (t[r] == bv[r] and Int32(row) < bi[r]):

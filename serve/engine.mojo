@@ -998,6 +998,10 @@ def main() raises:
     ctx.synchronize()
     var dt = Float64(perf_counter_ns() - t0) / 1e9
     print("host_enqueue_s:", t_host, " gpu_total_s:", dt)
+    var flw = ctx.enqueue_create_host_buffer[DType.uint32](3)
+    ctx.enqueue_copy(dst_buf=flw, src_buf=ctr_d)
+    ctx.synchronize()
+    print("mega fail word:", flw[2], "" if flw[2] == 0 else " NOT-RESIDENT: a grid barrier timed out, tokens after it are invalid")
     if dump:
         ctx.synchronize()
         with open(dump_path, "w") as f:
