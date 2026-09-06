@@ -248,6 +248,11 @@ prompt ids from `.work/ref-p07-json/`) sides with the prefill path on
 p07-json: reference `198 79871 763 328 760 8252 ...` == prefill v1/v2,
 while `engine-base` produced `198 220 328 2034 ...` — the divergence is a
 near-tie at generated token 1 that the decode path resolves the other
-way. The identity gate for a non-bit-exact path is therefore the
-model-ref agreement (as for the q8 and q4 rounds), plus first-token
-identity 20/20 and the 64-token identity on the four protocol prompts.
+way. Same on p09-explain-gpu (`.work/ref-p09-explain-gpu.log`, 40
+tokens): the reference equals the prefill path on all 40 and differs from
+`engine-base` at token 37 (383 vs 436). Both divergent streams are the
+prefill path being right where the decode path resolves a near-tie the
+other way. The identity gate for a non-bit-exact path is therefore the
+model-ref agreement (as for the q8 and q4 rounds): 2/2 checked, plus
+first-token identity 20/20 and the 64-token identity on the four protocol
+prompts.
