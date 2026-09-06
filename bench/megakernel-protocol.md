@@ -202,3 +202,33 @@ window is a separate freeze. Arm: 290 W / -100 mV, sclk med 3040.
 
 q4/q8dot weights, prefill, MTP verify width, hipLaunchCooperativeKernel (0.1
 us, not needed), Mojo `Semaphore` (unprobed).
+
+### Phase-efficiency receipt (2026-09-06, stage 0 for any GEMM-side follow-up; token kernel with the chunked-reload delta, 234 VGPRs / 0 spills)
+
+Bytes moved / phase time, synthetic 4-layer pack (cold), G=96, m=1. `own` =
+block 0's loop time, `wait` = barrier wait after it (straggler + barrier).
+
+| phase | bytes | us | GB/s | note |
+|---|---|---|---|---|
+| ssm qkv+z+a+b GEMM (1544 groups, 16.1/block) | 50.6 MB | 75 | 675 | |
+| ssm out-proj (512 groups, 5.3/block) | 17.4 MB | own 31 + wait 3 | 560 | 6 rounds for 5.33 of work |
+| attn q,k,v GEMM (1280 groups) | 42.5 MB | 61 | 695 | |
+| attn o-proj (512 groups) | 17.4 MB | own 30 + wait 2.4 | 580 | |
+| ffn gate+up (3072 groups, 32/block) | 100.7 MB | 142 | 710 | |
+| ffn down (512 groups, K=12288) | 50.3 MB | own 65 + wait 3.5 | 770 | |
+| head (31040 groups, 323/block) | 1017 MB | 1208 | 842 | |
+| standalone wave-per-row q8row, cold (q8-protocol Q1b) | 100.7 MB | 118 | 855 | reference |
+| delta (reload, 32-chunk) | -- | 10.0 | -- | register column: 17.3; bit-exact |
+
+Reading: the loop reaches the standalone stream rate only when a wave owns
+hundreds of rows (head, 842). With 5-32 rows per wave each phase pays its
+ramp (all 768 waves issue at once, then the last rows straggle): 560-770
+GB/s. Barrier wait itself is 2-4 us (3-10% of the small phases). Summed over
+the token this is ~1.3 ms of 12 (the m=1 GEMM phases at 855 would be 11%
+faster), but it is phase granularity, not the loop: the only levers are
+fewer, larger phases (which the data dependencies mostly forbid) or a
+different row distribution for the 512-group GEMMs (6 rounds for 5.33 of
+work = 11% idle, fixable only by splitting rows, which breaks bit-exactness).
+Not frozen as a round: expected <= +4% for an L change; the head is at 842
+and the ffn at 710-770 is the realistic remaining target (+5% of the token
+if it reached the head's rate). G=192 / 192-cap ruled out (W3).

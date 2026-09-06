@@ -229,7 +229,7 @@ def run_case[MRT: Int](ctx: DeviceContext, mut wbuf: DeviceBuffer[u8], mut offd:
     comptime gmul_k = amar_gate_mul_cast[type_of(xflat_layout), type_of(xflat_layout), type_of(xflat_layout)]
     comptime GW = MEGA_G if MRT == 1 else MEGA_G_WIN
     comptime mega_k = amar_mega_token[
-        MRT, XL, XL,
+        MRT, True, XL, XL,
         type_of(convm_layout), type_of(g32m_layout), type_of(convm_layout), type_of(om_layout),
         type_of(csall_layout), type_of(ssall_layout),
         type_of(qfm_layout), type_of(kvm_flat), type_of(qm_layout), type_of(xflat_layout),
@@ -237,7 +237,7 @@ def run_case[MRT: Int](ctx: DeviceContext, mut wbuf: DeviceBuffer[u8], mut offd:
         TM, NL,
     ]
     comptime mega_w = amar_mega_window[
-        MRT, XL, XL,
+        MRT, True, XL, XL,
         type_of(convm_layout), type_of(g32m_layout), type_of(convm_layout), type_of(om_layout),
         type_of(csall_layout), type_of(ssall_layout),
         type_of(qfm_layout), type_of(kvm_flat), type_of(qm_layout), type_of(xflat_layout),
@@ -445,6 +445,16 @@ def run_case[MRT: Int](ctx: DeviceContext, mut wbuf: DeviceBuffer[u8], mut offd:
                 grid_dim=MEGA_G_WIN, block_dim=ROW_THREADS,
             )
 
+    @parameter
+    def window_path(ring: Int, grid: Int) raises:
+        ctx.enqueue_function[mega_w](
+            wbuf.unsafe_ptr(), Off, XM_, CurB, ResB, Qkvm, Zm, Araw, Braw, Eg, Beta, Conv, So, CsM, SsM,
+            Qfm, Kflat, Vflat, Q, Gate, Ao, kcM.unsafe_ptr(), vcM.unsafe_ptr(), Pg1, Pu1, FgB, Ctr, prof_d.unsafe_ptr(), dbg_d.unsafe_ptr(),
+            ToksM, DtokM, HnM, hmax_d.unsafe_ptr(), hidx_d.unsafe_ptr(),
+            Int32(ring), Int32(SLOTS), Int32(POS), Int32(M), Int32(0), Int32(1 if MRT == 1 else 2),
+            grid_dim=grid, block_dim=ROW_THREADS,
+        )
+
     launch_path(0)
     ctx.synchronize()
     mega_path(0)
@@ -560,9 +570,32 @@ def run_case[MRT: Int](ctx: DeviceContext, mut wbuf: DeviceBuffer[u8], mut offd:
         line += " tail " + String(Float64(ph[16 * layer + 11] - ph[16 * layer + 10]) / 100.0)
         if layer == NL - 1:
             line += " | head: rmsc " + String(Float64(ph[16 * NL + 1] - ph[16 * NL]) / 100.0) + " gemm+argmax " + String(Float64(ph[16 * NL + 2] - ph[16 * NL + 1]) / 100.0) + " final " + String(Float64(ph[16 * NL + 3] - ph[16 * NL + 2]) / 100.0)
+        line += " | gemm-own " + String(Float64(ph[16 * layer + 13] - ph[16 * layer + nph]) / 100.0) + " wait " + String(Float64(ph[16 * layer + 7] - ph[16 * layer + 13]) / 100.0) + " | down-own " + String(Float64(ph[16 * layer + 14] - ph[16 * layer + 10]) / 100.0) + " wait " + String(Float64(ph[16 * layer + 11] - ph[16 * layer + 14]) / 100.0)
         line += " | sub " + String(Float64(ph[16 * layer + 7] - ph[16 * layer]) / 100.0) + " ffn " + String(Float64(ph[16 * layer + 11] - ph[16 * layer + 7]) / 100.0)
         print(line)
     print("m =", M, " 4-layer+head us/window: launch=", us_launch, " mega(G=", GW, ")=", us_mega, " ratio=", us_mega / us_launch, " fail=", flag[2])
+    comptime if MRT == 1:
+        for gi in range(2):
+            var grid = 96 if gi == 0 else 192
+            ctx.enqueue_memset(ctr_d, 0)
+            for it in range(10):
+                window_path(it % SLOTS, grid)
+            ctx.synchronize()
+            var t1 = perf_counter_ns()
+            for it in range(ITERS):
+                window_path(it % SLOTS, grid)
+            ctx.synchronize()
+            var us_w = Float64(perf_counter_ns() - t1) / 1e3 / Float64(ITERS)
+            ctx.enqueue_copy(dst_buf=flag, src_buf=ctr_d)
+            ctx.enqueue_copy(dst_buf=ph, src_buf=prof_d)
+            ctx.synchronize()
+            var l0 = String("    window kernel (192-cap, reload delta) G=") + String(grid) + ": us=" + String(us_w) + " fail=" + String(flag[2])
+            l0 += " | layer0 ssm phases:"
+            for k in range(1, 7):
+                l0 += " " + String(Float64(ph[k] - ph[k - 1]) / 100.0)
+            l0 += " tail " + String(Float64(ph[7] - ph[6]) / 100.0) + " | ffn: " + String(Float64(ph[9] - ph[8]) / 100.0) + " down-tail " + String(Float64(ph[11] - ph[10]) / 100.0)
+            l0 += " | layer3 attn gemm " + String(Float64(ph[16 * 3 + 2] - ph[16 * 3 + 1]) / 100.0) + " tail " + String(Float64(ph[16 * 3 + 7] - ph[16 * 3 + 5]) / 100.0) + " | head " + String(Float64(ph[16 * NL + 2] - ph[16 * NL + 1]) / 100.0)
+            print(l0)
     return 0
 
 

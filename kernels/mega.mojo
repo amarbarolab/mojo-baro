@@ -199,7 +199,7 @@ def rms_f32_phase[
 
 @always_inline
 def ssm_phases[
-    MR: Int,
+    MR: Int, RELOAD: Bool,
     XL: TensorLayout, GL: TensorLayout, CBL: TensorLayout,
     QqL: TensorLayout, QsL: TensorLayout,
     HqL: TensorLayout, HsL: TensorLayout,
@@ -377,7 +377,7 @@ def ssm_phases[
                 var eg = rebind[Scalar[f32]](Eg[r, h])
                 var beta = rebind[Scalar[f32]](Beta[r, h])
                 var vj = rebind[Scalar[f32]](Conv[r, 2 * KDIM + h * SSTATE + j])
-                comptime if MR == 1:
+                comptime if not RELOAD:
                     var col = SIMD[f32, SSTATE]()
                     comptime for i in range(SSTATE):
                         col[i] = rebind[Scalar[f32]](SAll[rs, si, h, i, j])
@@ -811,7 +811,7 @@ def wf2[N: Int, M: Int](wbuf: MutPointer[Scalar[u8], MutAnyOrigin], o: Int) -> T
 
 @always_inline
 def mega_body[
-    MR: Int,
+    MR: Int, RELOAD: Bool,
     XL: TensorLayout, CBL: TensorLayout,
     QkvL: TensorLayout, G32mL: TensorLayout, ConvL: TensorLayout, OmL: TensorLayout,
     CsL: TensorLayout, SsL: TensorLayout,
@@ -926,7 +926,7 @@ def mega_body[
             var o7 = Int(rebind[Scalar[i64]](off[w + 7]))
             var o8 = Int(rebind[Scalar[i64]](off[w + 8]))
             var o9 = Int(rebind[Scalar[i64]](off[w + 9]))
-            if not ssm_phases[MR](
+            if not ssm_phases[MR, RELOAD](
                 X_, wf[H](wbuf, o0), CurB_,
                 wq[CONV, H](wbuf, o1), ws[CONV, H](wbuf, o1),
                 wq[H, H](wbuf, o2), ws[H, H](wbuf, o2),
@@ -942,6 +942,7 @@ def mega_body[
             w += 10
         var ctr = Ctr_.ptr
         var gen = Ctr_.ptr.unsafe_offset(1)
+        stamp(prof, 16 * layer + 13)
         if not grid_barrier(ctr, gen, fail):
             return
         stamp(prof, 16 * layer + 7)
@@ -963,6 +964,7 @@ def mega_body[
         ):
             return
         w += 4
+        stamp(prof, 16 * layer + 14)
         if not grid_barrier(ctr, gen, fail):
             return
         stamp(prof, 16 * layer + 11)
@@ -1045,7 +1047,7 @@ def mega_body[
 
 @__llvm_metadata(`rocdl.flat_work_group_size`=StaticTuple[Int32, 1](Int32(ROW_THREADS)))
 def amar_mega_token[
-    MR: Int,
+    MR: Int, RELOAD: Bool,
     XL: TensorLayout, CBL: TensorLayout,
     QkvL: TensorLayout, G32mL: TensorLayout, ConvL: TensorLayout, OmL: TensorLayout,
     CsL: TensorLayout, SsL: TensorLayout,
@@ -1089,11 +1091,11 @@ def amar_mega_token[
     hidx: MutPointer[Scalar[i32], MutAnyOrigin],
     ring: Int32, slots: Int32, pos: Int32, m: Int32, dump: Int32, fold_head: Int32,
 ):
-    mega_body[MR, XL, CBL, QkvL, G32mL, ConvL, OmL, CsL, SsL, QfL, KvfL, QmL, GfL, PfL, FbL, OffL, CtrL, TkL, DkL, TM, NL](wbuf, off, X, CurB, ResB, Qkvm, Zm, Araw, Braw, Eg, Beta, Conv, So, ConvState, SAll, Qfm, Kflat, Vflat, Q, Gate, Ao, kc, vc, Pg, Pu, FgB, Ctr, prof, dbg, Toks, Dtok, Hn, hmax, hidx, ring, slots, pos, m, dump, fold_head)
+    mega_body[MR, RELOAD, XL, CBL, QkvL, G32mL, ConvL, OmL, CsL, SsL, QfL, KvfL, QmL, GfL, PfL, FbL, OffL, CtrL, TkL, DkL, TM, NL](wbuf, off, X, CurB, ResB, Qkvm, Zm, Araw, Braw, Eg, Beta, Conv, So, ConvState, SAll, Qfm, Kflat, Vflat, Q, Gate, Ao, kc, vc, Pg, Pu, FgB, Ctr, prof, dbg, Toks, Dtok, Hn, hmax, hidx, ring, slots, pos, m, dump, fold_head)
 
 
 def amar_mega_window[
-    MR: Int,
+    MR: Int, RELOAD: Bool,
     XL: TensorLayout, CBL: TensorLayout,
     QkvL: TensorLayout, G32mL: TensorLayout, ConvL: TensorLayout, OmL: TensorLayout,
     CsL: TensorLayout, SsL: TensorLayout,
@@ -1137,4 +1139,4 @@ def amar_mega_window[
     hidx: MutPointer[Scalar[i32], MutAnyOrigin],
     ring: Int32, slots: Int32, pos: Int32, m: Int32, dump: Int32, fold_head: Int32,
 ):
-    mega_body[MR, XL, CBL, QkvL, G32mL, ConvL, OmL, CsL, SsL, QfL, KvfL, QmL, GfL, PfL, FbL, OffL, CtrL, TkL, DkL, TM, NL](wbuf, off, X, CurB, ResB, Qkvm, Zm, Araw, Braw, Eg, Beta, Conv, So, ConvState, SAll, Qfm, Kflat, Vflat, Q, Gate, Ao, kc, vc, Pg, Pu, FgB, Ctr, prof, dbg, Toks, Dtok, Hn, hmax, hidx, ring, slots, pos, m, dump, fold_head)
+    mega_body[MR, RELOAD, XL, CBL, QkvL, G32mL, ConvL, OmL, CsL, SsL, QfL, KvfL, QmL, GfL, PfL, FbL, OffL, CtrL, TkL, DkL, TM, NL](wbuf, off, X, CurB, ResB, Qkvm, Zm, Araw, Braw, Eg, Beta, Conv, So, ConvState, SAll, Qfm, Kflat, Vflat, Q, Gate, Ao, kc, vc, Pg, Pu, FgB, Ctr, prof, dbg, Toks, Dtok, Hn, hmax, hidx, ring, slots, pos, m, dump, fold_head)
