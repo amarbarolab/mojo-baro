@@ -34,3 +34,17 @@ some of it: **-5% to +3%**, and any NOT-RESIDENT in 20 runs disqualifies it as a
 P1+P2: **119.5 -> 126-132 (+5-10%)**: wide phases lose the A unpack (VALU -25%) and the A VMEM reads; ffn down and
 the head gain most. Land >= 124 (+4%); close < 122. Stop rules: P1 any mismatch = a staging index bug, fix it,
 never the check; P1 LDS > 56 KB = drop the f32 form for bf16 in LDS (unpack stays) and re-freeze the number.
+
+## P0 result (2026-09-06, `results/mega-structural/p0-*.log`)
+
+| binary | VGPR / spills | tok/s_gen (3 runs) | tokens | 20-prompt A/B vs HEAD |
+|---|---|---|---|---|
+| HEAD (256 cap, G=96) | 256 / 77 | 119-120 | 64/64 | 119.14 (spread 3.2%) |
+| 192 cap, G=96 | 192 / 310 | 105.6-105.8 | 64/64 | **105.00 (8.5%), 0.881x** |
+| 192 cap, G=192 | 192 / 310 | 61.6-68.1 | **wrong from token 14-25 (argmax 0)** | not run |
+
+The cap alone costs 12% (spills 77 -> 310, in the dot loops); G=192 on top runs at half speed and stops
+producing tokens mid-sequence with no host-visible fail line: consistent with the zero-slack residency
+receipt (a stolen CU slot trips the bounded barrier; the kernel returns early; the host reads zeros). Occupancy
+via the register cap is closed for the q4 path too, with numbers. The 1024-thread-block variant (32 waves per
+CU in one block, no residency risk) would need the same 192 cap and therefore the same spills; not pursued.
