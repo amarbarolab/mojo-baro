@@ -7,7 +7,7 @@ GEMM; f32 tensors (norms, conv, ssm scalars) as-is. Emits, per line:
 in a fixed, engine-known order. The blk.32 NextN draft head is appended
 after output.weight, so every trunk offset is unchanged by its presence.
 
-Usage: tools/engine-pack.py MODEL.gguf OUTDIR [--q8|--q2b3|--tq1|--tq2] [--q4-draft]
+Usage: tools/engine-pack.py MODEL.gguf OUTDIR [--q8|--q4|--q2b3|--tq1|--tq2] [--q4-draft]
 
 --q8: every 2D bf16 weight except token_embd is stored int8 in weight-native
 [out, in] layout followed by fp16 block scales [out, in/32], ggml q8_0
@@ -199,12 +199,16 @@ def main():
     q8 = "--q8" in sys.argv
     if q8:
         sys.argv.remove("--q8")
+    q4 = "--q4" in sys.argv
+    if q4:
+        sys.argv.remove("--q4")
+    assert not (q8 and q4), "--q8 and --q4 are exclusive"
     ternary = None
     for flag in TERNARY:
         if "--" + flag in sys.argv:
             sys.argv.remove("--" + flag)
             ternary = flag
-    assert not (q8 and ternary), "--q8 and a ternary flag are exclusive"
+    assert not ((q8 or q4) and ternary), "--q8/--q4 and a ternary flag are exclusive"
     q4_draft = "--q4-draft" in sys.argv
     if q4_draft:
         sys.argv.remove("--q4-draft")
@@ -234,6 +238,10 @@ def main():
                     q, d = quantize_q8_0(w)
                     raw = q.tobytes() + d.tobytes()
                     tname = "q8"
+                elif q4:
+                    q, d = quantize_q4_0(w)
+                    raw = q.tobytes() + d.tobytes()
+                    tname = "q4"
                 elif ternary:
                     q, d = TERNARY[ternary](w)
                     raw = q.tobytes() + d.tobytes()

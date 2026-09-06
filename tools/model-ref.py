@@ -43,6 +43,22 @@ def T(name, shape):
         w = np.ascontiguousarray((q.astype(np.float32) * d.astype(np.float32)).reshape(n_out, n_in).T)
         _Q8_CACHE[name] = w
         return w
+    if dt == "q4":
+        # ggml Q4_0: per 32-block, 16 bytes; byte j holds element j (low nibble)
+        # and element j+16 (high nibble), value = (nibble - 8) * d. Same cached
+        # [in, out] f32 view as the q8 path.
+        if name in _Q8_CACHE:
+            return _Q8_CACHE[name]
+        n_in, n_out = shape
+        nb = n_in // 32
+        b = pack[off : off + n // 2].view(np.uint8).reshape(n_out, nb, 16)
+        d = pack[off + n // 2 : off + n // 2 + nb * n_out * 2].view(np.float16).reshape(n_out, nb, 1)
+        lo = (b & 0xF).astype(np.float32) - 8.0
+        hi = (b >> 4).astype(np.float32) - 8.0
+        q = np.concatenate([lo, hi], axis=2)
+        w = np.ascontiguousarray((q * d.astype(np.float32)).reshape(n_out, n_in).T)
+        _Q8_CACHE[name] = w
+        return w
     return pack[off : off + n * 4].view(np.float32).reshape(shape).copy()
 
 

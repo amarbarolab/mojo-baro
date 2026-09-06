@@ -152,7 +152,7 @@ def blk32_forward(
     mut hd_d: DeviceBuffer[f32], mut kc32_d: DeviceBuffer[f32], mut vc32_d: DeviceBuffer[f32],
     mut toks_d: DeviceBuffer[DType.int32], mut dtok_d: DeviceBuffer[DType.int32],
     prof3: Bool, mut p3: List[Int],
-    draft_q4: Bool, q4_off: Int,
+    draft_q4: Bool, q4_off: Int, pack_q4: Bool,
 ) raises:
     # blk.32 (NextN) draft head over m rows: row r is token Toks[tok_pos + r]
     # at sequence position pos + r, paired with hidden row r of hsrc
@@ -187,7 +187,7 @@ def blk32_forward(
     var Wehq = tens_q8q(ctx, wbuf, off[e + 11], QF * H, q_qf_h)
     var Wehs = tens_q8s(ctx, wbuf, off[e + 11], QF * H, s_qf_h)
     var PhEh = TileTensor(p_h_d, p_h)
-    gemm_q8(ctx, CcM, Wehq, Wehs, PhEh, m, H, QF)
+    gemm_w[H, QF](ctx, CcM, wbuf, off[e + 11], pack_q4, PhEh, m)
     ctx.enqueue_function[r_h](PhEh, Xm, Int32(m), Int32(H), grid_dim=ceildiv(m * H, 256), block_dim=256)
 
     var AttNorm32 = tens_f32(ctx, wbuf, off[e + 0], H, h_layout)
@@ -218,11 +218,11 @@ def blk32_forward(
     var Aoflat = TileTensor(ao_d, xflat_layout)
     var AoB = TileTensor(resb_d, xflat_layout)
     var AoBm = TileTensor(resb_d, xm_layout)
-    gemm_q8(ctx, CurBm, Wqq, Wqs, Pqf, m, QF, H)
+    gemm_w[QF, H](ctx, CurBm, wbuf, off[e + 1], pack_q4, Pqf, m)
     ctx.enqueue_function[r_qf](Pqf, Qfm, Int32(m), Int32(QF), grid_dim=ceildiv(m * QF, 256), block_dim=256)
-    gemm_q8(ctx, CurBm, Wkq, Wks, Pkv, m, KV, H)
+    gemm_w[KV, H](ctx, CurBm, wbuf, off[e + 2], pack_q4, Pkv, m)
     ctx.enqueue_function[r_kv](Pkv, Kflat, Int32(m), Int32(KV), grid_dim=ceildiv(m * KV, 256), block_dim=256)
-    gemm_q8(ctx, CurBm, Wvq, Wvs, Pkv, m, KV, H)
+    gemm_w[KV, H](ctx, CurBm, wbuf, off[e + 3], pack_q4, Pkv, m)
     ctx.enqueue_function[r_kv](Pkv, Vflat, Int32(m), Int32(KV), grid_dim=ceildiv(m * KV, 256), block_dim=256)
     ctx.enqueue_function[split_k](Qfm, Q, Gate, grid_dim=(NQH, m), block_dim=HD)
     ctx.enqueue_function[hrms_q](Q, Qn, Float32(1e-6), grid_dim=m * NQH, block_dim=HD)
@@ -233,7 +233,7 @@ def blk32_forward(
     ctx.enqueue_function[append_k](Vc, Vhd, Int32(pos), grid_dim=(NKVH, m), block_dim=HD)
     ctx.enqueue_function[att_k](Q, Kc, Vc, Ao, Int32(pos + 1), Float32(0.0625), grid_dim=(NQH, m), block_dim=HD)
     ctx.enqueue_function[gmul_k](Aoflat, Gate, AoB, Int32(m * H), grid_dim=ceildiv(m * H, 256), block_dim=256)
-    gemm_q8(ctx, AoBm, Woq, Wos, Ph, m, H, H)
+    gemm_w[H, H](ctx, AoBm, wbuf, off[e + 6], pack_q4, Ph, m)
     ctx.enqueue_function[r_add](Ph, Xm, Int32(m), Int32(H), grid_dim=ceildiv(m * H, 256), block_dim=256)
 
     var PostAttnNorm = tens_f32(ctx, wbuf, off[e + 7], H, h_layout)
@@ -248,10 +248,10 @@ def blk32_forward(
     var Pu = TileTensor(p_ffn2_d, p_ffn)
     var Ph2 = TileTensor(p_h_d, p_h)
     var FgBm = TileTensor(fgb_d, ffnm_layout)
-    gemm_q8(ctx, CurBm, Wfgq, Wfgs, Pg, m, FFN, H)
-    gemm_q8(ctx, CurBm, Wfuq, Wfus, Pu, m, FFN, H)
+    gemm_w[FFN, H](ctx, CurBm, wbuf, off[e + 8], pack_q4, Pg, m)
+    gemm_w[FFN, H](ctx, CurBm, wbuf, off[e + 9], pack_q4, Pu, m)
     ctx.enqueue_function[r_swiglu](Pg, Pu, FgBm, Int32(m), Int32(FFN), grid_dim=ceildiv(m * FFN, 256), block_dim=256)
-    gemm_q8(ctx, FgBm, Wfdq, Wfds, Ph2, m, H, FFN)
+    gemm_w[H, FFN](ctx, FgBm, wbuf, off[e + 10], pack_q4, Ph2, m)
     ctx.enqueue_function[r_add](Ph2, Xm, Int32(m), Int32(H), grid_dim=ceildiv(m * H, 256), block_dim=256)
 
     var SharedHeadNorm = tens_f32(ctx, wbuf, off[e + 14], H, h_layout)
@@ -272,7 +272,7 @@ def blk32_forward(
         else:
             var Wheadq = tens_q8q(ctx, wbuf, off[e - 1], H * VOCAB, q_h_v)
             var Wheads = tens_q8s(ctx, wbuf, off[e - 1], H * VOCAB, s_h_v)
-            gemm_q8(ctx, CurBm, Wheadq, Wheads, Pv, m, VOCAB, H)
+            gemm_w[VOCAB, H](ctx, CurBm, wbuf, off[e - 1], pack_q4, Pv, m)
         ctx.enqueue_function[r_head](Pv, Logitsm, Int32(m), Int32(VOCAB), grid_dim=ceildiv(m * VOCAB, 256), block_dim=256)
         if prof3:
             ctx.synchronize()
@@ -283,6 +283,22 @@ def blk32_forward(
         if prof3:
             ctx.synchronize()
             p3[2] += Int(perf_counter_ns() - t3)
+
+
+
+def gemm_w[
+    N: Int, K: Int, AL: TensorLayout, PL: TensorLayout
+](
+    ctx: DeviceContext,
+    A: TileTensor[bf16, AL, MutAnyOrigin],
+    wbuf: DeviceBuffer[DType.uint8], o: Int, q4: Bool,
+    P: TileTensor[f32, PL, MutAnyOrigin],
+    m: Int,
+) raises:
+    if q4:
+        gemm_q4(ctx, A, tens_q4q(ctx, wbuf, o, N * K, row_major[N, K // 2]()), tens_q4s(ctx, wbuf, o, N * K, row_major[N, K // 32]()), P, m, N, K)
+    else:
+        gemm_q8(ctx, A, tens_q8q(ctx, wbuf, o, N * K, row_major[N, K]()), tens_q8s(ctx, wbuf, o, N * K, row_major[N, K // 32]()), P, m, N, K)
 
 
 def main() raises:
@@ -296,6 +312,7 @@ def main() raises:
     var total = 0
     var q4_off = 0
     var have_q4_draft = False
+    var pack_q4 = False
     with open(packdir + "/index.txt", "r") as f:
         for line in f.read().splitlines():
             var parts = line.split(" ")
@@ -311,19 +328,24 @@ def main() raises:
             elif dt == "q8":
                 total += n + (n // 32) * 2
             elif dt == "q4":
-                # trailing entry (tools/engine-pack.py --q4-draft): the draft
-                # head's own q4 copy of output.weight, appended after the
-                # trunk order -- excluded from the blk.32 index math below.
-                q4_off = Int(parts[2])
-                have_q4_draft = True
+                if String(parts[0]) == "output.weight.q4draft":
+                    # trailing entry (tools/engine-pack.py --q4-draft): the draft
+                    # head's own q4 copy of output.weight, appended after the
+                    # trunk order -- excluded from the blk.32 index math below.
+                    q4_off = Int(parts[2])
+                    have_q4_draft = True
+                else:
+                    # --q4 pack: every 2D trunk weight is ggml Q4_0
+                    pack_q4 = True
                 total += n // 2 + (n // 32) * 2
             else:
                 raise Error("unknown pack dtype " + dt)
     var draft_q4 = getenv("BARO_DRAFT_Q4", "0") == "1" and have_q4_draft
     print("BARO_DRAFT_Q4:", draft_q4)
-    var dot3 = getenv("BARO_DOT", "0") == "1"
+    var dot3 = getenv("BARO_DOT", "0") == "1" and not pack_q4
     print("BARO_DOT:", dot3)
-    var mega = getenv("BARO_MEGA", "1") == "1"
+    print("pack q4 trunk:", pack_q4)
+    var mega = getenv("BARO_MEGA", "1") == "1" and not pack_q4
     print("BARO_MEGA:", mega)
     var mega_win = getenv("BARO_MEGA_WIN", "0") == "1"
     print("BARO_MEGA_WIN:", mega_win)
@@ -589,7 +611,7 @@ def main() raises:
             blk32_forward(ctx, wbuf, off, e, nproc, pos_prev + 1, pos_prev + 1, True, hn_rows,
                 x_d, curb_d, qf_d, q_d, k_d, v_d, gate_d, ao_d, resb_d, fgb_d, p_qf_d, p_kv_d, p_h_d,
                 p_ffn_d, p_ffn2_d, p_v_d, logits_d, cc_d, de_d, hd_d, kc32_d, vc32_d, toks_d, dtok_d,
-                pf3, p3, draft_q4, q4_off)
+                pf3, p3, draft_q4, q4_off, pack_q4)
             var Dtok = TileTensor(dtok_d, dtok_layout)
             ctx.enqueue_function[tokcp_k](Dtok, Toks, Int32(nproc - 1), Int32(pos + 1), Int32(1), grid_dim=1, block_dim=32)
             m = min(kcfg + 1, n_total - 1 - pos)
@@ -603,7 +625,7 @@ def main() raises:
                 blk32_forward(ctx, wbuf, off, e, 1, pos + j, pos + j, True, hd_row,
                     x_d, curb_d, qf_d, q_d, k_d, v_d, gate_d, ao_d, resb_d, fgb_d, p_qf_d, p_kv_d, p_h_d,
                     p_ffn_d, p_ffn2_d, p_v_d, logits_d, cc_d, de_d, hd_d, kc32_d, vc32_d, toks_d, dtok_d,
-                    pf3, p3, draft_q4, q4_off)
+                    pf3, p3, draft_q4, q4_off, pack_q4)
                 ctx.enqueue_function[tokcp_k](Dtok, Toks, Int32(0), Int32(pos + j + 1), Int32(1), grid_dim=1, block_dim=32)
                 hrow = 0
             n_drafted += m - 1
@@ -703,11 +725,11 @@ def main() raises:
                 var AoB = TileTensor(resb_d, xflat_layout)
                 var AoBm = TileTensor(resb_d, xm_layout)
 
-                gemm_q8(ctx, CurBm, Wqq, Wqs, Pqf, m, QF, H)
+                gemm_w[QF, H](ctx, CurBm, wbuf, off[w + 1], pack_q4, Pqf, m)
                 ctx.enqueue_function[r_qf](Pqf, Qfm, Int32(m), Int32(QF), grid_dim=ceildiv(m * QF, 256), block_dim=256)
-                gemm_q8(ctx, CurBm, Wkq, Wks, Pkv, m, KV, H)
+                gemm_w[KV, H](ctx, CurBm, wbuf, off[w + 2], pack_q4, Pkv, m)
                 ctx.enqueue_function[r_kv](Pkv, Kflat, Int32(m), Int32(KV), grid_dim=ceildiv(m * KV, 256), block_dim=256)
-                gemm_q8(ctx, CurBm, Wvq, Wvs, Pkv, m, KV, H)
+                gemm_w[KV, H](ctx, CurBm, wbuf, off[w + 3], pack_q4, Pkv, m)
                 ctx.enqueue_function[r_kv](Pkv, Vflat, Int32(m), Int32(KV), grid_dim=ceildiv(m * KV, 256), block_dim=256)
                 ctx.enqueue_function[split_k](Qfm, Q, Gate, grid_dim=(NQH, m), block_dim=HD)
                 ctx.enqueue_function[hrms_q](Q, Qn, Float32(1e-6), grid_dim=m * NQH, block_dim=HD)
@@ -718,7 +740,7 @@ def main() raises:
                 ctx.enqueue_function[append_k](Vc, Vhd, Int32(pos), grid_dim=(NKVH, m), block_dim=HD)
                 ctx.enqueue_function[att_k](Q, Kc, Vc, Ao, Int32(pos + 1), Float32(0.0625), grid_dim=(NQH, m), block_dim=HD)
                 ctx.enqueue_function[gmul_k](Aoflat, Gate, AoB, Int32(m * H), grid_dim=ceildiv(m * H, 256), block_dim=256)
-                gemm_q8(ctx, AoBm, Woq, Wos, Ph, m, H, H)
+                gemm_w[H, H](ctx, AoBm, wbuf, off[w + 6], pack_q4, Ph, m)
                 ctx.enqueue_function[r_add](Ph, Xm, Int32(m), Int32(H), grid_dim=ceildiv(m * H, 256), block_dim=256)
                 att_i += 1
                 w += 7
@@ -749,10 +771,10 @@ def main() raises:
                 var So = TileTensor(so_d, om_layout)
                 var ResBm = TileTensor(resb_d, xm_layout)
 
-                gemm_q8(ctx, CurBm, Wqkvq, Wqkvs, Pq, m, CONV, H)
-                gemm_q8(ctx, CurBm, Wzq, Wzs, Ph, m, H, H)
-                gemm_q8(ctx, CurBm, Waq, Was, Pab, m, NH_V, H)
-                gemm_q8(ctx, CurBm, Wbq, Wbs, Pab2, m, NH_V, H)
+                gemm_w[CONV, H](ctx, CurBm, wbuf, off[w + 1], pack_q4, Pq, m)
+                gemm_w[H, H](ctx, CurBm, wbuf, off[w + 2], pack_q4, Ph, m)
+                gemm_w[NH_V, H](ctx, CurBm, wbuf, off[w + 3], pack_q4, Pab, m)
+                gemm_w[NH_V, H](ctx, CurBm, wbuf, off[w + 4], pack_q4, Pab2, m)
                 ctx.enqueue_function[r_qf](Pq, Qkvm, Int32(m), Int32(CONV), grid_dim=ceildiv(m * CONV, 256), block_dim=256)
                 ctx.enqueue_function[r_h](Ph, Zm, Int32(m), Int32(H), grid_dim=ceildiv(m * H, 256), block_dim=256)
 
@@ -792,7 +814,7 @@ def main() raises:
                     var nw = perf_counter_ns()
                     pc[5] += Int(nw - tq)
                     tq = nw
-                gemm_q8(ctx, ResBm, Wsoutq, Wsouts, Ph, m, H, H)
+                gemm_w[H, H](ctx, ResBm, wbuf, off[w + 9], pack_q4, Ph, m)
                 ctx.enqueue_function[r_add](Ph, Xm, Int32(m), Int32(H), grid_dim=ceildiv(m * H, 256), block_dim=256)
                 ssm_i += 1
                 w += 10
@@ -840,7 +862,7 @@ def main() raises:
                 quant_rows(ctx, CurBm, AqH, AsH, m, H)
                 gemm_q8dot(ctx, AqH, AsH, Wfgq, Wfgs, Pg, m, FFN, H)
             else:
-                gemm_q8(ctx, CurBm, Wfgq, Wfgs, Pg, m, FFN, H)
+                gemm_w[FFN, H](ctx, CurBm, wbuf, off[w + 1], pack_q4, Pg, m)
             if pf4:
                 ctx.synchronize()
                 var nw = perf_counter_ns()
@@ -849,7 +871,7 @@ def main() raises:
             if use_dot:
                 gemm_q8dot(ctx, AqH, AsH, Wfuq, Wfus, Pu, m, FFN, H)
             else:
-                gemm_q8(ctx, CurBm, Wfuq, Wfus, Pu, m, FFN, H)
+                gemm_w[FFN, H](ctx, CurBm, wbuf, off[w + 2], pack_q4, Pu, m)
             if pf4:
                 ctx.synchronize()
                 var nw = perf_counter_ns()
@@ -867,7 +889,7 @@ def main() raises:
                 quant_rows(ctx, FgBm, AqF, AsF, m, FFN)
                 gemm_q8dot(ctx, AqF, AsF, Wfdq, Wfds, Ph2, m, H, FFN)
             else:
-                gemm_q8(ctx, FgBm, Wfdq, Wfds, Ph2, m, H, FFN)
+                gemm_w[H, FFN](ctx, FgBm, wbuf, off[w + 3], pack_q4, Ph2, m)
             if pf4:
                 ctx.synchronize()
                 var nw = perf_counter_ns()
@@ -913,7 +935,7 @@ def main() raises:
                 )
                 var Wheadq = tens_q8q(ctx, wbuf, off[w + 1], H * VOCAB, q_h_v)
                 var Wheads = tens_q8s(ctx, wbuf, off[w + 1], H * VOCAB, s_h_v)
-                gemm_q8(ctx, CurBm, Wheadq, Wheads, Pv, m, VOCAB, H)
+                gemm_w[VOCAB, H](ctx, CurBm, wbuf, off[w + 1], pack_q4, Pv, m)
                 ctx.enqueue_function[r_head](Pv, Logitsm, Int32(m), Int32(VOCAB), grid_dim=ceildiv(m * VOCAB, 256), block_dim=256)
             if use_mega:
                 pass
@@ -1045,7 +1067,7 @@ def main() raises:
     blk32_forward(ctx, wbuf, off, e, 1, 0, n_total - 1, True, hn_last,
         x_d, curb_d, qf_d, q_d, k_d, v_d, gate_d, ao_d, resb_d, fgb_d, p_qf_d, p_kv_d, p_h_d,
         p_ffn_d, p_ffn2_d, p_v_d, logits_d, cc_d, de_d, hd_d, kc32_d, vc32_d, toks_d, dtok_d,
-        False, p3, False, 0)
+        False, p3, False, 0, pack_q4)
     var last_tok = generated[len(generated) - 1]
     ctx.synchronize()
     var draft_logits_h = ctx.enqueue_create_host_buffer[f32](VOCAB)

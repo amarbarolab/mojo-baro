@@ -1,5 +1,5 @@
 from std.math import ceildiv
-from max.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext, DeviceBuffer
 from layout import TileTensor, TensorLayout, row_major
 
 from elementwise import (
