@@ -395,6 +395,102 @@ def amar_matmul_skinny_q4row[
                 Cp[0, r, row] = rebind[Cp.ElementType](total)
 
 
+@always_inline
+def bf16x16_to_f32(a: SIMD[DType.bfloat16, 16]) -> SIMD[dtype, 16]:
+    var au = bitcast[DType.uint32, 8](a)
+    var lo = bitcast[dtype, 8](au << 16)
+    var hi = bitcast[dtype, 8](au & 0xFFFF0000)
+    return lo.interleave(hi)
+
+
+def amar_matmul_skinny_q4rowb[
+    UNROLL: Int, MR: Int,
+    ALayout: TensorLayout, QLayout: TensorLayout, SLayout: TensorLayout,
+    PLayout: TensorLayout
+](
+    A: TileTensor[DType.bfloat16, ALayout, MutAnyOrigin],
+    Q: TileTensor[DType.uint8, QLayout, MutAnyOrigin],
+    S: TileTensor[DType.float16, SLayout, MutAnyOrigin],
+    Cp: TileTensor[dtype, PLayout, MutAnyOrigin],
+    m: Int32,
+    n: Int32,
+    k_dim: Int32,
+):
+    # Same contract and bit-identical results as amar_matmul_skinny_q4row
+    # (bench/q4-alu-protocol.md A1): nibbles are masked as u32 so each byte
+    # converts with one v_cvt_f32_ubyteN, the -8 is folded into the scale as
+    # fma(nib, d, -8d) (one rounding of the same real number), the bf16 A
+    # unpack is a shift or a mask per element, the accumulate chain is the
+    # q4row one.
+    comptime assert A.flat_rank == 2 and Q.flat_rank == 2
+    comptime assert S.flat_rank == 2 and Cp.flat_rank == 3
+
+    var M = Int(m)
+    var N = Int(n)
+    var K = Int(k_dim)
+    var lane = Int(lane_id())
+    var row = Int(block_idx.x) * ROW_WAVES + Int(thread_idx.x) // WARP_SIZE
+    if row >= N:
+        return
+
+    comptime QV = 16
+    comptime STEP = WARP_SIZE
+    var Qb = Q.vectorize[1, QV]()
+    var Av = A.vectorize[1, QV]()
+    var acc = InlineArray[SIMD[dtype, QV], MR](fill=SIMD[dtype, QV](0))
+
+    var nb = K // 32
+    var kk = 0
+    while kk + UNROLL * STEP <= nb:
+        var bytes_u = InlineArray[SIMD[DType.uint8, QV], UNROLL](uninitialized=True)
+        var ds = InlineArray[Scalar[DType.float16], UNROLL](uninitialized=True)
+
+        comptime for u in range(UNROLL):
+            var blk = kk + u * STEP + lane
+            bytes_u[u] = rebind[SIMD[DType.uint8, QV]](Qb[row, blk])
+            ds[u] = rebind[Scalar[DType.float16]](S[row, blk])
+
+        comptime for u in range(UNROLL):
+            var blk = kk + u * STEP + lane
+            var d = ds[u].cast[dtype]()
+            var w32 = bitcast[DType.uint32, 4](bytes_u[u])
+            var lo = bitcast[DType.uint8, QV](w32 & 0x0F0F0F0F).cast[dtype]()
+            var hi = bitcast[DType.uint8, QV]((w32 >> 4) & 0x0F0F0F0F).cast[dtype]()
+            var dv = SIMD[dtype, QV](d)
+            var m8d = SIMD[dtype, QV](d * -8)
+            var wlo = fma(lo, dv, m8d)
+            var whi = fma(hi, dv, m8d)
+            comptime for r in range(MR):
+                if r < M:
+                    var a_lo = bf16x16_to_f32(rebind[SIMD[DType.bfloat16, QV]](Av[r, blk * 2]))
+                    var a_hi = bf16x16_to_f32(rebind[SIMD[DType.bfloat16, QV]](Av[r, blk * 2 + 1]))
+                    acc[r] = fma(wlo, a_lo, fma(whi, a_hi, acc[r]))
+        kk += UNROLL * STEP
+    while kk < nb:
+        var blk = kk + lane
+        var bytes1 = rebind[SIMD[DType.uint8, QV]](Qb[row, blk])
+        var d = rebind[Scalar[DType.float16]](S[row, blk]).cast[dtype]()
+        var w32 = bitcast[DType.uint32, 4](bytes1)
+        var lo = bitcast[DType.uint8, QV](w32 & 0x0F0F0F0F).cast[dtype]()
+        var hi = bitcast[DType.uint8, QV]((w32 >> 4) & 0x0F0F0F0F).cast[dtype]()
+        var dv = SIMD[dtype, QV](d)
+        var m8d = SIMD[dtype, QV](d * -8)
+        var wlo = fma(lo, dv, m8d)
+        var whi = fma(hi, dv, m8d)
+        comptime for r in range(MR):
+            if r < M:
+                var a_lo = bf16x16_to_f32(rebind[SIMD[DType.bfloat16, QV]](Av[r, blk * 2]))
+                var a_hi = bf16x16_to_f32(rebind[SIMD[DType.bfloat16, QV]](Av[r, blk * 2 + 1]))
+                acc[r] = fma(wlo, a_lo, fma(whi, a_hi, acc[r]))
+        kk += STEP
+
+    comptime for r in range(MR):
+        if r < M:
+            var total = warp.sum(acc[r].reduce_add())
+            if lane == 0:
+                Cp[0, r, row] = rebind[Cp.ElementType](total)
+
+
 def amar_matmul_skinny_q8dot[
     UNROLL: Int, MR: Int,
     AQLayout: TensorLayout, ASLayout: TensorLayout,

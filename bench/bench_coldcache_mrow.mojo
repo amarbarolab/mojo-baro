@@ -16,6 +16,7 @@ fp64-per-row host check, timed against this run's own q8row MR=1 number.
 """
 
 from std.math import ceildiv
+from std.memory import bitcast
 from std.sys import has_accelerator
 from std.time import perf_counter_ns
 
@@ -23,7 +24,7 @@ from max.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
 from layout import TileTensor, row_major
 
 from matmul_skinny import (
-    amar_matmul_skinny_q8row, amar_matmul_skinny_q8dot, amar_matmul_skinny_q4row,
+    amar_matmul_skinny_q8row, amar_matmul_skinny_q8dot, amar_matmul_skinny_q4row, amar_matmul_skinny_q4rowb,
     SM, SPLITK, ROW_WAVES, ROW_THREADS,
 )
 from elementwise import amar_quantize_q8_rows
@@ -377,6 +378,98 @@ def run_q4_arm(
     return us
 
 
+def run_q4b_arm(
+    ctx: DeviceContext,
+    a_host: HostBuffer[bf16],
+    q4_dev: DeviceBuffer[u8],
+    q8row_us1: Float64,
+    q4row_us: Float64,
+) raises -> Float64:
+    # bench/q4-alu-protocol.md A1: amar_matmul_skinny_q4rowb must be BITWISE
+    # equal to amar_matmul_skinny_q4row on every output, then timed the same way.
+    comptime MR = 1
+    comptime UNROLL = 2
+    comptime a_layout = row_major[MR, K]()
+    comptime q4row = amar_matmul_skinny_q4row[
+        UNROLL, MR, type_of(a_layout), type_of(q4_layout), type_of(s_layout), type_of(p_layout)
+    ]
+    comptime q4rowb = amar_matmul_skinny_q4rowb[
+        UNROLL, MR, type_of(a_layout), type_of(q4_layout), type_of(s_layout), type_of(p_layout)
+    ]
+
+    var a_host_mr = ctx.enqueue_create_host_buffer[bf16](MR * K)
+    ctx.synchronize()
+    for i in range(MR * K):
+        a_host_mr[i] = a_host[i]
+    var a_dev = ctx.enqueue_create_buffer[bf16](MR * K)
+    ctx.enqueue_copy(dst_buf=a_dev, src_buf=a_host_mr)
+    var p_dev = ctx.enqueue_create_buffer[f32](SPLITK * SM * N)
+    var p_ref_dev = ctx.enqueue_create_buffer[f32](SPLITK * SM * N)
+    var p_host = ctx.enqueue_create_host_buffer[f32](SPLITK * SM * N)
+    var p_ref = ctx.enqueue_create_host_buffer[f32](SPLITK * SM * N)
+    ctx.synchronize()
+
+    var A = TileTensor(a_dev, a_layout)
+    var Cp = TileTensor(p_dev, p_layout)
+    var Cr = TileTensor(p_ref_dev, p_layout)
+
+    print(
+        "MR=" + String(MR) + "(q4b)", "UNROLL=" + String(UNROLL), "grid_dim=" + String(GR),
+        "block_dim=" + String(ROW_THREADS), "ROW_WAVES=" + String(ROW_WAVES),
+    )
+
+    var qt0 = q4_tensors(ctx, q4_dev, 0)
+    ctx.enqueue_function[q4row](
+        A, qt0[0], qt0[1], Cr, Int32(MR), Int32(N), Int32(K), grid_dim=GR, block_dim=ROW_THREADS
+    )
+    ctx.enqueue_function[q4rowb](
+        A, qt0[0], qt0[1], Cp, Int32(MR), Int32(N), Int32(K), grid_dim=GR, block_dim=ROW_THREADS
+    )
+    ctx.enqueue_copy(dst_buf=p_host, src_buf=p_dev)
+    ctx.enqueue_copy(dst_buf=p_ref, src_buf=p_ref_dev)
+    ctx.synchronize()
+
+    var bad = 0
+    var first = -1
+    for j in range(N):
+        if bitcast[DType.uint32, 1](p_host[j]) != bitcast[DType.uint32, 1](p_ref[j]):
+            bad += 1
+            if first < 0:
+                first = j
+    if bad > 0:
+        print("MR=1(q4b)", "m=1", "FAIL bitwise vs q4row: " + String(bad) + " / " + String(N) + " rows differ, first row " + String(first) + " " + String(p_host[first]) + " vs " + String(p_ref[first]))
+        return -1.0
+    print("MR=1(q4b) bitwise equal to q4row on", N, "rows")
+
+    var w0 = perf_counter_ns()
+    while Float64(perf_counter_ns() - w0) / 1.0e9 < 1.0:
+        for b in range(NBUF):
+            var qtw = q4_tensors(ctx, q4_dev, b)
+            ctx.enqueue_function[q4rowb](
+                A, qtw[0], qtw[1], Cp, Int32(MR), Int32(N), Int32(K), grid_dim=GR, block_dim=ROW_THREADS
+            )
+            ctx.synchronize()
+
+    var durs = InlineArray[Float64, ITERS](uninitialized=True)
+    for it in range(ITERS):
+        var qtw = q4_tensors(ctx, q4_dev, it % NBUF)
+        var t0 = perf_counter_ns()
+        ctx.enqueue_function[q4rowb](
+            A, qtw[0], qtw[1], Cp, Int32(MR), Int32(N), Int32(K), grid_dim=GR, block_dim=ROW_THREADS
+        )
+        ctx.synchronize()
+        durs[it] = Float64(perf_counter_ns() - t0) / 1.0e3
+
+    var us = median_us(durs)
+    var gbps = Float64(QBYTES4) / (us * 1.0e-6) / 1.0e9
+    print(
+        "MR=1(q4b)", "m=1", "us=" + String(us), "GBps=" + String(gbps),
+        "ratio_vs_q8row_MR1=" + String(us / q8row_us1 if q8row_us1 > 0 else 0.0),
+        "ratio_vs_q4row=" + String(us / q4row_us if q4row_us > 0 else 0.0), "correct=true",
+    )
+    return us
+
+
 def main() raises:
     comptime assert has_accelerator(), "Requires a GPU"
     var ctx = DeviceContext()
@@ -418,4 +511,5 @@ def main() raises:
         ctx.enqueue_copy(dst_buf=qb, src_buf=q4_host)
     ctx.synchronize()
 
-    _ = run_q4_arm(ctx, a_host, q4_host, q4_dev, us1)
+    var us4 = run_q4_arm(ctx, a_host, q4_host, q4_dev, us1)
+    _ = run_q4b_arm(ctx, a_host, q4_dev, us1, us4)
