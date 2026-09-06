@@ -13,7 +13,7 @@ from layout import TileTensor, TensorLayout, row_major, stack_allocation
 from elementwise import EW_THREADS
 from matmul_skinny import ROW_WAVES, ROW_THREADS, q4_dot_blocks, bf16x16_to_f32
 from ssm import CONV, KDIM, NH_K, NH_V, SSTATE, SSM_EPS
-from attn import HD, NQH, NKVH, MAX_T, NROT, YARN_LOW, YARN_HIGH, FREQ_BASE, FREQ_SCALE, MSCALE
+from attn import HD, NQH, NKVH, MAX_T, NROT, YARN_LOW, YARN_HIGH, FREQ_BASE, FREQ_SCALE, MSCALE, attn_head_body
 
 comptime u32 = DType.uint32
 comptime f32 = DType.float32
@@ -850,61 +850,7 @@ def attn_phases[
         var qrow = r * NQH + h
         var kvh = h // (NQH // NKVH)
         var T = pos + 1 + r
-        if tid < HD:
-            qs[tid] = rebind[qs.ElementType](Q[qrow, tid])
-        barrier()
-        var local_max = Float32(-3.4e38)
-        if tid < HD:
-            var t = tid
-            while t < T:
-                var acc: Float32 = 0
-                for d in range(HD):
-                    acc += rebind[Scalar[f32]](qs[d]) * rebind[Scalar[f32]](Kc[kvh, t, d])
-                scores[t] = rebind[scores.ElementType](acc * ATT_SCALE)
-                t += HD
-        barrier()
-        if tid < HD:
-            var t = tid
-            while t < T:
-                var sc = rebind[Scalar[f32]](scores[t])
-                if sc > local_max:
-                    local_max = sc
-                t += HD
-            var wmax = warp.max(local_max)
-            if lane == 0:
-                sums[wave] = rebind[sums.ElementType](wmax)
-        barrier()
-        var row_max = Float32(-3.4e38)
-        if tid < HD:
-            comptime for w in range(HD // WARP_SIZE):
-                var sc = rebind[Scalar[f32]](sums[w])
-                if sc > row_max:
-                    row_max = sc
-        barrier()
-        if tid < HD:
-            var partial: Float32 = 0
-            var t = tid
-            while t < T:
-                var e = exp(rebind[Scalar[f32]](scores[t]) - row_max)
-                scores[t] = rebind[scores.ElementType](e)
-                partial += e
-                t += HD
-            var wsum = warp.sum(partial)
-            if lane == 0:
-                sums[wave] = rebind[sums.ElementType](wsum)
-        barrier()
-        var inv: Float32 = 0
-        if tid < HD:
-            var total: Float32 = 0
-            comptime for w in range(HD // WARP_SIZE):
-                total += rebind[Scalar[f32]](sums[w])
-            inv = 1 / total
-        barrier()
-        if tid < HD:
-            var o: Float32 = 0
-            for tt in range(T):
-                o += rebind[Scalar[f32]](scores[tt]) * rebind[Scalar[f32]](Vc[kvh, tt, tid])
-            Ao[qrow, tid] = rebind[Ao.ElementType](o * inv)
+        attn_head_body(Q, Kc, Vc, Ao, qs, scores, sums, qrow, kvh, T, tid, lane, ATT_SCALE)
     if not grid_barrier(ctr, gen, fail):
         return False
     stamp(prof, pbase + 4)

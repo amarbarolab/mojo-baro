@@ -30,3 +30,15 @@ attn phase 306 -> 120-170 us per token: **125.4 -> 127-128 (+1.5-2.5%)**. Land >
 small round by design: the pool is 3.9% of the token. Stop rules: A0 any mismatch = the two copies were not the same
 computation, find the difference, do not paper over it; A1 mismatch vs model-ref = the contraction moved the tokens,
 report and revert.
+
+## Result (2026-09-06, `results/attn-latency/`)
+
+| stage | receipt |
+|---|---|
+| A0 shared body | gate all cases 0 mismatches (no numeric change) |
+| A1 | gate 0 mismatches; engine mega == launch spec 0/1; 64/64 vs model-ref; fail word 0 in 40/40 runs |
+| A2 | same stint, 2988 MHz med: **pre 125.14 (spread 2.2%) -> attn 130.74 (1.2%), 1.045x**, identity 20/20 |
+| attn phase 3->4 | 295 / 605 us (the old form was also unstable run to run) -> **92 / 92** |
+
+**LANDS: +4.5% (predicted +1.5-2.5%; the old phase's bad runs were worse than its good ones).** 8.18 -> 7.50 ms/token.
+Both kernels moved together (shared body), tokens unchanged vs the fp32 reference: the contraction did not move.
