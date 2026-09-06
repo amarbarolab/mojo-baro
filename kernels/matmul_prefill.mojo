@@ -1,5 +1,7 @@
 from std.gpu import block_idx, global_idx, thread_idx, WARP_SIZE
 from std.math import exp, fma
+from std.memory import bitcast
+from std.sys.intrinsics import llvm_intrinsic
 from layout import TileTensor, TensorLayout, row_major
 from layout.tensor_core import mma
 
@@ -7,6 +9,15 @@ comptime f32 = DType.float32
 comptime bf16 = DType.bfloat16
 comptime PF_WAVES = 8
 comptime PF_THREADS = PF_WAVES * WARP_SIZE
+
+
+@always_inline
+def f32x16_to_bf16_trunc(x: SIMD[f32, 16]) -> SIMD[bf16, 16]:
+    var u = bitcast[DType.uint32, 16](x)
+    var packed = SIMD[DType.uint32, 8](0)
+    comptime for i in range(8):
+        packed[i] = llvm_intrinsic["llvm.amdgcn.perm", UInt32](u[2 * i + 1], u[2 * i], UInt32(0x07060302))
+    return bitcast[bf16, 16](packed)
 
 
 def amar_matmul_prefill_q4[
@@ -46,7 +57,7 @@ def amar_matmul_prefill_q4[
     var Av = A.vectorize[1, 16]()
     var Qv = Q.vectorize[1, 16]()
     var acc = InlineArray[SIMD[f32, 8], WTM * WTN](fill=SIMD[f32, 8](0))
-    var eight = SIMD[DType.int8, 16](8)
+    var eight = SIMD[f32, 16](8)
     var nb = K // 32
 
     for kb in range(nb):
@@ -63,8 +74,8 @@ def amar_matmul_prefill_q4[
             var c = min(col0 + tn * 16 + h, N - 1)
             var bytes16 = rebind[SIMD[DType.uint8, 16]](Qv[c, kb])
             var d = rebind[Scalar[DType.float16]](S[c, kb]).cast[f32]()
-            var lo = ((bytes16 & UInt8(0xF)).cast[DType.int8]() - eight).cast[bf16]()
-            var hi = ((bytes16 >> UInt8(4)).cast[DType.int8]() - eight).cast[bf16]()
+            var lo = f32x16_to_bf16_trunc((bytes16 & UInt8(0xF)).cast[f32]() - eight)
+            var hi = f32x16_to_bf16_trunc((bytes16 >> UInt8(4)).cast[f32]() - eight)
             comptime for tm in range(WTM):
                 var t = SIMD[f32, 8](0)
                 var t2 = SIMD[f32, 8](0)
@@ -139,8 +150,8 @@ def amar_matmul_prefill_q8[
         comptime for tn in range(WTN):
             var c = min(col0 + tn * 16 + h, N - 1)
             var d = rebind[Scalar[DType.float16]](S[c, kb]).cast[f32]()
-            var lo = rebind[SIMD[DType.int8, 16]](Qv[c, kb * 2]).cast[bf16]()
-            var hi = rebind[SIMD[DType.int8, 16]](Qv[c, kb * 2 + 1]).cast[bf16]()
+            var lo = f32x16_to_bf16_trunc(rebind[SIMD[DType.int8, 16]](Qv[c, kb * 2]).cast[f32]())
+            var hi = f32x16_to_bf16_trunc(rebind[SIMD[DType.int8, 16]](Qv[c, kb * 2 + 1]).cast[f32]())
             comptime for tm in range(WTM):
                 var t = SIMD[f32, 8](0)
                 var t2 = SIMD[f32, 8](0)
