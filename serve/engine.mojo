@@ -1023,6 +1023,39 @@ def main() raises:
             ffn_us += b
         var head_us = Float64(ph[16 * N_LAYERS + 3] - ph[16 * N_LAYERS]) / 100.0
         print("mega profile (last token, us): ssm sub-blocks", sub_ssm, " attn sub-blocks", sub_att, " ffn", ffn_us, " head", head_us, " total", Float64(ph[16 * N_LAYERS + 3] - ph[0]) / 100.0, " fail", fl[2])
+        # per-phase sums over the layers of each kind, in stamp order (us)
+        var ssm_seq: List[Int] = [0, 12, 1, 2, 3, 4, 5, 6, 7]
+        var att_seq: List[Int] = [0, 1, 2, 3, 4, 5, 7]
+        var ffn_seq: List[Int] = [7, 8, 9, 10, 11]
+        var ssm_ph = InlineArray[Float64, 8](fill=0.0)
+        var att_ph = InlineArray[Float64, 6](fill=0.0)
+        var ffn_ph = InlineArray[Float64, 4](fill=0.0)
+        for layer in range(N_LAYERS):
+            var b = 16 * layer
+            if is_attn(layer):
+                for i in range(6):
+                    att_ph[i] += Float64(ph[b + att_seq[i + 1]] - ph[b + att_seq[i]]) / 100.0
+            else:
+                for i in range(8):
+                    ssm_ph[i] += Float64(ph[b + ssm_seq[i + 1]] - ph[b + ssm_seq[i]]) / 100.0
+            for i in range(4):
+                ffn_ph[i] += Float64(ph[b + ffn_seq[i + 1]] - ph[b + ffn_seq[i]]) / 100.0
+        var ssm_s = String("mega phases ssm (24 layers, us, stamps 0>12>1>2>3>4>5>6>7):")
+        for i in range(8):
+            ssm_s += " " + String(Int(ssm_ph[i]))
+        print(ssm_s)
+        var att_s = String("mega phases attn (8 layers, us, stamps 0>1>2>3>4>5>7):")
+        for i in range(6):
+            att_s += " " + String(Int(att_ph[i]))
+        print(att_s)
+        var ffn_s = String("mega phases ffn (32 layers, us, stamps 7>8>9>10>11):")
+        for i in range(4):
+            ffn_s += " " + String(Int(ffn_ph[i]))
+        print(ffn_s)
+        var head_s = String("mega phases head (us, stamps 0>1>2>3):")
+        for i in range(3):
+            head_s += " " + String(Int(Float64(ph[16 * N_LAYERS + i + 1] - ph[16 * N_LAYERS + i]) / 100.0))
+        print(head_s)
     if prof:
         var tot = Float64(pf_att + pf_ssm + pf_ffn + pf_head)
         print("profile: attn", Float64(pf_att) / 1e9, Float64(pf_att) / tot)
