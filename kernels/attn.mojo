@@ -1,6 +1,6 @@
 from std.gpu import block_idx, global_idx, lane_id, thread_idx, WARP_SIZE
 from std.gpu.primitives import warp
-from std.math import cos, exp, log, rsqrt, sin
+from std.math import cos, exp, fma, log, rsqrt, sin
 from max.gpu.memory import AddressSpace
 from max.gpu.sync import barrier
 from layout import TileTensor, TensorLayout, row_major, stack_allocation
@@ -9,7 +9,7 @@ comptime f32 = DType.float32
 comptime HD = 256
 comptime NQH = 16
 comptime NKVH = 4
-comptime MAX_T = 1024
+comptime MAX_T = 1088
 
 
 def amar_head_rmsnorm[
@@ -259,3 +259,99 @@ def amar_kv_append[
     var r = Int(block_idx.y)
     var d = thread_idx.x
     Cache[h, Int(t_idx) + r, d] = rebind[Cache.ElementType](New[r * NKVH + h, d])
+
+
+comptime PA_TK = 16
+comptime PA_ROWS = 2
+comptime PA_KS = HD + 4
+
+
+def amar_attn_prefill[
+    QLayout: TensorLayout, KLayout: TensorLayout, OLayout: TensorLayout
+](
+    Q: TileTensor[f32, QLayout, MutAnyOrigin],
+    Kc: TileTensor[f32, KLayout, MutAnyOrigin],
+    Vc: TileTensor[f32, KLayout, MutAnyOrigin],
+    O: TileTensor[f32, OLayout, MutAnyOrigin],
+    pos: Int32,
+    m: Int32,
+    scale: Float32,
+):
+    comptime assert Q.flat_rank == 2 and Kc.flat_rank == 3 and Vc.flat_rank == 3 and O.flat_rank == 2
+    var kvh = Int(block_idx.x)
+    var tile = Int(block_idx.y)
+    var tid = Int(thread_idx.x)
+    var wave = tid // WARP_SIZE
+    var lane = tid % WARP_SIZE
+    var M = Int(m)
+    var P = Int(pos)
+    var head = kvh * (NQH // NKVH) + wave % (NQH // NKVH)
+    var r = tile * PA_ROWS + wave // (NQH // NKVH)
+    var valid = r < M
+    var qrow = r * NQH + head
+    var T = P + r + 1
+    var t_blk = P + min(tile * PA_ROWS + PA_ROWS, M)
+    var j = lane % PA_TK
+    var dpart = lane // PA_TK
+
+    var ks = stack_allocation[f32, address_space = AddressSpace.SHARED](row_major[PA_TK, PA_KS]())
+    var vs = stack_allocation[f32, address_space = AddressSpace.SHARED](row_major[PA_TK, HD]())
+    var qs = stack_allocation[f32, address_space = AddressSpace.SHARED](row_major[PA_ROWS * (NQH // NKVH), HD]())
+    var ksv = ks.vectorize[1, 8]()
+    var vsv = vs.vectorize[1, 8]()
+    var qsv = qs.vectorize[1, 8]()
+    var Qv = Q.vectorize[1, 8]()
+    var Kv = Kc.vectorize[1, 1, 8]()
+    var Vv = Vc.vectorize[1, 1, 8]()
+    var O_ = O
+
+    if valid:
+        qsv[wave, lane] = rebind[qsv.ElementType](Qv[qrow, lane])
+    var m_run = Float32(-3.4e38)
+    var l_run = Float32(0)
+    var o = SIMD[f32, 8](0)
+    var lp = tid // 16
+    var lc = (tid % 16) * 2
+    var t0 = 0
+    while t0 < t_blk:
+        barrier()
+        var p = t0 + lp
+        if p < t_blk:
+            ksv[lp, lc] = rebind[ksv.ElementType](Kv[kvh, p, lc])
+            ksv[lp, lc + 1] = rebind[ksv.ElementType](Kv[kvh, p, lc + 1])
+            vsv[lp, lc] = rebind[vsv.ElementType](Vv[kvh, p, lc])
+            vsv[lp, lc + 1] = rebind[vsv.ElementType](Vv[kvh, p, lc + 1])
+        else:
+            ksv[lp, lc] = rebind[ksv.ElementType](SIMD[f32, 8](0))
+            ksv[lp, lc + 1] = rebind[ksv.ElementType](SIMD[f32, 8](0))
+            vsv[lp, lc] = rebind[vsv.ElementType](SIMD[f32, 8](0))
+            vsv[lp, lc + 1] = rebind[vsv.ElementType](SIMD[f32, 8](0))
+        barrier()
+        var part: Float32 = 0
+        comptime for d8 in range(HD // 16):
+            var q8 = rebind[SIMD[f32, 8]](qsv[wave, dpart * (HD // 16) + d8])
+            var k8 = rebind[SIMD[f32, 8]](ksv[j, dpart * (HD // 16) + d8])
+            comptime for i in range(8):
+                part += q8[i] * k8[i]
+        part += warp.shuffle_xor(part, UInt32(PA_TK))
+        var s = Float32(-3.4e38)
+        if valid and t0 + j < T:
+            s = part * scale
+        var tmax = warp.max(s)
+        if tmax > Float32(-3.4e38):
+            var m_new = max(m_run, tmax)
+            var alpha = exp(m_run - m_new)
+            var pj = exp(s - m_new)
+            var psum = pj if dpart == 0 else Float32(0)
+            l_run = l_run * alpha + warp.sum(psum)
+            o = o * alpha
+            comptime for jj in range(PA_TK):
+                var pb = warp.shuffle_idx(pj, UInt32(jj))
+                var v8 = rebind[SIMD[f32, 8]](vsv[jj, lane])
+                o = fma(v8, SIMD[f32, 8](pb), o)
+            m_run = m_new
+        t0 += PA_TK
+    if valid:
+        var inv = 1 / l_run
+        comptime for i in range(8):
+            O_[qrow, lane * 8 + i] = rebind[O_.ElementType](o[i] * inv)

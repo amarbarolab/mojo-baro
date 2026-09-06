@@ -13,11 +13,16 @@ from matmul_skinny import (
 from ssm import (
     amar_ssm_reduce_gates, amar_ssm_conv, amar_ssm_qk_l2norm,
     amar_ssm_delta_step, amar_ssm_gated_out_bf16, amar_cast_bf16, CONV, NH_V, SSTATE,
+    amar_ssm_gates_rows, amar_ssm_conv_chunk, amar_ssm_qk_l2norm_rows, amar_ssm_delta_chunk,
+    amar_ssm_gated_out_rows_bf16,
+)
+from matmul_prefill import (
+    amar_matmul_prefill_q4, amar_matmul_prefill_q8, amar_prefill_swiglu_bf16, PF_THREADS,
 )
 from mega import amar_mega_token, amar_mega_window, MEGA_G, MEGA_G_WIN
 from attn import (
     amar_head_rmsnorm, amar_attn_decode, amar_gate_mul_cast, amar_qgate_split, amar_rope_yarn, amar_kv_append,
-    HD, NQH, NKVH,
+    amar_attn_prefill, HD, NQH, NKVH, MAX_T, PA_ROWS,
 )
 
 comptime H = 4096
@@ -28,8 +33,10 @@ comptime KV = NKVH * HD
 comptime N_LAYERS = 32
 comptime N_SSM = 24
 comptime N_ATT = 8
-comptime TMAX = 128
+comptime TMAX = 1088
 comptime GEN_N = 64
+comptime CP = 1024
+comptime PF_MIN = 16
 
 comptime bf16 = DType.bfloat16
 comptime f32 = DType.float32
@@ -148,6 +155,17 @@ comptime mega_win_k = amar_mega_window[
     TMAX, N_LAYERS,
 ]
 
+comptime xp_layout = row_major[CP, H]()
+comptime xpflat_layout = row_major[CP * H]()
+comptime qfp_layout = row_major[CP, QF]()
+comptime g32p_layout = row_major[CP, NH_V]()
+comptime convp_layout = row_major[CP, CONV]()
+comptime op_layout = row_major[CP, NH_V, SSTATE]()
+comptime qp_layout = row_major[CP * NQH, HD]()
+comptime kvp_layout = row_major[CP * NKVH, HD]()
+comptime kvp_flat = row_major[CP, KV]()
+comptime ffnp_layout = row_major[CP, FFN]()
+
 comptime B2 = 2
 comptime B4 = 4
 
@@ -188,6 +206,59 @@ comptime append_k = amar_kv_append[type_of(cache_layout), type_of(kvm_layout)]
 comptime att_k = amar_attn_decode[type_of(qm_layout), type_of(cache_layout), type_of(qm_layout)]
 comptime gmul_k = amar_gate_mul_cast[type_of(xflat_layout), type_of(xflat_layout), type_of(xflat_layout)]
 
+comptime rmsc_p = amar_rmsnorm_cast[type_of(xp_layout), type_of(h_layout), type_of(xp_layout)]
+comptime embed_p = amar_embed_lookup_pos[type_of(emb_layout), type_of(xp_layout), type_of(toks_layout)]
+comptime gates_p = amar_ssm_gates_rows[type_of(g32p_layout), type_of(g32p_layout), type_of(g32_layout)]
+comptime conv_p = amar_ssm_conv_chunk[type_of(qfp_layout), type_of(csall_layout), type_of(cw_layout), type_of(convp_layout)]
+comptime l2_p = amar_ssm_qk_l2norm_rows[type_of(convp_layout)]
+comptime delta_p = amar_ssm_delta_chunk[type_of(ssall_layout), type_of(convp_layout), type_of(g32p_layout), type_of(op_layout)]
+comptime gated_p = amar_ssm_gated_out_rows_bf16[type_of(op_layout), type_of(xp_layout), type_of(n128_layout), type_of(xp_layout)]
+comptime split_p = amar_qgate_split[type_of(qfp_layout), type_of(qp_layout), type_of(xpflat_layout)]
+comptime hrms_qp = amar_head_rmsnorm[type_of(qp_layout), type_of(hd_layout)]
+comptime hrms_kvp = amar_head_rmsnorm[type_of(kvp_layout), type_of(hd_layout)]
+comptime rope_qp = amar_rope_yarn[type_of(qp_layout)]
+comptime rope_kp = amar_rope_yarn[type_of(kvp_layout)]
+comptime append_p = amar_kv_append[type_of(cache_layout), type_of(kvp_layout)]
+comptime attp_k = amar_attn_prefill[type_of(qp_layout), type_of(cache_layout), type_of(qp_layout)]
+comptime gmul_p = amar_gate_mul_cast[type_of(xpflat_layout), type_of(xpflat_layout), type_of(xpflat_layout)]
+comptime swiglu_p = amar_prefill_swiglu_bf16[type_of(ffnp_layout), type_of(ffnp_layout)]
+
+
+def gemm_prefill_q4[
+    ACC: Bool, AL: TensorLayout, QL: TensorLayout, SL: TensorLayout, CL: TensorLayout
+](
+    ctx: DeviceContext,
+    A: TileTensor[bf16, AL, MutAnyOrigin],
+    Wq: TileTensor[DType.uint8, QL, MutAnyOrigin],
+    Ws: TileTensor[DType.float16, SL, MutAnyOrigin],
+    C: TileTensor[f32, CL, MutAnyOrigin],
+    m: Int, n: Int, k: Int,
+) raises:
+    if m <= 64:
+        ctx.enqueue_function[amar_matmul_prefill_q4[2, 2, 2, ACC, AL, QL, SL, CL]](
+            A, Wq, Ws, C, Int32(m), Int32(n), Int32(k), grid_dim=(ceildiv(n, 128), ceildiv(m, 64)), block_dim=PF_THREADS)
+    else:
+        ctx.enqueue_function[amar_matmul_prefill_q4[4, 2, 2, ACC, AL, QL, SL, CL]](
+            A, Wq, Ws, C, Int32(m), Int32(n), Int32(k), grid_dim=(ceildiv(n, 128), ceildiv(m, 128)), block_dim=PF_THREADS)
+
+
+def gemm_prefill_q8[
+    ACC: Bool, AL: TensorLayout, QL: TensorLayout, SL: TensorLayout, CL: TensorLayout
+](
+    ctx: DeviceContext,
+    A: TileTensor[bf16, AL, MutAnyOrigin],
+    Wq: TileTensor[DType.int8, QL, MutAnyOrigin],
+    Ws: TileTensor[DType.float16, SL, MutAnyOrigin],
+    C: TileTensor[f32, CL, MutAnyOrigin],
+    m: Int, n: Int, k: Int,
+) raises:
+    if m <= 64:
+        ctx.enqueue_function[amar_matmul_prefill_q8[2, 2, 2, ACC, AL, QL, SL, CL]](
+            A, Wq, Ws, C, Int32(m), Int32(n), Int32(k), grid_dim=(ceildiv(n, 128), ceildiv(m, 64)), block_dim=PF_THREADS)
+    else:
+        ctx.enqueue_function[amar_matmul_prefill_q8[4, 2, 2, ACC, AL, QL, SL, CL]](
+            A, Wq, Ws, C, Int32(m), Int32(n), Int32(k), grid_dim=(ceildiv(n, 128), ceildiv(m, 128)), block_dim=PF_THREADS)
+
 
 def delta_dispatch(
     ctx: DeviceContext,
@@ -198,6 +269,7 @@ def delta_dispatch(
     O: TileTensor[f32, type_of(om_layout), MutAnyOrigin],
     ring: Int32, ssm_i: Int32, slots: Int32, m: Int,
 ) raises:
+    comptime assert TMAX <= MAX_T
     comptime DL = type_of(ssall_layout)
     comptime CL = type_of(convm_layout)
     comptime GL = type_of(g32m_layout)

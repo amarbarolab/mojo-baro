@@ -400,6 +400,117 @@ def tok_line(id: Int, tok: Int) -> String:
 
 def err_line(id: Int, msg: String) -> String:
     return String("{\"id\":") + String(id) + ",\"error\":\"" + msg + "\"}"
+def gemm_pw[
+    N: Int, K: Int, ACC: Bool, AL: TensorLayout, CL: TensorLayout
+](
+    ctx: DeviceContext,
+    A: TileTensor[bf16, AL, MutAnyOrigin],
+    wbuf: DeviceBuffer[DType.uint8], o: Int, q4: Bool,
+    C: TileTensor[f32, CL, MutAnyOrigin],
+    m: Int,
+) raises:
+    if q4:
+        gemm_prefill_q4[ACC](ctx, A, tens_q4q(ctx, wbuf, o, N * K, row_major[N, K // 2]()), tens_q4s(ctx, wbuf, o, N * K, row_major[N, K // 32]()), C, m, N, K)
+    else:
+        gemm_prefill_q8[ACC](ctx, A, tens_q8q(ctx, wbuf, o, N * K, row_major[N, K]()), tens_q8s(ctx, wbuf, o, N * K, row_major[N, K // 32]()), C, m, N, K)
+
+
+def prefill_forward(
+    ctx: DeviceContext, wbuf: DeviceBuffer[DType.uint8], off: List[Int], pack_q4: Bool,
+    m: Int, pos: Int, ring: Int,
+    mut toks_d: DeviceBuffer[DType.int32], mut convstate_d: DeviceBuffer[f32], mut sstate_d: DeviceBuffer[f32],
+    mut kc_d: DeviceBuffer[f32], mut vc_d: DeviceBuffer[f32],
+    mut xp_d: DeviceBuffer[f32], mut curbp_d: DeviceBuffer[bf16], mut qkvp_d: DeviceBuffer[f32], mut zp_d: DeviceBuffer[f32],
+    mut arp_d: DeviceBuffer[f32], mut brp_d: DeviceBuffer[f32], mut egp_d: DeviceBuffer[f32], mut betap_d: DeviceBuffer[f32],
+    mut convp_d: DeviceBuffer[f32], mut sop_d: DeviceBuffer[f32], mut resbp_d: DeviceBuffer[bf16], mut qfp_d: DeviceBuffer[f32],
+    mut qp_d: DeviceBuffer[f32], mut gatep_d: DeviceBuffer[f32], mut kp_d: DeviceBuffer[f32], mut vp_d: DeviceBuffer[f32],
+    mut aop_d: DeviceBuffer[f32], mut gp_d: DeviceBuffer[f32], mut up_d: DeviceBuffer[f32], mut fgbp_d: DeviceBuffer[bf16],
+) raises:
+    # Prompt rows pos .. pos+m-1 through the 32-block trunk in one chunk
+    # (bench/prefill-protocol.md): WMMA GEMMs over the weight-native q4/q8
+    # layout, causal chunk attention, SSM conv + delta recurrence batched per
+    # chunk. Same per-layer op order as the decode window path; state ring
+    # slot (ring + m) receives the chunk's final conv window / delta state.
+    var Embd = tens_bf16(ctx, wbuf, off[0], VOCAB * H, emb_layout)
+    var Toks = TileTensor(toks_d, toks_layout)
+    var ConvStateAll = TileTensor(convstate_d, csall_layout)
+    var SStateAll = TileTensor(sstate_d, ssall_layout)
+    var Xp = TileTensor(xp_d, xp_layout)
+    var CurBp = TileTensor(curbp_d, xp_layout)
+    ctx.enqueue_function[embed_p](Embd, Xp, Toks, Int32(pos), Int32(H), grid_dim=(ceildiv(H, 256), m), block_dim=256)
+    var w = 1
+    var ssm_i = 0
+    var att_i = 0
+    for layer in range(N_LAYERS):
+        ctx.enqueue_function[rmsc_p](Xp, tens_f32(ctx, wbuf, off[w], H, h_layout), CurBp, Int32(H), Float32(1e-6), grid_dim=m, block_dim=256)
+        if is_attn(layer):
+            var Qn = tens_f32(ctx, wbuf, off[w + 4], HD, hd_layout)
+            var Kn = tens_f32(ctx, wbuf, off[w + 5], HD, hd_layout)
+            var Qfp = TileTensor(qfp_d, qfp_layout)
+            var Qp = TileTensor(qp_d, qp_layout)
+            var Gatep = TileTensor(gatep_d, xpflat_layout)
+            var Kflat = TileTensor(kp_d, kvp_flat)
+            var Khd = TileTensor(kp_d, kvp_layout)
+            var Vflat = TileTensor(vp_d, kvp_flat)
+            var Vhd = TileTensor(vp_d, kvp_layout)
+            var kcb = DeviceBuffer[f32](ctx, kc_d.unsafe_ptr() + att_i * NKVH * TMAX * HD, NKVH * TMAX * HD, owning=False)
+            var vcb = DeviceBuffer[f32](ctx, vc_d.unsafe_ptr() + att_i * NKVH * TMAX * HD, NKVH * TMAX * HD, owning=False)
+            var Kc = TileTensor(kcb, cache_layout)
+            var Vc = TileTensor(vcb, cache_layout)
+            var Aop = TileTensor(aop_d, qp_layout)
+            var Aopflat = TileTensor(aop_d, xpflat_layout)
+            var AoBp = TileTensor(resbp_d, xpflat_layout)
+            var AoBpm = TileTensor(resbp_d, xp_layout)
+            gemm_pw[QF, H, False](ctx, CurBp, wbuf, off[w + 1], pack_q4, Qfp, m)
+            gemm_pw[KV, H, False](ctx, CurBp, wbuf, off[w + 2], pack_q4, Kflat, m)
+            gemm_pw[KV, H, False](ctx, CurBp, wbuf, off[w + 3], pack_q4, Vflat, m)
+            ctx.enqueue_function[split_p](Qfp, Qp, Gatep, grid_dim=(NQH, m), block_dim=HD)
+            ctx.enqueue_function[hrms_qp](Qp, Qn, Float32(1e-6), grid_dim=m * NQH, block_dim=HD)
+            ctx.enqueue_function[hrms_kvp](Khd, Kn, Float32(1e-6), grid_dim=m * NKVH, block_dim=HD)
+            ctx.enqueue_function[rope_qp](Qp, Int32(pos), Int32(NQH), grid_dim=(NQH, m), block_dim=32)
+            ctx.enqueue_function[rope_kp](Khd, Int32(pos), Int32(NKVH), grid_dim=(NKVH, m), block_dim=32)
+            ctx.enqueue_function[append_p](Kc, Khd, Int32(pos), grid_dim=(NKVH, m), block_dim=HD)
+            ctx.enqueue_function[append_p](Vc, Vhd, Int32(pos), grid_dim=(NKVH, m), block_dim=HD)
+            ctx.enqueue_function[attp_k](Qp, Kc, Vc, Aop, Int32(pos), Int32(m), Float32(0.0625), grid_dim=(NKVH, ceildiv(m, PA_ROWS)), block_dim=256)
+            ctx.enqueue_function[gmul_p](Aopflat, Gatep, AoBp, Int32(m * H), grid_dim=ceildiv(m * H, 256), block_dim=256)
+            gemm_pw[H, H, True](ctx, AoBpm, wbuf, off[w + 6], pack_q4, Xp, m)
+            att_i += 1
+            w += 7
+        else:
+            var Cw = tens_f32(ctx, wbuf, off[w + 5], CONV * 4, cw_layout)
+            var SsmA = tens_f32(ctx, wbuf, off[w + 6], NH_V, g32_layout)
+            var DtB = tens_f32(ctx, wbuf, off[w + 7], NH_V, g32_layout)
+            var Nw = tens_f32(ctx, wbuf, off[w + 8], SSTATE, n128_layout)
+            var Qkvp = TileTensor(qkvp_d, qfp_layout)
+            var Zp = TileTensor(zp_d, xp_layout)
+            var Arp = TileTensor(arp_d, g32p_layout)
+            var Brp = TileTensor(brp_d, g32p_layout)
+            var Egp = TileTensor(egp_d, g32p_layout)
+            var Betap = TileTensor(betap_d, g32p_layout)
+            var Convp = TileTensor(convp_d, convp_layout)
+            var Sop = TileTensor(sop_d, op_layout)
+            var ResBp = TileTensor(resbp_d, xp_layout)
+            gemm_pw[CONV, H, False](ctx, CurBp, wbuf, off[w + 1], pack_q4, Qkvp, m)
+            gemm_pw[H, H, False](ctx, CurBp, wbuf, off[w + 2], pack_q4, Zp, m)
+            gemm_pw[NH_V, H, False](ctx, CurBp, wbuf, off[w + 3], pack_q4, Arp, m)
+            gemm_pw[NH_V, H, False](ctx, CurBp, wbuf, off[w + 4], pack_q4, Brp, m)
+            ctx.enqueue_function[gates_p](Arp, Brp, Egp, Betap, SsmA, DtB, Int32(m), grid_dim=ceildiv(m * NH_V, 256), block_dim=256)
+            ctx.enqueue_function[conv_p](Qkvp, ConvStateAll, Cw, Convp, Int32(ring), Int32(ssm_i), Int32(SLOTS), Int32(m), grid_dim=ceildiv(CONV, 256), block_dim=256)
+            ctx.enqueue_function[l2_p](Convp, Int32(m), grid_dim=(NH_V, m), block_dim=SSTATE)
+            ctx.enqueue_function[delta_p](SStateAll, Convp, Egp, Betap, Sop, Int32(ring), Int32(ssm_i), Int32(SLOTS), Int32(m), grid_dim=NH_V, block_dim=SSTATE)
+            ctx.enqueue_function[gated_p](Sop, Zp, Nw, ResBp, grid_dim=(NH_V, m), block_dim=SSTATE)
+            gemm_pw[H, H, True](ctx, ResBp, wbuf, off[w + 9], pack_q4, Xp, m)
+            ssm_i += 1
+            w += 10
+        ctx.enqueue_function[rmsc_p](Xp, tens_f32(ctx, wbuf, off[w], H, h_layout), CurBp, Int32(H), Float32(1e-6), grid_dim=m, block_dim=256)
+        var Gp = TileTensor(gp_d, ffnp_layout)
+        var Up = TileTensor(up_d, ffnp_layout)
+        var FgBp = TileTensor(fgbp_d, ffnp_layout)
+        gemm_pw[FFN, H, False](ctx, CurBp, wbuf, off[w + 1], pack_q4, Gp, m)
+        gemm_pw[FFN, H, False](ctx, CurBp, wbuf, off[w + 2], pack_q4, Up, m)
+        ctx.enqueue_function[swiglu_p](Gp, Up, FgBp, Int32(m), Int32(FFN), grid_dim=ceildiv(m * FFN, 256), block_dim=256)
+        gemm_pw[H, FFN, True](ctx, FgBp, wbuf, off[w + 3], pack_q4, Xp, m)
+        w += 4
 
 
 def main() raises:
@@ -531,6 +642,16 @@ def main() raises:
     if kcfg > KMAX:
         kcfg = KMAX
     print("spec k:", kcfg)
+    # Prefill plan (bench/prefill-protocol.md): prompt rows 0 .. L-2 go through
+    # prefill_forward in chunks of pf_chunk; the last prompt token still runs
+    # the megakernel. The MTP draft's "process" window is kept identical to
+    # the decode window path: pos_prev is set so it covers the last
+    # (L-1) mod 8 rows (8 when 0), whose post-final-norm hidden rows the last
+    # chunk writes into hn_d. pf_rows/pf_tail are per request (below).
+    var pf_chunk = min(atol(getenv("BARO_PREFILL_C", String(CP))), CP)
+    if pf_chunk < PF_MIN:
+        pf_chunk = PF_MIN
+    var pf_on = getenv("BARO_PREFILL", "1") == "1"
     var spec_env = getenv("BARO_SPEC", "0") == "1"
     print("BARO_SPEC:", spec_env)
     var spec_dbg = getenv("BARO_SPEC_DBG", "0") == "1"
@@ -573,6 +694,27 @@ def main() raises:
     var p_ffn_d = ctx.enqueue_create_buffer[f32](SPLITK * SM * FFN)
     var p_ffn2_d = ctx.enqueue_create_buffer[f32](SPLITK * SM * FFN)
     var p_v_d = ctx.enqueue_create_buffer[f32](SPLITK * SM * VOCAB)
+
+    var xp_d = ctx.enqueue_create_buffer[f32](CP * H)
+    var curbp_d = ctx.enqueue_create_buffer[bf16](CP * H)
+    var qkvp_d = ctx.enqueue_create_buffer[f32](CP * CONV)
+    var zp_d = ctx.enqueue_create_buffer[f32](CP * H)
+    var arp_d = ctx.enqueue_create_buffer[f32](CP * NH_V)
+    var brp_d = ctx.enqueue_create_buffer[f32](CP * NH_V)
+    var egp_d = ctx.enqueue_create_buffer[f32](CP * NH_V)
+    var betap_d = ctx.enqueue_create_buffer[f32](CP * NH_V)
+    var convp_d = ctx.enqueue_create_buffer[f32](CP * CONV)
+    var sop_d = ctx.enqueue_create_buffer[f32](CP * NH_V * SSTATE)
+    var resbp_d = ctx.enqueue_create_buffer[bf16](CP * H)
+    var qfp_d = ctx.enqueue_create_buffer[f32](CP * QF)
+    var qp_d = ctx.enqueue_create_buffer[f32](CP * NQH * HD)
+    var gatep_d = ctx.enqueue_create_buffer[f32](CP * H)
+    var kp_d = ctx.enqueue_create_buffer[f32](CP * KV)
+    var vp_d = ctx.enqueue_create_buffer[f32](CP * KV)
+    var aop_d = ctx.enqueue_create_buffer[f32](CP * NQH * HD)
+    var gp_d = ctx.enqueue_create_buffer[f32](CP * FFN)
+    var up_d = ctx.enqueue_create_buffer[f32](CP * FFN)
+    var fgbp_d = ctx.enqueue_create_buffer[bf16](CP * FFN)
 
     var convstate_d = ctx.enqueue_create_buffer[f32](SLOTS * CONV_SLOT)
     var sstate_d = ctx.enqueue_create_buffer[f32](SLOTS * SSM_SLOT)
@@ -677,6 +819,15 @@ def main() raises:
                     prompt.append(val)
             print("prompt tokens:", len(prompt))
 
+        var pf_rows = 0
+        var pf_tail = 0
+        if pf_on and len(prompt) - 1 >= PF_MIN:
+            pf_rows = len(prompt) - 1
+            pf_tail = pf_rows % MROWS
+            if pf_tail == 0:
+                pf_tail = MROWS
+        print("TMAX:", TMAX, " prefill chunk:", pf_chunk, " prefill rows:", pf_rows)
+
         var n_drafted = 0
         var n_accepted = 0
         var pos_prev = 0
@@ -740,6 +891,22 @@ def main() raises:
         var tp = t0
         var prefill_done = False
         while pos < n_total - 1:
+            if pos < pf_rows:
+                var mc = min(pf_chunk, pf_rows - pos)
+                prefill_forward(ctx, wbuf, off, pack_q4, mc, pos, ring, toks_d, convstate_d, sstate_d, kc_d, vc_d,
+                    xp_d, curbp_d, qkvp_d, zp_d, arp_d, brp_d, egp_d, betap_d, convp_d, sop_d, resbp_d, qfp_d,
+                    qp_d, gatep_d, kp_d, vp_d, aop_d, gp_d, up_d, fgbp_d)
+                ring = (ring + mc) % SLOTS
+                pos_prev = pos
+                pos += mc
+                if pos == pf_rows:
+                    var Xtail = row_f32(ctx, xp_d, (mc - pf_tail) * H, MROWS * H, xm_layout)
+                    ctx.enqueue_function[rms_m](
+                        Xtail, tens_f32(ctx, wbuf, off[1 + N_SSM * 10 + N_ATT * 7 + N_LAYERS * 4], H, h_layout),
+                        TileTensor(hn_d, xm_layout), Int32(H), Float32(1e-6), grid_dim=pf_tail, block_dim=256,
+                    )
+                    pos_prev = pos - pf_tail
+                continue
             var m = 1
             var win_spec = False
             if pos + 1 < len(prompt):
