@@ -1,0 +1,236 @@
+//! The stdin/stdout line protocol between this server and `serve/engine.mojo`
+//! running with `BARO_SERVE=1`. Documented in `serve/PROTOCOL.md`.
+//!
+//! Every function here is total: a malformed or unexpected line is returned
+//! as [`EngineMsg::Log`] and never panics or is trusted.
+
+use serde::Serialize;
+use serde_json::Value;
+
+/// One request line, serialised exactly as the engine's parser expects.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct Request {
+    pub id: u64,
+    pub prompt: Vec<u32>,
+    pub n: u32,
+    pub spec: bool,
+}
+
+impl Request {
+    /// The wire form: one JSON object plus a trailing newline.
+    pub fn line(&self) -> String {
+        // A struct of integers, a vector and a bool cannot fail to serialise.
+        let mut s = serde_json::to_string(self).unwrap_or_default();
+        s.push('\n');
+        s
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DoneStats {
+    pub n: u32,
+    pub prefill_s: f64,
+    pub decode_s: f64,
+    pub tok_s: f64,
+    pub drafted: Option<u64>,
+    pub accepted: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum EngineMsg {
+    /// Printed once after the pack is loaded and every buffer is allocated.
+    Ready {
+        tmax: u32,
+        mrows: u32,
+        kmax: u32,
+        spec_k: u32,
+        pack: String,
+    },
+    /// One generated token id for request `id`, in generation order.
+    Tok { id: u64, tok: u32 },
+    /// Request `id` finished; no more `Tok` lines follow for it.
+    Done { id: u64, stats: DoneStats },
+    /// Request `id` was rejected before any token was produced.
+    Error { id: u64, error: String },
+    /// Anything else: engine diagnostics, or a line that failed validation.
+    Log(String),
+}
+
+fn get_u64(v: &Value, key: &str) -> Option<u64> {
+    v.get(key)?.as_u64()
+}
+
+fn get_u32(v: &Value, key: &str) -> Option<u32> {
+    u32::try_from(get_u64(v, key)?).ok()
+}
+
+fn get_f64(v: &Value, key: &str) -> Option<f64> {
+    let f = v.get(key)?.as_f64()?;
+    f.is_finite().then_some(f)
+}
+
+/// Classify one engine stdout line. Never trusts a malformed line.
+pub fn parse_line(line: &str) -> EngineMsg {
+    let raw = line.trim_end_matches(['\r', '\n']);
+    if !raw.starts_with('{') {
+        return EngineMsg::Log(raw.to_string());
+    }
+    let v: Value = match serde_json::from_str(raw) {
+        Ok(Value::Object(m)) => Value::Object(m),
+        _ => return EngineMsg::Log(raw.to_string()),
+    };
+    if v.get("ready").and_then(Value::as_bool) == Some(true) {
+        if let (Some(tmax), Some(mrows), Some(kmax), Some(spec_k), Some(pack)) = (
+            get_u32(&v, "tmax"),
+            get_u32(&v, "mrows"),
+            get_u32(&v, "kmax"),
+            get_u32(&v, "spec_k"),
+            v.get("pack").and_then(Value::as_str),
+        ) {
+            return EngineMsg::Ready {
+                tmax,
+                mrows,
+                kmax,
+                spec_k,
+                pack: pack.to_string(),
+            };
+        }
+        return EngineMsg::Log(raw.to_string());
+    }
+    let Some(id) = get_u64(&v, "id") else {
+        return EngineMsg::Log(raw.to_string());
+    };
+    if let Some(err) = v.get("error") {
+        return match err.as_str() {
+            Some(s) => EngineMsg::Error {
+                id,
+                error: s.to_string(),
+            },
+            None => EngineMsg::Log(raw.to_string()),
+        };
+    }
+    if v.get("done").and_then(Value::as_bool) == Some(true) {
+        if let (Some(n), Some(prefill_s), Some(decode_s), Some(tok_s)) = (
+            get_u32(&v, "n"),
+            get_f64(&v, "prefill_s"),
+            get_f64(&v, "decode_s"),
+            get_f64(&v, "tok_s"),
+        ) {
+            return EngineMsg::Done {
+                id,
+                stats: DoneStats {
+                    n,
+                    prefill_s,
+                    decode_s,
+                    tok_s,
+                    drafted: get_u64(&v, "drafted"),
+                    accepted: get_u64(&v, "accepted"),
+                },
+            };
+        }
+        return EngineMsg::Log(raw.to_string());
+    }
+    if let Some(tok) = get_u32(&v, "tok") {
+        return EngineMsg::Tok { id, tok };
+    }
+    EngineMsg::Log(raw.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_line_is_the_engine_shape() {
+        let r = Request {
+            id: 7,
+            prompt: vec![760, 6511, 314],
+            n: 64,
+            spec: false,
+        };
+        assert_eq!(r.line(), "{\"id\":7,\"prompt\":[760,6511,314],\"n\":64,\"spec\":false}\n");
+    }
+
+    #[test]
+    fn ready_line() {
+        let m = parse_line(
+            "{\"ready\":true,\"tmax\":128,\"mrows\":8,\"kmax\":8,\"spec_k\":2,\"pack\":\".work/engine-pack-q4\"}\n",
+        );
+        assert_eq!(
+            m,
+            EngineMsg::Ready {
+                tmax: 128,
+                mrows: 8,
+                kmax: 8,
+                spec_k: 2,
+                pack: ".work/engine-pack-q4".into()
+            }
+        );
+    }
+
+    #[test]
+    fn tok_and_done_lines() {
+        assert_eq!(parse_line("{\"id\":3,\"tok\":11751}"), EngineMsg::Tok { id: 3, tok: 11751 });
+        let m = parse_line(
+            "{\"id\":3,\"done\":true,\"n\":64,\"prefill_s\":0.01,\"decode_s\":0.5,\"tok_s\":126.0,\"drafted\":40,\"accepted\":28,\"k\":2}",
+        );
+        match m {
+            EngineMsg::Done { id, stats } => {
+                assert_eq!(id, 3);
+                assert_eq!(stats.n, 64);
+                assert_eq!(stats.drafted, Some(40));
+                assert_eq!(stats.accepted, Some(28));
+                assert_eq!(stats.tok_s, 126.0);
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+        let m = parse_line("{\"id\":4,\"done\":true,\"n\":1,\"prefill_s\":0.01,\"decode_s\":0.0,\"tok_s\":0.0}");
+        assert!(matches!(m, EngineMsg::Done { id: 4, .. }));
+    }
+
+    #[test]
+    fn error_line() {
+        assert_eq!(
+            parse_line("{\"id\":9,\"error\":\"prompt+n exceeds TMAX 128\"}"),
+            EngineMsg::Error {
+                id: 9,
+                error: "prompt+n exceeds TMAX 128".into()
+            }
+        );
+    }
+
+    #[test]
+    fn diagnostics_are_logs() {
+        assert_eq!(parse_line("tok/s_gen: 126.5\n"), EngineMsg::Log("tok/s_gen: 126.5".into()));
+        assert_eq!(parse_line("GENERATED: 1 2 3 "), EngineMsg::Log("GENERATED: 1 2 3 ".into()));
+        assert_eq!(parse_line(""), EngineMsg::Log(String::new()));
+    }
+
+    #[test]
+    fn malformed_lines_are_never_trusted() {
+        for bad in [
+            "{\"id\":",                              // truncated
+            "{\"id\":\"x\",\"tok\":5}",              // id not an integer
+            "{\"id\":1,\"tok\":-5}",                 // negative token
+            "{\"id\":1,\"tok\":4294967296}",         // token above u32
+            "{\"id\":1,\"tok\":\"5\"}",              // token as string
+            "{\"tok\":5}",                           // no id
+            "{\"id\":1,\"done\":true}",              // done without stats
+            "{\"id\":1,\"done\":true,\"n\":1,\"prefill_s\":\"a\",\"decode_s\":0,\"tok_s\":0}",
+            "{\"id\":1,\"error\":5}",                // error not a string
+            "{\"ready\":true}",                      // ready without limits
+            "[1,2,3]",                               // not an object
+            "{\"id\":1,\"done\":true,\"n\":1,\"prefill_s\":1e999,\"decode_s\":0,\"tok_s\":0}",
+        ] {
+            assert!(matches!(parse_line(bad), EngineMsg::Log(_)), "{bad} must not parse");
+        }
+    }
+
+    #[test]
+    fn extra_fields_are_ignored() {
+        assert_eq!(
+            parse_line("{\"id\":1,\"tok\":2,\"extra\":{\"x\":[1]}}"),
+            EngineMsg::Tok { id: 1, tok: 2 }
+        );
+    }
+}

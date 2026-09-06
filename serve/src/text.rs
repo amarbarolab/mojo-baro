@@ -1,0 +1,209 @@
+//! Text in, text out: the pack's `tokenizer.json` (HF `tokenizers` format,
+//! written by tools/gguf-tokenizer.py) plus the optional
+//! `tokenizer-meta.json` (bos/eos ids, chat template). Absent tokenizer =>
+//! the server still runs, token-id endpoints only.
+
+use std::path::Path;
+
+use minijinja::Environment;
+use serde::Deserialize;
+use serde_json::Value;
+use tokenizers::Tokenizer;
+
+#[derive(Debug, Default, Deserialize)]
+struct Meta {
+    #[serde(default)]
+    chat_template: Option<String>,
+    #[serde(default, alias = "bos_id")]
+    bos_token_id: Option<u32>,
+    #[serde(default, alias = "eos_id")]
+    eos_token_id: Option<u32>,
+    #[serde(default)]
+    bos_token: Option<String>,
+    #[serde(default)]
+    eos_token: Option<String>,
+    #[serde(default)]
+    add_bos: Option<bool>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChatMessage {
+    pub role: String,
+    pub content: String,
+}
+
+pub struct Text {
+    tok: Tokenizer,
+    meta: Meta,
+    /// Token ids that end a generation (eos, plus Qwen's <|im_end|> /
+    /// <|endoftext|> when the vocabulary has them).
+    pub stop_ids: Vec<u32>,
+}
+
+impl Text {
+    pub fn load(tokenizer_json: &Path) -> Result<Text, String> {
+        let tok = Tokenizer::from_file(tokenizer_json).map_err(|e| format!("{}: {e}", tokenizer_json.display()))?;
+        let meta_path = tokenizer_json.with_file_name("tokenizer-meta.json");
+        let meta: Meta = match std::fs::read_to_string(&meta_path) {
+            Ok(s) => serde_json::from_str(&s).map_err(|e| format!("{}: {e}", meta_path.display()))?,
+            Err(_) => Meta::default(),
+        };
+        let mut stop_ids = Vec::new();
+        if let Some(e) = meta.eos_token_id {
+            stop_ids.push(e);
+        }
+        for s in ["<|im_end|>", "<|endoftext|>"] {
+            if let Some(id) = tok.token_to_id(s) {
+                if !stop_ids.contains(&id) {
+                    stop_ids.push(id);
+                }
+            }
+        }
+        Ok(Text { tok, meta, stop_ids })
+    }
+
+    pub fn encode(&self, text: &str, add_special: bool) -> Result<Vec<u32>, String> {
+        let enc = self.tok.encode(text, add_special).map_err(|e| e.to_string())?;
+        let mut ids = enc.get_ids().to_vec();
+        if add_special && self.meta.add_bos == Some(true) {
+            if let Some(bos) = self.meta.bos_token_id {
+                if ids.first() != Some(&bos) {
+                    ids.insert(0, bos);
+                }
+            }
+        }
+        Ok(ids)
+    }
+
+    pub fn decode(&self, ids: &[u32]) -> Result<String, String> {
+        self.tok.decode(ids, false).map_err(|e| e.to_string())
+    }
+
+    /// Render the chat template (the pack's, else ChatML which is what Qwen
+    /// ships) with the generation prompt appended.
+    pub fn apply_chat_template(&self, messages: &[ChatMessage]) -> Result<String, String> {
+        let Some(tpl) = &self.meta.chat_template else {
+            let mut s = String::new();
+            for m in messages {
+                s.push_str("<|im_start|>");
+                s.push_str(&m.role);
+                s.push('\n');
+                s.push_str(&m.content);
+                s.push_str("<|im_end|>\n");
+            }
+            s.push_str("<|im_start|>assistant\n");
+            return Ok(s);
+        };
+        let mut env = Environment::new();
+        minijinja_contrib::add_to_environment(&mut env);
+        env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+        env.add_template("chat", tpl).map_err(|e| format!("chat_template: {e}"))?;
+        let msgs: Vec<Value> = messages
+            .iter()
+            .map(|m| serde_json::json!({"role": m.role, "content": m.content}))
+            .collect();
+        let ctx = serde_json::json!({
+            "messages": msgs,
+            "add_generation_prompt": true,
+            "bos_token": self.meta.bos_token.clone().unwrap_or_default(),
+            "eos_token": self.meta.eos_token.clone().unwrap_or_default(),
+        });
+        env.get_template("chat")
+            .and_then(|t| t.render(minijinja::Value::from_serialize(&ctx)))
+            .map_err(|e| format!("chat_template: {e}"))
+    }
+
+    pub fn is_stop(&self, id: u32) -> bool {
+        self.stop_ids.contains(&id)
+    }
+}
+
+/// Incremental detokenizer for streaming: decodes the whole prefix each
+/// step (prefixes are <= TMAX tokens) and emits only the new, complete
+/// text, holding back a trailing replacement character from a split
+/// multi-byte sequence.
+pub struct Detok {
+    ids: Vec<u32>,
+    emitted: usize,
+}
+
+impl Detok {
+    pub fn new() -> Detok {
+        Detok {
+            ids: Vec::new(),
+            emitted: 0,
+        }
+    }
+
+    pub fn push(&mut self, text: &Text, id: u32) -> String {
+        self.ids.push(id);
+        let Ok(full) = text.decode(&self.ids) else {
+            return String::new();
+        };
+        let stable = full.strip_suffix('\u{FFFD}').unwrap_or(&full);
+        if stable.len() <= self.emitted || !stable.is_char_boundary(self.emitted) {
+            return String::new();
+        }
+        let delta = stable[self.emitted..].to_string();
+        self.emitted = stable.len();
+        delta
+    }
+
+}
+
+impl Default for Detok {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chatml_fallback_shape() {
+        let t = Text {
+            tok: Tokenizer::new(tokenizers::models::bpe::BPE::default()),
+            meta: Meta::default(),
+            stop_ids: vec![],
+        };
+        let s = t
+            .apply_chat_template(&[
+                ChatMessage {
+                    role: "system".into(),
+                    content: "be brief".into(),
+                },
+                ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                },
+            ])
+            .unwrap();
+        assert_eq!(
+            s,
+            "<|im_start|>system\nbe brief<|im_end|>\n<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n"
+        );
+    }
+
+    #[test]
+    fn jinja_template_renders_with_pycompat() {
+        let t = Text {
+            tok: Tokenizer::new(tokenizers::models::bpe::BPE::default()),
+            meta: Meta {
+                chat_template: Some(
+                    "{% for m in messages %}<{{ m.role }}>{{ m.content.strip() }}</>{% endfor %}{% if add_generation_prompt %}<assistant>{% endif %}".into(),
+                ),
+                ..Meta::default()
+            },
+            stop_ids: vec![],
+        };
+        let s = t
+            .apply_chat_template(&[ChatMessage {
+                role: "user".into(),
+                content: "  hi  ".into(),
+            }])
+            .unwrap();
+        assert_eq!(s, "<user>hi</><assistant>");
+    }
+}
