@@ -345,7 +345,7 @@ def main() raises:
     var dot3 = getenv("BARO_DOT", "0") == "1" and not pack_q4
     print("BARO_DOT:", dot3)
     print("pack q4 trunk:", pack_q4)
-    var mega = getenv("BARO_MEGA", "1") == "1" and not pack_q4
+    var mega = getenv("BARO_MEGA", "1") == "1"
     print("BARO_MEGA:", mega)
     var mega_win = getenv("BARO_MEGA_WIN", "0") == "1"
     print("BARO_MEGA_WIN:", mega_win)
@@ -648,7 +648,22 @@ def main() raises:
         if use_mega or use_mega_win:
             var Hnm0 = TileTensor(hn_d, xm_layout)
             var Dtok0 = TileTensor(dtok_d, dtok_layout)
-            if use_mega:
+            if use_mega and pack_q4:
+                ctx.enqueue_function[mega_token_q4_k](
+                    wbuf.unsafe_ptr(), TileTensor(off_d, off_layout), Xm, CurBm,
+                    TileTensor(resb_d, xm_layout), TileTensor(qkv_d, qfm_layout), TileTensor(z_d, xm_layout),
+                    TileTensor(araw_d, g32m_layout), TileTensor(braw_d, g32m_layout),
+                    TileTensor(eg_d, g32m_layout), TileTensor(beta_d, g32m_layout),
+                    TileTensor(conv_d, convm_layout), TileTensor(so_d, om_layout), ConvStateAll, SStateAll,
+                    TileTensor(qf_d, qfm_layout), TileTensor(k_d, kvm_flat), TileTensor(v_d, kvm_flat),
+                    TileTensor(q_d, qm_layout), TileTensor(gate_d, xflat_layout), TileTensor(ao_d, qm_layout),
+                    kc_d.unsafe_ptr(), vc_d.unsafe_ptr(),
+                    TileTensor(p_ffn_d, pf_sm), TileTensor(p_ffn2_d, pf_sm), TileTensor(fgb_d, ffnm_layout),
+                    TileTensor(ctr_d, ctr_layout), prof_d.unsafe_ptr(), dbg_d.unsafe_ptr(),
+                    Toks, Dtok0, Hnm0, hmax_d.unsafe_ptr(), hidx_d.unsafe_ptr(),
+                    Int32(ring), Int32(SLOTS), Int32(pos), Int32(1), Int32(1 if dump else 0), Int32(1), grid_dim=MEGA_G, block_dim=ROW_THREADS,
+                )
+            elif use_mega:
                 ctx.enqueue_function[mega_token_k](
                     wbuf.unsafe_ptr(), TileTensor(off_d, off_layout), Xm, CurBm,
                     TileTensor(resb_d, xm_layout), TileTensor(qkv_d, qfm_layout), TileTensor(z_d, xm_layout),

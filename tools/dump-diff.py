@@ -34,7 +34,7 @@ for t in range(n):
             ratio = np.divide(b[t, k], a[t, k], out=np.ones_like(a[t, k]), where=a[t, k] != 0)
             prev = a[t, k - 1] if k > 0 else None
             print(f"FIRST DIVERGENCE: token {t} layer {l} ({kind}) {half}: {(d != 0).sum()}/{H} differ, max|d| {np.abs(d).max():.3g}, max|a| {np.abs(a[t, k]).max():.3g}")
-            print(f"  ratio b/a over differing elements: min {ratio[d != 0].min():.6f} max {ratio[d != 0].max():.6f}  ({'pure scale -> rmsnorm/scalar' if ratio[d != 0].ptp() < 1e-5 else 'per-element -> input rounding / FMA form'})")
+            print(f"  ratio b/a over differing elements: min {ratio[d != 0].min():.6f} max {ratio[d != 0].max():.6f}  ({'pure scale -> rmsnorm/scalar' if np.ptp(ratio[d != 0]) < 1e-5 else 'per-element -> input rounding / FMA form'})")
             if prev is not None:
                 ca, cb = a[t, k] - prev, b[t, k] - prev
                 r2 = np.divide(cb, ca, out=np.ones_like(ca), where=ca != 0)

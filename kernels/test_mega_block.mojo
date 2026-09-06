@@ -17,7 +17,7 @@ from max.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
 from layout import TileTensor, TensorLayout, row_major
 
 from elementwise import amar_rmsnorm_cast, amar_rmsnorm, amar_argmax_pos
-from matmul_skinny import amar_matmul_skinny_q8row, amar_skinny_reduce, amar_skinny_reduce_add, amar_skinny_reduce_swiglu_bf16, ROW_WAVES, ROW_THREADS, SM, SPLITK
+from matmul_skinny import amar_matmul_skinny_q8row, amar_matmul_skinny_q4row, amar_skinny_reduce, amar_skinny_reduce_add, amar_skinny_reduce_swiglu_bf16, ROW_WAVES, ROW_THREADS, SM, SPLITK
 from ssm import amar_ssm_reduce_gates, amar_ssm_conv, amar_ssm_qk_l2norm, amar_ssm_delta_step, amar_ssm_gated_out_bf16, CONV, NH_V, SSTATE
 from attn import amar_head_rmsnorm, amar_attn_decode, amar_gate_mul_cast, amar_qgate_split, amar_rope_yarn, amar_kv_append, HD, NQH, NKVH
 from mega import amar_mega_token, amar_mega_window, MEGA_G, MEGA_G_WIN, H, FFN, QF, KV, VOCAB
@@ -92,6 +92,21 @@ def put_q8(h: HostBuffer[u8], o: Int, n: Int, k: Int, salt: Int):
     var so = o + n * k
     for i in range(n * k // 32):
         var v = Scalar[f16](0.002 + 0.004 * hash01(i, salt + 7))
+        var b = bitcast[DType.uint16, 1](SIMD[f16, 1](v))[0]
+        h[so + 2 * i] = UInt8(b & 0xFF)
+        h[so + 2 * i + 1] = UInt8((b >> 8) & 0xFF)
+
+
+def q4_bytes(n: Int, k: Int) -> Int:
+    return n * k // 2 + (n * k // 32) * 2
+
+
+def put_q4(h: HostBuffer[u8], o: Int, n: Int, k: Int, salt: Int):
+    for i in range(n * k // 2):
+        h[o + i] = UInt8(Int(hash01(i, salt) * 255.0) & 0xFF)
+    var so = o + n * k // 2
+    for i in range(n * k // 32):
+        var v = Scalar[f16](0.004 + 0.008 * hash01(i, salt + 7))
         var b = bitcast[DType.uint16, 1](SIMD[f16, 1](v))[0]
         h[so + 2 * i] = UInt8(b & 0xFF)
         h[so + 2 * i + 1] = UInt8((b >> 8) & 0xFF)
@@ -176,13 +191,36 @@ def ts[LT: TensorLayout](ctx: DeviceContext, w: DeviceBuffer[u8], o: Int, n: Int
     return rebind[TileTensor[f16, LT, MutAnyOrigin]](TileTensor(b, lt))
 
 
+def tq4[LT: TensorLayout](ctx: DeviceContext, w: DeviceBuffer[u8], o: Int, n: Int, lt: LT) -> TileTensor[u8, LT, MutAnyOrigin]:
+    var b = DeviceBuffer[u8](ctx, w.unsafe_ptr() + o, n // 2, owning=False)
+    return rebind[TileTensor[u8, LT, MutAnyOrigin]](TileTensor(b, lt))
+
+
+def ts4[LT: TensorLayout](ctx: DeviceContext, w: DeviceBuffer[u8], o: Int, n: Int, lt: LT) -> TileTensor[f16, LT, MutAnyOrigin]:
+    var b = DeviceBuffer[f16](ctx, (w.unsafe_ptr() + o + n // 2).unsafe_bitcast[Scalar[f16]](), n // 32, owning=False)
+    return rebind[TileTensor[f16, LT, MutAnyOrigin]](TileTensor(b, lt))
+
+
+def gl[
+    Q4: Bool, MR: Int, N: Int, K: Int, AL: TensorLayout, PL: TensorLayout
+](ctx: DeviceContext, mut w: DeviceBuffer[u8], A: TileTensor[bf16, AL, MutAnyOrigin], o: Int, P: TileTensor[f32, PL, MutAnyOrigin], M: Int) raises:
+    comptime if Q4:
+        comptime ql = row_major[N, K // 2]()
+        comptime sl = row_major[N, K // 32]()
+        ctx.enqueue_function[amar_matmul_skinny_q4row[2, MR, AL, type_of(ql), type_of(sl), PL]](A, tq4(ctx, w, o, N * K, ql), ts4(ctx, w, o, N * K, sl), P, Int32(M), Int32(N), Int32(K), grid_dim=ceildiv(N, ROW_WAVES), block_dim=ROW_THREADS)
+    else:
+        comptime ql = row_major[N, K]()
+        comptime sl = row_major[N, K // 32]()
+        ctx.enqueue_function[amar_matmul_skinny_q8row[4, MR, AL, type_of(ql), type_of(sl), PL]](A, tq(ctx, w, o, N * K, ql), ts(ctx, w, o, N * K, sl), P, Int32(M), Int32(N), Int32(K), grid_dim=ceildiv(N, ROW_WAVES), block_dim=ROW_THREADS)
+
+
 def tf[LT: TensorLayout](ctx: DeviceContext, w: DeviceBuffer[u8], o: Int, n: Int, lt: LT) -> TileTensor[f32, LT, MutAnyOrigin]:
     var b = DeviceBuffer[f32](ctx, (w.unsafe_ptr() + o).unsafe_bitcast[Scalar[f32]](), n, owning=False)
     return rebind[TileTensor[f32, LT, MutAnyOrigin]](TileTensor(b, lt))
 
 
 
-def run_case[MRT: Int](ctx: DeviceContext, mut wbuf: DeviceBuffer[u8], mut offd: DeviceBuffer[i64], off: List[Int]) raises -> Int:
+def run_case[MRT: Int, Q4: Bool](ctx: DeviceContext, mut wbuf: DeviceBuffer[u8], mut offd: DeviceBuffer[i64], off: List[Int]) raises -> Int:
     comptime xm_layout = row_major[MRT, H]()
     comptime qfm_layout = row_major[MRT, QF]()
     comptime g32m_layout = row_major[MRT, NH_V]()
@@ -197,14 +235,6 @@ def run_case[MRT: Int](ctx: DeviceContext, mut wbuf: DeviceBuffer[u8], mut offd:
     comptime XL = type_of(xm_layout)
     comptime rmsc_k = amar_rmsnorm_cast[XL, type_of(h_layout), XL]
     comptime rms_m = amar_rmsnorm[XL, type_of(h_layout), XL]
-    comptime g_conv = amar_matmul_skinny_q8row[4, MRT, XL, type_of(q_conv_h), type_of(s_conv_h), type_of(p_qf)]
-    comptime g_qf = amar_matmul_skinny_q8row[4, MRT, XL, type_of(q_h_qf), type_of(s_h_qf), type_of(p_qf)]
-    comptime g_kv = amar_matmul_skinny_q8row[4, MRT, XL, type_of(q_h_kv), type_of(s_h_kv), type_of(p_kv)]
-    comptime g_h = amar_matmul_skinny_q8row[4, MRT, XL, type_of(q_h_h), type_of(s_h_h), type_of(p_h)]
-    comptime g_ab = amar_matmul_skinny_q8row[4, MRT, XL, type_of(q_h_32), type_of(s_h_32), type_of(p_32)]
-    comptime g_ffn = amar_matmul_skinny_q8row[4, MRT, XL, type_of(q_h_ffn), type_of(s_h_ffn), type_of(p_ffn)]
-    comptime g_down = amar_matmul_skinny_q8row[4, MRT, type_of(ffnm_layout), type_of(q_ffn_h), type_of(s_ffn_h), type_of(p_h)]
-    comptime g_head = amar_matmul_skinny_q8row[4, MRT, XL, type_of(q_h_v), type_of(s_h_v), type_of(p_v)]
     comptime r_conv = amar_skinny_reduce[type_of(p_qf), type_of(convm_layout), 1]
     comptime r_qf = amar_skinny_reduce[type_of(p_qf), type_of(qfm_layout), 1]
     comptime r_kv = amar_skinny_reduce[type_of(p_kv), type_of(kvm_flat), 1]
@@ -229,7 +259,7 @@ def run_case[MRT: Int](ctx: DeviceContext, mut wbuf: DeviceBuffer[u8], mut offd:
     comptime gmul_k = amar_gate_mul_cast[type_of(xflat_layout), type_of(xflat_layout), type_of(xflat_layout)]
     comptime GW = MEGA_G if MRT == 1 else MEGA_G_WIN
     comptime mega_k = amar_mega_token[
-        MRT, False, XL, XL,
+        MRT, False, Q4, XL, XL,
         type_of(convm_layout), type_of(g32m_layout), type_of(convm_layout), type_of(om_layout),
         type_of(csall_layout), type_of(ssall_layout),
         type_of(qfm_layout), type_of(kvm_flat), type_of(qm_layout), type_of(xflat_layout),
@@ -237,7 +267,7 @@ def run_case[MRT: Int](ctx: DeviceContext, mut wbuf: DeviceBuffer[u8], mut offd:
         TM, NL,
     ]
     comptime mega_w = amar_mega_window[
-        MRT, True, XL, XL,
+        MRT, True, Q4, XL, XL,
         type_of(convm_layout), type_of(g32m_layout), type_of(convm_layout), type_of(om_layout),
         type_of(csall_layout), type_of(ssall_layout),
         type_of(qfm_layout), type_of(kvm_flat), type_of(qm_layout), type_of(xflat_layout),
@@ -248,7 +278,7 @@ def run_case[MRT: Int](ctx: DeviceContext, mut wbuf: DeviceBuffer[u8], mut offd:
     comptime NSS = SLOTS * N_SSM_T * NH_V * SSTATE * SSTATE
     comptime NKC = N_ATT_T * NKVH * TM * HD
     var M = MRT
-    print("=== case m =", M, "===")
+    print("=== case m =", M, " q4 =", Q4, "===")
 
     var x0 = fill_f32(ctx, MRT * H, 1, -1.0, 1.0)
     var cs0 = fill_f32(ctx, NCS, 12, -0.3, 0.3)
@@ -376,11 +406,11 @@ def run_case[MRT: Int](ctx: DeviceContext, mut wbuf: DeviceBuffer[u8], mut offd:
         for layer in range(NL):
             ctx.enqueue_function[rmsc_k](XL_, tf(ctx, wbuf, off[w], H, h_layout), CurB, Int32(H), Float32(1e-6), grid_dim=M, block_dim=256)
             if (layer + 1) % 4 == 0:
-                ctx.enqueue_function[g_qf](CurB, tq(ctx, wbuf, off[w + 1], QF * H, q_h_qf), ts(ctx, wbuf, off[w + 1], QF * H, s_h_qf), Pq, Int32(M), Int32(QF), Int32(H), grid_dim=ceildiv(QF, ROW_WAVES), block_dim=ROW_THREADS)
+                gl[Q4, MRT, QF, H](ctx, wbuf, CurB, off[w + 1], Pq, M)
                 ctx.enqueue_function[r_qf](Pq, Qfm, Int32(M), Int32(QF), grid_dim=ceildiv(M * QF, 256), block_dim=256)
-                ctx.enqueue_function[g_kv](CurB, tq(ctx, wbuf, off[w + 2], KV * H, q_h_kv), ts(ctx, wbuf, off[w + 2], KV * H, s_h_kv), Pkv, Int32(M), Int32(KV), Int32(H), grid_dim=ceildiv(KV, ROW_WAVES), block_dim=ROW_THREADS)
+                gl[Q4, MRT, KV, H](ctx, wbuf, CurB, off[w + 2], Pkv, M)
                 ctx.enqueue_function[r_kv](Pkv, Kflat, Int32(M), Int32(KV), grid_dim=ceildiv(M * KV, 256), block_dim=256)
-                ctx.enqueue_function[g_kv](CurB, tq(ctx, wbuf, off[w + 3], KV * H, q_h_kv), ts(ctx, wbuf, off[w + 3], KV * H, s_h_kv), Pkv, Int32(M), Int32(KV), Int32(H), grid_dim=ceildiv(KV, ROW_WAVES), block_dim=ROW_THREADS)
+                gl[Q4, MRT, KV, H](ctx, wbuf, CurB, off[w + 3], Pkv, M)
                 ctx.enqueue_function[r_kv](Pkv, Vflat, Int32(M), Int32(KV), grid_dim=ceildiv(M * KV, 256), block_dim=256)
                 ctx.enqueue_function[split_k](Qfm, Q, Gate, grid_dim=(NQH, M), block_dim=HD)
                 ctx.enqueue_function[hrms_q](Q, tf(ctx, wbuf, off[w + 4], HD, hd_layout), Float32(1e-6), grid_dim=M * NQH, block_dim=HD)
@@ -391,14 +421,14 @@ def run_case[MRT: Int](ctx: DeviceContext, mut wbuf: DeviceBuffer[u8], mut offd:
                 ctx.enqueue_function[append_k](VcL, Vhd, Int32(POS), grid_dim=(NKVH, M), block_dim=HD)
                 ctx.enqueue_function[att_k](Q, KcL, VcL, Ao, Int32(POS + 1), Float32(0.0625), grid_dim=(NQH, M), block_dim=HD)
                 ctx.enqueue_function[gmul_k](Aoflat, Gate, AoBflat, Int32(M * H), grid_dim=ceildiv(M * H, 256), block_dim=256)
-                ctx.enqueue_function[g_h](ResB, tq(ctx, wbuf, off[w + 6], H * H, q_h_h), ts(ctx, wbuf, off[w + 6], H * H, s_h_h), Ph, Int32(M), Int32(H), Int32(H), grid_dim=ceildiv(H, ROW_WAVES), block_dim=ROW_THREADS)
+                gl[Q4, MRT, H, H](ctx, wbuf, ResB, off[w + 6], Ph, M)
                 ctx.enqueue_function[r_add](Ph, XL_, Int32(M), Int32(H), grid_dim=ceildiv(M * H, 256), block_dim=256)
                 w += 7
             else:
-                ctx.enqueue_function[g_conv](CurB, tq(ctx, wbuf, off[w + 1], CONV * H, q_conv_h), ts(ctx, wbuf, off[w + 1], CONV * H, s_conv_h), Pq, Int32(M), Int32(CONV), Int32(H), grid_dim=ceildiv(CONV, ROW_WAVES), block_dim=ROW_THREADS)
-                ctx.enqueue_function[g_h](CurB, tq(ctx, wbuf, off[w + 2], H * H, q_h_h), ts(ctx, wbuf, off[w + 2], H * H, s_h_h), Ph, Int32(M), Int32(H), Int32(H), grid_dim=ceildiv(H, ROW_WAVES), block_dim=ROW_THREADS)
-                ctx.enqueue_function[g_ab](CurB, tq(ctx, wbuf, off[w + 3], NH_V * H, q_h_32), ts(ctx, wbuf, off[w + 3], NH_V * H, s_h_32), Pab, Int32(M), Int32(NH_V), Int32(H), grid_dim=ceildiv(NH_V, ROW_WAVES), block_dim=ROW_THREADS)
-                ctx.enqueue_function[g_ab](CurB, tq(ctx, wbuf, off[w + 4], NH_V * H, q_h_32), ts(ctx, wbuf, off[w + 4], NH_V * H, s_h_32), Pab2, Int32(M), Int32(NH_V), Int32(H), grid_dim=ceildiv(NH_V, ROW_WAVES), block_dim=ROW_THREADS)
+                gl[Q4, MRT, CONV, H](ctx, wbuf, CurB, off[w + 1], Pq, M)
+                gl[Q4, MRT, H, H](ctx, wbuf, CurB, off[w + 2], Ph, M)
+                gl[Q4, MRT, NH_V, H](ctx, wbuf, CurB, off[w + 3], Pab, M)
+                gl[Q4, MRT, NH_V, H](ctx, wbuf, CurB, off[w + 4], Pab2, M)
                 ctx.enqueue_function[r_conv](Pq, Qkvm, Int32(M), Int32(CONV), grid_dim=ceildiv(M * CONV, 256), block_dim=256)
                 ctx.enqueue_function[r_h](Ph, Zm, Int32(M), Int32(H), grid_dim=ceildiv(M * H, 256), block_dim=256)
                 ctx.enqueue_function[rgates_k](Pab, Pab2, Eg, Beta, tf(ctx, wbuf, off[w + 6], NH_V, g32_layout), tf(ctx, wbuf, off[w + 7], NH_V, g32_layout), Int32(M), grid_dim=1, block_dim=NH_V)
@@ -406,20 +436,20 @@ def run_case[MRT: Int](ctx: DeviceContext, mut wbuf: DeviceBuffer[u8], mut offd:
                 ctx.enqueue_function[l2_k](Conv, Int32(M), grid_dim=NH_V, block_dim=SSTATE)
                 ctx.enqueue_function[delta_k](SsL, Conv, Eg, Beta, So, Int32(ring), Int32(ssm_i), Int32(SLOTS), grid_dim=NH_V, block_dim=SSTATE)
                 ctx.enqueue_function[gated_k](So, Zm, tf(ctx, wbuf, off[w + 8], SSTATE, n128_layout), ResB, Int32(M), grid_dim=NH_V, block_dim=SSTATE)
-                ctx.enqueue_function[g_h](ResB, tq(ctx, wbuf, off[w + 9], H * H, q_h_h), ts(ctx, wbuf, off[w + 9], H * H, s_h_h), Ph, Int32(M), Int32(H), Int32(H), grid_dim=ceildiv(H, ROW_WAVES), block_dim=ROW_THREADS)
+                gl[Q4, MRT, H, H](ctx, wbuf, ResB, off[w + 9], Ph, M)
                 ctx.enqueue_function[r_add](Ph, XL_, Int32(M), Int32(H), grid_dim=ceildiv(M * H, 256), block_dim=256)
                 ssm_i += 1
                 w += 10
             ctx.enqueue_function[rmsc_k](XL_, tf(ctx, wbuf, off[w], H, h_layout), CurB, Int32(H), Float32(1e-6), grid_dim=M, block_dim=256)
-            ctx.enqueue_function[g_ffn](CurB, tq(ctx, wbuf, off[w + 1], FFN * H, q_h_ffn), ts(ctx, wbuf, off[w + 1], FFN * H, s_h_ffn), Pg, Int32(M), Int32(FFN), Int32(H), grid_dim=ceildiv(FFN, ROW_WAVES), block_dim=ROW_THREADS)
-            ctx.enqueue_function[g_ffn](CurB, tq(ctx, wbuf, off[w + 2], FFN * H, q_h_ffn), ts(ctx, wbuf, off[w + 2], FFN * H, s_h_ffn), Pu, Int32(M), Int32(FFN), Int32(H), grid_dim=ceildiv(FFN, ROW_WAVES), block_dim=ROW_THREADS)
+            gl[Q4, MRT, FFN, H](ctx, wbuf, CurB, off[w + 1], Pg, M)
+            gl[Q4, MRT, FFN, H](ctx, wbuf, CurB, off[w + 2], Pu, M)
             ctx.enqueue_function[r_swiglu](Pg, Pu, FgB, Int32(M), Int32(FFN), grid_dim=ceildiv(M * FFN, 256), block_dim=256)
-            ctx.enqueue_function[g_down](FgB, tq(ctx, wbuf, off[w + 3], H * FFN, q_ffn_h), ts(ctx, wbuf, off[w + 3], H * FFN, s_ffn_h), Ph, Int32(M), Int32(H), Int32(FFN), grid_dim=ceildiv(H, ROW_WAVES), block_dim=ROW_THREADS)
+            gl[Q4, MRT, H, FFN](ctx, wbuf, FgB, off[w + 3], Ph, M)
             ctx.enqueue_function[r_add](Ph, XL_, Int32(M), Int32(H), grid_dim=ceildiv(M * H, 256), block_dim=256)
             w += 4
         ctx.enqueue_function[rms_m](XL_, tf(ctx, wbuf, off[w], H, h_layout), HnL, Int32(H), Float32(1e-6), grid_dim=M, block_dim=256)
         ctx.enqueue_function[rmsc_k](XL_, tf(ctx, wbuf, off[w], H, h_layout), CurB, Int32(H), Float32(1e-6), grid_dim=M, block_dim=256)
-        ctx.enqueue_function[g_head](CurB, tq(ctx, wbuf, off[w + 1], VOCAB * H, q_h_v), ts(ctx, wbuf, off[w + 1], VOCAB * H, s_h_v), Pv, Int32(M), Int32(VOCAB), Int32(H), grid_dim=ceildiv(VOCAB, ROW_WAVES), block_dim=ROW_THREADS)
+        gl[Q4, MRT, VOCAB, H](ctx, wbuf, CurB, off[w + 1], Pv, M)
         ctx.enqueue_function[r_head](Pv, Logits, Int32(M), Int32(VOCAB), grid_dim=ceildiv(M * VOCAB, 256), block_dim=256)
         if MRT == 1:
             ctx.enqueue_function[argmax_k](Logits, ToksL, Int32(VOCAB), Int32(POS + 1), grid_dim=M, block_dim=256)
@@ -501,11 +531,11 @@ def run_case[MRT: Int](ctx: DeviceContext, mut wbuf: DeviceBuffer[u8], mut offd:
         ctx.enqueue_function[rmsc_k](XL_, tf(ctx, wbuf, off[wl], H, h_layout), CurB, Int32(H), Float32(1e-6), grid_dim=M, block_dim=256)
     ctx.synchronize()
     print("  native rmsc m =", M, ":", Float64(perf_counter_ns() - t_50_438) / 1e3 / 50.0, "us")
-    ctx.enqueue_function[g_conv](CurB, tq(ctx, wbuf, off[wl + 1], CONV * H, q_conv_h), ts(ctx, wbuf, off[wl + 1], CONV * H, s_conv_h), Pq, Int32(M), Int32(CONV), Int32(H), grid_dim=ceildiv(CONV, ROW_WAVES), block_dim=ROW_THREADS)
+    gl[Q4, MRT, CONV, H](ctx, wbuf, CurB, off[wl + 1], Pq, M)
     ctx.synchronize()
     var t_20_180 = perf_counter_ns()
     for _ in range(20):
-        ctx.enqueue_function[g_conv](CurB, tq(ctx, wbuf, off[wl + 1], CONV * H, q_conv_h), ts(ctx, wbuf, off[wl + 1], CONV * H, s_conv_h), Pq, Int32(M), Int32(CONV), Int32(H), grid_dim=ceildiv(CONV, ROW_WAVES), block_dim=ROW_THREADS)
+        gl[Q4, MRT, CONV, H](ctx, wbuf, CurB, off[wl + 1], Pq, M)
     ctx.synchronize()
     print("  native qkv-gemm 8192x4096 m =", M, ":", Float64(perf_counter_ns() - t_20_180) / 1e3 / 20.0, "us")
     ctx.enqueue_function[delta_k](SsL, Conv, Eg, Beta, So, Int32(0), Int32(1), Int32(SLOTS), grid_dim=NH_V, block_dim=SSTATE)
@@ -515,25 +545,25 @@ def run_case[MRT: Int](ctx: DeviceContext, mut wbuf: DeviceBuffer[u8], mut offd:
         ctx.enqueue_function[delta_k](SsL, Conv, Eg, Beta, So, Int32(0), Int32(1), Int32(SLOTS), grid_dim=NH_V, block_dim=SSTATE)
     ctx.synchronize()
     print("  native delta m =", M, ":", Float64(perf_counter_ns() - t_50_166) / 1e3 / 50.0, "us")
-    ctx.enqueue_function[g_ffn](CurB, tq(ctx, wbuf, off[wl + 11], FFN * H, q_h_ffn), ts(ctx, wbuf, off[wl + 11], FFN * H, s_h_ffn), Pg, Int32(M), Int32(FFN), Int32(H), grid_dim=ceildiv(FFN, ROW_WAVES), block_dim=ROW_THREADS)
+    gl[Q4, MRT, FFN, H](ctx, wbuf, CurB, off[wl + 11], Pg, M)
     ctx.synchronize()
     var t_20_222 = perf_counter_ns()
     for _ in range(20):
-        ctx.enqueue_function[g_ffn](CurB, tq(ctx, wbuf, off[wl + 11], FFN * H, q_h_ffn), ts(ctx, wbuf, off[wl + 11], FFN * H, s_h_ffn), Pg, Int32(M), Int32(FFN), Int32(H), grid_dim=ceildiv(FFN, ROW_WAVES), block_dim=ROW_THREADS)
+        gl[Q4, MRT, FFN, H](ctx, wbuf, CurB, off[wl + 11], Pg, M)
     ctx.synchronize()
     print("  native ffn gate 12288x4096 m =", M, ":", Float64(perf_counter_ns() - t_20_222) / 1e3 / 20.0, "us")
-    ctx.enqueue_function[g_down](FgB, tq(ctx, wbuf, off[wl + 13], H * FFN, q_ffn_h), ts(ctx, wbuf, off[wl + 13], H * FFN, s_ffn_h), Ph, Int32(M), Int32(H), Int32(FFN), grid_dim=ceildiv(H, ROW_WAVES), block_dim=ROW_THREADS)
+    gl[Q4, MRT, H, FFN](ctx, wbuf, FgB, off[wl + 13], Ph, M)
     ctx.synchronize()
     var t_20_437 = perf_counter_ns()
     for _ in range(20):
-        ctx.enqueue_function[g_down](FgB, tq(ctx, wbuf, off[wl + 13], H * FFN, q_ffn_h), ts(ctx, wbuf, off[wl + 13], H * FFN, s_ffn_h), Ph, Int32(M), Int32(H), Int32(FFN), grid_dim=ceildiv(H, ROW_WAVES), block_dim=ROW_THREADS)
+        gl[Q4, MRT, H, FFN](ctx, wbuf, FgB, off[wl + 13], Ph, M)
     ctx.synchronize()
     print("  native ffn down 4096x12288 m =", M, ":", Float64(perf_counter_ns() - t_20_437) / 1e3 / 20.0, "us")
-    ctx.enqueue_function[g_head](CurB, tq(ctx, wbuf, off[len(off) - 1], VOCAB * H, q_h_v), ts(ctx, wbuf, off[len(off) - 1], VOCAB * H, s_h_v), Pv, Int32(M), Int32(VOCAB), Int32(H), grid_dim=ceildiv(VOCAB, ROW_WAVES), block_dim=ROW_THREADS)
+    gl[Q4, MRT, VOCAB, H](ctx, wbuf, CurB, off[len(off) - 1], Pv, M)
     ctx.synchronize()
     var t_10_148 = perf_counter_ns()
     for _ in range(10):
-        ctx.enqueue_function[g_head](CurB, tq(ctx, wbuf, off[len(off) - 1], VOCAB * H, q_h_v), ts(ctx, wbuf, off[len(off) - 1], VOCAB * H, s_h_v), Pv, Int32(M), Int32(VOCAB), Int32(H), grid_dim=ceildiv(VOCAB, ROW_WAVES), block_dim=ROW_THREADS)
+        gl[Q4, MRT, VOCAB, H](ctx, wbuf, CurB, off[len(off) - 1], Pv, M)
     ctx.synchronize()
     print("  native head 248320x4096 m =", M, ":", Float64(perf_counter_ns() - t_10_148) / 1e3 / 10.0, "us")
 
@@ -602,82 +632,88 @@ def main() raises:
     comptime assert has_accelerator(), "Requires a GPU"
     var ctx = DeviceContext()
 
-    var off = List[Int]()
-    var kinds = List[Int]()
-    var nrows = List[Int]()
-    var ncols = List[Int]()
-    var cursor = 0
-    off.append(0)
-    kinds.append(-1)
-    nrows.append(0)
-    ncols.append(0)
+    var bad = 0
+    comptime for q4i in range(2):
+        comptime Q4C = q4i == 1
+        var off = List[Int]()
+        var kinds = List[Int]()
+        var nrows = List[Int]()
+        var ncols = List[Int]()
+        var cursor = 0
+        off.append(0)
+        kinds.append(-1)
+        nrows.append(0)
+        ncols.append(0)
 
-    @parameter
-    def add(kind: Int, n: Int, k: Int):
-        off.append(cursor)
-        kinds.append(kind)
-        nrows.append(n)
-        ncols.append(k)
-        if kind == 1:
-            cursor += q8_bytes(n, k)
-        else:
-            cursor += n * 4
-
-    for layer in range(NL):
-        add(0, H, 0)
-        if (layer + 1) % 4 == 0:
-            add(1, QF, H)
-            add(1, KV, H)
-            add(1, KV, H)
-            add(0, HD, 0)
-            add(0, HD, 0)
-            add(1, H, H)
-        else:
-            add(1, CONV, H)
-            add(1, H, H)
-            add(1, NH_V, H)
-            add(1, NH_V, H)
-            add(0, CONV * 4, 0)
-            add(0, NH_V, 0)
-            add(0, NH_V, 0)
-            add(0, SSTATE, 0)
-            add(1, H, H)
-        add(0, H, 0)
-        add(1, FFN, H)
-        add(1, FFN, H)
-        add(1, H, FFN)
-    add(0, H, 0)
-    add(1, VOCAB, H)
-    print("synthetic pack:", cursor, "bytes,", len(off), "entries")
-
-    var wh = ctx.enqueue_create_host_buffer[u8](cursor)
-    var offh = ctx.enqueue_create_host_buffer[i64](64)
-    ctx.synchronize()
-    for i in range(64):
-        offh[i] = 0
-    for e in range(len(off)):
-        offh[e] = Int64(off[e])
-        if kinds[e] == 1:
-            put_q8(wh, off[e], nrows[e], ncols[e], 100 + e)
-        elif kinds[e] == 0:
-            var n = nrows[e]
-            if n == CONV * 4:
-                put_f32(wh, off[e], n, 100 + e, -0.5, 0.5)
-            elif n == NH_V and e % 2 == 0:
-                put_f32(wh, off[e], n, 100 + e, -2.0, -0.1)
-            elif n == NH_V:
-                put_f32(wh, off[e], n, 100 + e, -1.0, 1.0)
+        @parameter
+        def add(kind: Int, n: Int, k: Int):
+            off.append(cursor)
+            kinds.append(kind)
+            nrows.append(n)
+            ncols.append(k)
+            if kind == 1:
+                cursor += q4_bytes(n, k) if Q4C else q8_bytes(n, k)
             else:
-                put_f32(wh, off[e], n, 100 + e, 0.5, 1.5)
-    var wbuf = ctx.enqueue_create_buffer[u8](cursor)
-    var offd = ctx.enqueue_create_buffer[i64](64)
-    ctx.enqueue_copy(dst_buf=wbuf, src_buf=wh)
-    ctx.enqueue_copy(dst_buf=offd, src_buf=offh)
-    ctx.synchronize()
+                cursor += n * 4
 
-    var bad = run_case[1](ctx, wbuf, offd, off)
-    bad += run_case[3](ctx, wbuf, offd, off)
+        for layer in range(NL):
+            add(0, H, 0)
+            if (layer + 1) % 4 == 0:
+                add(1, QF, H)
+                add(1, KV, H)
+                add(1, KV, H)
+                add(0, HD, 0)
+                add(0, HD, 0)
+                add(1, H, H)
+            else:
+                add(1, CONV, H)
+                add(1, H, H)
+                add(1, NH_V, H)
+                add(1, NH_V, H)
+                add(0, CONV * 4, 0)
+                add(0, NH_V, 0)
+                add(0, NH_V, 0)
+                add(0, SSTATE, 0)
+                add(1, H, H)
+            add(0, H, 0)
+            add(1, FFN, H)
+            add(1, FFN, H)
+            add(1, H, FFN)
+        add(0, H, 0)
+        add(1, VOCAB, H)
+        print("synthetic pack q4 =", Q4C, ":", cursor, "bytes,", len(off), "entries")
+
+        var wh = ctx.enqueue_create_host_buffer[u8](cursor)
+        var offh = ctx.enqueue_create_host_buffer[i64](64)
+        ctx.synchronize()
+        for i in range(64):
+            offh[i] = 0
+        for e in range(len(off)):
+            offh[e] = Int64(off[e])
+            if kinds[e] == 1:
+                comptime if Q4C:
+                    put_q4(wh, off[e], nrows[e], ncols[e], 100 + e)
+                else:
+                    put_q8(wh, off[e], nrows[e], ncols[e], 100 + e)
+            elif kinds[e] == 0:
+                var n = nrows[e]
+                if n == CONV * 4:
+                    put_f32(wh, off[e], n, 100 + e, -0.5, 0.5)
+                elif n == NH_V and e % 2 == 0:
+                    put_f32(wh, off[e], n, 100 + e, -2.0, -0.1)
+                elif n == NH_V:
+                    put_f32(wh, off[e], n, 100 + e, -1.0, 1.0)
+                else:
+                    put_f32(wh, off[e], n, 100 + e, 0.5, 1.5)
+        var wbuf = ctx.enqueue_create_buffer[u8](cursor)
+        var offd = ctx.enqueue_create_buffer[i64](64)
+        ctx.enqueue_copy(dst_buf=wbuf, src_buf=wh)
+        ctx.enqueue_copy(dst_buf=offd, src_buf=offh)
+        ctx.synchronize()
+        bad += run_case[1, Q4C](ctx, wbuf, offd, off)
+        comptime if not Q4C:
+            bad += run_case[3, Q4C](ctx, wbuf, offd, off)
     if bad != 0:
         print("FAIL: megakernel gate")
         return
-    print("PASS: megakernel gate at m = 1 and m = 3")
+    print("PASS: megakernel gate at m = 1 and m = 3 (q8) and m = 1 (q4)")
