@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Mechanical gate ladder for loop candidates. Serial, fail-closed, one receipt per candidate.
-# usage: tools/loop-gate.sh ITER CHAMPION_TOKPS   (llama-server must be stopped: engine needs the GPU)
+# usage: [LOOP_PROMPT2=ids-file] tools/loop-gate.sh ITER CHAMPION_TOKPS   (llama-server must be stopped: engine needs the GPU)
 set -uo pipefail
 cd "$(dirname "$0")/.."
 iter=$1; champ=$2; dir=.work/loop/$iter
@@ -16,6 +16,17 @@ check() { # check RUNLOG -> identity against the snapshot, and the fixture must 
   if ! cmp -s "$work/ref.txt" "$ref"; then cp "$work/ref.txt" "$ref"; echo "candidate rewrote $ref (restored)"; return 1; fi
   tools/check-tokens.sh "$work/ref.txt" "$1"
 }
+# Optional second, unpublished workload (audit 2026-09-08, lead 2): LOOP_PROMPT2=<ids file>.
+# The iteration's own pristine sources are built once and generate that prompt's
+# reference; every candidate must reproduce it as well as the published fixture.
+# Behind a flag so the default ladder's cost and meaning are unchanged.
+if [ -n "${LOOP_PROMPT2:-}" ]; then
+  [ -f "$LOOP_PROMPT2" ] || { echo "LOOP_PROMPT2 not found: $LOOP_PROMPT2"; exit 1; }
+  ./.venv/bin/mojo build "$dir/src/engine.mojo" -I "$dir/src" -o "$dir/champion-engine" > "$dir/champion-build.log" 2>&1 || { echo "champion build failed: $(grep -m1 error: "$dir/champion-build.log")"; exit 1; }
+  BARO_PROMPT=$LOOP_PROMPT2 ./"$dir/champion-engine" > "$dir/champion-run2.log" 2>&1 || { echo "champion run on $LOOP_PROMPT2 failed"; exit 1; }
+  ref2snap=$(grep -m1 '^GENERATED:' "$dir/champion-run2.log" | sed 's/^GENERATED://' | tr -s ' ' '\n' | sed '/^$/d')
+  echo "second fixture: $LOOP_PROMPT2 ($(wc -l < "$LOOP_PROMPT2") prompt tokens), $(echo "$ref2snap" | wc -l) reference tokens from the iteration's own sources"
+fi
 for d in "$dir"/cand-*.diff; do
   c=$(basename "$d" .diff); r="$dir/$c.receipt.json"; work="$dir/$c"; rm -rf "$work"; mkdir -p "$work"
   fail() { echo "{\"cand\":\"$c\",\"stage\":\"$1\",\"result\":\"FAIL\",\"why\":\"$2\"}" > "$r"; echo "$c: FAIL $1: $2"; return 1; }
@@ -57,6 +68,11 @@ for d in "$dir"/cand-*.diff; do
   # stage 2: token identity at 64
   ./"$work/engine" > "$work/run0.log" 2>&1 || { fail run "engine exited $?"; continue; }
   check "$work/run0.log" > "$work/gate.log" 2>&1 || { fail identity "$(head -1 "$work/gate.log")"; continue; }
+  if [ -n "${LOOP_PROMPT2:-}" ]; then
+    BARO_PROMPT=$LOOP_PROMPT2 ./"$work/engine" > "$work/run0b.log" 2>&1 || { fail run "engine exited $? on second fixture"; continue; }
+    printf '%s\n' "$ref2snap" > "$work/ref2.txt"
+    tools/check-tokens.sh "$work/ref2.txt" "$work/run0b.log" > "$work/gate0b.log" 2>&1 || { fail identity2 "$(head -1 "$work/gate0b.log")"; continue; }
+  fi
   # stage 3: preregistered perf -- candidate's own PREDICT is the preregistration; read tok/s_gen back
   pred=$(cat "$dir/$c.predict"); t=(); w=(); g=(); idfail=""
   for k in 1 2 3; do
@@ -94,7 +110,7 @@ print(f"code_objects={n} bad={bad}")
 sys.exit(1 if bad or n==0 else 0)
 PY
   [ $? = 0 ] || { fail isa "scratch or spills"; continue; }
-  echo "{\"cand\":\"$c\",\"stage\":\"all\",\"result\":\"PASS\",\"predict_pct\":\"$pred\",\"tokps\":[${t[0]},${t[1]},${t[2]}],\"median\":$med,\"champion\":$champ,\"spread\":$spread,\"wall_s\":[${w[0]},${w[1]},${w[2]}],\"gpu_total_s\":[${g[0]},${g[1]},${g[2]}],\"apply_mode\":\"$mode\",\"hunks_renumbered\":$nfix}" > "$r"
+  echo "{\"cand\":\"$c\",\"stage\":\"all\",\"result\":\"PASS\",\"predict_pct\":\"$pred\",\"tokps\":[${t[0]},${t[1]},${t[2]}],\"median\":$med,\"champion\":$champ,\"spread\":$spread,\"wall_s\":[${w[0]},${w[1]},${w[2]}],\"gpu_total_s\":[${g[0]},${g[1]},${g[2]}],\"fixture2\":\"${LOOP_PROMPT2:-none}\",\"apply_mode\":\"$mode\",\"hunks_renumbered\":$nfix}" > "$r"
   echo "$c: PASS median $med vs $champ (predict $pred%)"; { echo "## $c  median $med vs champion $champ (predict $pred%)"; echo '```diff'; cat "$d"; echo '```'; } >> "$dir/SURVIVORS.md"
 done
 echo "survivors: $(grep -c '^## ' "$dir/SURVIVORS.md")"
