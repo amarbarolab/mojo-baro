@@ -17,7 +17,14 @@ for d in "$dir"/cand-*.diff; do
   # The banned-token list alone is evadable: iteration 004's cand-1 commented out
   # `if pf4:`, a profiling GUARD, whose own line carries none of these tokens while
   # disabling the block underneath it. Guard names are in the pattern for that reason.
-  grep -E '^[+-].*(BARO_PROFILE|perf_counter_ns|tok/s|check-tokens|ref-tokens|getenv|print\(|\b(prof|pf2|pf3|pf4|pf_[a-z]+)\b)' "$d" >/dev/null && { fail scope "touches timing/print/profile code"; continue; }
+  # Audit 2026-09-08 (exchange/scorer-integrity-report.md): the timing STATE is
+  # as reachable as the timing CALLS. `t_prefill_end += 500_000_000`, deleting
+  # `prefill_done = True`, or deleting the synchronize before `dt` each carried
+  # none of the tokens above and each passed the whole ladder with an inflated
+  # tok/s_gen. Every identifier the tok/s_gen arithmetic reads, every host sync,
+  # file writes and the fixture paths are banned on +/- lines. None of these
+  # names occur in any kernel file; a legitimate kernel edit is unaffected.
+  grep -E '^[+-].*(BARO_PROFILE|perf_counter_ns|tok/s|check-tokens|ref-tokens|getenv|print\(|open\(|synchronize|engine-pack|GEN_N|generated|toks_h|\b(prof|pf2|pf3|pf4|pf_[a-z]+|t0|tq|tp|dt|nw|now[0-9]?|t_acc|t_load|t_host|t_prefill_end|prefill_done|prefill_s|decode_s)\b)' "$d" >/dev/null && { fail scope "touches timing/print/profile/fixture code"; continue; }
   # stage 1: apply + compile on a copy of the gguf sources
   # Hunk counts are rewritten from the hunk body first (iteration 002 lost 4/4
   # here to headers declaring 7 context lines while supplying 4). Content is
