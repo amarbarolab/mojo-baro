@@ -3,6 +3,10 @@
 sources embedded in its own gguf plus the engine's BARO_PROFILE shares, and
 proposes ONE unified diff per identity framing.
 
+The output-format block is a placeholder skeleton, not a worked example:
+iterations 002-005 saw 8 of 14 candidates echo the example back, invented
+symbols and all (bench/loop-protocol.md, iteration 005 result).
+
 Usage: tools/loop-propose.py MODEL.gguf ITER [--n 4] [--region auto|attn|ssm|ffn|head]
          [--profile .work/profile-run.log] [--endpoint http://127.0.0.1:8083]
 Writes .work/loop/<ITER>/{meta.json,FILES,src/,prompt.md,cand-<i>.raw.md,cand-<i>.diff,cand-<i>.predict}
@@ -43,15 +47,20 @@ Output format, exactly:
 <= 8 lines of rationale, then
 
 ```diff
---- a/engine.mojo
-+++ b/engine.mojo
-@@ -470,7 +470,7 @@
-             ctx.enqueue_function[g_ffn](CurB2, Wfg, Pg, ...)
--            ctx.enqueue_function[r_swiglu](Pg, Pu, FgB2, ...)
-+            ctx.enqueue_function[r_swiglu_fused](Pg, Pu, FgB2, ...)
+--- a/<one of the files shown>
++++ b/<the same file>
+@@ -<first line>,<count> +<first line>,<count> @@
+ <an unchanged line, copied verbatim from the file>
+-<the exact line you remove>
++<the line you put in its place>
+ <an unchanged line, copied verbatim from the file>
 ```
 
-then one line `PREDICT: <signed percent>`."""
+then one line `PREDICT: <signed percent>`.
+
+Every line inside the fence is a real line of the file shown or your real
+replacement. No `...`, no angle-bracket placeholders left in, no name that is
+absent from the binding table and the files shown."""
 
 
 def identities():
