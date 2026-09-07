@@ -16,13 +16,25 @@ check() { # check RUNLOG -> identity against the snapshot, and the fixture must 
   if ! cmp -s "$work/ref.txt" "$ref"; then cp "$work/ref.txt" "$ref"; echo "candidate rewrote $ref (restored)"; return 1; fi
   tools/check-tokens.sh "$work/ref.txt" "$1"
 }
+# The iteration's own pristine sources are built once per gate run. That binary is
+# (a) the wall-clock reference for the plausibility term, (b) the ISA baseline for
+# stage 4, and (c) the oracle for the optional second workload. Rule amended
+# 2026-09-08 (bench/loop-protocol.md): the acceptance denominator stays the
+# CHAMPION_TOKPS argument, measured in-session by tools/gguf-closure.sh.
+./.venv/bin/mojo build "$dir/src/engine.mojo" -I "$dir/src" -o "$dir/champion-engine" > "$dir/champion-build.log" 2>&1 || { echo "champion build failed: $(grep -m1 error: "$dir/champion-build.log")"; exit 1; }
+cw=(); ct=()
+for k in 1 2 3; do
+  s0=$(date +%s%N); ./"$dir/champion-engine" > "$dir/champion-run$k.log" 2>&1 || { echo "champion run $k failed"; exit 1; }; s1=$(date +%s%N)
+  cw+=("$(awk -v a="$s0" -v b="$s1" 'BEGIN{printf "%.3f", (b-a)/1e9}')"); ct+=("$(grep -oE 'tok/s_gen: [0-9.]+' "$dir/champion-run$k.log" | awk '{print $2}')")
+done
+cwall=$(printf '%s\n' "${cw[@]}" | sort -n | sed -n 2p); ctok=$(printf '%s\n' "${ct[@]}" | sort -n | sed -n 2p)
+python3 tools/isa-spills.py "$dir/champion-engine" > "$dir/champion-isa.json" || { echo "champion ISA census failed"; exit 1; }
+echo "champion binary from $dir/src: wall_s median $cwall (${cw[*]}), tok/s_gen median $ctok (${ct[*]}), argument $champ; ISA baseline $(python3 -c "import json;d=json.load(open('$dir/champion-isa.json'));print(sum(1 for v in d['families'].values() if v['spills'] or v['scratch']),'spilling families of',len(d['families']))")"
 # Optional second, unpublished workload (audit 2026-09-08, lead 2): LOOP_PROMPT2=<ids file>.
-# The iteration's own pristine sources are built once and generate that prompt's
-# reference; every candidate must reproduce it as well as the published fixture.
-# Behind a flag so the default ladder's cost and meaning are unchanged.
+# Every candidate must reproduce the champion binary's 64 tokens on it as well as
+# on the published fixture. Behind a flag so the default ladder's cost is unchanged.
 if [ -n "${LOOP_PROMPT2:-}" ]; then
   [ -f "$LOOP_PROMPT2" ] || { echo "LOOP_PROMPT2 not found: $LOOP_PROMPT2"; exit 1; }
-  ./.venv/bin/mojo build "$dir/src/engine.mojo" -I "$dir/src" -o "$dir/champion-engine" > "$dir/champion-build.log" 2>&1 || { echo "champion build failed: $(grep -m1 error: "$dir/champion-build.log")"; exit 1; }
   BARO_PROMPT=$LOOP_PROMPT2 ./"$dir/champion-engine" > "$dir/champion-run2.log" 2>&1 || { echo "champion run on $LOOP_PROMPT2 failed"; exit 1; }
   ref2snap=$(grep -m1 '^GENERATED:' "$dir/champion-run2.log" | sed 's/^GENERATED://' | tr -s ' ' '\n' | sed '/^$/d')
   echo "second fixture: $LOOP_PROMPT2 ($(wc -l < "$LOOP_PROMPT2") prompt tokens), $(echo "$ref2snap" | wc -l) reference tokens from the iteration's own sources"
@@ -91,26 +103,16 @@ for d in "$dir"/cand-*.diff; do
   spread=$(awk -v l="$lo" -v h="$hi" 'BEGIN{printf "%.3f", (h-l)/l}')
   ok=$(awk -v m="$med" -v c="$champ" -v s="$spread" 'BEGIN{print (m >= c*1.02 && s < 0.05) ? 1 : 0}')
   [ "$ok" = 1 ] || { fail perf "median $med vs champion $champ (need +2%), spread $spread"; continue; }
-  # stage 4: ISA sanity -- no scratch, no spills in any kernel of the built binary
-  python3 - "$work/engine" "$work" <<'PY'
-import struct,sys,subprocess
-d=open(sys.argv[1],'rb').read(); i=0; n=0; bad=[]
-while True:
-    i=d.find(b'\x7fELF',i)
-    if i<0: break
-    if struct.unpack_from('<H',d,i+18)[0]==224:
-        shoff,=struct.unpack_from('<Q',d,i+40); se,sn=struct.unpack_from('<HH',d,i+58)
-        p=f"{sys.argv[2]}/co{n}.co"; open(p,'wb').write(d[i:i+shoff+se*sn]); n+=1
-        notes=subprocess.run(['/opt/rocm/llvm/bin/llvm-readelf','--notes',p],capture_output=True,text=True).stdout
-        for line in notes.splitlines():
-            if ('.private_segment_fixed_size:' in line or 'spill_count:' in line) and line.split(':')[1].strip()!='0':
-                bad.append(line.strip())
-    i+=4
-print(f"code_objects={n} bad={bad}")
-sys.exit(1 if bad or n==0 else 0)
-PY
-  [ $? = 0 ] || { fail isa "scratch or spills"; continue; }
-  echo "{\"cand\":\"$c\",\"stage\":\"all\",\"result\":\"PASS\",\"predict_pct\":\"$pred\",\"tokps\":[${t[0]},${t[1]},${t[2]}],\"median\":$med,\"champion\":$champ,\"spread\":$spread,\"wall_s\":[${w[0]},${w[1]},${w[2]}],\"gpu_total_s\":[${g[0]},${g[1]},${g[2]}],\"fixture2\":\"${LOOP_PROMPT2:-none}\",\"apply_mode\":\"$mode\",\"hunks_renumbered\":$nfix}" > "$r"
+  # Plausibility (rule 2026-09-08): the claimed decode saving must show in the
+  # gate's own clock. Champion and candidate wall_s come from the same gate run.
+  wmed=$(printf '%s\n' "${w[@]}" | sort -n | sed -n 2p)
+  plaus=$(awk -v cw="$cwall" -v ww="$wmed" -v c="$champ" -v m="$med" 'BEGIN{print ((cw-ww) >= 0.5*(63/c-63/m)) ? 1 : 0}')
+  [ "$plaus" = 1 ] || { fail perf "tok/s_gen $med claims $(awk -v c="$champ" -v m="$med" 'BEGIN{printf "%.3f", 63/c-63/m}') s of decode saved, wall clock moved $(awk -v cw="$cwall" -v ww="$wmed" 'BEGIN{printf "%.3f", cw-ww}') s (champion wall $cwall, candidate $wmed)"; continue; }
+  # stage 4: ISA -- no kernel family with more scratch or more spills than the
+  # champion build of the same sources, none new with any (rule 2026-09-08; the
+  # absolute form rejected the champion itself: delta-step variants spill).
+  python3 tools/isa-spills.py "$work/engine" --baseline "$dir/champion-isa.json" > "$work/isa.log" 2>&1 || { fail isa "$(sed -n 2p "$work/isa.log" | sed 's/^ *//')"; continue; }
+  echo "{\"cand\":\"$c\",\"stage\":\"all\",\"result\":\"PASS\",\"predict_pct\":\"$pred\",\"tokps\":[${t[0]},${t[1]},${t[2]}],\"median\":$med,\"champion\":$champ,\"spread\":$spread,\"wall_s\":[${w[0]},${w[1]},${w[2]}],\"champion_wall_s\":[${cw[0]},${cw[1]},${cw[2]}],\"champion_tokps_ingate\":[${ct[0]},${ct[1]},${ct[2]}],\"gpu_total_s\":[${g[0]},${g[1]},${g[2]}],\"fixture2\":\"${LOOP_PROMPT2:-none}\",\"apply_mode\":\"$mode\",\"hunks_renumbered\":$nfix}" > "$r"
   echo "$c: PASS median $med vs $champ (predict $pred%)"; { echo "## $c  median $med vs champion $champ (predict $pred%)"; echo '```diff'; cat "$d"; echo '```'; } >> "$dir/SURVIVORS.md"
 done
 echo "survivors: $(grep -c '^## ' "$dir/SURVIVORS.md")"
