@@ -6,6 +6,16 @@ cd "$(dirname "$0")/.."
 iter=$1; champ=$2; dir=.work/loop/$iter
 export MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_SIZE_PERCENT=10
 : > "$dir/SURVIVORS.md"
+# The reference is read ONCE, before any candidate binary runs, and every
+# identity check compares against this snapshot. The on-disk file lives in
+# .work/, which the candidate's process can write; a candidate that rewrites
+# it to its own output would otherwise pass identity (audit 2026-09-08, cand-3).
+ref=.work/engine-pack/ref-tokens-64.txt; refsnap=$(cat "$ref")
+check() { # check RUNLOG -> identity against the snapshot, and the fixture must be untouched
+  printf '%s\n' "$refsnap" > "$work/ref.txt"
+  if ! cmp -s "$work/ref.txt" "$ref"; then cp "$work/ref.txt" "$ref"; echo "candidate rewrote $ref (restored)"; return 1; fi
+  tools/check-tokens.sh "$work/ref.txt" "$1"
+}
 for d in "$dir"/cand-*.diff; do
   c=$(basename "$d" .diff); r="$dir/$c.receipt.json"; work="$dir/$c"; rm -rf "$work"; mkdir -p "$work"
   fail() { echo "{\"cand\":\"$c\",\"stage\":\"$1\",\"result\":\"FAIL\",\"why\":\"$2\"}" > "$r"; echo "$c: FAIL $1: $2"; return 1; }
@@ -46,10 +56,21 @@ for d in "$dir"/cand-*.diff; do
   ./.venv/bin/mojo build "$work/src/engine.mojo" -I "$work/src" -o "$work/engine" > "$work/build.log" 2>&1 || { fail compile "$(grep -m1 error: "$work/build.log" | cut -c1-160)"; continue; }
   # stage 2: token identity at 64
   ./"$work/engine" > "$work/run0.log" 2>&1 || { fail run "engine exited $?"; continue; }
-  tools/check-tokens.sh .work/engine-pack/ref-tokens-64.txt "$work/run0.log" > "$work/gate.log" 2>&1 || { fail identity "$(head -1 "$work/gate.log")"; continue; }
+  check "$work/run0.log" > "$work/gate.log" 2>&1 || { fail identity "$(head -1 "$work/gate.log")"; continue; }
   # stage 3: preregistered perf -- candidate's own PREDICT is the preregistration; read tok/s_gen back
-  pred=$(cat "$dir/$c.predict"); t=()
-  for k in 1 2 3; do ./"$work/engine" > "$work/run$k.log" 2>&1; t+=("$(grep -oE 'tok/s_gen: [0-9.]+' "$work/run$k.log" | awk '{print $2}')"); done
+  pred=$(cat "$dir/$c.predict"); t=(); w=(); g=(); idfail=""
+  for k in 1 2 3; do
+    s0=$(date +%s%N); ./"$work/engine" > "$work/run$k.log" 2>&1; s1=$(date +%s%N)
+    t+=("$(grep -oE 'tok/s_gen: [0-9.]+' "$work/run$k.log" | awk '{print $2}')")
+    w+=("$(awk -v a="$s0" -v b="$s1" 'BEGIN{printf "%.3f", (b-a)/1e9}')")
+    g+=("$(grep -oE 'gpu_total_s: [0-9.]+' "$work/run$k.log" | awk '{print $2}')")
+    check "$work/run$k.log" > "$work/gate$k.log" 2>&1 || idfail="run$k: $(head -1 "$work/gate$k.log")"
+  done
+  # The identity rule is 64/64 on the engine's output; a candidate that is right
+  # once and wrong on the timed runs is not right. wall_s is the gate's own clock
+  # around the whole process (load + prefill + decode + receipt tail): a receipt
+  # field for cross-checking the self-reported tok/s_gen, not an acceptance term.
+  [ -z "$idfail" ] || { fail identity "$idfail"; continue; }
   med=$(printf '%s\n' "${t[@]}" | sort -n | sed -n 2p); lo=$(printf '%s\n' "${t[@]}" | sort -n | head -1); hi=$(printf '%s\n' "${t[@]}" | sort -n | tail -1)
   spread=$(awk -v l="$lo" -v h="$hi" 'BEGIN{printf "%.3f", (h-l)/l}')
   ok=$(awk -v m="$med" -v c="$champ" -v s="$spread" 'BEGIN{print (m >= c*1.02 && s < 0.05) ? 1 : 0}')
@@ -73,7 +94,7 @@ print(f"code_objects={n} bad={bad}")
 sys.exit(1 if bad or n==0 else 0)
 PY
   [ $? = 0 ] || { fail isa "scratch or spills"; continue; }
-  echo "{\"cand\":\"$c\",\"stage\":\"all\",\"result\":\"PASS\",\"predict_pct\":\"$pred\",\"tokps\":[${t[0]},${t[1]},${t[2]}],\"median\":$med,\"champion\":$champ,\"spread\":$spread,\"apply_mode\":\"$mode\",\"hunks_renumbered\":$nfix}" > "$r"
+  echo "{\"cand\":\"$c\",\"stage\":\"all\",\"result\":\"PASS\",\"predict_pct\":\"$pred\",\"tokps\":[${t[0]},${t[1]},${t[2]}],\"median\":$med,\"champion\":$champ,\"spread\":$spread,\"wall_s\":[${w[0]},${w[1]},${w[2]}],\"gpu_total_s\":[${g[0]},${g[1]},${g[2]}],\"apply_mode\":\"$mode\",\"hunks_renumbered\":$nfix}" > "$r"
   echo "$c: PASS median $med vs $champ (predict $pred%)"; { echo "## $c  median $med vs champion $champ (predict $pred%)"; echo '```diff'; cat "$d"; echo '```'; } >> "$dir/SURVIVORS.md"
 done
 echo "survivors: $(grep -c '^## ' "$dir/SURVIVORS.md")"
