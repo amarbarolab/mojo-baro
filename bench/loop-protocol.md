@@ -311,3 +311,33 @@ is the fallback if it does not move the 8/14.
 
 Not decided here — the worth-it rule is frozen and says widen. Flagging that
 the evidence points elsewhere, for the maintainer's call.
+
+## Gate amendment (2026-09-08, scorer-integrity audit) — acceptance rule unchanged
+
+Audit report: `exchange/scorer-integrity-report.md`. Four hand-written
+candidates ran through the ladder as it stood: one-line edits to the timing
+*state* (`t_prefill_end += …`, deleting `prefill_done = True`, deleting the
+host sync before `dt`) passed scope and identity and reported 108–920 000
+`tok/s_gen`; one rewrote `ref-tokens-64.txt` with its own wrong output and
+passed identity. The sync-deletion candidate passed perf at +63 % and died only
+at stage 4 — which **the champion's own sources also fail** (9 spilling
+kernel instantiations at ffa1808), so no candidate has ever been able to land.
+That last point is a rule question and is left for the maintainer (proposals P-A..P-D
+in the report).
+
+Gate changes, none of which alters what counts as a win:
+
+- scope: the identifiers the `tok/s_gen` arithmetic reads, host syncs, file
+  writes and the fixture paths are banned on `+`/`-` lines; none occur in any
+  kernel file. 14/14 historical candidates keep their stage-0 verdict.
+- the reference is snapshotted before any candidate runs; every timed run is
+  identity-checked against the snapshot; a rewritten reference fails the
+  candidate and is restored.
+- receipts carry the gate's own `wall_s` and the engine's `gpu_total_s` per
+  timed run, for cross-checking the self-reported number.
+- `LOOP_PROMPT2=<ids file>` (optional): a second workload whose reference is
+  generated in-session from the iteration's pristine sources
+  (`bench/loop-prompt2.txt`, 27 tokens). Default cost and meaning unchanged.
+
+Gotcha: `gpu-wait run` does not forward the caller's environment; pass the
+flag inside the job (`gpu-wait run -- env LOOP_PROMPT2=… tools/loop-gate.sh …`).
