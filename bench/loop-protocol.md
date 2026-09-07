@@ -9,10 +9,38 @@ re-embedded into a NEW gguf with lineage. Claude reads survivors only.
 - `tools/gguf-closure.sh MODEL` -- build the engine from the gguf's own sources, gate 64/64. The floor.
 - `BARO_PROFILE=1 .work/engine` -- per-sub-block GPU shares; picks the target region.
 - `tools/loop-propose.py MODEL ITER --n N --start I` -- N identity framings, one diff each, into `.work/loop/ITER/`.
-- `tools/loop-gate.sh ITER CHAMPION_TOKPS` -- scope -> compile -> identity@64 -> perf -> ISA. Receipt per candidate.
+- `tools/loop-gate.sh ITER CHAMPION_TOKPS` -- scope -> compile -> identity@64 (+ `LOOP_PROMPT2`) -> perf + wall-clock plausibility -> ISA vs champion build. Receipt per candidate.
+- `tools/loop-run.sh ITER MODEL.gguf` -- the whole choreography below as ONE GPU job: proposer server up -> propose -> server down -> champion (`gguf-closure`, 3 runs) -> gate.
 - `tools/loop-embed-winner.sh SRC.gguf ITER` -- embeds the COMMITTED repo sources into `<src>-loop-ITER.gguf`, adds `baro.kernel.parent`.
 
-## Frozen acceptance rule (2026-09-01)
+## Acceptance rule (amended 2026-09-08; iterations >= 006)
+
+A candidate lands only if: touches only `baro.kernel.files`; compiles; 64/64
+greedy tokens identical on every run, and on the second fixture when
+`LOOP_PROMPT2` is set; median of 3 `tok/s_gen` read back from the engine's own
+output >= champion + 2% with spread < 5%; **the claimed decode saving shows in
+the gate's own wall clock**: median(champion `wall_s`) - median(candidate
+`wall_s`) >= 0.5 x (63/champion - 63/median `tok/s_gen`), both walls measured
+by the same gate run around the whole process; **no kernel family with more
+scratch or more spills than the champion build of the same sources, none new
+with any** (`tools/isa-spills.py`). The candidate's own `PREDICT` line is its
+preregistration and is recorded in the receipt. Server (port 8083) must be
+stopped for stages 2-4; it is the proposer, not the instrument.
+
+Why amended (the maintainer, 2026-09-08, after `exchange/scorer-integrity-report.md`):
+the 2026-09-01 form said "no scratch and no spills in any embedded code
+object", and the champion's own sources fail that (eight `ssm_delta_step`
+variants and one skinny matmul spill), so no candidate could ever have landed;
+and the metric is the engine's own print, which a one-line edit could set to
+any value -- the wall-clock term is the bound a candidate cannot print. The
+0.5 factor is loose on purpose (wall jitter ~6% at 64 tokens): it rejects a
+2x claim whose process did not get faster, it does not adjudicate +2%.
+
+Receipts 001-005 were judged under the 2026-09-01 rule below. No candidate in
+them reached stage 4, so no verdict changes; the audit's hand-written
+candidates are the only ones that did.
+
+### Superseded: frozen acceptance rule (2026-09-01)
 
 A candidate lands only if: touches only `baro.kernel.files`; compiles; 64/64
 greedy tokens identical; median of 3 `tok/s_gen` read back from the engine's
@@ -341,3 +369,27 @@ Gate changes, none of which alters what counts as a win:
 
 Gotcha: `gpu-wait run` does not forward the caller's environment; pass the
 flag inside the job (`gpu-wait run -- env LOOP_PROMPT2=… tools/loop-gate.sh …`).
+
+## Iteration 006 preregistration (2026-09-08) — the worked example becomes a skeleton
+
+**The variable is the proposer's output-format block, and only that.** The
+`RULES` worked example (`ctx.enqueue_function[g_ffn](CurB2, Wfg, Pg, ...)` and
+friends) is replaced by a placeholder skeleton with no plausible symbol names
+and no ellipsis (`tools/loop-propose.py`). Held from iteration 004: gguf
+`Qwen3.8-27B-OBLITERATED.Q4_K_M-BARO-ffa1808.gguf` as source of the sources and
+proposer, region `ffn`, identities 01-04, `--max-tokens 12288`, Qwen3 sampler
+(`temp 0.6 / top_p 0.95 / top_k 20 / min_p 0`, `repeat_penalty 1.05`,
+`presence_penalty 1.0`), read back from `/props` before proposing.
+
+Also live for the first time, none of it a variable under test: the amended
+acceptance rule above, the hardened scope stage, identity on every run,
+`LOOP_PROMPT2=bench/loop-prompt2.txt`, and `tools/loop-run.sh` running the
+whole choreography as one GPU job (server started and stopped inside it).
+
+Predictions, frozen before the run: the example-echo class (8/14 across
+002-005) goes to 0/4 by construction; the number that matters is candidates
+editing **real lines of the shown files** — 2/4 in iteration 004, and a
+skeleton that names no symbol should put it at >= 3/4. Survivors: still 0 is
+the likely outcome; a candidate reaching perf on merits would be the first.
+If real-line edits do not rise, the worth-it rule's "widen the region" is the
+next move.
