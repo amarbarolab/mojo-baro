@@ -1,9 +1,10 @@
 from std.gpu import block_dim, block_idx, global_idx, lane_id, thread_idx, WARP_SIZE
+from std.gpu.primitives import warp
 from std.math import cos, exp, log, sin, tanh
 from max.gpu.memory import AddressSpace
 from layout import TileTensor, TensorLayout, row_major, stack_allocation
 from attn import KVT, HD, NQH, NKVH, attn_head_span
-from matmul_skinny import dtype, SPLITK
+from matmul_skinny import dtype, SPLITK, ROW_WAVES
 
 comptime f32 = DType.float32
 
@@ -122,3 +123,61 @@ def amar_skinny_reduce_gelu_par_bf16[
         u += rebind[Scalar[dtype]](Up[s, r, c])
     var gelu = 0.5 * g * (1 + tanh(0.7978845608028654 * g * (1 + 0.044715 * g * g)))
     C[r, c] = rebind[C.ElementType]((gelu * u).cast[DType.bfloat16]())
+
+
+def amar_gemv_q8[
+    EPI: Int, ALayout: TensorLayout, QLayout: TensorLayout, SLayout: TensorLayout,
+    CLayout: TensorLayout, BLayout: TensorLayout
+](
+    A: TileTensor[DType.bfloat16, ALayout, MutAnyOrigin],
+    Q: TileTensor[DType.int8, QLayout, MutAnyOrigin],
+    S: TileTensor[DType.float16, SLayout, MutAnyOrigin],
+    C: TileTensor[f32, CLayout, MutAnyOrigin],
+    Ob: TileTensor[DType.bfloat16, BLayout, MutAnyOrigin],
+    n: Int32,
+    k_dim: Int32,
+):
+    comptime assert A.flat_rank == 2 and Q.flat_rank == 2 and S.flat_rank == 2
+    comptime assert C.flat_rank == 1 and Ob.flat_rank == 1
+    var N = Int(n)
+    var K = Int(k_dim)
+    var lane = Int(lane_id())
+    var row = Int(block_idx.x) * ROW_WAVES + Int(thread_idx.x) // WARP_SIZE
+    if row >= N:
+        return
+    comptime QV = 16
+    comptime STEP = WARP_SIZE * QV
+    comptime UNROLL = 4
+    var Qv = Q.vectorize[1, QV]()
+    var Av = A.vectorize[1, QV]()
+    var acc = SIMD[f32, QV](0)
+    var kk = 0
+    while kk + UNROLL * STEP <= K:
+        var qs = InlineArray[SIMD[DType.int8, QV], UNROLL](uninitialized=True)
+        var ds = InlineArray[Scalar[DType.float16], UNROLL](uninitialized=True)
+        comptime for u in range(UNROLL):
+            var kb = kk + u * STEP
+            qs[u] = rebind[SIMD[DType.int8, QV]](Qv[row, kb // QV + lane])
+            ds[u] = rebind[Scalar[DType.float16]](S[row, (kb + lane * QV) // 32])
+        comptime for u in range(UNROLL):
+            var kb = kk + u * STEP
+            var w = qs[u].cast[f32]() * ds[u].cast[f32]()
+            var a = rebind[SIMD[DType.bfloat16, QV]](Av[0, kb // QV + lane]).cast[f32]()
+            acc += w * a
+        kk += UNROLL * STEP
+    while kk < K:
+        var q = rebind[SIMD[DType.int8, QV]](Qv[row, kk // QV + lane]).cast[f32]()
+        var d = rebind[Scalar[DType.float16]](S[row, (kk + lane * QV) // 32]).cast[f32]()
+        var a = rebind[SIMD[DType.bfloat16, QV]](Av[0, kk // QV + lane]).cast[f32]()
+        acc += q * d * a
+        kk += STEP
+    var total = warp.sum(acc.reduce_add())
+    if lane == 0:
+        comptime if EPI == 0:
+            C[row] = rebind[C.ElementType](total)
+        elif EPI == 1:
+            C[row] = rebind[C.ElementType](rebind[Scalar[f32]](C[row]) + total)
+        else:
+            var g = rebind[Scalar[f32]](C[row])
+            var gelu = 0.5 * g * (1 + tanh(0.7978845608028654 * g * (1 + 0.044715 * g * g)))
+            Ob[row] = rebind[Ob.ElementType]((gelu * total).cast[DType.bfloat16]())
