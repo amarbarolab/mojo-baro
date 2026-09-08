@@ -243,3 +243,32 @@ loops got a worse schedule. Rule: a whole-kernel change is judged on the
 real pack in one stint, never on the synthetic test alone; the spill count
 is not a fitness function. The m=1 kernel keeps the register column
 (`RELOAD=False`); the window kernel keeps the reload (it needs the 192 cap).
+
+## Round: rmsnorm fold into the LDS prologue (preregistered 2026-09-08, before any run)
+
+**Change.** On the m=1 q4 path (`LDSA`) every block already reduces the full
+H row for the rmsnorm, then writes a 1/G slice of `CurB` (bf16, global),
+grid-barriers, and reads row 0 of `CurB` back into `Af` (`stage_a`). The fold
+computes the same reduction and writes the full normalised row straight into
+`Af` (`stage_rms`), so the rmsc phase and its grid barrier disappear: one per
+layer for the ssm/attn phase, one per ffn phase, one for the head = 65
+barriers per token. The window kernel (MR=3) and the q8 packs keep `rmsc_phase`
++ barrier untouched. Each block now reads X twice from L2 (16 KB f32) instead
+of once plus its `CurB` slice; that is < 1 us per phase.
+
+**Predictions (frozen).**
+1. Bit-identical: mega-gate identity stages all PASS (q8/q8d/q4 x spec 0/1,
+   ref 64/64); `test_mega_block` PASS. The expression
+   `(X * scale * Gn).cast[bf16]().cast[f32]()` is the old `CurB` value
+   re-read, same reduction order (EW_THREADS stride, warp.sum, wave sums in
+   order), so no bit may move.
+2. Real pack, q4, no-spec, 20-prompt median (P4), interleaved A/B x5 in one
+   stint, old binary `.work/engine-split` vs new: **+2.0 to +3.5 %
+   tok/s_gen** (the 2026-09-08 profile: 65 barriers x ~4 us = 0.26 ms of
+   7.52 ms). `BARO_PROFILE=5`: the rmsc+barrier slot shrinks by 3-4 us per
+   phase; ssm/attn/ffn GEMM slots unchanged within noise.
+3. Failure mode to watch (2026-09-06 rule): the kernel's register allocation
+   may move and cost an untouched phase. Judge on the real pack, all phases;
+   VGPR/spill census recorded as a receipt, not a fitness function. If the
+   real-pack median is < +1 % the round is a no-op and is reverted with the
+   numbers in the log.
