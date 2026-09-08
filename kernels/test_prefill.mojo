@@ -25,7 +25,7 @@ from layout import TileTensor, TensorLayout, row_major
 
 from matmul_skinny import amar_matmul_skinny_q4rowb, amar_skinny_reduce, SM, ROW_WAVES, ROW_THREADS
 from matmul_prefill import amar_matmul_prefill_q4, amar_matmul_prefill_q8, amar_prefill_swiglu_bf16, PF_THREADS
-from attn import amar_attn_decode, amar_attn_prefill, HD, NQH, NKVH, PA_ROWS
+from attn import amar_attn_decode, amar_attn_prefill, HD, NQH, NKVH, PA_ROWS, KVT, TCAP, KVHSTR, kv_off
 from ssm import (
     amar_ssm_conv, amar_ssm_delta_step, amar_ssm_qk_l2norm, amar_ssm_gated_out_bf16,
     amar_ssm_gates_rows, amar_ssm_conv_chunk, amar_ssm_qk_l2norm_rows, amar_ssm_delta_chunk,
@@ -340,7 +340,8 @@ comptime AT_M = 21
 comptime AT_P = 37
 comptime AT_T = 64
 comptime qa_layout = row_major[AT_M * NQH, HD]()
-comptime kca_layout = row_major[NKVH, AT_T, HD]()
+comptime kca_layout = row_major[TCAP]()
+comptime AT_POOL = NKVH * KVHSTR
 
 
 def test_attn(ctx: DeviceContext) raises:
@@ -353,18 +354,30 @@ def test_attn(ctx: DeviceContext) raises:
     var st = UInt64(777)
     for i in range(AT_M * NQH * HD):
         q_h[i] = lcg(st) * 4
+    var kp_h = ctx.enqueue_create_host_buffer[KVT](AT_POOL)
+    var vp_h = ctx.enqueue_create_host_buffer[KVT](AT_POOL)
+    ctx.synchronize()
+    for i in range(AT_POOL):
+        kp_h[i] = 0
+        vp_h[i] = 0
     for i in range(NKVH * AT_T * HD):
         var p = (i // HD) % AT_T
-        k_h[i] = lcg(st) * 4 if p < AT_P + AT_M else 0
-        v_h[i] = lcg(st) if p < AT_P + AT_M else 0
+        var kv = (lcg(st) * 4 if p < AT_P + AT_M else 0).cast[KVT]()
+        var vv = (lcg(st) if p < AT_P + AT_M else 0).cast[KVT]()
+        k_h[i] = kv.cast[f32]()
+        v_h[i] = vv.cast[f32]()
+        var h = i // (AT_T * HD)
+        var d = i % HD
+        kp_h[kv_off[1](p, 0, h) + d] = kv
+        vp_h[kv_off[1](p, 0, h) + d] = vv
     var q_d = ctx.enqueue_create_buffer[f32](AT_M * NQH * HD)
-    var k_d = ctx.enqueue_create_buffer[f32](NKVH * AT_T * HD)
-    var v_d = ctx.enqueue_create_buffer[f32](NKVH * AT_T * HD)
+    var k_d = ctx.enqueue_create_buffer[KVT](AT_POOL)
+    var v_d = ctx.enqueue_create_buffer[KVT](AT_POOL)
     var o_d = ctx.enqueue_create_buffer[f32](AT_M * NQH * HD)
     var o2_d = ctx.enqueue_create_buffer[f32](AT_M * NQH * HD)
     ctx.enqueue_copy(dst_buf=q_d, src_buf=q_h)
-    ctx.enqueue_copy(dst_buf=k_d, src_buf=k_h)
-    ctx.enqueue_copy(dst_buf=v_d, src_buf=v_h)
+    ctx.enqueue_copy(dst_buf=k_d, src_buf=kp_h)
+    ctx.enqueue_copy(dst_buf=v_d, src_buf=vp_h)
     ctx.enqueue_memset(o_d, 0)
     var Q = TileTensor(q_d, qa_layout)
     var Kc = TileTensor(k_d, kca_layout)
@@ -372,11 +385,11 @@ def test_attn(ctx: DeviceContext) raises:
     var O = TileTensor(o_d, qa_layout)
     var O2 = TileTensor(o2_d, qa_layout)
     var scale = Float32(0.0625)
-    ctx.enqueue_function[amar_attn_prefill[type_of(qa_layout), type_of(kca_layout), type_of(qa_layout)]](
-        Q, Kc, Vc, O, Int32(AT_P), Int32(AT_M), scale, grid_dim=(NKVH, ceildiv(AT_M, PA_ROWS)), block_dim=256,
+    ctx.enqueue_function[amar_attn_prefill[type_of(qa_layout), type_of(kca_layout), type_of(qa_layout), 1]](
+        Q, Kc, Vc, O, Int32(AT_P), Int32(AT_M), scale, Int32(0), grid_dim=(NKVH, ceildiv(AT_M, PA_ROWS)), block_dim=256,
     )
-    ctx.enqueue_function[amar_attn_decode[type_of(qa_layout), type_of(kca_layout), type_of(qa_layout)]](
-        Q, Kc, Vc, O2, Int32(AT_P + 1), scale, grid_dim=(NQH, AT_M), block_dim=HD,
+    ctx.enqueue_function[amar_attn_decode[type_of(qa_layout), type_of(kca_layout), type_of(qa_layout), 1]](
+        Q, Kc, Vc, O2, Int32(AT_P + 1), scale, Int32(0), grid_dim=(NQH, AT_M), block_dim=HD,
     )
     ctx.enqueue_copy(dst_buf=o_h, src_buf=o_d)
     ctx.enqueue_copy(dst_buf=o2_h, src_buf=o2_d)

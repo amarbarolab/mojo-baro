@@ -142,7 +142,7 @@ def blk32_forward(
     mut p_qf_d: DeviceBuffer[f32], mut p_kv_d: DeviceBuffer[f32], mut p_h_d: DeviceBuffer[f32],
     mut p_ffn_d: DeviceBuffer[f32], mut p_ffn2_d: DeviceBuffer[f32], mut p_v_d: DeviceBuffer[f32],
     mut logits_d: DeviceBuffer[f32], mut cc_d: DeviceBuffer[bf16], mut de_d: DeviceBuffer[f32],
-    mut hd_d: DeviceBuffer[f32], mut kc32_d: DeviceBuffer[f32], mut vc32_d: DeviceBuffer[f32],
+    mut hd_d: DeviceBuffer[f32], mut kc32_d: DeviceBuffer[KVT], mut vc32_d: DeviceBuffer[KVT],
     mut toks_d: DeviceBuffer[DType.int32], mut dtok_d: DeviceBuffer[DType.int32],
     prof3: Bool, mut p3: List[Int],
     draft_q4: Bool, q4_off: Int, pack_q4: Bool,
@@ -205,8 +205,8 @@ def blk32_forward(
     var Khd = TileTensor(k_d, kvm_layout)
     var Vflat = TileTensor(v_d, kvm_flat)
     var Vhd = TileTensor(v_d, kvm_layout)
-    var Kc = TileTensor(kc32_d, cache_layout)
-    var Vc = TileTensor(vc32_d, cache_layout)
+    var Kc = TileTensor(kc32_d, cache1_layout)
+    var Vc = TileTensor(vc32_d, cache1_layout)
     var Ao = TileTensor(ao_d, qm_layout)
     var Aoflat = TileTensor(ao_d, xflat_layout)
     var AoB = TileTensor(resb_d, xflat_layout)
@@ -222,9 +222,9 @@ def blk32_forward(
     ctx.enqueue_function[hrms_kv](Khd, Kn, Float32(1e-6), grid_dim=m * NKVH, block_dim=HD)
     ctx.enqueue_function[rope_q](Q, Int32(pos), Int32(NQH), grid_dim=(NQH, m), block_dim=32)
     ctx.enqueue_function[rope_k](Khd, Int32(pos), Int32(NKVH), grid_dim=(NKVH, m), block_dim=32)
-    ctx.enqueue_function[append_k](Kc, Khd, Int32(pos), grid_dim=(NKVH, m), block_dim=HD)
-    ctx.enqueue_function[append_k](Vc, Vhd, Int32(pos), grid_dim=(NKVH, m), block_dim=HD)
-    ctx.enqueue_function[att_k](Q, Kc, Vc, Ao, Int32(pos + 1), Float32(0.0625), grid_dim=(NQH, m), block_dim=HD)
+    ctx.enqueue_function[append_1](Kc, Khd, Int32(pos), Int32(0), grid_dim=(NKVH, m), block_dim=HD)
+    ctx.enqueue_function[append_1](Vc, Vhd, Int32(pos), Int32(0), grid_dim=(NKVH, m), block_dim=HD)
+    ctx.enqueue_function[att_1](Q, Kc, Vc, Ao, Int32(pos + 1), Float32(0.0625), Int32(0), grid_dim=(NQH, m), block_dim=HD)
     ctx.enqueue_function[gmul_k](Aoflat, Gate, AoB, Int32(m * H), grid_dim=ceildiv(m * H, 256), block_dim=256)
     gemm_w[H, H](ctx, AoBm, wbuf, off[e + 6], pack_q4, Ph, m)
     ctx.enqueue_function[r_add](Ph, Xm, Int32(m), Int32(H), grid_dim=ceildiv(m * H, 256), block_dim=256)
@@ -321,7 +321,7 @@ def prefill_forward(
     ctx: DeviceContext, wbuf: DeviceBuffer[DType.uint8], off: List[Int], pack_q4: Bool,
     m: Int, pos: Int, ring: Int,
     mut toks_d: DeviceBuffer[DType.int32], mut convstate_d: DeviceBuffer[f32], mut sstate_d: DeviceBuffer[f32],
-    mut kc_d: DeviceBuffer[f32], mut vc_d: DeviceBuffer[f32],
+    mut kc_d: DeviceBuffer[KVT], mut vc_d: DeviceBuffer[KVT],
     mut xp_d: DeviceBuffer[f32], mut curbp_d: DeviceBuffer[bf16], mut qkvp_d: DeviceBuffer[f32], mut zp_d: DeviceBuffer[f32],
     mut arp_d: DeviceBuffer[f32], mut brp_d: DeviceBuffer[f32], mut egp_d: DeviceBuffer[f32], mut betap_d: DeviceBuffer[f32],
     mut convp_d: DeviceBuffer[f32], mut sop_d: DeviceBuffer[f32], mut resbp_d: DeviceBuffer[bf16], mut qfp_d: DeviceBuffer[f32],
@@ -355,10 +355,8 @@ def prefill_forward(
             var Khd = TileTensor(kp_d, kvp_layout)
             var Vflat = TileTensor(vp_d, kvp_flat)
             var Vhd = TileTensor(vp_d, kvp_layout)
-            var kcb = DeviceBuffer[f32](ctx, kc_d.unsafe_ptr() + att_i * NKVH * TMAX * HD, NKVH * TMAX * HD, owning=False)
-            var vcb = DeviceBuffer[f32](ctx, vc_d.unsafe_ptr() + att_i * NKVH * TMAX * HD, NKVH * TMAX * HD, owning=False)
-            var Kc = TileTensor(kcb, cache_layout)
-            var Vc = TileTensor(vcb, cache_layout)
+            var Kc = TileTensor(kc_d, cache_layout)
+            var Vc = TileTensor(vc_d, cache_layout)
             var Aop = TileTensor(aop_d, qp_layout)
             var Aopflat = TileTensor(aop_d, xpflat_layout)
             var AoBp = TileTensor(resbp_d, xpflat_layout)
@@ -371,9 +369,9 @@ def prefill_forward(
             ctx.enqueue_function[hrms_kvp](Khd, Kn, Float32(1e-6), grid_dim=m * NKVH, block_dim=HD)
             ctx.enqueue_function[rope_qp](Qp, Int32(pos), Int32(NQH), grid_dim=(NQH, m), block_dim=32)
             ctx.enqueue_function[rope_kp](Khd, Int32(pos), Int32(NKVH), grid_dim=(NKVH, m), block_dim=32)
-            ctx.enqueue_function[append_p](Kc, Khd, Int32(pos), grid_dim=(NKVH, m), block_dim=HD)
-            ctx.enqueue_function[append_p](Vc, Vhd, Int32(pos), grid_dim=(NKVH, m), block_dim=HD)
-            ctx.enqueue_function[attp_k](Qp, Kc, Vc, Aop, Int32(pos), Int32(m), Float32(0.0625), grid_dim=(NKVH, ceildiv(m, PA_ROWS)), block_dim=256)
+            ctx.enqueue_function[append_p](Kc, Khd, Int32(pos), Int32(att_i), grid_dim=(NKVH, m), block_dim=HD)
+            ctx.enqueue_function[append_p](Vc, Vhd, Int32(pos), Int32(att_i), grid_dim=(NKVH, m), block_dim=HD)
+            ctx.enqueue_function[attp_k](Qp, Kc, Vc, Aop, Int32(pos), Int32(m), Float32(0.0625), Int32(att_i), grid_dim=(NKVH, ceildiv(m, PA_ROWS)), block_dim=256)
             ctx.enqueue_function[gmul_p](Aopflat, Gatep, AoBp, Int32(m * H), grid_dim=ceildiv(m * H, 256), block_dim=256)
             gemm_pw[H, H, True](ctx, AoBpm, wbuf, off[w + 6], pack_q4, Xp, m)
             att_i += 1
@@ -477,10 +475,11 @@ struct WindowBufs(Copyable, Movable):
     var fgbp_d: DeviceBuffer[bf16]
     var convstate_d: DeviceBuffer[f32]
     var sstate_d: DeviceBuffer[f32]
-    var kc_d: DeviceBuffer[f32]
-    var vc_d: DeviceBuffer[f32]
-    var kc32_d: DeviceBuffer[f32]
-    var vc32_d: DeviceBuffer[f32]
+    var kvpool: Int
+    var kc_d: DeviceBuffer[KVT]
+    var vc_d: DeviceBuffer[KVT]
+    var kc32_d: DeviceBuffer[KVT]
+    var vc32_d: DeviceBuffer[KVT]
     var off_d: DeviceBuffer[DType.int64]
     var araw_d: DeviceBuffer[f32]
     var braw_d: DeviceBuffer[f32]
@@ -510,6 +509,7 @@ struct WindowCfg(Copyable, Movable):
     var pf4: Bool
     var dump: Bool
     var mega: Bool
+    var att_split: Int
     var mega_win: Bool
     var dot3: Bool
     var pf_chunk: Int
@@ -651,7 +651,7 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                     TileTensor(b.p_ffn_d, pf_sm), TileTensor(b.p_ffn2_d, pf_sm), TileTensor(b.fgb_d, ffnm_layout),
                     TileTensor(b.ctr_d, ctr_layout), b.prof_d.unsafe_ptr(), b.dbg_d.unsafe_ptr(),
                     Toks, Dtok0, Hnm0, b.hmax_d.unsafe_ptr(), b.hidx_d.unsafe_ptr(),
-                    Int32(st.ring), Int32(SLOTS), Int32(st.pos), Int32(1), Int32(1 if cfg.dump else 0), Int32(1), grid_dim=MEGA_G, block_dim=ROW_THREADS,
+                    Int32(st.ring), Int32(SLOTS), Int32(st.pos), Int32(1), Int32(1 if cfg.dump else 0), Int32(1), Int32(cfg.att_split), grid_dim=MEGA_G, block_dim=ROW_THREADS,
                 )
             elif use_mega:
                 ctx.enqueue_function[mega_token_k](
@@ -666,7 +666,7 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                     TileTensor(b.p_ffn_d, pf_sm), TileTensor(b.p_ffn2_d, pf_sm), TileTensor(b.fgb_d, ffnm_layout),
                     TileTensor(b.ctr_d, ctr_layout), b.prof_d.unsafe_ptr(), b.dbg_d.unsafe_ptr(),
                     Toks, Dtok0, Hnm0, b.hmax_d.unsafe_ptr(), b.hidx_d.unsafe_ptr(),
-                    Int32(st.ring), Int32(SLOTS), Int32(st.pos), Int32(1), Int32(1 if cfg.dump else 0), Int32(1), grid_dim=MEGA_G, block_dim=ROW_THREADS,
+                    Int32(st.ring), Int32(SLOTS), Int32(st.pos), Int32(1), Int32(1 if cfg.dump else 0), Int32(1), Int32(cfg.att_split), grid_dim=MEGA_G, block_dim=ROW_THREADS,
                 )
             else:
                 ctx.enqueue_function[mega_win_k](
@@ -681,7 +681,7 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                     TileTensor(b.p_ffn_d, pf_sm), TileTensor(b.p_ffn2_d, pf_sm), TileTensor(b.fgb_d, ffnm_layout),
                     TileTensor(b.ctr_d, ctr_layout), b.prof_d.unsafe_ptr(), b.dbg_d.unsafe_ptr(),
                     Toks, Dtok0, Hnm0, b.hmax_d.unsafe_ptr(), b.hidx_d.unsafe_ptr(),
-                    Int32(st.ring), Int32(SLOTS), Int32(st.pos), Int32(m), Int32(0), Int32(0), grid_dim=MEGA_G_WIN, block_dim=ROW_THREADS,
+                    Int32(st.ring), Int32(SLOTS), Int32(st.pos), Int32(m), Int32(0), Int32(0), Int32(cfg.att_split), grid_dim=MEGA_G_WIN, block_dim=ROW_THREADS,
                 )
         for layer in range(0 if (use_mega or use_mega_win) else N_LAYERS):
             if cfg.prof:
@@ -715,13 +715,13 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                 var Khd = TileTensor(b.k_d, kvm_layout)
                 var Vflat = TileTensor(b.v_d, kvm_flat)
                 var Vhd = TileTensor(b.v_d, kvm_layout)
-                var kcb = DeviceBuffer[f32](
-                    ctx, b.kc_d.unsafe_ptr() + att_i * NKVH * TMAX * HD,
-                    NKVH * TMAX * HD, owning=False,
+                var kcb = DeviceBuffer[KVT](
+                    ctx, b.kc_d.unsafe_ptr(),
+                    b.kvpool, owning=False,
                 )
-                var vcb = DeviceBuffer[f32](
-                    ctx, b.vc_d.unsafe_ptr() + att_i * NKVH * TMAX * HD,
-                    NKVH * TMAX * HD, owning=False,
+                var vcb = DeviceBuffer[KVT](
+                    ctx, b.vc_d.unsafe_ptr(),
+                    b.kvpool, owning=False,
                 )
                 var Kc = TileTensor(kcb, cache_layout)
                 var Vc = TileTensor(vcb, cache_layout)
@@ -741,9 +741,9 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                 ctx.enqueue_function[hrms_kv](Khd, Kn, Float32(1e-6), grid_dim=m * NKVH, block_dim=HD)
                 ctx.enqueue_function[rope_q](Q, Int32(st.pos), Int32(NQH), grid_dim=(NQH, m), block_dim=32)
                 ctx.enqueue_function[rope_k](Khd, Int32(st.pos), Int32(NKVH), grid_dim=(NKVH, m), block_dim=32)
-                ctx.enqueue_function[append_k](Kc, Khd, Int32(st.pos), grid_dim=(NKVH, m), block_dim=HD)
-                ctx.enqueue_function[append_k](Vc, Vhd, Int32(st.pos), grid_dim=(NKVH, m), block_dim=HD)
-                ctx.enqueue_function[att_k](Q, Kc, Vc, Ao, Int32(st.pos + 1), Float32(0.0625), grid_dim=(NQH, m), block_dim=HD)
+                ctx.enqueue_function[append_k](Kc, Khd, Int32(st.pos), Int32(att_i), grid_dim=(NKVH, m), block_dim=HD)
+                ctx.enqueue_function[append_k](Vc, Vhd, Int32(st.pos), Int32(att_i), grid_dim=(NKVH, m), block_dim=HD)
+                ctx.enqueue_function[att_k](Q, Kc, Vc, Ao, Int32(st.pos + 1), Float32(0.0625), Int32(att_i), grid_dim=(NQH, m), block_dim=HD)
                 ctx.enqueue_function[gmul_k](Aoflat, Gate, AoB, Int32(m * H), grid_dim=ceildiv(m * H, 256), block_dim=256)
                 gemm_w[H, H](ctx, AoBm, b.wbuf, b.off[w + 6], cfg.pack_q4, Ph, m)
                 ctx.enqueue_function[r_add](Ph, Xm, Int32(m), Int32(H), grid_dim=ceildiv(m * H, 256), block_dim=256)
