@@ -22,7 +22,7 @@ from matmul_prefill import (
 from mega import amar_mega_token, amar_mega_window, MEGA_G, MEGA_G_WIN
 from attn import (
     amar_head_rmsnorm, amar_attn_decode, amar_gate_mul_cast, amar_qgate_split, amar_rope_yarn, amar_kv_append,
-    amar_attn_prefill, HD, NQH, NKVH, PA_ROWS,
+    amar_attn_prefill, HD, NQH, NKVH, KVT, TCAP, KVPAGE, KVHSTR, PA_ROWS,
 )
 
 comptime H = 4096
@@ -48,7 +48,9 @@ comptime KMAX = SM
 comptime SLOTS = KMAX + 1
 comptime CONV_SLOT = N_SSM * 3 * CONV
 comptime SSM_SLOT = N_SSM * NH_V * SSTATE * SSTATE
-comptime ATT32 = NKVH * TMAX * HD
+comptime TPAGES = ceildiv(TMAX, KVPAGE)
+comptime KVPOOL = TPAGES * N_ATT * NKVH * KVHSTR
+comptime KVPOOL1 = TPAGES * NKVH * KVHSTR
 
 comptime h_layout = row_major[H]()
 comptime h2_layout = row_major[1, H]()
@@ -70,7 +72,8 @@ comptime qf_layout = row_major[QF]()
 comptime q_layout = row_major[NQH, HD]()
 comptime kvh_layout = row_major[NKVH, HD]()
 comptime kvflat_layout = row_major[KV]()
-comptime cache_layout = row_major[NKVH, TMAX, HD]()
+comptime cache_layout = row_major[TCAP]()
+comptime cache1_layout = row_major[TCAP]()
 comptime hd_layout = row_major[HD]()
 comptime conv_layout = row_major[CONV]()
 comptime cs_layout = row_major[3, CONV]()
@@ -135,7 +138,7 @@ comptime mega_token_k = amar_mega_token[
     type_of(csall_layout), type_of(ssall_layout),
     type_of(qfm_layout), type_of(kvm_flat), type_of(qm_layout), type_of(xflat_layout),
     type_of(pf_sm), type_of(ffnm_layout), type_of(off_layout), type_of(ctr_layout), type_of(toks_layout), type_of(dtok_layout),
-    TMAX, N_LAYERS,
+    N_LAYERS, N_ATT,
 ]
 comptime mega_token_q4_k = amar_mega_token[
     1, True, True, type_of(xm_layout), type_of(xm_layout),
@@ -143,7 +146,7 @@ comptime mega_token_q4_k = amar_mega_token[
     type_of(csall_layout), type_of(ssall_layout),
     type_of(qfm_layout), type_of(kvm_flat), type_of(qm_layout), type_of(xflat_layout),
     type_of(pf_sm), type_of(ffnm_layout), type_of(off_layout), type_of(ctr_layout), type_of(toks_layout), type_of(dtok_layout),
-    TMAX, N_LAYERS,
+    N_LAYERS, N_ATT,
 ]
 comptime MEGA_MR = 3
 comptime mega_win_k = amar_mega_window[
@@ -152,7 +155,7 @@ comptime mega_win_k = amar_mega_window[
     type_of(csall_layout), type_of(ssall_layout),
     type_of(qfm_layout), type_of(kvm_flat), type_of(qm_layout), type_of(xflat_layout),
     type_of(pf_sm), type_of(ffnm_layout), type_of(off_layout), type_of(ctr_layout), type_of(toks_layout), type_of(dtok_layout),
-    TMAX, N_LAYERS,
+    N_LAYERS, N_ATT,
 ]
 
 comptime xp_layout = row_major[CP, H]()
@@ -202,8 +205,10 @@ comptime hrms_q = amar_head_rmsnorm[type_of(qm_layout), type_of(hd_layout)]
 comptime hrms_kv = amar_head_rmsnorm[type_of(kvm_layout), type_of(hd_layout)]
 comptime rope_q = amar_rope_yarn[type_of(qm_layout)]
 comptime rope_k = amar_rope_yarn[type_of(kvm_layout)]
-comptime append_k = amar_kv_append[type_of(cache_layout), type_of(kvm_layout)]
-comptime att_k = amar_attn_decode[type_of(qm_layout), type_of(cache_layout), type_of(qm_layout)]
+comptime append_k = amar_kv_append[type_of(cache_layout), type_of(kvm_layout), N_ATT]
+comptime append_1 = amar_kv_append[type_of(cache1_layout), type_of(kvm_layout), 1]
+comptime att_k = amar_attn_decode[type_of(qm_layout), type_of(cache_layout), type_of(qm_layout), N_ATT]
+comptime att_1 = amar_attn_decode[type_of(qm_layout), type_of(cache1_layout), type_of(qm_layout), 1]
 comptime gmul_k = amar_gate_mul_cast[type_of(xflat_layout), type_of(xflat_layout), type_of(xflat_layout)]
 
 comptime rmsc_p = amar_rmsnorm_cast[type_of(xp_layout), type_of(h_layout), type_of(xp_layout)]
@@ -218,8 +223,8 @@ comptime hrms_qp = amar_head_rmsnorm[type_of(qp_layout), type_of(hd_layout)]
 comptime hrms_kvp = amar_head_rmsnorm[type_of(kvp_layout), type_of(hd_layout)]
 comptime rope_qp = amar_rope_yarn[type_of(qp_layout)]
 comptime rope_kp = amar_rope_yarn[type_of(kvp_layout)]
-comptime append_p = amar_kv_append[type_of(cache_layout), type_of(kvp_layout)]
-comptime attp_k = amar_attn_prefill[type_of(qp_layout), type_of(cache_layout), type_of(qp_layout)]
+comptime append_p = amar_kv_append[type_of(cache_layout), type_of(kvp_layout), N_ATT]
+comptime attp_k = amar_attn_prefill[type_of(qp_layout), type_of(cache_layout), type_of(qp_layout), N_ATT]
 comptime gmul_p = amar_gate_mul_cast[type_of(xpflat_layout), type_of(xpflat_layout), type_of(xpflat_layout)]
 comptime swiglu_p = amar_prefill_swiglu_bf16[type_of(ffnp_layout), type_of(ffnp_layout)]
 

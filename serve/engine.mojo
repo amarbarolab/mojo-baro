@@ -323,10 +323,10 @@ def main() raises:
 
     var convstate_d = ctx.enqueue_create_buffer[f32](SLOTS * CONV_SLOT)
     var sstate_d = ctx.enqueue_create_buffer[f32](SLOTS * SSM_SLOT)
-    var kc_d = ctx.enqueue_create_buffer[f32](N_ATT * ATT32)
-    var vc_d = ctx.enqueue_create_buffer[f32](N_ATT * ATT32)
-    var kc32_d = ctx.enqueue_create_buffer[f32](ATT32)
-    var vc32_d = ctx.enqueue_create_buffer[f32](ATT32)
+    var kc_d = ctx.enqueue_create_buffer[KVT](KVPOOL)
+    var vc_d = ctx.enqueue_create_buffer[KVT](KVPOOL)
+    var kc32_d = ctx.enqueue_create_buffer[KVT](KVPOOL1)
+    var vc32_d = ctx.enqueue_create_buffer[KVT](KVPOOL1)
     ctx.enqueue_memset(convstate_d, 0)
     ctx.enqueue_memset(sstate_d, 0)
     ctx.enqueue_memset(kc_d, 0)
@@ -366,7 +366,7 @@ def main() raises:
     var bufs = WindowBufs(wbuf=wbuf.copy(), off=off.copy(), dtok_h=dtok_h.copy(), win_h=win_h.copy(), x_d=x_d.copy(), curb_d=curb_d.copy(), qkv_d=qkv_d.copy(), z_d=z_d.copy(), eg_d=eg_d.copy(), beta_d=beta_d.copy(), conv_d=conv_d.copy(), so_d=so_d.copy(), resb_d=resb_d.copy(), qf_d=qf_d.copy(), q_d=q_d.copy(), gate_d=gate_d.copy(), k_d=k_d.copy(), v_d=v_d.copy(), ao_d=ao_d.copy(), fgb_d=fgb_d.copy(), aq_d=aq_d.copy(), asc_d=asc_d.copy(), logits_d=logits_d.copy(), toks_d=toks_d.copy(), hn_d=hn_d.copy(), de_d=de_d.copy(), hd_d=hd_d.copy(), cc_d=cc_d.copy(), dtok_d=dtok_d.copy(), p_qf_d=p_qf_d.copy(), p_h_d=p_h_d.copy(), p_kv_d=p_kv_d.copy(), p_32_d=p_32_d.copy(), p_32b_d=p_32b_d.copy(), p_ffn_d=p_ffn_d.copy(), p_ffn2_d=p_ffn2_d.copy(), p_v_d=p_v_d.copy(), xp_d=xp_d.copy(), curbp_d=curbp_d.copy(), qkvp_d=qkvp_d.copy(), zp_d=zp_d.copy(), arp_d=arp_d.copy(), brp_d=brp_d.copy(), egp_d=egp_d.copy(), betap_d=betap_d.copy(), convp_d=convp_d.copy(), sop_d=sop_d.copy(), resbp_d=resbp_d.copy(), qfp_d=qfp_d.copy(), qp_d=qp_d.copy(), gatep_d=gatep_d.copy(), kp_d=kp_d.copy(), vp_d=vp_d.copy(), aop_d=aop_d.copy(), gp_d=gp_d.copy(), up_d=up_d.copy(), fgbp_d=fgbp_d.copy(), convstate_d=convstate_d.copy(), sstate_d=sstate_d.copy(), kc_d=kc_d.copy(), vc_d=vc_d.copy(), kc32_d=kc32_d.copy(), vc32_d=vc32_d.copy(), off_d=off_d.copy(), araw_d=araw_d.copy(), braw_d=braw_d.copy(), ctr_d=ctr_d.copy(), prof_d=prof_d.copy(), dbg_d=dbg_d.copy(), hmax_d=hmax_d.copy(), hidx_d=hidx_d.copy(), dump_h=dump_h.copy(), stream_h=stream_h.copy())
     var req_id = 0
     if serve:
-        print("{\"ready\":true,\"tmax\":" + String(TMAX) + ",\"mrows\":" + String(MROWS) + ",\"kmax\":" + String(KMAX) + ",\"spec_k\":" + String(kcfg) + ",\"pack\":\"" + packdir + "\"}")
+        print("{\"ready\":true,\"tmax\":" + String(TMAX) + ",\"mrows\":" + String(MROWS) + ",\"kmax\":" + String(KMAX) + ",\"spec_k\":" + String(kcfg) + ",\"kv\":\"" + String(KVT) + "\",\"pack\":\"" + packdir + "\"}")
 
     # --- request loop: one prompt from the file (BARO_SERVE=0, then exit) or
     # JSON lines from stdin until EOF (BARO_SERVE=1, serve/PROTOCOL.md) ------
@@ -432,7 +432,7 @@ def main() raises:
             pf_tail = pf_rows % MROWS
             if pf_tail == 0:
                 pf_tail = MROWS
-        print("TMAX:", TMAX, " prefill chunk:", pf_chunk, " prefill rows:", pf_rows)
+        print("TMAX:", TMAX, " kv dtype:", String(KVT), " prefill chunk:", pf_chunk, " prefill rows:", pf_rows)
 
         # --- decode loop ---------------------------------------------------------
 

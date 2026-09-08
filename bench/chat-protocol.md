@@ -303,7 +303,47 @@ each run's output; `arm.txt` first for the A/B.
 vs `engine-m0a` within P-C4; P-C3 within band. Then the dtype arms under
 P-B2 as frozen, each arm fingerprinted before its run.
 
-**Result.** (filled after the gated run)
+**Result.** PASS on the f32 arm, recorded 2026-09-08. The dtype arms both
+fail identity; f32 ships (P-B2 as frozen).
+
+Arms: A = `.work/engine-m0a` (4027b6e); B = `.work/engine` = `.work/engine-c2`
+(sha `ba6eebfb1b53911c`, working tree, `KVT = float32`, `KVPAD = 0`, M0a V-loop
+form). `arm.txt`: `power_cap_uW=290000000`, `vddgfx=-100mV`, both arms
+`BARO_PACK=.work/engine-pack-q4`.
+
+| receipt | M0a | M0b attempt 2 | source |
+|---|---|---|---|
+| P-C1 fingerprint (q4 `amar_mega_token`) | 12727 instr, dual 117/80/80/60 | 12746 instr, dual 115/80/80/60, spill 0 | `.work/isa/c2.txt`, status 07:20 |
+| 20-prompt median tok/s_gen (P4) | 133.59 (spread 0.8 %) | 133.41 (spread 0.8 %), ratio 0.999 | `.work/ab-c2y/results.txt` |
+| 20-prompt identity B == A | - | 20/20 PASS | same |
+| one-shot q4 identity / tok/s_gen | PASS 64/64 | PASS 64/64 / 133.92 | `.work/merge-oneshot-q4.log` |
+| one-shot q8 identity / tok/s_gen | PASS 64/64 | PASS 64/64 / 83.53 | `.work/merge-oneshot-q8.log` |
+| prefill p0512 (T ~ 575) tok/s_gen | 129.00 / 128.85 | 128.67 (merge-gate), 128.48 / 128.61 (one-shots) | `.work/merge-pf512.log` |
+| mtp k=2 identity | 20/20 | 20/20 | `.work/merge-mtp/results.txt` |
+| test_server.sh | ALL PASS | ALL PASS | `.work/merge-server-test/SUMMARY.txt` |
+| test_prefill / test_attn_block / test_mega_block | PASS | PASS / PASS / PASS (0 mismatches, q4 and q8, m=1 and m=3) | `.work/c2-stint4.out`, `.work/c2-run-test_mega_block.log` |
+| mega fail word | 0 | 0 | engine stdout |
+
+A first A/B run (`.work/ab-c2x`) was VOID: spread 32.5 % from one 124 outlier
+under a co-running llama-server; the rerun above was exclusive.
+
+Verdict against the frozen predictions:
+- P-C1 held (one ticket, no re-roll).
+- P-C2 held: every identity check PASS.
+- P-C3 held: 128.5-128.7 vs 129.0, inside the 2 % band; the serialisation
+  diagnosis stands.
+- P-C4 held: ratio 0.999.
+- P-C5 held.
+
+Dtype arms (P-B2, 20-prompt A/B vs M0a, same stint, `.work/ab-c2f16`,
+`.work/ab-c2bf16`): **f16 identity 17/20** (fails p12-rust, p13-haiku,
+p15-bash), **bf16 identity 17/20** (fails p07-json, p12-rust, p13-haiku).
+The one-shot 64-token checks passed for both, which is why the status file
+briefly said "bf16 PASS everywhere"; the 20-prompt set is the gate and it
+says otherwise. P-B2's f16 half is falsified (f16 does not hold either), its
+bf16 half held. Neither narrow format ships; `KVT = float32` is the default
+and the narrow KV question moves to M5 with the RULER gate, where the
+long-context effect it is for can be measured.
 
 ---
 

@@ -15,7 +15,7 @@ from matmul_skinny import amar_matmul_skinny, amar_skinny_reduce, SM, SBN, SPLIT
 from ssm import amar_cast_bf16, amar_residual_add
 from attn import (
     amar_head_rmsnorm, amar_attn_decode, amar_gate_mul, amar_qgate_split, amar_rope_yarn, amar_kv_append,
-    HD, NQH, NKVH,
+    HD, NQH, NKVH, KVT, TCAP, KVHSTR, kv_off,
 )
 
 comptime H = 4096
@@ -33,7 +33,8 @@ comptime qf_layout = row_major[QF]()
 comptime q_layout = row_major[NQH, HD]()
 comptime kv_layout = row_major[NKVH, HD]()
 comptime kvflat_layout = row_major[KV]()
-comptime cache_layout = row_major[NKVH, T, HD]()
+comptime cache_layout = row_major[TCAP]()
+comptime KVPOOL_T = NKVH * KVHSTR
 comptime hd_layout = row_major[HD]()
 
 comptime wq_layout = row_major[H, QF]()
@@ -122,8 +123,8 @@ def main() raises:
     var gate_d = ctx.enqueue_create_buffer[f32](H)
     var k_d = ctx.enqueue_create_buffer[f32](KV)
     var v_d = ctx.enqueue_create_buffer[f32](KV)
-    var kc_d = ctx.enqueue_create_buffer[f32](NKVH * T * HD)
-    var vc_d = ctx.enqueue_create_buffer[f32](NKVH * T * HD)
+    var kc_d = ctx.enqueue_create_buffer[KVT](KVPOOL_T)
+    var vc_d = ctx.enqueue_create_buffer[KVT](KVPOOL_T)
     var o_d = ctx.enqueue_create_buffer[f32](NQH * HD)
     var ob_d = ctx.enqueue_create_buffer[bf16](H)
     var out_d = ctx.enqueue_create_buffer[f32](H)
@@ -145,8 +146,8 @@ def main() raises:
     for h in range(NKVH):
         for t in range(T_PRE):
             for d in range(HD):
-                kcp[unsafe_offset = h * T * HD + t * HD + d] = kc_h[h * T_PRE * HD + t * HD + d]
-                vcp[unsafe_offset = h * T * HD + t * HD + d] = vc_h[h * T_PRE * HD + t * HD + d]
+                kcp[unsafe_offset = kv_off[1](t, 0, h) + d] = kc_h[h * T_PRE * HD + t * HD + d].cast[KVT]()
+                vcp[unsafe_offset = kv_off[1](t, 0, h) + d] = vc_h[h * T_PRE * HD + t * HD + d].cast[KVT]()
 
     var X2 = TileTensor(x_d, x2_layout)
     var X1 = TileTensor(x_d, h_layout)
@@ -195,8 +196,8 @@ def main() raises:
     comptime hrms_kv = amar_head_rmsnorm[type_of(kv_layout), type_of(hd_layout)]
     comptime rope_q = amar_rope_yarn[type_of(q_layout)]
     comptime rope_k = amar_rope_yarn[type_of(kv_layout)]
-    comptime append_k = amar_kv_append[type_of(cache_layout), type_of(kv_layout)]
-    comptime att_k = amar_attn_decode[type_of(q_layout), type_of(cache_layout), type_of(q_layout)]
+    comptime append_k = amar_kv_append[type_of(cache_layout), type_of(kv_layout), 1]
+    comptime att_k = amar_attn_decode[type_of(q_layout), type_of(cache_layout), type_of(q_layout), 1]
     comptime gmul_k = amar_gate_mul[type_of(h_layout), type_of(h_layout)]
     comptime add_k = amar_residual_add[type_of(h_layout), type_of(h_layout)]
 
@@ -213,9 +214,9 @@ def main() raises:
     ctx.enqueue_function[hrms_kv](Khd, Kn, Float32(1e-6), grid_dim=NKVH, block_dim=HD)
     ctx.enqueue_function[rope_q](Q, Int32(POS), Int32(NQH), grid_dim=NQH, block_dim=32)
     ctx.enqueue_function[rope_k](Khd, Int32(POS), Int32(NKVH), grid_dim=NKVH, block_dim=32)
-    ctx.enqueue_function[append_k](Kc, Khd, Int32(T_PRE), grid_dim=NKVH, block_dim=HD)
-    ctx.enqueue_function[append_k](Vc, Vhd, Int32(T_PRE), grid_dim=NKVH, block_dim=HD)
-    ctx.enqueue_function[att_k](Q, Kc, Vc, O, Int32(T), Float32(0.0625), grid_dim=NQH, block_dim=HD)
+    ctx.enqueue_function[append_k](Kc, Khd, Int32(T_PRE), Int32(0), grid_dim=NKVH, block_dim=HD)
+    ctx.enqueue_function[append_k](Vc, Vhd, Int32(T_PRE), Int32(0), grid_dim=NKVH, block_dim=HD)
+    ctx.enqueue_function[att_k](Q, Kc, Vc, O, Int32(T), Float32(0.0625), Int32(0), grid_dim=NQH, block_dim=HD)
     ctx.enqueue_function[gmul_k](O1, Gate1, Int32(H), grid_dim=ceildiv(H, 256), block_dim=256)
     ctx.enqueue_function[cast_k](O1, ObB1, Int32(H), grid_dim=ceildiv(H, 256), block_dim=256)
     ctx.enqueue_function[g_h](ObB2, Wo, Ph, Int32(1), Int32(H), Int32(H), grid_dim=(ceildiv(H, SBN), SPLITK), block_dim=SK_THREADS)

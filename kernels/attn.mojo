@@ -9,6 +9,17 @@ comptime f32 = DType.float32
 comptime HD = 256
 comptime NQH = 16
 comptime NKVH = 4
+comptime KVT = DType.float32
+comptime KVPAGE = 128
+comptime KVPSH = 7
+comptime KVPAD = 0
+comptime KVHSTR = KVPAGE * HD + KVPAD
+comptime TCAP = 1 << 24
+
+
+@always_inline
+def kv_off[NAT: Int](t: Int, att_i: Int, kvh: Int) -> Int:
+    return (((t >> KVPSH) * NAT + att_i) * NKVH + kvh) * KVHSTR + (t & (KVPAGE - 1)) * HD
 
 
 def amar_head_rmsnorm[
@@ -40,31 +51,36 @@ def amar_head_rmsnorm[
 @always_inline
 def attn_head_body[
     QLayout: TensorLayout, KLayout: TensorLayout, OLayout: TensorLayout,
-    QsL: TensorLayout, ScL: TensorLayout, RdL: TensorLayout
+    QsL: TensorLayout, ScL: TensorLayout, RdL: TensorLayout, NAT: Int
 ](
     Q: TileTensor[f32, QLayout, MutAnyOrigin],
-    Kc: TileTensor[f32, KLayout, MutAnyOrigin],
-    Vc: TileTensor[f32, KLayout, MutAnyOrigin],
+    Kc: TileTensor[KVT, KLayout, MutAnyOrigin],
+    Vc: TileTensor[KVT, KLayout, MutAnyOrigin],
     mut O: TileTensor[f32, OLayout, MutAnyOrigin],
     mut qs: TileTensor[f32, QsL, MutUntrackedOrigin, address_space = AddressSpace.SHARED],
     mut scores: TileTensor[f32, ScL, MutUntrackedOrigin, address_space = AddressSpace.SHARED],
     mut red: TileTensor[f32, RdL, MutUntrackedOrigin, address_space = AddressSpace.SHARED],
-    qrow: Int, kvh: Int, T: Int, tid: Int, lane: Int, scale: Float32,
+    qrow: Int, kvh: Int, T: Int, tid: Int, lane: Int, scale: Float32, att_i: Int,
 ):
     # One decode head (q row qrow against kv head kvh over T positions), shared
     # by amar_attn_decode and the megakernel's attention phase so both paths
     # compute the same bits (bench/attn-latency-protocol.md). Online softmax
     # over chunks of HD positions: `scores` holds one chunk, never T, so the
-    # kernel has no compile-time context bound. Threads >= HD (a 512-thread
+    # kernel has no compile-time context bound. The KV pool is
+    # [page][layer][kv head][KVPAGE][HD] -- every stride is comptime and the
+    # page count is not a stride, which is what lets capacity be a runtime
+    # allocation. The chunk is HD positions = HD // KVPAGE whole pages, so the
+    # page base is hoisted out of both inner loops. Threads >= HD (a 512-thread
     # megakernel block) only take part in the barriers.
-    comptime assert Q.flat_rank == 2 and Kc.flat_rank == 3 and Vc.flat_rank == 3 and O.flat_rank == 2
+    comptime assert Q.flat_rank == 2 and Kc.flat_rank == 1 and Vc.flat_rank == 1 and O.flat_rank == 2
     comptime assert qs.flat_rank == 1 and scores.flat_rank == 1 and red.flat_rank == 1
     var wave = tid // WARP_SIZE
     if tid < HD:
         qs[tid] = rebind[qs.ElementType](Q[qrow, tid])
     barrier()
-    var Kv = Kc.vectorize[1, 1, 8]()
     var qv = qs.vectorize[8]()
+    var kp = Kc.ptr
+    var vp = Vc.ptr
     var m_run = Float32(-3.4e38)
     var l_run = Float32(0)
     var o = Float32(0)
@@ -75,11 +91,13 @@ def attn_head_body[
         if tid < HD:
             var t = t0 + tid
             if t < T:
+                var kb = kv_off[NAT](t, att_i, kvh)
+                var Kr = TileTensor(kp.unsafe_offset(kb), row_major[HD]()).vectorize[8]()
                 # 8-wide loads of K and q, scalar accumulation in the same order
                 # as the element loop (bench/attn-latency-protocol.md A1)
                 var acc: Float32 = 0
                 for d8 in range(HD // 8):
-                    var k8 = rebind[SIMD[f32, 8]](Kv[kvh, t, d8])
+                    var k8 = rebind[SIMD[KVT, 8]](Kr[d8]).cast[f32]()
                     var q8 = rebind[SIMD[f32, 8]](qv[d8])
                     comptime for j in range(8):
                         acc += q8[j] * k8[j]
@@ -114,18 +132,22 @@ def attn_head_body[
             var n = T - t0
             if n > HD:
                 n = HD
+            comptime PGSTR = NAT * NKVH * KVHSTR
+            var vb = kv_off[NAT](t0, att_i, kvh) + tid
             var tt = 0
             while tt + 8 <= n:
+                var pb = vb + (tt >> KVPSH) * PGSTR + (tt & (KVPAGE - 1)) * HD
                 var v = InlineArray[Float32, 8](uninitialized=True)
                 var sc = InlineArray[Float32, 8](uninitialized=True)
                 comptime for j in range(8):
-                    v[j] = rebind[Scalar[f32]](Vc[kvh, t0 + tt + j, tid])
+                    v[j] = vp[unsafe_offset=pb + j * HD].cast[f32]()
                     sc[j] = rebind[Scalar[f32]](scores[tt + j])
                 comptime for j in range(8):
                     o += sc[j] * v[j]
                 tt += 8
             while tt < n:
-                o += rebind[Scalar[f32]](scores[tt]) * rebind[Scalar[f32]](Vc[kvh, t0 + tt, tid])
+                var pb = vb + (tt >> KVPSH) * PGSTR + (tt & (KVPAGE - 1)) * HD
+                o += rebind[Scalar[f32]](scores[tt]) * vp[unsafe_offset=pb].cast[f32]()
                 tt += 1
         t0 += HD
     if tid < HD:
@@ -134,16 +156,17 @@ def attn_head_body[
 
 
 def amar_attn_decode[
-    QLayout: TensorLayout, KLayout: TensorLayout, OLayout: TensorLayout
+    QLayout: TensorLayout, KLayout: TensorLayout, OLayout: TensorLayout, NAT: Int
 ](
     Q: TileTensor[f32, QLayout, MutAnyOrigin],
-    Kc: TileTensor[f32, KLayout, MutAnyOrigin],
-    Vc: TileTensor[f32, KLayout, MutAnyOrigin],
+    Kc: TileTensor[KVT, KLayout, MutAnyOrigin],
+    Vc: TileTensor[KVT, KLayout, MutAnyOrigin],
     O: TileTensor[f32, OLayout, MutAnyOrigin],
     t_len: Int32,
     scale: Float32,
+    att_i: Int32,
 ):
-    comptime assert Q.flat_rank == 2 and Kc.flat_rank == 3 and O.flat_rank == 2
+    comptime assert Q.flat_rank == 2 and Kc.flat_rank == 1 and O.flat_rank == 2
     var h = Int(block_idx.x)
     var r = Int(block_idx.y)
     var tid = Int(thread_idx.x)
@@ -154,7 +177,7 @@ def amar_attn_decode[
     var scores = stack_allocation[f32, address_space = AddressSpace.SHARED](row_major[HD]())
     var red = stack_allocation[f32, address_space = AddressSpace.SHARED](row_major[HD // WARP_SIZE]())
     var O_ = O
-    attn_head_body(Q, Kc, Vc, O_, qs, scores, red, qrow, kvh, T, tid, Int(lane_id()), scale)
+    attn_head_body[NAT=NAT](Q, Kc, Vc, O_, qs, scores, red, qrow, kvh, T, tid, Int(lane_id()), scale, Int(att_i))
 
 
 def amar_gate_mul[
@@ -247,17 +270,22 @@ def amar_rope_yarn[
 
 
 def amar_kv_append[
-    CLayout: TensorLayout, NLayout: TensorLayout
+    CLayout: TensorLayout, NLayout: TensorLayout, NAT: Int
 ](
-    Cache: TileTensor[f32, CLayout, MutAnyOrigin],
+    Cache: TileTensor[KVT, CLayout, MutAnyOrigin],
     New: TileTensor[f32, NLayout, MutAnyOrigin],
     t_idx: Int32,
+    att_i: Int32,
 ):
-    comptime assert Cache.flat_rank == 3 and New.flat_rank == 2
+    comptime assert Cache.flat_rank == 1 and New.flat_rank == 2
     var h = block_idx.x
     var r = Int(block_idx.y)
     var d = thread_idx.x
-    Cache[h, Int(t_idx) + r, d] = rebind[Cache.ElementType](New[r * NKVH + h, d])
+    var t = Int(t_idx) + r
+    var cb = kv_off[NAT](t, Int(att_i), Int(h)) + Int(d)
+    Cache.ptr[unsafe_offset=cb] = rebind[Scalar[KVT]](
+        rebind[Scalar[f32]](New[r * NKVH + h, d]).cast[KVT]()
+    )
 
 
 comptime PA_TK = 16
@@ -266,17 +294,18 @@ comptime PA_KS = HD + 4
 
 
 def amar_attn_prefill[
-    QLayout: TensorLayout, KLayout: TensorLayout, OLayout: TensorLayout
+    QLayout: TensorLayout, KLayout: TensorLayout, OLayout: TensorLayout, NAT: Int
 ](
     Q: TileTensor[f32, QLayout, MutAnyOrigin],
-    Kc: TileTensor[f32, KLayout, MutAnyOrigin],
-    Vc: TileTensor[f32, KLayout, MutAnyOrigin],
+    Kc: TileTensor[KVT, KLayout, MutAnyOrigin],
+    Vc: TileTensor[KVT, KLayout, MutAnyOrigin],
     O: TileTensor[f32, OLayout, MutAnyOrigin],
     pos: Int32,
     m: Int32,
     scale: Float32,
+    att_i: Int32,
 ):
-    comptime assert Q.flat_rank == 2 and Kc.flat_rank == 3 and Vc.flat_rank == 3 and O.flat_rank == 2
+    comptime assert Q.flat_rank == 2 and Kc.flat_rank == 1 and Vc.flat_rank == 1 and O.flat_rank == 2
     var kvh = Int(block_idx.x)
     var tile = Int(block_idx.y)
     var tid = Int(thread_idx.x)
@@ -300,8 +329,6 @@ def amar_attn_prefill[
     var vsv = vs.vectorize[1, 8]()
     var qsv = qs.vectorize[1, 8]()
     var Qv = Q.vectorize[1, 8]()
-    var Kv = Kc.vectorize[1, 1, 8]()
-    var Vv = Vc.vectorize[1, 1, 8]()
     var O_ = O
 
     if valid:
@@ -316,10 +343,13 @@ def amar_attn_prefill[
         barrier()
         var p = t0 + lp
         if p < t_blk:
-            ksv[lp, lc] = rebind[ksv.ElementType](Kv[kvh, p, lc])
-            ksv[lp, lc + 1] = rebind[ksv.ElementType](Kv[kvh, p, lc + 1])
-            vsv[lp, lc] = rebind[vsv.ElementType](Vv[kvh, p, lc])
-            vsv[lp, lc + 1] = rebind[vsv.ElementType](Vv[kvh, p, lc + 1])
+            var pb = kv_off[NAT](p, Int(att_i), kvh)
+            var Kr = TileTensor(Kc.ptr.unsafe_offset(pb), row_major[HD]()).vectorize[8]()
+            var Vr = TileTensor(Vc.ptr.unsafe_offset(pb), row_major[HD]()).vectorize[8]()
+            ksv[lp, lc] = rebind[ksv.ElementType](rebind[SIMD[KVT, 8]](Kr[lc]).cast[f32]())
+            ksv[lp, lc + 1] = rebind[ksv.ElementType](rebind[SIMD[KVT, 8]](Kr[lc + 1]).cast[f32]())
+            vsv[lp, lc] = rebind[vsv.ElementType](rebind[SIMD[KVT, 8]](Vr[lc]).cast[f32]())
+            vsv[lp, lc + 1] = rebind[vsv.ElementType](rebind[SIMD[KVT, 8]](Vr[lc + 1]).cast[f32]())
         else:
             ksv[lp, lc] = rebind[ksv.ElementType](SIMD[f32, 8](0))
             ksv[lp, lc + 1] = rebind[ksv.ElementType](SIMD[f32, 8](0))

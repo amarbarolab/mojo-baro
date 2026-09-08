@@ -13,7 +13,7 @@ from layout import TileTensor, TensorLayout, row_major, stack_allocation
 from elementwise import EW_THREADS
 from matmul_skinny import ROW_WAVES, ROW_THREADS, q4_dot_blocks, bf16x16_to_f32
 from ssm import CONV, KDIM, NH_K, NH_V, SSTATE, SSM_EPS
-from attn import HD, NQH, NKVH, NROT, YARN_LOW, YARN_HIGH, FREQ_BASE, FREQ_SCALE, MSCALE, attn_head_body
+from attn import HD, NQH, NKVH, KVT, TCAP, KVPAGE, KVPSH, KVHSTR, kv_off, NROT, YARN_LOW, YARN_HIGH, FREQ_BASE, FREQ_SCALE, MSCALE, attn_head_body
 
 comptime u32 = DType.uint32
 comptime f32 = DType.float32
@@ -750,7 +750,7 @@ def rope_cs(j: Int, pos: Int) -> SIMD[f32, 2]:
 
 @always_inline
 def attn_phases[
-    MR: Int, Q4: Bool,
+    MR: Int, Q4: Bool, NAT: Int,
     XL: TensorLayout, GL: TensorLayout, CBL: TensorLayout, AfL: TensorLayout,
     QqL: TensorLayout, QsL: TensorLayout, KqL: TensorLayout, KsL: TensorLayout,
     HqL: TensorLayout, HsL: TensorLayout, HdL: TensorLayout,
@@ -774,10 +774,10 @@ def attn_phases[
     mut Gate: TileTensor[f32, GfL, MutAnyOrigin],
     mut Ao: TileTensor[f32, QmL, MutAnyOrigin],
     mut AoB: TileTensor[bf16, CBL, MutAnyOrigin],
-    mut Kc: TileTensor[f32, CacheL, MutAnyOrigin],
-    mut Vc: TileTensor[f32, CacheL, MutAnyOrigin],
+    mut Kc: TileTensor[KVT, CacheL, MutAnyOrigin],
+    mut Vc: TileTensor[KVT, CacheL, MutAnyOrigin],
     mut Ctr: TileTensor[u32, CtrL, MutAnyOrigin],
-    pos: Int, M: Int,
+    pos: Int, M: Int, att_i: Int,
     prof: MutPointer[Scalar[i64], MutAnyOrigin], pbase: Int,
 ) -> Bool:
     comptime assert X.flat_rank == 2 and CurB.flat_rank == 2 and Gn.flat_rank == 1
@@ -785,7 +785,7 @@ def attn_phases[
     comptime LDSA = (MR == 1) and Q4
     comptime assert Qfm.flat_rank == 2 and Kflat.flat_rank == 2 and Vflat.flat_rank == 2
     comptime assert Q.flat_rank == 2 and Ao.flat_rank == 2 and Gate.flat_rank == 1 and AoB.flat_rank == 2
-    comptime assert Kc.flat_rank == 3 and Vc.flat_rank == 3 and Qn.flat_rank == 1 and Kn.flat_rank == 1
+    comptime assert Kc.flat_rank == 1 and Vc.flat_rank == 1 and Qn.flat_rank == 1 and Kn.flat_rank == 1
     comptime assert MR * (NQH + NKVH) <= MEGA_G
     comptime G_Q = QF // ROW_WAVES
     comptime G_KV = KV // ROW_WAVES
@@ -897,8 +897,13 @@ def attn_phases[
             Kflat[r, h * HD + tid + NROT // 2] = rebind[Kflat.ElementType](x0 * cs[1] + x1 * cs[0])
         barrier()
         if tid < HD:
-            Kc[h, pos + r, tid] = rebind[Kc.ElementType](Kflat[r, h * HD + tid])
-            Vc[h, pos + r, tid] = rebind[Vc.ElementType](Vflat[r, h * HD + tid])
+            var kb = kv_off[NAT](pos + r, att_i, Int(h)) + tid
+            Kc.ptr[unsafe_offset=kb] = rebind[Scalar[KVT]](
+                rebind[Scalar[f32]](Kflat[r, h * HD + tid]).cast[KVT]()
+            )
+            Vc.ptr[unsafe_offset=kb] = rebind[Scalar[KVT]](
+                rebind[Scalar[f32]](Vflat[r, h * HD + tid]).cast[KVT]()
+            )
     if not grid_barrier(ctr, gen, fail):
         return False
     stamp(prof, pbase + 3)
@@ -909,7 +914,7 @@ def attn_phases[
         var qrow = r * NQH + h
         var kvh = h // (NQH // NKVH)
         var T = pos + 1 + r
-        attn_head_body(Q, Kc, Vc, Ao, qs, scores, sums, qrow, kvh, T, tid, lane, ATT_SCALE)
+        attn_head_body[NAT=NAT](Q, Kc, Vc, Ao, qs, scores, sums, qrow, kvh, T, tid, lane, ATT_SCALE, att_i)
     if not grid_barrier(ctr, gen, fail):
         return False
     stamp(prof, pbase + 4)
@@ -967,7 +972,7 @@ def mega_body[
     CsL: TensorLayout, SsL: TensorLayout,
     QfL: TensorLayout, KvfL: TensorLayout, QmL: TensorLayout, GfL: TensorLayout,
     PfL: TensorLayout, FbL: TensorLayout, OffL: TensorLayout, CtrL: TensorLayout, TkL: TensorLayout, DkL: TensorLayout,
-    TM: Int, NL: Int,
+    NL: Int, NAT: Int,
 ](
     wbuf: MutPointer[Scalar[u8], MutAnyOrigin],
     off: TileTensor[i64, OffL, MutAnyOrigin],
@@ -990,8 +995,8 @@ def mega_body[
     Q: TileTensor[f32, QmL, MutAnyOrigin],
     Gate: TileTensor[f32, GfL, MutAnyOrigin],
     Ao: TileTensor[f32, QmL, MutAnyOrigin],
-    kc: MutPointer[Scalar[f32], MutAnyOrigin],
-    vc: MutPointer[Scalar[f32], MutAnyOrigin],
+    kc: MutPointer[Scalar[KVT], MutAnyOrigin],
+    vc: MutPointer[Scalar[KVT], MutAnyOrigin],
     Pg: TileTensor[f32, PfL, MutAnyOrigin],
     Pu: TileTensor[f32, PfL, MutAnyOrigin],
     FgB: TileTensor[bf16, FbL, MutAnyOrigin],
@@ -1006,8 +1011,7 @@ def mega_body[
     ring: Int32, slots: Int32, pos: Int32, m: Int32, dump: Int32, fold_head: Int32,
 ):
     comptime assert off.flat_rank == 1 and Toks.flat_rank == 1 and Dtok.flat_rank == 1 and Hn.flat_rank == 2
-    comptime cache_layout = row_major[NKVH, TM, HD]()
-    comptime ATT32 = NKVH * TM * HD
+    comptime cache_layout = row_major[TCAP]()
     var X_ = X
     var CurB_ = CurB
     var ResB_ = ResB
@@ -1054,16 +1058,16 @@ def mega_body[
             var o4 = Int(rebind[Scalar[i64]](off[w + 4]))
             var o5 = Int(rebind[Scalar[i64]](off[w + 5]))
             var o6 = Int(rebind[Scalar[i64]](off[w + 6]))
-            var Kc = TileTensor(kc + att_i * ATT32, cache_layout)
-            var Vc = TileTensor(vc + att_i * ATT32, cache_layout)
-            if not attn_phases[MR, Q4](
+            var Kc = TileTensor(kc, cache_layout)
+            var Vc = TileTensor(vc, cache_layout)
+            if not attn_phases[MR, Q4, NAT](
                 X_, wf[H](wbuf, o0), CurB_, Af,
                 wq[QF, H, Q4](wbuf, o1), ws[QF, H, Q4](wbuf, o1),
                 wq[KV, H, Q4](wbuf, o2), ws[KV, H, Q4](wbuf, o2),
                 wq[KV, H, Q4](wbuf, o3), ws[KV, H, Q4](wbuf, o3),
                 wf[HD](wbuf, o4), wf[HD](wbuf, o5),
                 wq[H, H, Q4](wbuf, o6), ws[H, H, Q4](wbuf, o6),
-                Qfm_, Kflat_, Vflat_, Q_, Gate_, Ao_, ResB_, Kc, Vc, Ctr_, p, M, prof, 16 * layer,
+                Qfm_, Kflat_, Vflat_, Q_, Gate_, Ao_, ResB_, Kc, Vc, Ctr_, p, M, att_i, prof, 16 * layer,
             ):
                 return
             att_i += 1
@@ -1206,7 +1210,7 @@ def amar_mega_token[
     CsL: TensorLayout, SsL: TensorLayout,
     QfL: TensorLayout, KvfL: TensorLayout, QmL: TensorLayout, GfL: TensorLayout,
     PfL: TensorLayout, FbL: TensorLayout, OffL: TensorLayout, CtrL: TensorLayout, TkL: TensorLayout, DkL: TensorLayout,
-    TM: Int, NL: Int,
+    NL: Int, NAT: Int,
 ](
     wbuf: MutPointer[Scalar[u8], MutAnyOrigin],
     off: TileTensor[i64, OffL, MutAnyOrigin],
@@ -1229,8 +1233,8 @@ def amar_mega_token[
     Q: TileTensor[f32, QmL, MutAnyOrigin],
     Gate: TileTensor[f32, GfL, MutAnyOrigin],
     Ao: TileTensor[f32, QmL, MutAnyOrigin],
-    kc: MutPointer[Scalar[f32], MutAnyOrigin],
-    vc: MutPointer[Scalar[f32], MutAnyOrigin],
+    kc: MutPointer[Scalar[KVT], MutAnyOrigin],
+    vc: MutPointer[Scalar[KVT], MutAnyOrigin],
     Pg: TileTensor[f32, PfL, MutAnyOrigin],
     Pu: TileTensor[f32, PfL, MutAnyOrigin],
     FgB: TileTensor[bf16, FbL, MutAnyOrigin],
@@ -1244,7 +1248,7 @@ def amar_mega_token[
     hidx: MutPointer[Scalar[i32], MutAnyOrigin],
     ring: Int32, slots: Int32, pos: Int32, m: Int32, dump: Int32, fold_head: Int32,
 ):
-    mega_body[MR, RELOAD, Q4, XL, CBL, QkvL, G32mL, ConvL, OmL, CsL, SsL, QfL, KvfL, QmL, GfL, PfL, FbL, OffL, CtrL, TkL, DkL, TM, NL](wbuf, off, X, CurB, ResB, Qkvm, Zm, Araw, Braw, Eg, Beta, Conv, So, ConvState, SAll, Qfm, Kflat, Vflat, Q, Gate, Ao, kc, vc, Pg, Pu, FgB, Ctr, prof, dbg, Toks, Dtok, Hn, hmax, hidx, ring, slots, pos, m, dump, fold_head)
+    mega_body[MR, RELOAD, Q4, XL, CBL, QkvL, G32mL, ConvL, OmL, CsL, SsL, QfL, KvfL, QmL, GfL, PfL, FbL, OffL, CtrL, TkL, DkL, NL, NAT](wbuf, off, X, CurB, ResB, Qkvm, Zm, Araw, Braw, Eg, Beta, Conv, So, ConvState, SAll, Qfm, Kflat, Vflat, Q, Gate, Ao, kc, vc, Pg, Pu, FgB, Ctr, prof, dbg, Toks, Dtok, Hn, hmax, hidx, ring, slots, pos, m, dump, fold_head)
 
 
 def amar_mega_window[
@@ -1254,7 +1258,7 @@ def amar_mega_window[
     CsL: TensorLayout, SsL: TensorLayout,
     QfL: TensorLayout, KvfL: TensorLayout, QmL: TensorLayout, GfL: TensorLayout,
     PfL: TensorLayout, FbL: TensorLayout, OffL: TensorLayout, CtrL: TensorLayout, TkL: TensorLayout, DkL: TensorLayout,
-    TM: Int, NL: Int,
+    NL: Int, NAT: Int,
 ](
     wbuf: MutPointer[Scalar[u8], MutAnyOrigin],
     off: TileTensor[i64, OffL, MutAnyOrigin],
@@ -1277,8 +1281,8 @@ def amar_mega_window[
     Q: TileTensor[f32, QmL, MutAnyOrigin],
     Gate: TileTensor[f32, GfL, MutAnyOrigin],
     Ao: TileTensor[f32, QmL, MutAnyOrigin],
-    kc: MutPointer[Scalar[f32], MutAnyOrigin],
-    vc: MutPointer[Scalar[f32], MutAnyOrigin],
+    kc: MutPointer[Scalar[KVT], MutAnyOrigin],
+    vc: MutPointer[Scalar[KVT], MutAnyOrigin],
     Pg: TileTensor[f32, PfL, MutAnyOrigin],
     Pu: TileTensor[f32, PfL, MutAnyOrigin],
     FgB: TileTensor[bf16, FbL, MutAnyOrigin],
@@ -1292,4 +1296,4 @@ def amar_mega_window[
     hidx: MutPointer[Scalar[i32], MutAnyOrigin],
     ring: Int32, slots: Int32, pos: Int32, m: Int32, dump: Int32, fold_head: Int32,
 ):
-    mega_body[MR, RELOAD, Q4, XL, CBL, QkvL, G32mL, ConvL, OmL, CsL, SsL, QfL, KvfL, QmL, GfL, PfL, FbL, OffL, CtrL, TkL, DkL, TM, NL](wbuf, off, X, CurB, ResB, Qkvm, Zm, Araw, Braw, Eg, Beta, Conv, So, ConvState, SAll, Qfm, Kflat, Vflat, Q, Gate, Ao, kc, vc, Pg, Pu, FgB, Ctr, prof, dbg, Toks, Dtok, Hn, hmax, hidx, ring, slots, pos, m, dump, fold_head)
+    mega_body[MR, RELOAD, Q4, XL, CBL, QkvL, G32mL, ConvL, OmL, CsL, SsL, QfL, KvfL, QmL, GfL, PfL, FbL, OffL, CtrL, TkL, DkL, NL, NAT](wbuf, off, X, CurB, ResB, Qkvm, Zm, Araw, Braw, Eg, Beta, Conv, So, ConvState, SAll, Qfm, Kflat, Vflat, Q, Gate, Ao, kc, vc, Pg, Pu, FgB, Ctr, prof, dbg, Toks, Dtok, Hn, hmax, hidx, ring, slots, pos, m, dump, fold_head)
