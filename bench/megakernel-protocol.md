@@ -307,3 +307,28 @@ check whether `mega_token` carries `rocdl.flat_work_group_size` /
 `waves_per_eu` (the board rule: LLVM caps VGPRs at 192 without it), pin the
 delta phase there, re-measure the champion alone, then re-apply the fold
 from `lane-fold`.
+
+**Follow-up, same day: fold + chunked delta LANDS (`9d00280`, merged `9e6feaa`).**
+The fold's loss was the delta phase's allocation, so the m=1 q4 kernel now
+takes the chunked delta (`RELOAD=True`, already the window kernel's form,
+bit-identical by the same test): 239 VGPRs, 0 scratch, delta 464 -> 269 us,
+rmsc slots -60, ffn gate/up +180 (the shared q4 dot loop lost 28 VOPD pairs
+and gained 270 `s_delay_alu` with unchanged source -- a schedule change, not
+work), token 7498 -> 7358 us. Two other pins measured and dropped in the same
+stint: `@no_inline` on the delta column (delta 665, ffn +440, total 8035)
+and `@no_inline` on all three phase functions (call/arg overhead 108 us in
+the ssm entry, delta 659, total 7739). `rocdl.waves_per_eu` is not settable
+from Mojo's `@__llvm_metadata` (integer, tuple and literal forms all
+rejected), so the scheduler's occupancy target stays out of reach.
+
+| arm | median tok/s_gen | spread | identity |
+|---|---|---|---|
+| champion `37bca40` | 130.59 | 34.6% (one cold outlier) | ref |
+| fold + chunked delta | **133.93** | 14.1% (one outlier) | 20/20 |
+
+**+2.6 %**, inside the frozen +2.0 to +3.5 % band; gate 13/13
+(`.work/mega-gate-b2`), sclk med 3030 MHz, 290 W / -100 mV
+(`.work/ab-b2-real`). Two earlier A/Bs of this candidate read 1.001 because
+the branch lacked the `AB_ENGINE_B` runner commit and ran the champion
+against itself; `arm.txt` names both binaries since, and it is read before
+the ratio (ledger 2026-09-08).

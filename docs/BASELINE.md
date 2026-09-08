@@ -350,3 +350,16 @@ run-tests, identity on every runnable pack with spec on/off, ref tokens,
 per-sub-block device profile, `BARO_DUMP=path` dumps X per layer for both
 arms. Round receipts: `bench/megakernel-protocol.md`.
 
+**q4 m=1 champion since 2026-09-08 (`9e6feaa`): 133.9 tok/s_gen no-spec,
+20-prompt median** (was 130.6). The per-phase rmsnorm+quantise and its grid
+barrier are folded into the consuming GEMV's LDS prologue (`stage_rms`, 65
+barriers per token gone) and the m=1 q4 kernel runs the chunked delta
+(`RELOAD=True`, 239 VGPRs, 0 scratch). Bit-identical: gate 13/13, identity
+20/20, q4 vs model-ref 64/64. Per token (`BARO_PROFILE=5`): 7498 -> 7358 us;
+delta phase 464 -> 269. Known pool left by this round: the shared q4 dot loop
+lost dual-issue pairs (102 -> 74) and gained `s_delay_alu` (184 -> 454), ffn
+gate/up +180 us; read `isa-loops` (delay/dual columns) on every megakernel
+build -- a loop that changes there with unchanged source is the register
+allocator, and only the real-pack A/B settles it. `rocdl.waves_per_eu`
+cannot be set through `@__llvm_metadata` (six spellings rejected).
+
