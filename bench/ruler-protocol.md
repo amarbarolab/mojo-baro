@@ -203,6 +203,33 @@ a final pre-ship confirmation.
 
 <!-- RESULTS -->
 
+### Arm A (bf16 KV), llama.cpp Q4_0-pure, N=25, 4k-32k — 2026-09-08
+
+`-np 1 -ub 512` as frozen; 32k finished in-session after the 12:15 desktop
+crash (run.py resume, 100/100). Score: `bench/ruler/score.py
+.work/ruler-baseline/bf16/all` (per-size response dirs symlinked together).
+
+| task          | 4k   | 8k   | 16k  | 32k   | effective_len |
+|---------------|------|------|------|-------|---------------|
+| niah_single   | 88.0 | 68.0 | 96.0 | 100.0 | 32768 |
+| niah_multikey | 96.0 | 96.0 | 100.0| 88.0  | 32768 |
+| vt            | 100.0| 100.0| 100.0| 100.0 | 32768 |
+| cwe           | 93.6 | 100.0| 88.4 | 46.0  | **16384** |
+
+Prediction "Arm A effective 32k" holds for 3 of 4 tasks; **cwe (common-word
+extraction, aggregation) falls to 46 at 32k**, so the per-task effective
+length is 16k. niah_single 68 at 8k is a dip, not a cliff (96/100 after).
+Per-prompt wall at `-np 1`: 4k 5.3 s, 8k 8.3 s, 16k 10.9 s, 32k ~16 s.
+
+Arm B (K8/V4) and 64k/128k: NOT run — stopped after arm A 32k (the maintainer,
+2026-09-08 12:4x) on cost (~2 h more, 128k prefill dominated). The parallel
+slot amendment below is committed and untested on a real run.
+
+Deviation: `run-baseline.sh` was edited while the 32k run was executing;
+bash read the modified tail and printed `unexpected EOF` (exit 2) AFTER the
+last prompt completed — all 100 responses and metrics present, the server
+was killed by the trap. Committed script passes `bash -n`.
+
 ### What the M5 gate should run
 
 Once a format is built, the exact commands:
