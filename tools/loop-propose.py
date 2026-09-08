@@ -8,7 +8,7 @@ iterations 002-005 saw 8 of 14 candidates echo the example back, invented
 symbols and all (bench/loop-protocol.md, iteration 005 result).
 
 Usage: tools/loop-propose.py MODEL.gguf ITER [--n 4] [--region auto|attn|ssm|ffn|head]
-         [--profile .work/profile-run.log] [--endpoint http://127.0.0.1:8083]
+         [--profile .work/profile-run.log] [--endpoint http://127.0.0.1:8083] [--[no-]mega]
 Writes .work/loop/<ITER>/{meta.json,FILES,src/,prompt.md,cand-<i>.raw.md,cand-<i>.diff,cand-<i>.predict}
 """
 import argparse, json, re, subprocess, sys, urllib.request
@@ -20,6 +20,12 @@ MARK = {"attn": ("# -- attention / ssm sub-block --", "# -- ffn sub-block --"),
         "ssm": ("# -- attention / ssm sub-block --", "# -- ffn sub-block --"),
         "ffn": ("# -- ffn sub-block --", "# -- head --"),
         "head": ("# -- head --", "# advance by the window")}
+# Split layout under BARO_MEGA=1 (the default the gguf runs with): decode is one
+# persistent megakernel, so the launch-path regions above are not on the executed
+# path. The proposer is shown kernels/mega.mojo instead: the helper section (top
+# of the file up to the first phase) plus the phase def for the target region,
+# delimited by def boundaries -- kernel files carry no comment markers.
+MEGA_DEF = {"attn": "attn_phases", "ssm": "ssm_phases", "ffn": "ffn_phases", "head": "mega_body"}
 KFILES = {"attn": ["attn.mojo", "elementwise.mojo", "matmul_skinny.mojo"],
           "ssm": ["ssm.mojo", "elementwise.mojo", "matmul_skinny.mojo"],
           "ffn": ["elementwise.mojo", "matmul_skinny.mojo"],
@@ -103,12 +109,47 @@ def slice_region(engine_src, region, src_dir, body_file="engine.mojo"):
 
 
 def profile_shares(path):
-    shares = {}
+    shares, mega = {}, {}
     for line in Path(path).read_text().splitlines():
         m = re.match(r"profile: (\w+) ([\d.]+) ([\d.]+)", line)
         if m:
             shares[m.group(1)] = (float(m.group(2)), float(m.group(3)))
-    return shares
+        # BARO_PROFILE=5, megakernel: one line, microseconds per phase family. The
+        # same log also carries the launch-path `profile:` lines, which under
+        # BARO_MEGA=1 attribute one kernel to whichever sync follows; the stamp
+        # line wins when present.
+        m = re.match(r"mega profile \(last token, us\): ssm sub-blocks ([\d.]+)\s+attn sub-blocks ([\d.]+)"
+                     r"\s+ffn ([\d.]+)\s+head ([\d.]+)\s+total ([\d.]+)", line)
+        if m:
+            tot = float(m.group(5))
+            for k, v in zip(("ssm", "attn", "ffn", "head"), m.groups()[:4]):
+                mega[k] = (float(v) / 1e6, float(v) / tot)
+    return mega or shares
+
+
+def def_span(lines, name):
+    d = next(i for i, l in enumerate(lines) if l.startswith(f"def {name}["))
+    i = d
+    while i > 0 and lines[i - 1].startswith("@"):
+        i -= 1
+    j = next((k for k in range(d + 1, len(lines)) if re.match(r"^(@|def )", lines[k])), len(lines))
+    while j > i and not lines[j - 1].strip():
+        j -= 1
+    return i, j
+
+
+def slice_mega(mega_src, region):
+    lines = mega_src.splitlines()
+    h0, _ = def_span(lines, "ssm_phases")
+    a, b = def_span(lines, MEGA_DEF[region])
+    return (f"\nYou are editing device code inside the persistent decode megakernel "
+            f"(kernels/mega.mojo): one workgroup per row block, `grid_barrier` between "
+            f"phases, every weight read once per token. There are no kernel launches to "
+            f"add or remove here; wins are fewer bytes, fewer barriers, fewer passes. "
+            f"Only the helpers shown and the names already used in the excerpt are callable.\n"
+            f"\nmega.mojo, target region `{region}` = `{MEGA_DEF[region]}` (lines {a+1}-{b}); "
+            f"the excerpt below is lines 1-{h0} (helpers) and {a+1}-{b} of that file:\n",
+            "\n".join(lines[:h0]) + "\n\n" + "\n".join(lines[a:b]))
 
 
 def ask(endpoint, prompt, identity_line, max_tokens=4096):
@@ -147,6 +188,8 @@ def main():
     ap.add_argument("--profile", default=".work/profile-run.log")
     ap.add_argument("--endpoint", default="http://127.0.0.1:8083")
     ap.add_argument("--start", type=int, default=0, help="first identity index")
+    ap.add_argument("--mega", action=argparse.BooleanOptionalAction, default=None,
+                    help="show the megakernel phase instead of the launch-path region (default: auto, on when the gguf carries mega.mojo + window.mojo)")
     ap.add_argument("--max-tokens", type=int, default=4096,
                     help="answer budget per branch; a reasoning model needs room to think AND answer")
     a = ap.parse_args()
@@ -168,18 +211,23 @@ def main():
     # engine.mojo (the stopwatch) is no longer embedded. Legacy ggufs still
     # carry the body inside engine.mojo.
     body_file = "window.mojo" if (out / "src/window.mojo").exists() else "engine.mojo"
+    mega = a.mega if a.mega is not None else (out / "src/mega.mojo").exists() and body_file == "window.mojo"
     prompt = (f"Engine source commit in this gguf: {meta['baro.kernel.commit']}\n"
-              f"GPU time per decode run, by sub-block (BARO_PROFILE=1):\n{prof_txt}\n"
-              f"Target region: `{region}` (largest share).\n\n"
-              + slice_region((out / "src" / body_file).read_text(), region, out / "src", body_file))
-    # Tag-delimited, deliberately NOT diff-shaped: the old `===== f =====` banner
-    # taught iter-001 cand-2 to answer in banners instead of a unified diff, and
-    # the gate discarded it unparsed (receipt: parse / "no diff fence").
-    for f in KFILES[region]:
-        prompt += f'\n\n<file path="{f}">\n' + (out / "src" / f).read_text() + f'\n</file>'
+              f"GPU time per decode run, by sub-block ({'BARO_PROFILE=5, megakernel phases' if mega else 'BARO_PROFILE=1'}):\n{prof_txt}\n"
+              f"Target region: `{region}` (largest share).\n\n")
+    if mega:
+        intro, excerpt = slice_mega((out / "src/mega.mojo").read_text(), region)
+        prompt += intro + f'\n<file path="mega.mojo">\n' + excerpt + '\n</file>'
+    else:
+        prompt += slice_region((out / "src" / body_file).read_text(), region, out / "src", body_file)
+        # Tag-delimited, deliberately NOT diff-shaped: the old `===== f =====` banner
+        # taught iter-001 cand-2 to answer in banners instead of a unified diff, and
+        # the gate discarded it unparsed (receipt: parse / "no diff fence").
+        for f in KFILES[region]:
+            prompt += f'\n\n<file path="{f}">\n' + (out / "src" / f).read_text() + f'\n</file>'
     (out / "prompt.md").write_text(prompt)
     ids = identities()[a.start:a.start + a.n]
-    print(f"region={region} prompt_chars={len(prompt)} identities={[i[0] for i in ids]}", flush=True)
+    print(f"region={region} mega={mega} prompt_chars={len(prompt)} identities={[i[0] for i in ids]}", flush=True)
     for i, (name, line) in enumerate(ids):
         raw, finish, usage = ask(a.endpoint, prompt, line, a.max_tokens)
         (out / f"cand-{i}.raw.md").write_text(f"identity: {name}\n\n" + raw)
