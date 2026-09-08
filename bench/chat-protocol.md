@@ -141,20 +141,69 @@ lane's champion.
 
 ---
 
-## M0b — KV cache: paged, and narrower than f32
+## M0b — KV cache: token-major, runtime capacity, narrower than f32
 
-**Change (to be preregistered in full before its build).** KV pages of 128
-tokens with a per-slot page table, static per-page layout
-`row_major[NKVH, 128, HD]` so no kernel needs a runtime-strided layout, page
-count allocated at runtime. KV element type becomes a comptime switch over
-{f32, f16, bf16} so the identity gate decides the default rather than the
-design note deciding it: f16 carries 10 mantissa bits and is what llama.cpp
-stores by default, bf16 carries 7, and the reference token stream this repo
-gates against came from llama.cpp. The design (§2) names bf16; if f16 holds
-identity and bf16 does not, f16 ships and the design gets the correction.
+**Change.** The KV cache layout goes from `row_major[NKVH, TMAX, HD]` to
+`row_major[TCAP, NKVH, HD]` (token-major) and its element type from f32 to a
+comptime `KVT`.
 
-**Open until measured.** Whether the paged indirection costs decode
-throughput (one extra dependent load per 128 positions).
+Why token-major removes the ceiling: in `row_major[TCAP, NKVH, HD]` the
+outermost extent has no stride of its own, so the address of (t, kvh, d) is
+`t*NKVH*HD + kvh*HD + d` -- `TCAP` never enters the arithmetic. It is a
+nominal extent, and the real capacity is whatever the runtime allocation
+holds. In the old order `TMAX` was the *middle* extent and therefore the
+stride between kv heads, which is why it had to be a compile-time constant.
+The per-layer stride in the megakernel (`kc + att_i * ATT32`) becomes a
+runtime argument for the same reason.
+
+Token-major is also the layout paging wants: a 128-token page is one
+contiguous `128*NKVH*HD` run, so M1 turns `t*NKVH*HD` into
+`page_table[t >> 7]*PAGESZ + (t & 127)*NKVH*HD` and nothing else moves. The
+page table itself is NOT built here -- with one sequence and no prefix sharing
+it would be an identity map, i.e. dead weight until M1 gives it a job.
+
+Coalescing is preserved: the V accumulation still has thread `tid` reading
+`V[t, kvh, tid]` across a wave, 64 consecutive elements for one t.
+
+**Element type.** `KVT` is a comptime switched per build (the rebuild-in-the-
+same-command is its P1 receipt, and the engine prints `kv dtype:` from it).
+Arms: f32, f16, bf16. Design §2 names bf16; f16 carries 10 mantissa bits
+against bf16's 7 and is what llama.cpp stores by default, which is where this
+repo's reference token stream comes from. The identity gate picks, not the
+design note.
+
+**Not in this step.** The page table, `TMAX` as a runtime request parameter,
+the `exceed_context_size` error shape, chunked prefill past CP. Those are M0c.
+`TMAX = 1088` stays the engine's capacity, so nothing user-visible changes:
+this step is the re-layout alone, gated on identity.
+
+**Predictions (frozen before the build).**
+- P-B1 The f32 arm is **bit-exact** against the M0a binary: `GENERATED`
+  byte-identical on all 20 `bench/mtp-prompts/`, q4 and q8 identity 64/64.
+  Only addresses change; every value, cast and summation order is preserved.
+  This is the load-bearing prediction -- it is what makes the re-layout
+  separable from the dtype question.
+- P-B2 The f16 arm holds identity (q4 64/64, q8 64/64, mtp 20/20). The bf16
+  arm does **not**: at least one identity check fails. Frozen deliberately as
+  the asymmetric prediction -- if bf16 also holds, the design's choice stands
+  and bf16 ships.
+- P-B3 No arm separates from another on the 20-prompt median by more than
+  2 %. At T ~ 100 the KV read is 2*T*NKVH*HD*4 B per layer over 8 layers =
+  6.5 MB per token against a 6.2 GB q4 pack, i.e. under 0.2 % of the bytes
+  moved, so halving KV width cannot show up here. The KV-width win is a
+  long-context effect and is claimed only when M0c can measure it.
+- P-B4 `mega fail word: 0` on every run.
+- Falsifier: the f32 arm not bit-exact against M0a. That is a re-layout bug,
+  and the step goes back rather than the gate being relaxed.
+
+**Verification before timing (P1).** Each arm is a rebuild in the same command
+as its run; `kv dtype:`, `TMAX:`, `spec k:`, `prompt tokens:`, `tok/s_gen`
+and `mega fail word` all read back from the run's own output.
+
+**Gate.** `tools/merge-gate.sh` ALL PASS on the chosen default; 20-prompt A/B
+against the M0a binary within P-B3; P-B1 exact.
+
+**Result.** (filled after the gated run)
 
 ---
 
