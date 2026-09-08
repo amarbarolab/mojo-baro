@@ -1,22 +1,41 @@
-"""Load the engine pack's tokenizer (tools/gguf-tokenizer.py) for RULER sizing.
+"""Token counts for RULER sizing via the Mojo tokenizer (.work/baro-tokenize).
 
 Not llama.cpp's tokenizer, not nemo/hf/openai -- ours, per the lane brief:
-context size is measured in OUR tokenizer's tokens.
+context size is measured in OUR tokenizer's tokens. The GGUF that carries the
+tokenizer comes from $BARO_GGUF, else <pack>/tokenizer-meta.json "source_gguf".
 """
-import importlib.util
+import json
+import os
+import subprocess
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+CLI = ROOT / ".work/baro-tokenize"
 
 
 def load(pack):
-    spec = importlib.util.spec_from_file_location("gt", ROOT / "tools/gguf-tokenizer.py")
-    gt = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(gt)
-    meta = gt.load_meta(pack)
-    tokenizer = gt.load_tokenizer(pack)
+    meta_path = Path(pack) / "tokenizer-meta.json"
+    meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+    gguf = os.environ.get("BARO_GGUF") or meta.get("source_gguf")
+    if not gguf or not Path(gguf).exists():
+        raise SystemExit(f"tok.load: set BARO_GGUF to the tokenizer's GGUF (got {gguf!r})")
+    if not CLI.exists():
+        raise SystemExit(f"tok.load: build the CLI first: ./.venv/bin/mojo build tools/baro-tokenize.mojo "
+                         f"-I serve -I ~/Projects/mojo-uregex/src -o {CLI}")
+
+    def count_many(texts):
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as f:
+            f.write("\0".join(texts))
+            path = f.name
+        try:
+            r = subprocess.run([str(CLI), "count", path, gguf], capture_output=True, text=True, check=True)
+        finally:
+            os.unlink(path)
+        return [int(x) for x in r.stdout.split()][: len(texts)]
 
     def count(text):
-        return len(tokenizer.encode(text, add_special_tokens=False).ids)
+        return count_many([text])[0]
 
-    return tokenizer, meta, count
+    count.many = count_many
+    return gguf, meta, count

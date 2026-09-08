@@ -6,7 +6,7 @@ from tokenizer import Tokenizer
 def main() raises:
     var args = argv()
     if len(args) < 3:
-        print("usage: baro-tokenize (encode TEXT_FILE | decode IDS_FILE | decode-keep IDS_FILE | batch NUL_TEXTS_FILE | info) MODEL.gguf")
+        print("usage: baro-tokenize (encode TEXT_FILE | decode IDS_FILE | decode-keep IDS_FILE | batch NUL_TEXTS_FILE | count NUL_TEXTS_FILE | info) MODEL.gguf")
         return
     var t0 = perf_counter_ns()
     var tok = Tokenizer(String(args[len(args) - 1]))
@@ -27,6 +27,9 @@ def main() raises:
         for part in data.split():
             ids.append(atol(part))
         print(tok.decode(ids, keep_special=cmd == "decode-keep"), end="")
+    elif cmd == "count":
+        for t in data.split("\0"):
+            print(len(tok.encode(String(t))))
     elif cmd == "batch":
         for t in data.split("\0"):
             var line = String("")

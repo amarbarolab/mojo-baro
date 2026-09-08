@@ -1,14 +1,16 @@
 # Tokenizer — text in, text out, bit-equal to llama.cpp
 
+> **Default path since 2026-09-08: the Mojo tokenizer** (`serve/tokenizer.mojo`, CLI `tools/baro-tokenize.mojo`, gate `tools/test_tokenizer_mojo.py`) — see the last section. Everything referring to `tools/retired/*` below is the retired Python path, kept as oracle material.
+
 The engine reads token ids and prints token ids. This layer turns text into
 those ids and back, built from nothing but the GGUF's own metadata, and is
 gated on producing exactly the ids llama.cpp produces on the same file.
 
 | | |
 |---|---|
-| builder | `tools/gguf-tokenizer.py MODEL.gguf OUTDIR [OUTDIR ...]` |
-| gate | `.venv/bin/python tools/test_tokenizer.py [--pack DIR] [--gguf FILE]` |
-| CLI | `tools/baro-tokenize encode\|decode\|prompt\|info` |
+| builder | `tools/retired/gguf-tokenizer.py MODEL.gguf OUTDIR [OUTDIR ...]` |
+| gate | `.venv/bin/python tools/retired/test_tokenizer.py [--pack DIR] [--gguf FILE]` |
+| CLI | `tools/retired/baro-tokenize.py encode\|decode\|prompt\|info` |
 | runtime | HF `tokenizers` (Python dev dep; the Rust crate for the server) |
 
 ## Files next to a pack
@@ -69,7 +71,7 @@ Only `tokenizer.ggml.model == "gpt2"` (byte-level BPE) is supported:
 ## Gate
 
 ```
-.venv/bin/python tools/test_tokenizer.py            # default --pack .work/engine-pack-q4
+.venv/bin/python tools/retired/test_tokenizer.py            # default --pack .work/engine-pack-q4
 ```
 
 1. every `bench/mtp-prompts/*.txt` (checked equal to `prompts.json`) encodes
@@ -92,13 +94,13 @@ touching the builder. `--dump FILE` writes every case's ids for diffing.
 ## CLI
 
 ```
-tools/baro-tokenize encode "Water boils at 100 degrees"      # ids, one per line
-tools/baro-tokenize encode --chat --system "Be brief." "2+2?" # chat template applied
-tools/baro-tokenize encode -o /path/prompt-tokens.txt - < file.txt
-tools/baro-tokenize prompt --chat "What is 2+2?"             # writes <pack>/prompt-tokens.txt
-tools/baro-tokenize decode - < .work/engine-pack-q4/ref-tokens-64.txt
-tools/baro-tokenize decode --keep-special 248045 846 198
-tools/baro-tokenize info
+tools/retired/baro-tokenize.py encode "Water boils at 100 degrees"      # ids, one per line
+tools/retired/baro-tokenize.py encode --chat --system "Be brief." "2+2?" # chat template applied
+tools/retired/baro-tokenize.py encode -o /path/prompt-tokens.txt - < file.txt
+tools/retired/baro-tokenize.py prompt --chat "What is 2+2?"             # writes <pack>/prompt-tokens.txt
+tools/retired/baro-tokenize.py decode - < .work/engine-pack-q4/ref-tokens-64.txt
+tools/retired/baro-tokenize.py decode --keep-special 248045 846 198
+tools/retired/baro-tokenize.py info
 ```
 
 `--pack DIR` (or `BARO_PACK`) selects the pack; default `.work/engine-pack-q4`.
@@ -115,7 +117,7 @@ with `BARO_PROMPT=/path`), decimal ids separated by any non-digit byte, one
 per line by convention, and prints the generated ids on the `GENERATED:`
 line. `baro-tokenize prompt` writes that file; `baro-tokenize decode` reads
 the `GENERATED:` ids back (paste them, or `grep GENERATED: run.log | cut -d: -f2 |
-tools/baro-tokenize decode -`).
+tools/retired/baro-tokenize.py decode -`).
 
 ## Server: loading in Rust
 

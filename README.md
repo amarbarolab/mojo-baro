@@ -103,14 +103,14 @@ product — no server, no batching, no sampler beyond greedy.
 
 ### Tokenizer
 
-Text in, text out, bit-equal to llama.cpp: `tools/gguf-tokenizer.py` builds an
-HF `tokenizers` byte-level BPE (`<pack>/tokenizer.json` + `tokenizer-meta.json`)
-from the GGUF metadata alone, and `tools/test_tokenizer.py` gates it — the 20
+Text in, text out, bit-equal to llama.cpp: `serve/tokenizer.mojo` reads the
+byte-level BPE (vocab, merges, pre-tokenizer) from the GGUF header alone, regexes
+on [mojo-uregex](../mojo-uregex), and `tools/test_tokenizer_mojo.py` gates it — the 20
 `bench/mtp-prompts/` token files plus a 41-case hard set (unicode, CJK, emoji,
 code, whitespace, special tokens, chat template) against `llama-tokenize`, and
-`decode(encode(x)) == x`. `tools/baro-tokenize` encodes/decodes/applies the
-chat template and writes the `prompt-tokens.txt` the engine reads. Contract and
-Rust loading notes: `docs/TOKENIZER.md`.
+`decode(encode(x)) == x`. `tools/baro-tokenize.mojo` encodes/decodes/counts, and
+`serve/spark.mojo` tokenizes in-process (`BARO_PROMPT_TEXT`). The Python builder
+and its gate live in `tools/retired/`. Contract: `docs/TOKENIZER.md`.
 
 ### Throughput against llama.cpp
 

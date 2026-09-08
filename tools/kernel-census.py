@@ -23,7 +23,7 @@ def scan():
             pm = re.search(r"^(?:def|fn) " + name + r"\[([^\]]*)\]", src, re.M | re.S)
             params = " ".join(pm.group(1).split()) if pm else ""
             kernels[name] = {"file": f.name, "params": params, "used": []}
-    users = [REG, ROOT / "serve" / "engine.mojo", KDIR / "amarbaro.mojo"]
+    users = [REG, ROOT / "serve" / "engine.mojo", ROOT / "serve" / "spark.mojo", KDIR / "amarbaro.mojo"]
     users += sorted((ROOT / "bench").glob("*.mojo")) + sorted(KDIR.glob("test_*.mojo"))
     for u in users:
         src = u.read_text()

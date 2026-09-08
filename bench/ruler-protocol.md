@@ -29,7 +29,7 @@ for all four — per example, the fraction of `answers` found as a
 case-insensitive substring of the completion, averaged and x100.
 
 Sizes: 4096 / 8192 / 16384 / 32768 / 65536 / 131072, measured in **our**
-tokenizer's tokens (`tools/gguf-tokenizer.py` over `.work/engine-pack-q4`),
+tokenizer's tokens (`serve/tokenizer.mojo` via `.work/baro-tokenize count`, GGUF from `$BARO_GGUF`),
 per the brief — not nemo/hf/openai as RULER's own harness uses.
 
 ## Deviations from RULER's harness (not its task definitions)
