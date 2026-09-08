@@ -34,6 +34,9 @@ pub struct DoneStats {
     pub tok_s: f64,
     pub drafted: Option<u64>,
     pub accepted: Option<u64>,
+    pub cached: Option<u64>,
+    pub prefill_rows: Option<u64>,
+    pub restore_s: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -125,6 +128,9 @@ pub fn parse_line(line: &str) -> EngineMsg {
                     tok_s,
                     drafted: get_u64(&v, "drafted"),
                     accepted: get_u64(&v, "accepted"),
+                    cached: get_u64(&v, "cached"),
+                    prefill_rows: get_u64(&v, "prefill_rows"),
+                    restore_s: get_f64(&v, "restore_s"),
                 },
             };
         }
@@ -172,7 +178,7 @@ mod tests {
     fn tok_and_done_lines() {
         assert_eq!(parse_line("{\"id\":3,\"tok\":11751}"), EngineMsg::Tok { id: 3, tok: 11751 });
         let m = parse_line(
-            "{\"id\":3,\"done\":true,\"n\":64,\"prefill_s\":0.01,\"decode_s\":0.5,\"tok_s\":126.0,\"drafted\":40,\"accepted\":28,\"k\":2}",
+            "{\"id\":3,\"done\":true,\"n\":64,\"prefill_s\":0.01,\"decode_s\":0.5,\"tok_s\":126.0,\"drafted\":40,\"accepted\":28,\"k\":2,\"cached\":7913,\"prefill_rows\":41,\"restore_s\":0.002}",
         );
         match m {
             EngineMsg::Done { id, stats } => {
@@ -181,6 +187,9 @@ mod tests {
                 assert_eq!(stats.drafted, Some(40));
                 assert_eq!(stats.accepted, Some(28));
                 assert_eq!(stats.tok_s, 126.0);
+                assert_eq!(stats.cached, Some(7913));
+                assert_eq!(stats.prefill_rows, Some(41));
+                assert_eq!(stats.restore_s, Some(0.002));
             }
             other => panic!("expected Done, got {other:?}"),
         }
