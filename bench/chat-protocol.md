@@ -467,3 +467,75 @@ Verdict against the frozen predictions:
 Observation, not promoted: decode after an 8k prompt is 89 vs llama.cpp's
 109 on the same card; at T <= 1088 ours leads 133 vs ~110. The crossover is
 the M0d target.
+
+---
+
+## M0d — split-K decode attention inside the megakernel (frozen 2026-09-08, before its build)
+
+**Mechanism, read from source.** `attn_phases` (`kernels/mega.mojo`) runs
+the decode attention as `if bid < M * NQH:` — at m = 1, 16 of the 96
+resident blocks, one q head each, while 80 blocks wait at the grid barrier.
+Each active block walks all T positions in 256-position chunks
+(`attn_head_body`), four `barrier()`s per chunk, one position per thread,
+and threads 256..511 of the 512-thread block idle. M0c measured the cost
+of that at 0.44 ms per 1k tokens of context, 6x the KV-byte floor; per
+active block that is ~4.6 GB/s, latency-bound by construction.
+
+**Change.** Split-K over page spans in the same phase, no new launch:
+- Work item = (q head h, span s), s in 0..NSPLIT-1, NSPLIT = 6 at m = 1
+  (96 / 16; `MEGA_G // (M * NQH)` in general, at least 1). Span s covers
+  pages `[s * P / NSPLIT, (s + 1) * P / NSPLIT)` of the T positions
+  (P = ceildiv(T, KVPAGE)), so each item is contiguous and page-aligned.
+- Every block runs `attn_head_body` over its span with the same chunk loop
+  and writes a partial `(m, l, o[HD])` to scratch instead of `O`. Scratch
+  = the head split-K buffer `p_v` (`row_major[SPLITK, SM, VOCAB]` f32,
+  idle during attention; 16 * 6 * 258 floats needed, millions available),
+  no engine change.
+- Grid barrier, then blocks `bid < M * NQH` merge their head's NSPLIT
+  partials: `m = max m_s`, `O = sum_s exp(m_s - m) * o_s / sum_s exp(m_s
+  - m) * l_s`, in span order.
+- **T <= 1088 keeps NSPLIT = 1 and the direct `O` write**, i.e. today's
+  code path, so the champion path stays bit-exact and the P4 A/B is
+  untouched. `BARO_ATT_SPLIT=1` forces the split at every T for the
+  identity receipts. The threshold is a runtime compare on T.
+
+**Not in this step.** Using the idle upper 256 threads (a second chunk in
+flight per block, the next lever, predicted a further ~1.6x); GQA-grouping
+(one K/V read for the four q heads of a kv head; bytes are not the bound
+yet); a separate launch (design §4's standalone kernel) — the megakernel
+stays one launch per token.
+
+**Predictions.**
+- P-E1 Fingerprint: the dot loops are untouched, but `attn_phases` gains
+  code, so the schedule lottery applies: q4 `amar_mega_token` within
+  12746 ± 60 instructions, dual >= 105 / 80 ± 2 / 80 ± 2 / 60 ± 2, spill 0.
+  One re-roll by spelling; second miss stops the step.
+- P-E2 Identity: default (split off at T <= 1088) bit-exact vs `a86516b`'s
+  binary on q4/q8 one-shots and 20/20 A/B. Forced split (`BARO_ATT_SPLIT=1`)
+  at T <= 1088: q4 64/64 and q8 64/64 vs `tools/model-ref.py` reference
+  tokens, 20-prompt identity 20/20 vs the unsplit binary (the merge changes
+  summation order, so this is identity, not bit-exact). At 8192 and 32768
+  the split binary's `GENERATED` equals M0c's unsplit `GENERATED`
+  (`.work/m0c/long-*.log`); a mismatch there is arbitrated by
+  `tools/model-ref.py` on the 8192 prompt (falsifier if model-ref sides
+  with unsplit).
+- P-E3 Long-context decode, same prompts as M0c: 8192 >= 115 tok/s_gen
+  (from 89.4: 3.7 ms attention -> ~0.6 + 0.3 merge/barrier), 32768 >= 90
+  (from 45.7: 14.4 -> ~2.4 + 0.3), 100000 >= 55 (from 19.2: 44.6 -> ~7.4
+  + 0.4). Falsifier: 32768 < 70 means the per-block cost is not the
+  bound (look at the barrier count / merge before touching occupancy).
+- P-E4 20-prompt median within ±2 % of `a86516b` (path unchanged at
+  T <= 1088; only the fingerprint could move it).
+- P-E5 `mega fail word: 0` on every run; prefill_s unchanged (prefill
+  attention is not touched).
+
+**Verification before timing (P1).** `att split:` printed by the engine
+(threshold and forced flag), `TMAX:`, `prompt tokens:`, `tok/s_gen`,
+`mega fail word` from each run; fingerprint before any GPU run; rebuild in
+the same stint; `arm.txt` first for the A/B.
+
+**Gate.** P-E1 before GPU; P-E2 all four identity receipts; merge-gate ALL
+PASS; P-E4 within band; P-E3 recorded against its predictions (32768 >= 70
+is the hard floor, the three numbers are the claim).
+
+**Result.** (filled after the gated run)
