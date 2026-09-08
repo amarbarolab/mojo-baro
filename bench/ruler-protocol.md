@@ -139,7 +139,9 @@ Common flags: `-ngl 99 -fa on -b 2048 -ub 512 -t 8 -np 1 --host 127.0.0.1`
 above; a first version of this script used `+512` and got HTTP 400s from
 llama.cpp once prompt+max_tokens exceeded the context, fixed same session).
 Every
-launch through `gpu-wait run --priority 50 --vram 20`; server killed
+launch through `gpu-wait run --priority 50 --vram 8 --preemptible` (one job
+per context size; a preempted size restarts cheaply via `run.py`'s own
+resume logic); server killed
 between sizes; `/props` saved next to each run's outputs as the P1 receipt.
 
 - **Arm A — bf16 KV (baseline)**: llama.cpp's own default KV type is f16,
