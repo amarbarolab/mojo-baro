@@ -3,7 +3,7 @@
 # usage: [LOOP_PROMPT2=ids-file] tools/loop-gate.sh ITER CHAMPION_TOKPS   (llama-server must be stopped: engine needs the GPU)
 set -uo pipefail
 cd "$(dirname "$0")/.."
-iter=$1; champ=$2; dir=.work/loop/$iter
+iter=$1; champ=${2:-}; dir=.work/loop/$iter
 export MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_SIZE_PERCENT=10
 : > "$dir/SURVIVORS.md"
 # The reference is read ONCE, before any candidate binary runs, and every
@@ -18,9 +18,13 @@ check() { # check RUNLOG -> identity against the snapshot, and the fixture must 
 }
 # The iteration's own pristine sources are built once per gate run. That binary is
 # (a) the wall-clock reference for the plausibility term, (b) the ISA baseline for
-# stage 4, and (c) the oracle for the optional second workload. Rule amended
-# 2026-09-08 (bench/loop-protocol.md): the acceptance denominator stays the
-# CHAMPION_TOKPS argument, measured in-session by tools/gguf-closure.sh.
+# stage 4, (c) the oracle for the optional second workload and, since P-D
+# (2026-09-08 evening, bench/loop-protocol.md), (d) the ACCEPTANCE DENOMINATOR:
+# champion and candidate are the same binary pair on the same warm GPU in the
+# same run. Iteration 006 showed why: the gguf-closure median from a separate
+# session sat 2.2% below the in-gate build of the same sources, and a no-op
+# comment reached +1.7% against it. The optional second argument is the closure
+# run's tok/s_gen, recorded in the receipt as champion_closure, never compared.
 # Split layout (2026-09-08, P-A): the embedded sources carry window.mojo and no
 # main(); the harness -- pack load, stopwatch, prints -- is serve/engine.mojo at
 # the gguf's own commit, taken from git, never from the candidate. Legacy ggufs
@@ -40,7 +44,7 @@ for k in 1 2 3; do
 done
 cwall=$(printf '%s\n' "${cw[@]}" | sort -n | sed -n 2p); ctok=$(printf '%s\n' "${ct[@]}" | sort -n | sed -n 2p)
 python3 tools/isa-spills.py "$dir/champion-engine" > "$dir/champion-isa.json" || { echo "champion ISA census failed"; exit 1; }
-echo "champion binary from $dir/src: wall_s median $cwall (${cw[*]}), tok/s_gen median $ctok (${ct[*]}), argument $champ; ISA baseline $(python3 -c "import json;d=json.load(open('$dir/champion-isa.json'));print(sum(1 for v in d['families'].values() if v['spills'] or v['scratch']),'spilling families of',len(d['families']))")"
+echo "champion binary from $dir/src: wall_s median $cwall (${cw[*]}), tok/s_gen median $ctok (${ct[*]}), closure ${champ:-none}; ISA baseline $(python3 -c "import json;d=json.load(open('$dir/champion-isa.json'));print(sum(1 for v in d['families'].values() if v['spills'] or v['scratch']),'spilling families of',len(d['families']))")"
 # Optional second, unpublished workload (audit 2026-09-08, lead 2): LOOP_PROMPT2=<ids file>.
 # Every candidate must reproduce the champion binary's 64 tokens on it as well as
 # on the published fixture. Behind a flag so the default ladder's cost is unchanged.
@@ -121,8 +125,8 @@ for d in "$dir"/cand-*.diff; do
   [ -z "$idfail" ] || { fail identity "$idfail"; continue; }
   med=$(printf '%s\n' "${t[@]}" | sort -n | sed -n 2p); lo=$(printf '%s\n' "${t[@]}" | sort -n | head -1); hi=$(printf '%s\n' "${t[@]}" | sort -n | tail -1)
   spread=$(awk -v l="$lo" -v h="$hi" 'BEGIN{printf "%.3f", (h-l)/l}')
-  ok=$(awk -v m="$med" -v c="$champ" -v s="$spread" 'BEGIN{print (m >= c*1.02 && s < 0.05) ? 1 : 0}')
-  [ "$ok" = 1 ] || { fail perf "median $med vs champion $champ (need +2%), spread $spread"; continue; }
+  ok=$(awk -v m="$med" -v c="$ctok" -v s="$spread" 'BEGIN{print (m >= c*1.02 && s < 0.05) ? 1 : 0}')
+  [ "$ok" = 1 ] || { fail perf "median $med vs in-gate champion $ctok (need +2%), spread $spread"; continue; }
   # Plausibility (rule 2026-09-08): the claimed decode saving must show in the
   # gate's own clock. Champion and candidate wall_s come from the same gate run.
   wmed=$(printf '%s\n' "${w[@]}" | sort -n | sed -n 2p)
@@ -137,7 +141,7 @@ for d in "$dir"/cand-*.diff; do
   # champion build of the same sources, none new with any (rule 2026-09-08; the
   # absolute form rejected the champion itself: delta-step variants spill).
   python3 tools/isa-spills.py "$work/engine" --baseline "$dir/champion-isa.json" > "$work/isa.log" 2>&1 || { fail isa "$(sed -n 2p "$work/isa.log" | sed 's/^ *//')"; continue; }
-  echo "{\"cand\":\"$c\",\"stage\":\"all\",\"result\":\"PASS\",\"predict_pct\":\"$pred\",\"tokps\":[${t[0]},${t[1]},${t[2]}],\"median\":$med,\"champion\":$champ,\"spread\":$spread,\"wall_s\":[${w[0]},${w[1]},${w[2]}],\"champion_wall_s\":[${cw[0]},${cw[1]},${cw[2]}],\"champion_tokps_ingate\":[${ct[0]},${ct[1]},${ct[2]}],\"gpu_total_s\":[${g[0]},${g[1]},${g[2]}],\"fixture2\":\"${LOOP_PROMPT2:-none}\",\"apply_mode\":\"$mode\",\"hunks_renumbered\":$nfix}" > "$r"
-  echo "$c: PASS median $med vs $champ (predict $pred%)"; { echo "## $c  median $med vs champion $champ (predict $pred%)"; echo '```diff'; cat "$d"; echo '```'; } >> "$dir/SURVIVORS.md"
+  echo "{\"cand\":\"$c\",\"stage\":\"all\",\"result\":\"PASS\",\"predict_pct\":\"$pred\",\"tokps\":[${t[0]},${t[1]},${t[2]}],\"median\":$med,\"champion\":$ctok,\"champion_closure\":${champ:-null},\"spread\":$spread,\"wall_s\":[${w[0]},${w[1]},${w[2]}],\"champion_wall_s\":[${cw[0]},${cw[1]},${cw[2]}],\"champion_tokps_ingate\":[${ct[0]},${ct[1]},${ct[2]}],\"gpu_total_s\":[${g[0]},${g[1]},${g[2]}],\"fixture2\":\"${LOOP_PROMPT2:-none}\",\"apply_mode\":\"$mode\",\"hunks_renumbered\":$nfix}" > "$r"
+  echo "$c: PASS median $med vs in-gate champion $ctok (predict $pred%)"; { echo "## $c  median $med vs in-gate champion $ctok (predict $pred%)"; echo '```diff'; cat "$d"; echo '```'; } >> "$dir/SURVIVORS.md"
 done
 echo "survivors: $(grep -c '^## ' "$dir/SURVIVORS.md")"

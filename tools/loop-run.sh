@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # One loop iteration as ONE GPU job: proposer server up -> propose -> server down
-# -> champion from the gguf's own sources (3 runs) -> gate. bench/loop-protocol.md.
+# -> gguf closure (identity check of the gguf; its tok/s is informational since
+# P-D: the gate builds and times the champion itself) -> gate. bench/loop-protocol.md.
 # usage: gpu-wait run --vram 22 -- env [LOOP_PROMPT2=ids] tools/loop-run.sh ITER MODEL-BARO.gguf [propose args...]
 # The server is started and stopped INSIDE the job so the GPU never changes hands
 # mid-iteration; PID-exact stop; /props read back before proposing (P1).
@@ -24,15 +25,10 @@ cat "$dir/propose.log"
 kill $spid; wait $spid 2>/dev/null; sleep 3
 ss -ltn | grep -q ':8083 ' && { echo "server still on 8083 after kill"; exit 1; }
 [ $prc = 0 ] || { echo "propose failed ($prc)"; exit 1; }
-echo "== champion from the gguf's own sources"
-t=()
-for k in 1 2 3; do
-  tools/gguf-closure.sh "$model" > "$dir/champion-closure$k.log" 2>&1 || { echo "gguf-closure run $k FAILED: $(tail -2 "$dir/champion-closure$k.log")"; exit 1; }
-  t+=("$(grep -oE 'tok/s_gen: [0-9.]+' "$dir/champion-closure$k.log" | awk '{print $2}')")
-done
-champ=$(printf '%s\n' "${t[@]}" | sort -n | sed -n 2p)
-echo "champion tok/s_gen ${t[*]} -> median $champ ($(grep -h PASS "$dir/champion-closure1.log"))"
-echo "$champ" > "$dir/CHAMPION_TOKPS"
-echo "== gate"
-tools/loop-gate.sh "$iter" "$champ"
+echo "== gguf closure (identity of the gguf's own sources; tok/s informational)"
+tools/gguf-closure.sh "$model" > "$dir/champion-closure1.log" 2>&1 || { echo "gguf-closure FAILED: $(tail -2 "$dir/champion-closure1.log")"; exit 1; }
+closure=$(grep -oE 'tok/s_gen: [0-9.]+' "$dir/champion-closure1.log" | awk '{print $2}')
+echo "closure $(grep -h PASS "$dir/champion-closure1.log"), tok/s_gen $closure"
+echo "== gate (acceptance denominator = the gate's own champion build, P-D)"
+tools/loop-gate.sh "$iter" "$closure"
 echo "== done $(date -Is)"
