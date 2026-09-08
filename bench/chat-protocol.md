@@ -441,8 +441,8 @@ tokens, prompt files sha256 (first 16) p8192 `3ff81ea490f46aa6`, p32768
 | T | prefill_s ours | predicted | llama.cpp Q4_0-pure prompt_ms | ratio | tok/s_gen ours | predicted | llama.cpp | mega fail |
 |---|---|---|---|---|---|---|---|---|
 | 8192 | 8.33 | ~6 | 2.59 | 3.2x | 89.4 | - | 109.2 | 0 |
-| 32768 | 50.46 | ~24 | (rerun pending, argv-size bug in the first request) | | 45.7 | >= 100, floor 80 | | 0 |
-| 100000 | 298.3 | ~75 | (rerun pending) | | 19.2 | ~60 | | 0 |
+| 32768 | 50.46 | ~24 | 12.84 | 3.9x | 45.7 | >= 100, floor 80 | 100.2 | 0 |
+| 100000 | 298.3 | ~75 | 63.67 | 4.7x | 19.2 | ~60 | 78.8 | 0 |
 
 Verdict against the frozen predictions:
 - P-D1 held: bit-exact at 1088 on both packs, 20/20.
@@ -451,8 +451,10 @@ Verdict against the frozen predictions:
   not the linear ~0.75 ms/row the prediction assumed. The prediction
   modelled the GEMMs only; `amar_attn_prefill` re-reads the whole KV per
   1024-row chunk, so its cost grows with T per chunk and the sum is
-  quadratic. Against llama.cpp the 8k gap is 3.2x (2.4x expected from the
-  int8 MMQ GEMM alone; the rest is the attention sweep).
+  quadratic. Against llama.cpp the gap grows 3.2x -> 3.9x -> 4.7x from 8k to 100k
+  (2.4x expected from the int8 MMQ GEMM alone; the growth is the
+  attention sweep). llama.cpp's own decode falls 109 -> 100 -> 79 over the
+  same range, i.e. its attention costs ~0.04 ms per 1k, a tenth of ours.
 - P-D4 held: 6.7 GB f32 KV + pack, 100k prompt + 64 tokens, fail word 0.
 - P-D5 **falsified**: 45.7 at 32k, below the 80 floor. Per-token decode
   cost is linear in T at 0.44 ms per 1k tokens (7.5 ms + 3.7 at 8k, + 14.4
