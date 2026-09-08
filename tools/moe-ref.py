@@ -13,13 +13,17 @@ Implements transformers `Qwen3_5MoeSparseMoeBlock` exactly:
 Softmax-before-topk is the part worth getting right: topk-then-softmax is the
 more common convention and gives different weights for the same logits.
 
-Unlike tools/ssm-ref.py this invents fixed-seed weights instead of reading
-blk.0 from .work/gguf/ -- the 35B bf16 GGUF (69 GB) is not on this box, and a
-block-parity test only needs the math to agree, not these particular numbers.
+Two weight sources. With --gguf MODEL.gguf it reads the real blk.<L> MoE
+tensors and dequantises them (Q4_K experts, Q8_0 shared, F32 routers) -- that
+needs the repo venv, which has gguf-py: ./.venv/bin/python3. Without it, the
+weights are fixed-seed; the math is the same either way, and the synthetic path
+keeps the test runnable with no 20 GB file present.
+
 Weights are rounded to bf16 so the GPU consumes exactly what numpy did.
 
 Writes inputs + expected outputs for kernels/test_moe_block.mojo.
 """
+import argparse
 import json
 from pathlib import Path
 
@@ -55,24 +59,69 @@ def sigmoid(x):
     return 1.0 / (1.0 + np.exp(-x))
 
 
+def from_gguf(path, layer):
+    """Real blk.<layer> MoE tensors, dequantised. Needs the repo venv (gguf-py).
+
+    gguf-py hands back C-order arrays whose shape is the GGUF dim list reversed,
+    so ffn_gate_exps [2048, 512, 256] arrives as (expert, out, in) -- already the
+    layout this reference and the kernel both index.
+    """
+    import gguf
+
+    reader = gguf.GGUFReader(path)
+    want = {}
+    for t in reader.tensors:
+        if t.name.startswith("blk.%d.ffn_" % layer):
+            want[t.name.split(".", 2)[2]] = t
+
+    def get(name):
+        t = want[name]
+        if t.tensor_type == gguf.GGMLQuantizationType.F32:
+            return np.asarray(t.data, dtype=np.float32)
+        return gguf.quants.dequantize(t.data, t.tensor_type).astype(np.float32)
+
+    return (
+        get("ffn_gate_inp.weight").reshape(N_EXP, H),
+        get("ffn_gate_inp_shexp.weight").reshape(H),
+        to_bf16(get("ffn_gate_exps.weight").reshape(N_EXP, E_FFN, H)),
+        to_bf16(get("ffn_up_exps.weight").reshape(N_EXP, E_FFN, H)),
+        to_bf16(get("ffn_down_exps.weight").reshape(N_EXP, H, E_FFN)),
+        to_bf16(get("ffn_gate_shexp.weight").reshape(SH_FFN, H)),
+        to_bf16(get("ffn_up_shexp.weight").reshape(SH_FFN, H)),
+        to_bf16(get("ffn_down_shexp.weight").reshape(H, SH_FFN)),
+    )
+
+
+def synthetic(rng):
+    return (
+        (rng.standard_normal((N_EXP, H)) * 0.02).astype(np.float32),
+        (rng.standard_normal(H) * 0.02).astype(np.float32),
+        to_bf16(rng.standard_normal((N_EXP, E_FFN, H), dtype=np.float32) * 0.02),
+        to_bf16(rng.standard_normal((N_EXP, E_FFN, H), dtype=np.float32) * 0.02),
+        to_bf16(rng.standard_normal((N_EXP, H, E_FFN), dtype=np.float32) * 0.02),
+        to_bf16(rng.standard_normal((SH_FFN, H), dtype=np.float32) * 0.02),
+        to_bf16(rng.standard_normal((SH_FFN, H), dtype=np.float32) * 0.02),
+        to_bf16(rng.standard_normal((H, SH_FFN), dtype=np.float32) * 0.02),
+    )
+
+
 def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--gguf", default=None)
+    ap.add_argument("--layer", type=int, default=0)
+    args = ap.parse_args()
+
     D.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(SEED)
 
+    # The hidden state is fixed-seed either way: there is no real activation
+    # without running the model, and the block does not care where x came from.
     x = to_bf16(rng.standard_normal(H, dtype=np.float32) * 0.5)
 
-    # Router and the shared-expert gate stay f32: that is how the GGUF stores
-    # ffn_gate_inp.weight and ffn_gate_inp_shexp.weight.
-    wr = (rng.standard_normal((N_EXP, H)) * 0.02).astype(np.float32)
-    wsg = (rng.standard_normal(H) * 0.02).astype(np.float32)
-
-    wg = to_bf16(rng.standard_normal((N_EXP, E_FFN, H), dtype=np.float32) * 0.02)
-    wu = to_bf16(rng.standard_normal((N_EXP, E_FFN, H), dtype=np.float32) * 0.02)
-    wd = to_bf16(rng.standard_normal((N_EXP, H, E_FFN), dtype=np.float32) * 0.02)
-
-    wgs = to_bf16(rng.standard_normal((SH_FFN, H), dtype=np.float32) * 0.02)
-    wus = to_bf16(rng.standard_normal((SH_FFN, H), dtype=np.float32) * 0.02)
-    wds = to_bf16(rng.standard_normal((H, SH_FFN), dtype=np.float32) * 0.02)
+    if args.gguf:
+        wr, wsg, wg, wu, wd, wgs, wus, wds = from_gguf(args.gguf, args.layer)
+    else:
+        wr, wsg, wg, wu, wd, wgs, wus, wds = synthetic(rng)
 
     # --- router ---
     logits = (x @ wr.T).astype(np.float32)
@@ -121,6 +170,8 @@ def main():
         "routed_mean_abs": float(np.abs(out).mean()),
         "shared_mean_abs": float(np.abs(shared).mean()),
         "y_mean_abs": float(np.abs(y).mean()),
+        "source": args.gguf or "synthetic",
+        "layer": args.layer,
     }))
 
 
