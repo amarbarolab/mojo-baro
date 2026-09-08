@@ -19,6 +19,7 @@ from ssm import (
 from matmul_prefill import (
     amar_matmul_prefill_q4, amar_matmul_prefill_q8, amar_prefill_swiglu_bf16, PF_THREADS,
 )
+from matmul_prefill_lds import amar_matmul_prefill_lds, LDS_THREADS
 from mega import amar_mega_token, amar_mega_window, MEGA_G, MEGA_G_WIN
 from attn import (
     amar_head_rmsnorm, amar_attn_decode, amar_gate_mul_cast, amar_qgate_split, amar_rope_yarn, amar_kv_append,
@@ -36,6 +37,7 @@ comptime N_ATT = 8
 comptime TMAX = 1088
 comptime GEN_N = 64
 comptime CP = 1024
+comptime PF_LDS_MIN = 128
 comptime PF_MIN = 16
 
 comptime bf16 = DType.bfloat16
@@ -242,9 +244,12 @@ def gemm_prefill_q4[
     if m <= 64:
         ctx.enqueue_function[amar_matmul_prefill_q4[2, 2, 2, ACC, AL, QL, SL, CL]](
             A, Wq, Ws, C, Int32(m), Int32(n), Int32(k), grid_dim=(ceildiv(n, 128), ceildiv(m, 64)), block_dim=PF_THREADS)
-    else:
+    elif m <= PF_LDS_MIN:
         ctx.enqueue_function[amar_matmul_prefill_q4[4, 2, 2, ACC, AL, QL, SL, CL]](
             A, Wq, Ws, C, Int32(m), Int32(n), Int32(k), grid_dim=(ceildiv(n, 128), ceildiv(m, 128)), block_dim=PF_THREADS)
+    else:
+        ctx.enqueue_function[amar_matmul_prefill_lds[DType.uint8, 4, 2, 2, 4, ACC, AL, QL, SL, CL]](
+            A, Wq, Ws, C, Int32(m), Int32(n), Int32(k), grid_dim=(ceildiv(n, 128), ceildiv(m, 128)), block_dim=LDS_THREADS)
 
 
 def gemm_prefill_q8[
@@ -260,9 +265,12 @@ def gemm_prefill_q8[
     if m <= 64:
         ctx.enqueue_function[amar_matmul_prefill_q8[2, 2, 2, ACC, AL, QL, SL, CL]](
             A, Wq, Ws, C, Int32(m), Int32(n), Int32(k), grid_dim=(ceildiv(n, 128), ceildiv(m, 64)), block_dim=PF_THREADS)
-    else:
+    elif m <= PF_LDS_MIN:
         ctx.enqueue_function[amar_matmul_prefill_q8[4, 2, 2, ACC, AL, QL, SL, CL]](
             A, Wq, Ws, C, Int32(m), Int32(n), Int32(k), grid_dim=(ceildiv(n, 128), ceildiv(m, 128)), block_dim=PF_THREADS)
+    else:
+        ctx.enqueue_function[amar_matmul_prefill_lds[DType.int8, 4, 2, 2, 4, ACC, AL, QL, SL, CL]](
+            A, Wq, Ws, C, Int32(m), Int32(n), Int32(k), grid_dim=(ceildiv(n, 128), ceildiv(m, 128)), block_dim=LDS_THREADS)
 
 
 def delta_dispatch(
