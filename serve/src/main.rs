@@ -148,21 +148,45 @@ async fn main() {
 
 // ---- errors -----------------------------------------------------------------
 
-struct ApiError(StatusCode, String);
+enum ApiError {
+    Plain(StatusCode, String),
+    Exceed { n_prompt_tokens: u64, n_ctx: u64 },
+}
+
+impl ApiError {
+    /// llama.cpp's `exceed_context_size_error` shape, verbatim: harnesses
+    /// (DeerFlow) branch on `type` and read `n_prompt_tokens` / `n_ctx`.
+    fn exceed_context(n_prompt_tokens: u64, n_ctx: u64) -> ApiError {
+        ApiError::Exceed { n_prompt_tokens, n_ctx }
+    }
+}
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let body = json!({"error": {"message": self.1, "type": "invalid_request_error", "code": self.0.as_u16()}});
-        (self.0, Json(body)).into_response()
+        match self {
+            ApiError::Plain(code, msg) => {
+                let body = json!({"error": {"message": msg, "type": "invalid_request_error", "code": code.as_u16()}});
+                (code, Json(body)).into_response()
+            }
+            ApiError::Exceed { n_prompt_tokens, n_ctx } => {
+                let body = json!({"error": {
+                    "code": 400,
+                    "message": "the request exceeds the available context size, try increasing it",
+                    "type": "exceed_context_size_error",
+                    "n_prompt_tokens": n_prompt_tokens,
+                    "n_ctx": n_ctx}});
+                (StatusCode::BAD_REQUEST, Json(body)).into_response()
+            }
+        }
     }
 }
 
 fn bad(msg: impl Into<String>) -> ApiError {
-    ApiError(StatusCode::BAD_REQUEST, msg.into())
+    ApiError::Plain(StatusCode::BAD_REQUEST, msg.into())
 }
 
 fn need_text(app: &App) -> Result<&Text, ApiError> {
-    app.text.as_ref().ok_or(ApiError(
+    app.text.as_ref().ok_or(ApiError::Plain(
         StatusCode::SERVICE_UNAVAILABLE,
         "no tokenizer.json loaded; pass token ids or start with --tokenizer".into(),
     ))
@@ -234,15 +258,11 @@ fn check_and_submit(app: &App, g: &Gen) -> Result<mpsc::UnboundedReceiver<Event>
         return Err(bad("max_tokens must be >= 1"));
     }
     if g.prompt.len() as u64 + g.n as u64 > tmax as u64 {
-        return Err(bad(format!(
-            "prompt ({}) + max_tokens ({}) exceeds the engine's context of {tmax} tokens",
-            g.prompt.len(),
-            g.n
-        )));
+        return Err(ApiError::exceed_context(g.prompt.len() as u64, tmax as u64));
     }
     app.engine
         .submit(g.prompt.clone(), g.n, g.spec)
-        .map_err(|e| ApiError(StatusCode::SERVICE_UNAVAILABLE, e))
+        .map_err(|e| ApiError::Plain(StatusCode::SERVICE_UNAVAILABLE, e))
 }
 
 /// Streaming state shared by both SSE shapes.
@@ -309,7 +329,7 @@ async fn collect(app: &App, mut rx: mpsc::UnboundedReceiver<Event>) -> Result<(A
                 stats = stats_json(&s);
                 break;
             }
-            Event::Error(e) => return Err(ApiError(StatusCode::BAD_GATEWAY, format!("engine: {e}"))),
+            Event::Error(e) => return Err(ApiError::Plain(StatusCode::BAD_GATEWAY, format!("engine: {e}"))),
         }
     }
     Ok((acc, text_out, stats))
@@ -467,7 +487,7 @@ async fn chat_completions(State(app): State<Shared>, Json(r): Json<ChatReq>) -> 
         .iter()
         .map(|m| Ok(ChatMessage { role: m.role.clone(), content: content_text(&m.content)? }))
         .collect::<Result<Vec<_>, ApiError>>()?;
-    let rendered = t.apply_chat_template(&msgs).map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let rendered = t.apply_chat_template(&msgs).map_err(|e| ApiError::Plain(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let g = Gen {
         prompt: t.encode(&rendered, true).map_err(bad)?,
         n: r.max_completion_tokens.or(r.max_tokens).unwrap_or(DEFAULT_MAX_TOKENS),

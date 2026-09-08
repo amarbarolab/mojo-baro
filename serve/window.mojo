@@ -475,6 +475,7 @@ struct WindowBufs(Copyable, Movable):
     var fgbp_d: DeviceBuffer[bf16]
     var convstate_d: DeviceBuffer[f32]
     var sstate_d: DeviceBuffer[f32]
+    var kvpool: Int
     var kc_d: DeviceBuffer[KVT]
     var vc_d: DeviceBuffer[KVT]
     var kc32_d: DeviceBuffer[KVT]
@@ -715,11 +716,11 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                 var Vhd = TileTensor(b.v_d, kvm_layout)
                 var kcb = DeviceBuffer[KVT](
                     ctx, b.kc_d.unsafe_ptr(),
-                    KVPOOL, owning=False,
+                    b.kvpool, owning=False,
                 )
                 var vcb = DeviceBuffer[KVT](
                     ctx, b.vc_d.unsafe_ptr(),
-                    KVPOOL, owning=False,
+                    b.kvpool, owning=False,
                 )
                 var Kc = TileTensor(kcb, cache_layout)
                 var Vc = TileTensor(vcb, cache_layout)

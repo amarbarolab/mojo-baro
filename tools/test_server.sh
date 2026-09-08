@@ -116,6 +116,11 @@ PY
   [ "$code" = 200 ] || die chat "expected 200, got $code: $(cat "$out/chat.json")"
   python3 -c "import json; d=json.load(open('$out/chat.json')); assert d['choices'][0]['message']['role']=='assistant'; assert 1 <= len(d['choices'][0]['tokens']) <= 16; print(d['choices'][0]['finish_reason'], repr(d['choices'][0]['message']['content'][:60]))" > "$out/chat.check" || die chat "$(cat "$out/chat.json")"
   ok chat "$(cat "$out/chat.check")"
+  code=$(curl -s -o "$out/overflow.json" -w '%{http_code}' "$url/v1/chat/completions" -H 'content-type: application/json' \
+    -d '{"messages": [{"role": "user", "content": "Say hello."}], "max_tokens": 1000000, "spec": false}')
+  [ "$code" = 400 ] || die overflow "expected 400, got $code: $(cat "$out/overflow.json")"
+  python3 -c "import json; e=json.load(open('$out/overflow.json'))['error']; assert e['type']=='exceed_context_size_error', e; assert e['n_prompt_tokens']>0 and e['n_ctx']>0, e; print(e['type'], e['n_prompt_tokens'], e['n_ctx'])" > "$out/overflow.check" || die overflow "$(cat "$out/overflow.json")"
+  ok overflow "$(cat "$out/overflow.check")"
   curl -sfN "$url/v1/chat/completions" -H 'content-type: application/json' \
     -d '{"messages": [{"role": "user", "content": "Say hello."}], "max_tokens": 16, "spec": false, "stream": true}' > "$out/chat.sse" || die chat-stream "curl failed"
   python3 - "$out" <<'PY' > "$out/chat-stream.check" || die chat-stream "$(cat "$out/chat-stream.check")"

@@ -88,7 +88,7 @@ comptime ssall_layout = row_major[SLOTS, N_SSM, NH_V, SSTATE, SSTATE]()
 comptime n128_layout = row_major[SSTATE]()
 comptime emb_layout = row_major[VOCAB, H]()
 comptime vrow_layout = row_major[1, VOCAB]()
-comptime toks_layout = row_major[TMAX]()
+comptime toks_layout = row_major[TCAP]()
 comptime dtok_layout = row_major[KMAX + 1]()
 
 comptime w_h_qf = row_major[H, QF]()

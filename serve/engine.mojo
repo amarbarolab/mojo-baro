@@ -12,7 +12,7 @@ from std.ffi import c_ssize_t, external_call
 from std.math import ceildiv
 from std.memory import memcpy
 from std.os import getenv
-from std.sys import has_accelerator
+from std.sys import exit, has_accelerator
 from std.time import perf_counter_ns
 
 from max.algorithm import parallelize
@@ -253,6 +253,12 @@ def main() raises:
     # the decode window path: pos_prev is set so it covers the last
     # (L-1) mod 8 rows (8 when 0), whose post-final-norm hidden rows the last
     # chunk writes into hn_d. pf_rows/pf_tail are per request (below).
+    var tmax = atol(getenv("BARO_TMAX", String(TMAX)))
+    if tmax < CP + PF_MIN:
+        tmax = CP + PF_MIN
+    var tpages = ceildiv(tmax, KVPAGE)
+    var kvpool = tpages * N_ATT * NKVH * KVHSTR
+    var kvpool1 = tpages * NKVH * KVHSTR
     var pf_chunk = min(atol(getenv("BARO_PREFILL_C", String(CP))), CP)
     if pf_chunk < PF_MIN:
         pf_chunk = PF_MIN
@@ -283,7 +289,7 @@ def main() raises:
     var aq_d = ctx.enqueue_create_buffer[DType.int8](MROWS * FFN)
     var asc_d = ctx.enqueue_create_buffer[DType.float16](MROWS * (FFN // 32))
     var logits_d = ctx.enqueue_create_buffer[f32](MROWS * VOCAB)
-    var toks_d = ctx.enqueue_create_buffer[DType.int32](TMAX)
+    var toks_d = ctx.enqueue_create_buffer[DType.int32](tmax)
     var hn_d = ctx.enqueue_create_buffer[f32](MROWS * H)
     var de_d = ctx.enqueue_create_buffer[f32](MROWS * H)
     var hd_d = ctx.enqueue_create_buffer[f32](MROWS * H)
@@ -323,10 +329,10 @@ def main() raises:
 
     var convstate_d = ctx.enqueue_create_buffer[f32](SLOTS * CONV_SLOT)
     var sstate_d = ctx.enqueue_create_buffer[f32](SLOTS * SSM_SLOT)
-    var kc_d = ctx.enqueue_create_buffer[KVT](KVPOOL)
-    var vc_d = ctx.enqueue_create_buffer[KVT](KVPOOL)
-    var kc32_d = ctx.enqueue_create_buffer[KVT](KVPOOL1)
-    var vc32_d = ctx.enqueue_create_buffer[KVT](KVPOOL1)
+    var kc_d = ctx.enqueue_create_buffer[KVT](kvpool)
+    var vc_d = ctx.enqueue_create_buffer[KVT](kvpool)
+    var kc32_d = ctx.enqueue_create_buffer[KVT](kvpool1)
+    var vc32_d = ctx.enqueue_create_buffer[KVT](kvpool1)
     ctx.enqueue_memset(convstate_d, 0)
     ctx.enqueue_memset(sstate_d, 0)
     ctx.enqueue_memset(kc_d, 0)
@@ -363,10 +369,10 @@ def main() raises:
     var stream_h = ctx.enqueue_create_host_buffer[DType.int32](KMAX + 1)
     ctx.synchronize()
     var wst = WindowState(pos=0, pos_prev=0, ring=0, n_drafted=0, n_accepted=0, n_spec_windows=0, n_dumped=0, tp=0, tq=0, pf_att=0, pf_ssm=0, pf_ffn=0, pf_head=0, pf_proc=0, pf_draft=0, fc=[0, 0, 0, 0, 0, 0], pc=[0, 0, 0, 0, 0, 0, 0, 0], p3=[0, 0, 0, 0])
-    var bufs = WindowBufs(wbuf=wbuf.copy(), off=off.copy(), dtok_h=dtok_h.copy(), win_h=win_h.copy(), x_d=x_d.copy(), curb_d=curb_d.copy(), qkv_d=qkv_d.copy(), z_d=z_d.copy(), eg_d=eg_d.copy(), beta_d=beta_d.copy(), conv_d=conv_d.copy(), so_d=so_d.copy(), resb_d=resb_d.copy(), qf_d=qf_d.copy(), q_d=q_d.copy(), gate_d=gate_d.copy(), k_d=k_d.copy(), v_d=v_d.copy(), ao_d=ao_d.copy(), fgb_d=fgb_d.copy(), aq_d=aq_d.copy(), asc_d=asc_d.copy(), logits_d=logits_d.copy(), toks_d=toks_d.copy(), hn_d=hn_d.copy(), de_d=de_d.copy(), hd_d=hd_d.copy(), cc_d=cc_d.copy(), dtok_d=dtok_d.copy(), p_qf_d=p_qf_d.copy(), p_h_d=p_h_d.copy(), p_kv_d=p_kv_d.copy(), p_32_d=p_32_d.copy(), p_32b_d=p_32b_d.copy(), p_ffn_d=p_ffn_d.copy(), p_ffn2_d=p_ffn2_d.copy(), p_v_d=p_v_d.copy(), xp_d=xp_d.copy(), curbp_d=curbp_d.copy(), qkvp_d=qkvp_d.copy(), zp_d=zp_d.copy(), arp_d=arp_d.copy(), brp_d=brp_d.copy(), egp_d=egp_d.copy(), betap_d=betap_d.copy(), convp_d=convp_d.copy(), sop_d=sop_d.copy(), resbp_d=resbp_d.copy(), qfp_d=qfp_d.copy(), qp_d=qp_d.copy(), gatep_d=gatep_d.copy(), kp_d=kp_d.copy(), vp_d=vp_d.copy(), aop_d=aop_d.copy(), gp_d=gp_d.copy(), up_d=up_d.copy(), fgbp_d=fgbp_d.copy(), convstate_d=convstate_d.copy(), sstate_d=sstate_d.copy(), kc_d=kc_d.copy(), vc_d=vc_d.copy(), kc32_d=kc32_d.copy(), vc32_d=vc32_d.copy(), off_d=off_d.copy(), araw_d=araw_d.copy(), braw_d=braw_d.copy(), ctr_d=ctr_d.copy(), prof_d=prof_d.copy(), dbg_d=dbg_d.copy(), hmax_d=hmax_d.copy(), hidx_d=hidx_d.copy(), dump_h=dump_h.copy(), stream_h=stream_h.copy())
+    var bufs = WindowBufs(wbuf=wbuf.copy(), off=off.copy(), dtok_h=dtok_h.copy(), win_h=win_h.copy(), x_d=x_d.copy(), curb_d=curb_d.copy(), qkv_d=qkv_d.copy(), z_d=z_d.copy(), eg_d=eg_d.copy(), beta_d=beta_d.copy(), conv_d=conv_d.copy(), so_d=so_d.copy(), resb_d=resb_d.copy(), qf_d=qf_d.copy(), q_d=q_d.copy(), gate_d=gate_d.copy(), k_d=k_d.copy(), v_d=v_d.copy(), ao_d=ao_d.copy(), fgb_d=fgb_d.copy(), aq_d=aq_d.copy(), asc_d=asc_d.copy(), logits_d=logits_d.copy(), toks_d=toks_d.copy(), hn_d=hn_d.copy(), de_d=de_d.copy(), hd_d=hd_d.copy(), cc_d=cc_d.copy(), dtok_d=dtok_d.copy(), p_qf_d=p_qf_d.copy(), p_h_d=p_h_d.copy(), p_kv_d=p_kv_d.copy(), p_32_d=p_32_d.copy(), p_32b_d=p_32b_d.copy(), p_ffn_d=p_ffn_d.copy(), p_ffn2_d=p_ffn2_d.copy(), p_v_d=p_v_d.copy(), xp_d=xp_d.copy(), curbp_d=curbp_d.copy(), qkvp_d=qkvp_d.copy(), zp_d=zp_d.copy(), arp_d=arp_d.copy(), brp_d=brp_d.copy(), egp_d=egp_d.copy(), betap_d=betap_d.copy(), convp_d=convp_d.copy(), sop_d=sop_d.copy(), resbp_d=resbp_d.copy(), qfp_d=qfp_d.copy(), qp_d=qp_d.copy(), gatep_d=gatep_d.copy(), kp_d=kp_d.copy(), vp_d=vp_d.copy(), aop_d=aop_d.copy(), gp_d=gp_d.copy(), up_d=up_d.copy(), fgbp_d=fgbp_d.copy(), convstate_d=convstate_d.copy(), sstate_d=sstate_d.copy(), kvpool=kvpool, kc_d=kc_d.copy(), vc_d=vc_d.copy(), kc32_d=kc32_d.copy(), vc32_d=vc32_d.copy(), off_d=off_d.copy(), araw_d=araw_d.copy(), braw_d=braw_d.copy(), ctr_d=ctr_d.copy(), prof_d=prof_d.copy(), dbg_d=dbg_d.copy(), hmax_d=hmax_d.copy(), hidx_d=hidx_d.copy(), dump_h=dump_h.copy(), stream_h=stream_h.copy())
     var req_id = 0
     if serve:
-        print("{\"ready\":true,\"tmax\":" + String(TMAX) + ",\"mrows\":" + String(MROWS) + ",\"kmax\":" + String(KMAX) + ",\"spec_k\":" + String(kcfg) + ",\"kv\":\"" + String(KVT) + "\",\"pack\":\"" + packdir + "\"}")
+        print("{\"ready\":true,\"tmax\":" + String(tmax) + ",\"mrows\":" + String(MROWS) + ",\"kmax\":" + String(KMAX) + ",\"spec_k\":" + String(kcfg) + ",\"kv\":\"" + String(KVT) + "\",\"pack\":\"" + packdir + "\"}")
 
     # --- request loop: one prompt from the file (BARO_SERVE=0, then exit) or
     # JSON lines from stdin until EOF (BARO_SERVE=1, serve/PROTOCOL.md) ------
@@ -386,8 +392,8 @@ def main() raises:
                 perr = "empty prompt"
             if perr == "" and req_n < 1:
                 perr = "n must be >= 1"
-            if perr == "" and len(prompt) + req_n > TMAX:
-                perr = "prompt+n exceeds TMAX " + String(TMAX)
+            if perr == "" and len(prompt) + req_n > tmax:
+                perr = "prompt+n exceeds TMAX " + String(tmax)
             if perr != "":
                 print(err_line(req_id, perr))
                 continue
@@ -432,20 +438,23 @@ def main() raises:
             pf_tail = pf_rows % MROWS
             if pf_tail == 0:
                 pf_tail = MROWS
-        print("TMAX:", TMAX, " kv dtype:", String(KVT), " prefill chunk:", pf_chunk, " prefill rows:", pf_rows)
+        print("TMAX:", tmax, " kv dtype:", String(KVT), " prefill chunk:", pf_chunk, " prefill rows:", pf_rows)
 
         # --- decode loop ---------------------------------------------------------
 
 
         var n_total = len(prompt) + gen_n
-        if n_total > TMAX:
-            raise Error(
-                "prompt+generation exceeds TMAX: " + String(len(prompt)) + " + "
-                + String(gen_n) + " > " + String(TMAX)
+        if n_total > tmax:
+            print(
+                "{\"error\":{\"code\":400,\"message\":\"the request exceeds the"
+                " available context size, try increasing it\",\"type\":"
+                "\"exceed_context_size_error\",\"n_prompt_tokens\":"
+                + String(len(prompt)) + ",\"n_ctx\":" + String(tmax) + "}}"
             )
-        var toks_h = ctx.enqueue_create_host_buffer[DType.int32](TMAX)
+            exit(2)
+        var toks_h = ctx.enqueue_create_host_buffer[DType.int32](tmax)
         ctx.synchronize()
-        for i in range(TMAX):
+        for i in range(tmax):
             toks_h[i] = 0
         for i in range(len(prompt)):
             toks_h[i] = Int32(prompt[i])

@@ -419,4 +419,51 @@ A/B; llama.cpp `/props` saved beside its timings.
 P-D2 within band; P-D3/P-D4/P-D5 tables filled (P-D4 must hold; P-D3 and
 P-D5 are recorded against their predictions, not gated); P-D6.
 
-**Result.** (filled after the gated run)
+**Result.** PASS on the gate; P-D3 and P-D5 missed their predictions,
+recorded 2026-09-08 (`.work/m0c/stint.txt`, exclusive GPU, ref =
+`.work/engine-m0b` sha `321c5f25b3e172b3` built from 9d3b228, new =
+`.work/engine-m0c`).
+
+| receipt | M0b | M0c | source |
+|---|---|---|---|
+| fingerprint q4 `amar_mega_token` | 12746 / dual 115/80/80/60 / spill 0 | identical | `.work/isa/m0c/co64.s` |
+| one-shot q4 at 1088 | 133.75, 64/64 | **bit-exact**, 133.75 | `.work/m0c/one-q4-*.log` |
+| one-shot q8 at 1088 | 82.08, 64/64 | **bit-exact**, 83.63 | `.work/m0c/one-q8-*.log` |
+| 20-prompt median (P4) | 133.26 (spread 3.8 %) | 133.26 (spread 1.9 %), ratio 1.000, identity 20/20 | `.work/m0c/ab/results.txt` |
+| overflow, one-shot (8192 prompt at TMAX 1088) | raise | exit 2, `exceed_context_size_error` JSON | `.work/m0c/overflow.log` |
+| overflow, server (`max_tokens` 1e6) | 400 plain | 400 `exceed_context_size_error`, n_prompt_tokens 43, n_ctx 1088 | merge-gate `PASS overflow` |
+| merge-gate | ALL PASS | ALL PASS | `.work/merge-gate.txt` 11:35 |
+
+Long context, `BARO_TMAX=102400`, f32 KV, prefill chunk 1024, 64 generated
+tokens, prompt files sha256 (first 16) p8192 `3ff81ea490f46aa6`, p32768
+`a922d0b1d2f3b6f8`, p100000 `112722f7857c9962`:
+
+| T | prefill_s ours | predicted | llama.cpp Q4_0-pure prompt_ms | ratio | tok/s_gen ours | predicted | llama.cpp | mega fail |
+|---|---|---|---|---|---|---|---|---|
+| 8192 | 8.33 | ~6 | 2.59 | 3.2x | 89.4 | - | 109.2 | 0 |
+| 32768 | 50.46 | ~24 | (rerun pending, argv-size bug in the first request) | | 45.7 | >= 100, floor 80 | | 0 |
+| 100000 | 298.3 | ~75 | (rerun pending) | | 19.2 | ~60 | | 0 |
+
+Verdict against the frozen predictions:
+- P-D1 held: bit-exact at 1088 on both packs, 20/20.
+- P-D2 held: fingerprint identical, ratio 1.000.
+- P-D3 missed: prefill is superlinear (8.3 -> 50 -> 298 s, i.e. T^1.5-2),
+  not the linear ~0.75 ms/row the prediction assumed. The prediction
+  modelled the GEMMs only; `amar_attn_prefill` re-reads the whole KV per
+  1024-row chunk, so its cost grows with T per chunk and the sum is
+  quadratic. Against llama.cpp the 8k gap is 3.2x (2.4x expected from the
+  int8 MMQ GEMM alone; the rest is the attention sweep).
+- P-D4 held: 6.7 GB f32 KV + pack, 100k prompt + 64 tokens, fail word 0.
+- P-D5 **falsified**: 45.7 at 32k, below the 80 floor. Per-token decode
+  cost is linear in T at 0.44 ms per 1k tokens (7.5 ms + 3.7 at 8k, + 14.4
+  at 32k, + 44.6 at 100k), six times the KV-byte floor (67 MB per 1k
+  tokens = 0.075 ms at 900 GB/s). Bytes do not explain it; the attention
+  phase inside the megakernel runs on a fraction of the CUs while the rest
+  hold at the grid barrier. This triggers M0d: the GQA-grouped, split-K
+  decode attention kernel of design §4, as a separate launch (or phase
+  with every block participating), preregistered next.
+- P-D6 held in both modes; `tools/test_server.sh` gained the case.
+
+Observation, not promoted: decode after an 8k prompt is 89 vs llama.cpp's
+109 on the same card; at T <= 1088 ours leads 133 vs ~110. The crossover is
+the M0d target.
