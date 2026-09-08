@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parent.parent
 CLI = ROOT / ".work/baro-tokenize"
 MODEL = Path("~/Models/spark-x2.5-4b/Spark-X2.5-4B-Q8_0-requant.gguf").expanduser()
 OUT = ROOT / "bench/spark-prefill-prompts"
-TARGETS = [64, 256, 1024, 2048]
+TARGETS = [int(x) for x in sys.argv[1:]] or [64, 256, 1024, 2048]
 
 
 def count_ids(text):
