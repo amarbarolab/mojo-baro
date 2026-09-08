@@ -119,22 +119,18 @@ def attn_head_span[
             var n = t_hi - t0
             if n > HD:
                 n = HD
-            comptime PGSTR = NAT * NKVH * KVHSTR
-            var vb = kv_off[NAT](t0, att_i, kvh) + tid
             var tt = 0
             while tt + 8 <= n:
-                var pb = vb + (tt >> KVPSH) * PGSTR + (tt & (KVPAGE - 1)) * HD
                 var v = InlineArray[Float32, 8](uninitialized=True)
                 var sc = InlineArray[Float32, 8](uninitialized=True)
                 comptime for j in range(8):
-                    v[j] = vp[unsafe_offset=pb + j * HD].cast[f32]()
+                    v[j] = vp[unsafe_offset=kv_off[NAT](t0 + tt + j, att_i, kvh) + tid].cast[f32]()
                     sc[j] = rebind[Scalar[f32]](scores[tt + j])
                 comptime for j in range(8):
                     o += sc[j] * v[j]
                 tt += 8
             while tt < n:
-                var pb = vb + (tt >> KVPSH) * PGSTR + (tt & (KVPAGE - 1)) * HD
-                o += rebind[Scalar[f32]](scores[tt]) * vp[unsafe_offset=pb].cast[f32]()
+                o += rebind[Scalar[f32]](scores[tt]) * vp[unsafe_offset=kv_off[NAT](t0 + tt, att_i, kvh) + tid].cast[f32]()
                 tt += 1
         t0 += HD
     return SIMD[f32, 4](m_run, l_run, o, 0)
