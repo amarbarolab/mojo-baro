@@ -7,12 +7,12 @@ from max.algorithm import parallelize
 from max.gpu.host import DeviceContext, DeviceBuffer
 from layout import TileTensor, TensorLayout, row_major
 from attn import KVT, HD, NQH, NKVH, KVPAGE, KVHSTR
-from elementwise import amar_rmsnorm_cast, amar_argmax_pos
+from elementwise import amar_rmsnorm_cast
 from matmul_skinny import ROW_WAVES, ROW_THREADS
 from tokenizer import Tokenizer
 from minja import render_chat
 from spark_kernels import (
-    amar_embed_lookup_f32, amar_gemv_q8, amar_rope_kv_append, amar_attn_decode_swa_gated, amar_rope_plain,
+    amar_embed_lookup_f32, amar_gemv_q8, amar_argmax_part, amar_argmax_final, amar_rope_kv_append, amar_attn_decode_swa_gated, amar_rope_plain,
 )
 
 comptime f32 = DType.float32
@@ -56,7 +56,8 @@ comptime gate_l = row_major[NQH]()
 comptime p_h_l = row_major[1, 1, H]()
 comptime fgb_l = row_major[1, FFN]()
 comptime p_v_l = row_major[1, 1, VOCAB]()
-comptime logits_l = row_major[1, VOCAB]()
+comptime AM_NB = 128
+comptime amv_l = row_major[AM_NB]()
 
 comptime q_qkv = row_major[QKV, H]()
 comptime s_qkv = row_major[QKV, H // 32]()
@@ -85,7 +86,8 @@ comptime k_ffn_gate = amar_gemv_q8[0, type_of(xb_l), type_of(q_ffn), type_of(s_f
 comptime k_ffn_up = amar_gemv_q8[2, type_of(xb_l), type_of(q_ffn), type_of(s_ffn), type_of(ffn1_l), type_of(ffn1_l)]
 comptime k_down = amar_gemv_q8[1, type_of(fgb_l), type_of(q_down), type_of(s_down), type_of(h1_l), type_of(dummy_l)]
 comptime k_head = amar_gemv_q8[0, type_of(xb_l), type_of(q_out), type_of(s_out), type_of(v1_l), type_of(dummy_l)]
-comptime k_argmax = amar_argmax_pos[type_of(logits_l), type_of(toks_l)]
+comptime k_argmax = amar_argmax_part[AM_NB, type_of(v1_l), type_of(amv_l), type_of(amv_l)]
+comptime k_argmax_final = amar_argmax_final[AM_NB, type_of(amv_l), type_of(amv_l), type_of(toks_l)]
 
 
 def wq[LT: TensorLayout](ctx: DeviceContext, wbuf: DeviceBuffer[DType.uint8], o: Int, n: Int, lt: LT) -> TileTensor[DType.int8, LT, MutAnyOrigin]:
@@ -267,7 +269,10 @@ def main() raises:
     var Gate = TileTensor(gate_d, gate_l)
     var Fgb = TileTensor(fgb_d, fgb_l)
     var Logits1 = TileTensor(logits_d, v1_l)
-    var Logits = TileTensor(logits_d, logits_l)
+    var amv_d = ctx.enqueue_create_buffer[f32](AM_NB)
+    var ami_d = ctx.enqueue_create_buffer[DType.int32](AM_NB)
+    var Amv = TileTensor(amv_d, amv_l)
+    var Ami = TileTensor(ami_d, amv_l)
     var OutNorm = wf(ctx, wbuf, off[1 + 8 * N_LAYERS], H, h_l)
     var out_off = off[2 + 8 * N_LAYERS]
     var Woq = wq(ctx, wbuf, out_off, VOCAB * H, q_out)
@@ -302,7 +307,8 @@ def main() raises:
         if pos >= n_prompt - 1:
             ctx.enqueue_function[k_rms](X, OutNorm, Xb, Int32(H), Float32(1e-6), grid_dim=1, block_dim=256)
             ctx.enqueue_function[k_head](Xb, Woq, Wos, Logits1, Dummy, Int32(VOCAB), Int32(H), grid_dim=ceildiv(VOCAB, ROW_WAVES), block_dim=ROW_THREADS)
-            ctx.enqueue_function[k_argmax](Logits, Toks, Int32(VOCAB), Int32(pos + 1), grid_dim=1, block_dim=256)
+            ctx.enqueue_function[k_argmax](Logits1, Amv, Ami, Int32(VOCAB), grid_dim=AM_NB, block_dim=256)
+            ctx.enqueue_function[k_argmax_final](Amv, Ami, Toks, Int32(pos + 1), grid_dim=1, block_dim=32)
     ctx.synchronize()
     var dt = Float64(perf_counter_ns() - t_gen_start) / 1e9
     ctx.enqueue_copy(dst_buf=toks_h, src_buf=toks_d)

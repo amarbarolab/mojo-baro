@@ -13,7 +13,7 @@ must be reachable from `serve/registry.mojo`, a bench, or a test.
 | `amar_kv_append` | `attn.mojo` | `CLayout: TensorLayout, NLayout: TensorLayout, NAT: Int` | append_k, append_1, append_p | serve/registry.mojo, kernels/test_attn_block.mojo, kernels/test_mega_block.mojo |
 | `amar_qgate_split` | `attn.mojo` | `FLayout: TensorLayout, QLayout: TensorLayout, GLayout: TensorLayout` | split_k, split_p | serve/registry.mojo, kernels/test_attn_block.mojo, kernels/test_mega_block.mojo |
 | `amar_rope_yarn` | `attn.mojo` | `XLayout: TensorLayout` | rope_q, rope_k, rope_qp, rope_kp | serve/registry.mojo, kernels/test_attn_block.mojo, kernels/test_mega_block.mojo |
-| `amar_argmax_pos` | `elementwise.mojo` | `XLayout: TensorLayout, OLayout: TensorLayout` | argmax_k, argmax_d | serve/registry.mojo, serve/spark.mojo, kernels/test_mega_block.mojo |
+| `amar_argmax_pos` | `elementwise.mojo` | `XLayout: TensorLayout, OLayout: TensorLayout` | argmax_k, argmax_d | serve/registry.mojo, kernels/test_mega_block.mojo |
 | `amar_argmax_row` | `elementwise.mojo` | `XLayout: TensorLayout, OLayout: TensorLayout` |  | kernels/test_elementwise.mojo |
 | `amar_embed_lookup` | `elementwise.mojo` | `TLayout: TensorLayout, OLayout: TensorLayout` |  | kernels/test_elementwise.mojo |
 | `amar_embed_lookup_pos` | `elementwise.mojo` | `TLayout: TensorLayout, OLayout: TensorLayout, KLayout: TensorLayout` | embed_k, embed1_k, embed_p | serve/registry.mojo |
@@ -58,6 +58,8 @@ must be reachable from `serve/registry.mojo`, a bench, or a test.
 | `amar_moe_gate_up` | `moe.mojo` | `NSEL: Int, FFN: Int, XLayout: TensorLayout, GLayout: TensorLayout, ULayout: TensorLayout, ILayout: TensorLayout, HLayout: TensorLayout` |  | kernels/test_moe_block.mojo |
 | `amar_moe_router_top8` | `moe.mojo` | `LLayout: TensorLayout, ILayout: TensorLayout, WLayout: TensorLayout` |  | kernels/test_moe_block.mojo |
 | `amar_moe_sig_gate` | `moe.mojo` | `XLayout: TensorLayout, GLayout: TensorLayout, OLayout: TensorLayout` |  | kernels/test_moe_block.mojo |
+| `amar_argmax_final` | `spark_kernels.mojo` | `NB: Int, VLayout: TensorLayout, ILayout: TensorLayout, OLayout: TensorLayout` |  | serve/spark.mojo |
+| `amar_argmax_part` | `spark_kernels.mojo` | `NB: Int, XLayout: TensorLayout, VLayout: TensorLayout, ILayout: TensorLayout` |  | serve/spark.mojo |
 | `amar_attn_decode_swa` | `spark_kernels.mojo` | `QLayout: TensorLayout, KLayout: TensorLayout, OLayout: TensorLayout, NAT: Int` |  |  |
 | `amar_attn_decode_swa_gated` | `spark_kernels.mojo` | `QLayout: TensorLayout, KLayout: TensorLayout, GLayout: TensorLayout, OLayout: TensorLayout, NAT: Int` |  | serve/spark.mojo |
 | `amar_embed_lookup_f32` | `spark_kernels.mojo` | `TLayout: TensorLayout, OLayout: TensorLayout, KLayout: TensorLayout` |  | serve/spark.mojo |

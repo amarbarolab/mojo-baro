@@ -1,5 +1,6 @@
 from std.gpu import block_dim, block_idx, global_idx, lane_id, thread_idx, WARP_SIZE
 from std.gpu.primitives import warp
+from max.gpu.sync import barrier
 from std.math import cos, exp, log, sin, tanh
 from max.gpu.memory import AddressSpace
 from layout import TileTensor, TensorLayout, row_major, stack_allocation
@@ -249,3 +250,71 @@ def amar_attn_decode_swa_gated[
         var g = rebind[Scalar[f32]](Gate[h])
         var o = res[2] * inv
         O[qrow, tid] = rebind[O.ElementType]((o * (1 / (1 + exp(-g)))).cast[DType.bfloat16]())
+
+
+def amar_argmax_part[
+    NB: Int, XLayout: TensorLayout, VLayout: TensorLayout, ILayout: TensorLayout
+](
+    X: TileTensor[f32, XLayout, MutAnyOrigin],
+    Pv: TileTensor[f32, VLayout, MutAnyOrigin],
+    Pi: TileTensor[DType.int32, ILayout, MutAnyOrigin],
+    n: Int32,
+):
+    comptime assert X.flat_rank == 1 and Pv.flat_rank == 1 and Pi.flat_rank == 1
+    comptime T = 256
+    comptime V = 8
+    var N = Int(n)
+    var b = Int(block_idx.x)
+    var tid = Int(thread_idx.x)
+    var best_v = Float32(-3.4e38)
+    var best_i: Int32 = 0
+    var i = (b * T + tid) * V
+    while i < N:
+        var v = X.ptr.load[width=V](i)
+        comptime for j in range(V):
+            if v[j] > best_v:
+                best_v = v[j]
+                best_i = Int32(i + j)
+        i += NB * T * V
+    var vals = stack_allocation[f32, address_space = AddressSpace.SHARED](row_major[T]())
+    var idxs = stack_allocation[DType.int32, address_space = AddressSpace.SHARED](row_major[T]())
+    vals[tid] = rebind[vals.ElementType](best_v)
+    idxs[tid] = rebind[idxs.ElementType](best_i)
+    barrier()
+    var active = T
+    comptime for _ in range(8):
+        active >>= 1
+        if tid < active:
+            var v2 = rebind[Scalar[f32]](vals[tid + active])
+            var i2 = rebind[Scalar[DType.int32]](idxs[tid + active])
+            var v1 = rebind[Scalar[f32]](vals[tid])
+            var i1 = rebind[Scalar[DType.int32]](idxs[tid])
+            if v2 > v1 or (v2 == v1 and i2 < i1):
+                vals[tid] = rebind[vals.ElementType](v2)
+                idxs[tid] = rebind[idxs.ElementType](i2)
+        barrier()
+    if tid == 0:
+        Pv[b] = rebind[Pv.ElementType](rebind[Scalar[f32]](vals[0]))
+        Pi[b] = rebind[Pi.ElementType](rebind[Scalar[DType.int32]](idxs[0]))
+
+
+def amar_argmax_final[
+    NB: Int, VLayout: TensorLayout, ILayout: TensorLayout, OLayout: TensorLayout
+](
+    Pv: TileTensor[f32, VLayout, MutAnyOrigin],
+    Pi: TileTensor[DType.int32, ILayout, MutAnyOrigin],
+    Out: TileTensor[DType.int32, OLayout, MutAnyOrigin],
+    wpos: Int32,
+):
+    comptime assert Pv.flat_rank == 1 and Pi.flat_rank == 1 and Out.flat_rank == 1
+    if thread_idx.x != 0:
+        return
+    var bv = Float32(-3.4e38)
+    var bi: Int32 = 0
+    comptime for t in range(NB):
+        var v = rebind[Scalar[f32]](Pv[t])
+        var ix = rebind[Scalar[DType.int32]](Pi[t])
+        if v > bv or (v == bv and ix < bi):
+            bv = v
+            bi = ix
+    Out[Int(wpos)] = rebind[Out.ElementType](bi)
