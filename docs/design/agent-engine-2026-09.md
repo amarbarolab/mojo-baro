@@ -106,6 +106,51 @@ next-token logits `memcmp`-equal at positions 0/1/1023/1024/1025/7900/8191/
 8192, with mutations at first token, checkpoint±1, last token; a corrupted
 hash must fail restoration.
 
+
+### 3a. What the incumbents' merged PRs settled (read 2026-09-08, bodies in `.work/design/prs/`)
+- **Snapshot placement.** Fixed intervals waste memory and still miss the fork;
+  TensorRT-LLM #18272 measured agent traces (178 subagent groups): siblings
+  share 87-98 % of each other's prompt and always diverge before the end, so
+  the valuable snapshot is at the **branch point**, decided at lookup time on
+  the diverging request, aligned down to the page. With only prompt-end
+  snapshots 7 % of all prompt tokens matched in attention but were pruned for
+  want of a recurrent snapshot. We adopt: prompt-end + branch-point snapshots,
+  periodic 1024 only as a safety net, `per_conversation` policy for chat.
+- **One forward, not two.** vLLM #52789: a checkpoint inside the prompt used
+  to split the whole model forward at the checkpoint boundary; splitting only
+  the recurrent kernel at that offset inside one forward gave 9-25 % TTFT.
+  Our chunked prefill must checkpoint mid-chunk without a second pass over
+  the attention/FFN blocks.
+- **Restore points survive cancellation.** ollama #17901: agent clients cancel
+  long prefills (timeouts shorter than a 40k prefill); a cancelled prefill
+  keeps every restore point it crossed so the retry resumes. Every trie node
+  carries snapshots spanning exactly its edge from creation (#14887 trie).
+  Adopt both; cancel is a first-class path in M1, not an error.
+- **Checkpoints at message boundaries.** llama.cpp #24176/#25472: a checkpoint
+  at the start of every user message, evicting checkpoints within a
+  min-step of each other. Our boundary set = every role boundary in the
+  rendered template + prompt end + branch points.
+- **Recurrent rollback for speculation.** llama.cpp #26623/#28466: a state
+  copy per draft token, roll back to the last accepted; models without
+  snapshots corrupt under multi-sequence. Our ring slots already hold one
+  state per draft position; the invariant is written down and tested.
+- **Adaptive draft length.** ollama #16791: a controller picks the draft
+  length that maximises committed tokens/s from measured per-position
+  acceptance and forward cost, backs off to plain decode, one host sync per
+  round, draft head with its own prefix-cached KV. Replaces our fixed k=2.
+- **Reproducible page hashes.** vLLM prefix caching: parent hash + block
+  tokens + extra (salt, LoRA, media); `sha256_cbor` for cross-process
+  reproducibility. Our hash is canonical bytes, never a language-specific
+  pickle.
+- **Grammar across the reasoning boundary.** vLLM #44993: under speculation
+  the `</think>` marker and the first post-marker tokens must enter the FSM
+  exactly once; two silent failure modes were found. Test this case
+  explicitly in M6.
+- **Streaming cadence.** Dynamo #13975: emit tool-call deltas on every parser
+  delta, never buffer to a quiet chunk; #6422: the reasoning state machine
+  cycles normal→reasoning→normal per `<think>` block and handles
+  `</think>text<think>` inside one chunk.
+
 ## 4. Decode
 
 - Megakernel per token stays the m=1 engine (133.9 tok/s measured). Pools:
@@ -123,6 +168,15 @@ hash must fail restoration.
   identically to draft and target; counter-based RNG; adaptive off-switch by
   EWMA of effective tok/s. Relaxed acceptance in the thinking phase
   (TRT `use_relaxed_acceptance_for_thinking`, top-k + delta) is an opt-in.
+
+
+Reference for the prefill GEMM round (not this lane): vLLM #41394 ships a
+native gfx1100 W4A16 kernel pair — scalar `v_dot2_f32_f16` for M < 16,
+`v_wmma_f32_16x16x16` for M >= 16 (v1 one wave 16x16 tile, v2 two waves
+32x16 double-buffered LDS); on a 7900 XTX, fp16 WMMA was a wash against
+scalar+fdot2 end-to-end despite a 47 % microbench win, and the authors name
+"multi-wave WMMA with LDS-shared A" as the unbuilt 10-15 %. llama.cpp's int8
+MMQ remains the path to copy for Q4 x Q8; vLLM's is W4A16.
 
 ## 5. Sampler
 
