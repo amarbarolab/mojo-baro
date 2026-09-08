@@ -351,3 +351,80 @@ no-A -5% / -5%; no-epilogue -3% (bf16) / **-25% (mmq)**; no-barrier
 next sub-round's lever; a drop < 3% retires that lever. If no-epilogue on
 mmq is < 10%, the int8 kernel is bound by its loads/LDS, not by the
 epilogue, and the WMMA-rate receipt alone explains the loss.
+
+#### R5 / R5a / R5-abl Result (recorded 2026-09-08, exclusive GPU, driver `.work/r5-all.sh`)
+
+**Spread rule deviation, recorded.** Six R5 tries and four R5a tries, every
+one on an exclusive GPU (`gpu-wait run --priority 90 --vram 23`, queue
+empty, the orphaned ruler llama-server cancelled first), and not one run met
+the 5 % in-run spread rule on the n >= 256 rows. The n <= 128 rows are clean
+(<= 3 %) in every run. The spread is the bench's own at n >= 256 (bf16-lds
+n=512 ranges 1578-2280 us across runs, bimodal, not a co-runner), so the
+table below is the **median across tries of each row's in-run median**, with
+the cross-try min beside it. Numbers are receipts of that construction, not
+a P4-clean arm; the verdicts below do not depend on which of the two is read.
+
+us per GEMM, ffn shape (N=12288, K=4096), 128x128 config, NBUF 8, ITERS 16:
+
+| n | R4 bf16 (frozen) | wmma | bf16-lds med (min) | mmq med (min) | bf16-lds / R4 | mmq / bf16-lds | gate |
+|---|---|---|---|---|---|---|---|
+| 16 | 435-470 | 672 | 589 (582) | 535 (534) | 0.77 | 1.10 | - |
+| 64 | 512 | 605 | 631 (626) | 588 (576) | 0.81 | 1.07 | - |
+| 128 | 645 | 642 | 634 (629) | 600 (596) | 1.02 | 1.06 | - |
+| 256 | 1629 | 1650 | 932 (926) | 1040 (1011) | 1.75 | 0.90 | - |
+| 512 | 2451 | 3234 | 2175 (1578) | 2163 (2097) | 1.13-1.55 | 1.01 | int8 <= 1226: **FAIL** |
+| 1024 | 4183 | 4552 | 2250 (2219) | 2486 (2448) | 1.86 | 0.91 | int8 <= 2092: **FAIL** |
+
+Quantiser alone (`quant`, reported beside, not added): 10.8 us at n=512,
+15.4 us at n=1024.
+
+Verdict against the frozen predictions:
+- bf16-lds / R4 at n=1024 = 1.86x (predicted 2.0x, falsifier < 1.3x not
+  triggered): the LDS schedule transferred.
+- int8 / bf16-lds at n=1024 = 0.91x (predicted 1.31x; falsifier "< 1.1x =
+  epilogue VALU is the bound"). The int8 arm is **slower** than bf16 on the
+  same schedule. The gate is not met; R5 is closed negative.
+- The 07:39 WMMA issue-rate receipt (`.work/logs/peak-i8.txt`: iu8 133.4
+  TOP/s vs bf16 132.4 TFLOP/s, ratio 1.007) is the mechanism: gfx1100 issues
+  int8 WMMA at the bf16 rate, so int8 buys only half the operand bytes and
+  pays a per-block epilogue (cvt + mul + fma per 32-block d4) that bf16 does
+  not. Already in the vault as a standing rule; this round confirms it on the
+  real shape.
+
+R5a (uniform loader, `8347c55`): mmq n=1024 2511 (2357) vs R5 2486 (2448);
+bf16-lds 2520 (2396) vs 2250 (2219). No gain on mmq, a loss on bf16-lds
+inside the spread. Closed, no arm landed. The R5 adjacent control did not
+run (the driver only runs it after a clean R5a; none was).
+
+R5-abl (one run each, ABL 0..5, median of 5 repeats, us; bf16-lds / mmq):
+
+| ABL | n=256 | n=512 | n=1024 | drop at 1024 vs ABL 0 (bf16 / mmq) | predicted |
+|---|---|---|---|---|---|
+| 0 none | 1450 / 1566 | 2158 / 2201 | 2697 / 2890 | - | - |
+| 1 no-B | 342 / 394 | 704 / 737 | 1449 / 1488 | **-46 % / -49 %** | -10 % / -10 % |
+| 2 no-A | 1183 / 1426 | 1646 / 1854 | 2314 / 2645 | -14 % / -8 % | -5 % / -5 % |
+| 3 no-epilogue | 1341 / 1458 | 1727 / 1922 | 2485 / 2512 | -8 % / -13 % | -3 % / -25 % |
+| 4 no-barrier | 1401 / 1291 | 2082 / 1957 | 2910 / 3170 | +8 % / +10 % | -8 % / -8 % |
+| 5 no-scales | 1465 / 1338 | 2113 / 1818 | 2619 / 2506 | -3 % / -13 % | - / -5 % |
+
+Reading (rule: largest drop names the lever, < 3 % retires it):
+- The B (weight) global load is half the K-loop on both arms, 4-5x the
+  prediction. The kernel is bound by weight bytes in flight, not by issue.
+  That is the lever, and it is the same lever for bf16 and int8, which is
+  why int8 cannot win here: it halves A, not B, and B is q4 in both arms.
+- no-epilogue on mmq is -13 % (< the 25 % predicted, > the 10 % that would
+  have said "loads only"): the epilogue is a real but secondary cost.
+- no-barrier is slower on both arms: removing the barrier breaks the
+  double-buffer handoff, so this row measures a broken pipeline, not the
+  barrier's cost. Retired as a receipt, not as a lever.
+- ABL 0 is 10-20 % slower than the R5 rows for the same config (2697 vs
+  2250 at n=1024): the ablation binary carries the ABL branches and its own
+  rotation; compare rows within this table only.
+
+**Round verdict.** Int8 MMQ prefill closed negative on gfx1100 (int8 WMMA =
+bf16 rate; the kernel is B-load bound). The bf16-lds schedule is the win:
+1.86x over R4 at n=1024, 1.75x at n=256, bit-exact gate vs
+`amar_matmul_prefill_q4` held (test_mmq). Next round, if any, is the B-load
+path (bytes in flight per CU: wider loads, deeper NBUF, or K-tile 64), not
+the dtype. Item 5 (integration) stays dropped for int8; landing bf16-lds as
+the prefill GEMM is a separate preregistration on the prefill protocol.
