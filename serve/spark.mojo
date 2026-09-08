@@ -279,10 +279,13 @@ def main() raises:
     var Wos = ws(ctx, wbuf, out_off, VOCAB * H, s_out)
 
     var t_gen_start: Int = 0
+    ctx.synchronize()
+    var t_pf_start = perf_counter_ns()
     for pos in range(n_total - 1):
         if pos == n_prompt - 1:
             ctx.synchronize()
             t_gen_start = perf_counter_ns()
+            print("prefill_s:", Float64(t_gen_start - t_pf_start) / 1e9, " prefill rows:", n_prompt - 1, " chunk: 0")
         ctx.enqueue_function[k_emb](Emb, X, Toks, Int32(pos), Int32(H), grid_dim=(ceildiv(H, 256), 1), block_dim=256)
         for i in range(N_LAYERS):
             var e = 1 + 8 * i
