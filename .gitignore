@@ -9,3 +9,4 @@ bench/log.jsonl
 bench/sweep.jsonl
 .claude/
 .codex/
+bench/ruler/prompts/
