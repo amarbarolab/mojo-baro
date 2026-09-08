@@ -147,3 +147,24 @@ Identity is proven on 61 cases against this llama.cpp build (`ca3d5a3e1`,
 version skew between llama.cpp's `unicode-data.cpp` and Oniguruma for code
 points assigned after either was generated; add such a string to `HARD_SET`
 and the gate decides.
+
+## Mojo tokenizer (2026-09-08, default path)
+
+`serve/tokenizer.mojo` reads the same `tokenizer.ggml.*` keys straight from the
+GGUF header (96 MB cap, no tensors) and runs byte-level BPE in Mojo; pre-tokenizer
+regexes run on [`mojo-uregex`](~/Projects/mojo-uregex) (`-I ~/Projects/mojo-uregex/src`).
+Pre types: qwen2 / deepseek-r1-qwen, qwen35, llama3 / llama-bpe, spark2_5 (4-pass
+Sequence), gpt-2 / default. Load 0.06 s for a 131k vocab.
+
+```
+./.venv/bin/mojo build tools/baro-tokenize.mojo -I serve -I ~/Projects/mojo-uregex/src -o .work/baro-tokenize
+.work/baro-tokenize (encode TEXT | decode IDS | decode-keep IDS | batch NUL_TEXTS | info) MODEL.gguf
+./.venv/bin/python3 tools/test_tokenizer_mojo.py --gguf <Qwythos.gguf> \
+    --extra <Spark.gguf>:.work/spark/prompt.txt:.work/spark/ref/prompt-tokens.txt
+```
+
+Gate (ref = `llama-tokenize` on the source GGUF + Spark ids from llama-server
+`/tokenize`): 63 cases, encode identical, `decode-keep(encode(x)) == x`.
+`serve/spark.mojo` takes `BARO_PROMPT_TEXT=<file> BARO_GGUF=<gguf>` and tokenizes
+in-process; `BARO_PROMPT=<ids>` still works. The Python tool above stays as the
+oracle-side builder for HF `tokenizer.json` consumers.
