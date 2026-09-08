@@ -11,7 +11,11 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 eng=$1; out=$2; envA=$3; envB=$4; la=${5:-A}; lb=${6:-B}; engB=${AB_ENGINE_B:-$eng}
 mkdir -p "$out"
-echo "engA=$eng engB=$engB" | tee "$out/arm.txt"
+ha=$(sha256sum "$eng" | cut -c1-16); hb=$(sha256sum "$engB" | cut -c1-16)
+if [ "$ha" = "$hb" ] && [ "$envA" = "$envB" ]; then
+  echo "REFUSED: engA and engB are the same binary ($ha) with identical env -- this is champion vs itself (ledger 2026-09-08). Set AB_ENGINE_B or differ the env strings." >&2; exit 2
+fi
+echo "engA=$eng engB=$engB shaA=$ha shaB=$hb" | tee "$out/arm.txt"
 echo "power_cap_uW=$(cat /sys/class/drm/card1/device/hwmon/hwmon*/power1_cap) vddgfx=$(grep -A1 OD_VDDGFX_OFFSET /sys/class/drm/card1/device/pp_od_clk_voltage | tail -1) armA='$envA' armB='$envB'" | tee -a "$out/arm.txt"
 echo "prompt n_prompt ${la}_tok_s ${lb}_tok_s identity" > "$out/results.txt"
 for tf in bench/mtp-prompts/p*.tokens; do
