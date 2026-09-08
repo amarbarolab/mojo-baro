@@ -3,10 +3,9 @@ from max.gpu.sync import barrier
 from std.gpu import block_idx, global_idx, thread_idx, WARP_SIZE
 from std.math import ceildiv, fma
 from std.memory import bitcast
+from std.sys.intrinsics import llvm_intrinsic
 from layout import TileTensor, TensorLayout, row_major, stack_allocation
 from layout.tensor_core import mma
-
-from matmul_prefill import f32x16_to_bf16_trunc
 
 comptime f32 = DType.float32
 comptime f16 = DType.float16
@@ -17,6 +16,7 @@ comptime u8 = DType.uint8
 comptime MMQ_WAVES = 8
 comptime MMQ_THREADS = MMQ_WAVES * WARP_SIZE
 comptime QT_THREADS = 256
+comptime ABL = 0
 
 
 @always_inline
@@ -65,6 +65,15 @@ def amar_quant_q8[
         Aq[r, kb * 32 + 16 + i] = rebind[Aq.ElementType](q8hi[i])
     Ad[kb, slot] = rebind[Ad.ElementType](d)
     An[kb, slot] = rebind[An.ElementType](-8 * s)
+
+
+@always_inline
+def f32x8_to_bf16_trunc(x: SIMD[f32, 8]) -> SIMD[bf16, 8]:
+    var u = bitcast[DType.uint32, 8](x)
+    var packed = SIMD[DType.uint32, 4](0)
+    comptime for i in range(4):
+        packed[i] = llvm_intrinsic["llvm.amdgcn.perm", UInt32](u[2 * i + 1], u[2 * i], UInt32(0x07060302))
+    return bitcast[bf16, 8](packed)
 
 
 @always_inline
@@ -127,49 +136,52 @@ def amar_matmul_lds_q4[
     var sn = stack_allocation[i32, address_space=AddressSpace.SHARED](row_major[2, SBM]())
     var sav = sa.vectorize[1, AVEC]()
     var sbv = sb.vectorize[1, AVEC]()
-    var sd4 = sd.vectorize[1, 4]()
-    var sn4 = sn.vectorize[1, 4]()
+    var sb8 = sb.vectorize[1, 8]()
     var sd8 = sd.vectorize[1, 8]()
     var sn8 = sn.vectorize[1, 8]()
     var Av = A.vectorize[1, AVEC]()
-    var Qv = Q.vectorize[1, 16]()
-    var Ad4 = Ad.vectorize[1, 4]()
-    var An4 = An.vectorize[1, 4]()
+    var Q8 = Q.vectorize[1, 8]()
 
     var acc = InlineArray[SIMD[f32, 8], TM * TN](fill=SIMD[f32, 8](0))
     var sta = InlineArray[SIMD[ADT, AVEC], A_PER](fill=SIMD[ADT, AVEC](0))
-    var stb = SIMD[u8, 16](0)
-    var std8 = SIMD[f32, 4](0)
-    var stnu = SIMD[i32, 4](0)
-    var eight = SIMD[f32, 16](8)
+    var stb = SIMD[u8, 8](0)
+    var std8 = Scalar[f32](0)
+    var stnu = Scalar[i32](0)
+    var eight = SIMD[f32, 8](8)
     var nb = K // 32
 
-    var b_ok = tid < BN
-    var b_col = min(block_col + tid, N - 1)
-    var d_ok = tid >= NT // 2 and tid < NT // 2 + BM // 4
-    var n_ok = tid >= NT // 2 + BM // 4 and tid < NT // 2 + BM // 2
-    var d_slot = (block_row + (tid - NT // 2) * 4) // 4
-    var n_slot = (block_row + (tid - NT // 2 - BM // 4) * 4) // 4
+    var b_c = tid // 2
+    var b_half = tid % 2
+    var b_col = min(block_col + b_c, N - 1)
+    var s_row = block_row + tid if tid < BM else block_row + tid - BM
 
     for step in range(nb + 1):
-        barrier()
+        comptime if ABL != 4:
+            barrier()
         if step < nb:
             comptime for s in range(A_PER):
                 var v = tid + s * NT
                 var r = v // KCH
                 var c = v % KCH
-                var gr = block_row + r
-                if (A_CHUNKS % NT == 0 or v < A_CHUNKS) and gr < M:
-                    sta[s] = rebind[SIMD[ADT, AVEC]](Av[gr, step * KCH + c])
+                var gr = min(block_row + r, M - 1)
+                comptime if ABL == 2:
+                    sta[s] = SIMD[ADT, AVEC](Scalar[ADT](step % 3))
                 else:
-                    sta[s] = SIMD[ADT, AVEC](0)
-            if b_ok:
-                stb = rebind[SIMD[u8, 16]](Qv[b_col, step])
+                    if A_CHUNKS % NT == 0 or v < A_CHUNKS:
+                        sta[s] = rebind[SIMD[ADT, AVEC]](Av[gr, step * KCH + c])
+            comptime if ABL == 1:
+                stb = SIMD[u8, 8](UInt8(0x10 | (step & 0xF)))
+            else:
+                stb = rebind[SIMD[u8, 8]](Q8[b_col, step * 2 + b_half])
             comptime if INT8:
-                if d_ok:
-                    std8 = rebind[SIMD[f32, 4]](Ad4[step, d_slot])
-                if n_ok:
-                    stnu = rebind[SIMD[i32, 4]](An4[step, n_slot])
+                comptime if ABL == 5:
+                    std8 = Scalar[f32](step % 5) * 0.01
+                    stnu = Scalar[i32](step % 7)
+                else:
+                    if tid < BM:
+                        std8 = rebind[Scalar[f32]](Ad[step, s_row])
+                    elif tid < 2 * BM:
+                        stnu = rebind[Scalar[i32]](An[step, s_row])
 
         if step > 0:
             var kb = step - 1
@@ -216,13 +228,19 @@ def amar_matmul_lds_q4[
                         mma(t, afr[2 * tm], blo, nu[tm])
                         var t2 = SIMD[i32, 8](0)
                         mma(t2, afr[2 * tm + 1], bhi, t)
-                        acc[tm * TN + tn] = fma(t2.cast[f32](), d8[tm] * d4, acc[tm * TN + tn])
+                        comptime if ABL == 3:
+                            acc[tm * TN + tn] = acc[tm * TN + tn] + bitcast[f32, 8](t2)
+                        else:
+                            acc[tm * TN + tn] = fma(t2.cast[f32](), d8[tm] * d4, acc[tm * TN + tn])
                     else:
                         var t = SIMD[f32, 8](0)
                         mma(t, afr[2 * tm], blo, SIMD[f32, 8](0))
                         var t2 = SIMD[f32, 8](0)
                         mma(t2, afr[2 * tm + 1], bhi, t)
-                        acc[tm * TN + tn] = fma(t2, SIMD[f32, 8](d4), acc[tm * TN + tn])
+                        comptime if ABL == 3:
+                            acc[tm * TN + tn] = acc[tm * TN + tn] + t2
+                        else:
+                            acc[tm * TN + tn] = fma(t2, SIMD[f32, 8](d4), acc[tm * TN + tn])
 
         if step < nb:
             var buf = step % 2
@@ -232,25 +250,21 @@ def amar_matmul_lds_q4[
                 var c = v % KCH
                 if A_CHUNKS % NT == 0 or v < A_CHUNKS:
                     sav[buf * BM + r, lds_chunk[KCH](r, c)] = rebind[sav.ElementType](sta[s])
-            if b_ok:
-                var brow = buf * BN + tid
-                comptime if INT8:
-                    var blo = bitcast[i8, 16](stb & UInt8(0xF))
-                    var bhi = bitcast[i8, 16](stb >> UInt8(4))
-                    sbv[brow, lds_chunk[2](tid, 0)] = rebind[sbv.ElementType](blo)
-                    sbv[brow, lds_chunk[2](tid, 1)] = rebind[sbv.ElementType](bhi)
-                else:
-                    var blo = f32x16_to_bf16_trunc((stb & UInt8(0xF)).cast[f32]() - eight)
-                    var bhi = f32x16_to_bf16_trunc((stb >> UInt8(4)).cast[f32]() - eight)
-                    sbv[brow, lds_chunk[4](tid, 0)] = rebind[sbv.ElementType](blo.slice[8, offset=0]())
-                    sbv[brow, lds_chunk[4](tid, 1)] = rebind[sbv.ElementType](blo.slice[8, offset=8]())
-                    sbv[brow, lds_chunk[4](tid, 2)] = rebind[sbv.ElementType](bhi.slice[8, offset=0]())
-                    sbv[brow, lds_chunk[4](tid, 3)] = rebind[sbv.ElementType](bhi.slice[8, offset=8]())
+            var brow = buf * BN + b_c
             comptime if INT8:
-                if d_ok:
-                    sd4[buf, tid - NT // 2] = rebind[sd4.ElementType](std8)
-                if n_ok:
-                    sn4[buf, tid - NT // 2 - BM // 4] = rebind[sn4.ElementType](stnu)
+                var blo = bitcast[i8, 8](stb & UInt8(0xF))
+                var bhi = bitcast[i8, 8](stb >> UInt8(4))
+                sb8[brow, lds_chunk[2](b_c, 0) * 2 + b_half] = rebind[sb8.ElementType](blo)
+                sb8[brow, lds_chunk[2](b_c, 1) * 2 + b_half] = rebind[sb8.ElementType](bhi)
+                if tid < BM:
+                    sd[buf, tid] = rebind[sd.ElementType](std8)
+                elif tid < 2 * BM:
+                    sn[buf, tid - BM] = rebind[sn.ElementType](stnu)
+            else:
+                var blo = f32x8_to_bf16_trunc((stb & UInt8(0xF)).cast[f32]() - eight)
+                var bhi = f32x8_to_bf16_trunc((stb >> UInt8(4)).cast[f32]() - eight)
+                sbv[brow, lds_chunk[4](b_c, b_half)] = rebind[sbv.ElementType](blo)
+                sbv[brow, lds_chunk[4](b_c, 2 + b_half)] = rebind[sbv.ElementType](bhi)
 
     comptime for tm in range(TM):
         comptime for tn in range(TN):
