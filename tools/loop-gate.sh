@@ -68,7 +68,15 @@ for d in "$dir"/cand-*.diff; do
   # tok/s_gen. Every identifier the tok/s_gen arithmetic reads, every host sync,
   # file writes and the fixture paths are banned on +/- lines. None of these
   # names occur in any kernel file; a legitimate kernel edit is unaffected.
-  grep -E '^[+-].*(BARO_PROFILE|perf_counter_ns|tok/s|check-tokens|ref-tokens|getenv|print\(|open\(|synchronize|engine-pack|GEN_N|generated|toks_h|\b(prof|pf2|pf3|pf4|pf_[a-z]+|t0|tq|tp|dt|nw|now[0-9]?|t_acc|t_load|t_host|t_prefill_end|prefill_done|prefill_s|decode_s)\b)' "$d" >/dev/null && { fail scope "touches timing/print/profile/fixture code"; continue; }
+  # Split layout: the clock is not in the candidate's files at all, so the
+  # stopwatch identifiers come off the list (pos/ring/e are honest window state
+  # there); profiling, prints, file writes and fixture paths stay banned.
+  if [ "$entry" = harness.mojo ]; then
+    scope_pat='^[+-].*(BARO_PROFILE|perf_counter_ns|tok/s|check-tokens|ref-tokens|getenv|print\(|open\(|synchronize|engine-pack|GEN_N|\b(prof|pf2|pf3|pf4|pf_[a-z]+|tq|tp|nw|now[0-9]?|t_acc)\b)'
+  else
+    scope_pat='^[+-].*(BARO_PROFILE|perf_counter_ns|tok/s|check-tokens|ref-tokens|getenv|print\(|open\(|synchronize|engine-pack|GEN_N|generated|toks_h|\b(prof|pf2|pf3|pf4|pf_[a-z]+|t0|tq|tp|dt|nw|now[0-9]?|t_acc|t_load|t_host|t_prefill_end|prefill_done|prefill_s|decode_s)\b)'
+  fi
+  grep -E "$scope_pat" "$d" >/dev/null && { fail scope "touches timing/print/profile/fixture code"; continue; }
   # stage 1: apply + compile on a copy of the gguf sources
   # Hunk counts are rewritten from the hunk body first (iteration 002 lost 4/4
   # here to headers declaring 7 context lines while supplying 4). Content is
