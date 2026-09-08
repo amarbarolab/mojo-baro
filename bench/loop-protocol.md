@@ -19,7 +19,11 @@ re-embedded into a NEW gguf with lineage. Claude reads survivors only.
 A candidate lands only if: touches only `baro.kernel.files`; compiles; 64/64
 greedy tokens identical on every run, and on the second fixture when
 `LOOP_PROMPT2` is set; median of 3 `tok/s_gen` read back from the engine's own
-output >= champion + 2% with spread < 5%; **the claimed decode saving shows in
+output >= champion + 2% with spread < 5%, **where champion = the median
+`tok/s_gen` of the gate's own build of the iteration's pristine sources, timed
+in the same gate run** (P-D, 2026-09-08 evening; the `gguf-closure` run stays as
+the identity check of the gguf and its tok/s is recorded, never compared);
+**the claimed decode saving shows in
 the gate's own wall clock**: median(champion `wall_s`) - median(candidate
 `wall_s`) >= 0.5 x (63/champion - 63/median `tok/s_gen`), where this
 `champion` is the gate's own build of the iteration's sources (its in-gate
@@ -38,6 +42,11 @@ and the metric is the engine's own print, which a one-line edit could set to
 any value -- the wall-clock term is the bound a candidate cannot print. The
 0.5 factor is loose on purpose (wall jitter ~6% at 64 tokens): it rejects a
 2x claim whose process did not get faster, it does not adjudicate +2%.
+P-D (same day, after iteration 006): the closure median from a separate
+session (65.91, with a 62.2 outlier) sat 2.2% below the gate's own build of the
+same sources (67.40), and a `# noqa` no-op reached +1.7% against it; with the
+in-gate champion as denominator the pair is the same binary on the same warm
+GPU and the no-op reads +0.6%.
 
 Receipts 001-005 were judged under the 2026-09-01 rule below. No candidate in
 them reached stage 4, so no verdict changes; the audit's hand-written
@@ -435,3 +444,40 @@ Worth-it rule: 6 iterations, 0 survivors, 0 % gain. The prescribed widening
 was deferred once for the skeleton test; the skeleton fixed the echo and did
 not produce a mechanism. Widening the region is next unless the maintainer prefers a
 different proposer.
+
+## Iteration 007 preregistration (2026-09-08 evening) — in-gate denominator, megakernel region
+
+Two variables, both forced by what 006 showed, neither a proposer change:
+
+1. **Acceptance denominator = the gate's own champion build** (P-D, rule text
+   above). `tools/loop-run.sh` runs `gguf-closure` once as the identity check
+   of the gguf; the gate builds the iteration's pristine sources, times them
+   three times, and stage 3 compares against that median.
+2. **The proposer edits the executed path.** The gguf is the split-layout
+   `Qwen3.8-27B-OBLITERATED.Q4_K_M-BARO-3242573.gguf` (files attn, elementwise,
+   matmul, matmul_prefill, matmul_skinny, mega, ssm, registry, window; harness
+   `serve/engine.mojo` from git). It decodes under `BARO_MEGA=1`, one persistent
+   megakernel, so the launch-path regions of 001-006 are not on the path the
+   gate times. `tools/loop-propose.py --mega` (auto when the gguf carries
+   `mega.mojo` + `window.mojo`) shows `kernels/mega.mojo` instead: the helper
+   section (lines 1-323) plus the phase def of the target region, delimited by
+   def boundaries (kernel files carry no markers). Region from
+   `BARO_PROFILE=5` on the split champion binary (`.work/profile-mega-20260908.log`,
+   `.work/engine-split`, last token): ssm 2377 us (31.6 %), attn 652 (8.7 %),
+   **ffn 3839 (51.1 %)**, head 636 (8.5 %), total 7516 us, tok/s_gen 130.09.
+   Region `ffn` = `ffn_phases` (lines 592-680; excerpt 17.3k chars).
+
+Held from 006: identities 01-04, `--max-tokens 12288`, Qwen3 sampler, one GPU
+job, `LOOP_PROMPT2=bench/loop-prompt2.txt`, hardened scope (split pattern),
+identity every run, wall-clock term (both references in-gate), ISA relative to
+the champion build (baseline 5 spilling families of 29 at 3242573).
+
+Predictions, frozen before the run: real-line edits stay >= 3/4 (the skeleton
+did that); the `# noqa` class cannot land (+2 % against a same-session pair,
+spread of an unchanged binary measured 0.008-0.02); a candidate that touches a
+`stamp(prof, …)` line dies at scope (`prof` is banned) -- expect 0-1 of those.
+Survivors: 0 remains the likely outcome; the first candidate with a mechanism
+inside `ffn_phases` (fewer passes over the q8/q4 rows, a fused pass, a barrier
+removed) that passes identity is the result that matters, landed or not. If
+007 produces no mechanism either, the next move is the proposer, not the
+region.
