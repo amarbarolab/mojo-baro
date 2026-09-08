@@ -12,6 +12,7 @@ re-embedded into a NEW gguf with lineage. Claude reads survivors only.
 - `tools/loop-gate.sh ITER CHAMPION_TOKPS` -- scope -> compile -> identity@64 (+ `LOOP_PROMPT2`) -> perf + wall-clock plausibility -> ISA vs champion build. Receipt per candidate.
 - `tools/loop-run.sh ITER MODEL.gguf` -- the whole choreography below as ONE GPU job: proposer server up -> propose -> server down -> champion (`gguf-closure`, 3 runs) -> gate.
 - `tools/loop-embed-winner.sh SRC.gguf ITER` -- embeds the COMMITTED repo sources into `<src>-loop-ITER.gguf`, adds `baro.kernel.parent`.
+- Embedded file list = `$(tools/embed-files.py)`: `serve/window.mojo` (the per-window body the loop edits), `serve/registry.mojo`, kernel closure. `serve/engine.mojo` (stopwatch) stays in git and is never embedded (P-A, 2026-09-08); legacy ggufs with `main()` inside `engine.mojo` still gate.
 
 ## Acceptance rule (amended 2026-09-08; iterations >= 006)
 
@@ -393,3 +394,42 @@ skeleton that names no symbol should put it at >= 3/4. Survivors: still 0 is
 the likely outcome; a candidate reaching perf on merits would be the first.
 If real-line edits do not rise, the worth-it rule's "widen the region" is the
 next move.
+
+## Iteration 006 result (2026-09-08) — skeleton in, example-echo gone, instrument attacks continue
+
+`tools/loop-run.sh` end to end, one GPU job (`.work/loop/006/run.log`): server
+`/props` read back (temp 0.6 / top_p 0.95 / top_k 20 / min_p 0 / repeat 1.05 /
+presence 1.0, n_ctx 20480), 4/4 branches finished on `stop` (2065 / 5597 / 2562
+/ 1372 completion tokens). Champion from the gguf's sources via `gguf-closure`:
+65.91 / 67.21 / 62.22 -> **median 65.91**; the same sources built by the gate
+in-session: 67.40 / 67.07 / 67.48 -> median 67.40, wall 2.064 s.
+
+| cand | identity | stage reached | verdict |
+|---|---|---|---|
+| 0 | 01-father | scope | deletes the `if pf4:` guard (iteration 004 cand-1 again) |
+| 1 | 02-grandfather | scope | `fc[5] += Int(nw - tq)` -> `fc[4]`: edits a profiling counter |
+| 2 | 03-uncle | **perf** | `# noqa` appended to an import line in matmul_skinny.mojo: a no-op; both fixtures 64/64, all runs identical; 67.01 / 66.88 / 67.40 vs 65.91 = +1.7 %, spread 0.008 |
+| 3 | 04-mother | apply | empty hunk `@@ -0,0 +0,0 @@` |
+
+Survivors 0. Predictions: example-echo 0/4 (by construction, and confirmed:
+none of the four names a symbol from the old example); **real-line edits 3/4**
+(prediction was >= 3/4). The proposer now edits the code it is shown.
+
+What it edits, when it does: **2 of 4 went for the profiling code** — that is
+4 of 12 across iterations 004-006 — and both died at scope under the hardened
+pattern. The third real edit is a comment. Nothing in six iterations has
+proposed a kernel change with a mechanism.
+
+cand-2 is the closest a candidate has come to landing and it is a no-op: the
+`gguf-closure` champion carried a 62.2 outlier (median 65.91) while the gate's
+own build of the same sources measured 67.40 in the same session. Against the
+in-gate number the no-op is +0.6 %; against the argument it was +1.7 %, 0.3 %
+short of a recorded "win". **This is R2 from the audit, live.** Recommended
+(P-D, not applied): make the gate's in-session champion median the acceptance
+denominator, so champion and candidate are the same binary pair on the same
+warm GPU, and drop the separate `gguf-closure` timing run to an identity check.
+
+Worth-it rule: 6 iterations, 0 survivors, 0 % gain. The prescribed widening
+was deferred once for the skeleton test; the skeleton fixed the echo and did
+not produce a mechanism. Widening the region is next unless the maintainer prefers a
+different proposer.

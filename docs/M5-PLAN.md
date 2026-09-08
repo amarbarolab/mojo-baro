@@ -31,6 +31,13 @@ before touching anything. Board: `~/Brain/mojo-baro/whiteboard.md`.
   happened once, and the pre-`9b8a399` file sat 78 commits stale.
   **`serve/registry.mojo` MUST be in the file list**: `engine.mojo` does
   `from registry import *`, so omitting it makes the closure fail to compile.
+  **Since 2026-09-08 the list is `$(tools/embed-files.py)`** — `serve/window.mojo`
+  (the per-window body, what the loop may edit) + `serve/registry.mojo` + the
+  kernel modules they import — and `serve/engine.mojo` (pack load, stopwatch,
+  prints) is NOT embedded: `gguf-closure.sh`/`loop-gate.sh` take it from git at
+  `baro.kernel.commit`, so a loop candidate cannot reach the clock
+  (`exchange/scorer-integrity-report.md`, P-A). Legacy ggufs (engine.mojo with
+  `main()` embedded) still build the old way.
 - Key traps already paid for: gdn v-head h pairs with k-head **h % 16**
   (ggml_repeat tiles); q/k L2-norm not RMS; state decays BEFORE the delta
   error term; yarn ext_factor=1 validated; head_dim 256, contiguous q|gate.
