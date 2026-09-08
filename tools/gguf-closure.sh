@@ -22,6 +22,17 @@ fi
 # Split layout (2026-09-08): no main() in the embedded sources; the harness is
 # serve/engine.mojo at the gguf's commit, from git, never from the gguf.
 entry="$out/engine.mojo"
+if grep -qx moe.mojo "$out/FILES"; then
+  # qwen35moe: no engine yet; the closure rebuilds the parity test from the embedded
+  # kernels and checks blk.0 of THIS gguf against the numpy oracle (tools/moe-ref.py).
+  kcommit=$(jq -r '.["baro.kernel.commit"]' "$out/meta.json")
+  git show "$kcommit:kernels/test_moe_block.mojo" > "$out/harness.mojo" || { echo "no kernels/test_moe_block.mojo at gguf commit $kcommit"; exit 1; }
+  ./.venv/bin/mojo build "$out/harness.mojo" -I "$out" -o .work/moe-closure 2>&1 | grep -E "error" -A3 && exit 1 || true
+  ./.venv/bin/python3 tools/moe-ref.py --gguf "$model" --layer 0 > "$out/oracle.log"
+  ./.work/moe-closure > "$out/run.log" 2>&1 || { echo "closure test FAILED"; tail -20 "$out/run.log"; exit 1; }
+  grep -E "PASS|FAIL|rel|exact" "$out/run.log" | tail -12
+  exit
+fi
 if grep -qx spark_kernels.mojo "$out/FILES"; then
   kcommit=$(jq -r '.["baro.kernel.commit"]' "$out/meta.json")
   git show "$kcommit:serve/spark.mojo" > "$out/harness.mojo" || { echo "no serve/spark.mojo at gguf commit $kcommit"; exit 1; }
