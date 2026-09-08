@@ -214,6 +214,10 @@ def main() raises:
                 text = f.read()
         prompt = tok.encode(text)
         print("tokenized", len(prompt), "ids in", Float64(perf_counter_ns() - t0) / 1e9, "s (mojo tokenizer,", tok.pre, ")")
+        var ps = String()
+        for i in range(len(prompt)):
+            ps += String(prompt[i]) + " "
+        print("prompt ids:", ps)
     else:
         prompt = read_prompt(getenv("BARO_PROMPT", packdir + "/prompt-tokens.txt"))
     var n_prompt = len(prompt)
