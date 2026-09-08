@@ -260,6 +260,53 @@ another attempt inside `attn_phases`.
 
 ---
 
+## M0b attempt 2 — same layout, M0a's V-loop form, KVPAD = 0
+
+**Diagnosis receipts (CPU only, taken before this text, 2026-09-08).**
+- T ~ 575 loss: the scalar V loop compiles to `global_load_b32` →
+  `s_waitcnt vmcnt(0)` → `v_fmac_f32` per position (one load in flight);
+  M0a's issues 8 loads under `s_clause` before its FMAs. Memory-latency
+  serialisation, proportional to T. Attempt 1's diagnosis stands.
+- "Instruction cliff": falsified. The "simplified address" build was
+  reproduced CPU-side (12742 instructions, their number) and `isa-loops`
+  shows its q4 *dot loops* rescheduled (VOPD 80/80/60 → 75/75/57, +26..33
+  instructions each, more `s_delay_alu`) by a one-line edit in the attention
+  V loop. The T ~ 70 losses were the known schedule lottery, fingerprintable
+  at build time; the megakernel may unroll the V loop.
+
+**Change.** `KVPAD = 0`. `attn_head_body`'s V accumulation returns to M0a's
+8-wide form (8 loads into an `InlineArray`, then 8 in-order `o += sc*v`),
+group base `vb + (tt >> KVPSH) * PGSTR + (tt & (KVPAGE-1)) * HD`, loads at
+`+ j*HD` (8 | KVPAGE, no page crossing inside a group), scalar tail. Nothing
+else in the attempt-1 tree changes.
+
+**Predictions (frozen before the build).**
+- P-C1 Build fingerprint, read BEFORE any GPU run: q4 `amar_mega_token`
+  12727 ± 40 instructions, vgpr spill 0, `isa-loops` fused dot loop
+  `dual` ≥ 105, loops 2-4 `dual` within ±2 of 80 / 80 / 60. A miss is a lost
+  lottery ticket, not a layout verdict: one re-roll by spelling only, a second
+  miss stops the step (brief: ask, file not terminal).
+- P-C2 Identity: q4 64/64, q8 64/64, mtp k=2 20/20, 20-prompt A/B 20/20
+  identical to `.work/engine-m0a`. Same FMA form and order as M0a.
+- P-C3 p0512 (T ~ 575) tok/s_gen within ±2 % of M0a's 129.0 in the same
+  stint. Falsifier: < 126.4 means the serialisation diagnosis was wrong.
+- P-C4 20-prompt median within ±2 % of M0a (P-B3 restated).
+- P-C5 `mega fail word: 0` on every run.
+- Receipt run, not a prediction: `.work/engine-diag` one-shot at T ~ 70 in
+  the same stint, expected ~127 (ties the losing fingerprint to its number).
+
+**Verification before timing (P1).** Rebuild in the same stint; `kv dtype:`,
+`TMAX:`, `spec k:`, `prompt tokens:`, `tok/s_gen`, `mega fail word` read from
+each run's output; `arm.txt` first for the A/B.
+
+**Gate.** P-C1 before GPU; then `tools/merge-gate.sh` ALL PASS; 20-prompt A/B
+vs `engine-m0a` within P-C4; P-C3 within band. Then the dtype arms under
+P-B2 as frozen, each arm fingerprinted before its run.
+
+**Result.** (filled after the gated run)
+
+---
+
 ## M0c — runtime T end to end
 
 **Change (to be preregistered in full before its build).** `TMAX` moves from a
