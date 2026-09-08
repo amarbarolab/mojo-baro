@@ -21,7 +21,18 @@ check() { # check RUNLOG -> identity against the snapshot, and the fixture must 
 # stage 4, and (c) the oracle for the optional second workload. Rule amended
 # 2026-09-08 (bench/loop-protocol.md): the acceptance denominator stays the
 # CHAMPION_TOKPS argument, measured in-session by tools/gguf-closure.sh.
-./.venv/bin/mojo build "$dir/src/engine.mojo" -I "$dir/src" -o "$dir/champion-engine" > "$dir/champion-build.log" 2>&1 || { echo "champion build failed: $(grep -m1 error: "$dir/champion-build.log")"; exit 1; }
+# Split layout (2026-09-08, P-A): the embedded sources carry window.mojo and no
+# main(); the harness -- pack load, stopwatch, prints -- is serve/engine.mojo at
+# the gguf's own commit, taken from git, never from the candidate. Legacy ggufs
+# still embed an engine.mojo with main() and build as before.
+if [ -f "$dir/src/window.mojo" ] && ! grep -q '^def main' "$dir/src/engine.mojo" 2>/dev/null; then
+  kcommit=$(python3 -c "import json;print(json.load(open('$dir/meta.json'))['baro.kernel.commit'])")
+  git show "$kcommit:serve/engine.mojo" > "$dir/harness.mojo" || { echo "no serve/engine.mojo at gguf commit $kcommit"; exit 1; }
+  entry=harness.mojo; echo "split layout: harness serve/engine.mojo@$kcommit, body window.mojo"
+else
+  entry=src/engine.mojo
+fi
+./.venv/bin/mojo build "$dir/$entry" -I "$dir/src" -o "$dir/champion-engine" > "$dir/champion-build.log" 2>&1 || { echo "champion build failed: $(grep -m1 error: "$dir/champion-build.log")"; exit 1; }
 cw=(); ct=()
 for k in 1 2 3; do
   s0=$(date +%s%N); ./"$dir/champion-engine" > "$dir/champion-run$k.log" 2>&1 || { echo "champion run $k failed"; exit 1; }; s1=$(date +%s%N)
@@ -76,7 +87,8 @@ for d in "$dir"/cand-*.diff; do
     fi
   done
   [ -n "$mode" ] || { fail apply "patch does not apply (hunks renumbered: $nfix)"; continue; }
-  ./.venv/bin/mojo build "$work/src/engine.mojo" -I "$work/src" -o "$work/engine" > "$work/build.log" 2>&1 || { fail compile "$(grep -m1 error: "$work/build.log" | cut -c1-160)"; continue; }
+  [ "$entry" = harness.mojo ] && cp "$dir/harness.mojo" "$work/harness.mojo"
+  ./.venv/bin/mojo build "$work/$entry" -I "$work/src" -o "$work/engine" > "$work/build.log" 2>&1 || { fail compile "$(grep -m1 error: "$work/build.log" | cut -c1-160)"; continue; }
   # stage 2: token identity at 64
   ./"$work/engine" > "$work/run0.log" 2>&1 || { fail run "engine exited $?"; continue; }
   check "$work/run0.log" > "$work/gate.log" 2>&1 || { fail identity "$(head -1 "$work/gate.log")"; continue; }

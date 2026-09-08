@@ -30,7 +30,7 @@ RULES = """You are optimising the inference engine embedded inside your own mode
 bandwidth-bound: single-token decode reads every weight once, so wins come from
 fewer bytes moved, fewer kernel launches, and fused math -- not from FLOPs.
 Propose exactly ONE change, one concern, as a unified diff against the files
-shown (paths relative to the source dir, e.g. `--- a/engine.mojo`). Rules:
+shown (paths relative to the source dir, e.g. `--- a/matmul_skinny.mojo`). Rules:
 - Only edit the files shown. Never touch anything else.
 - Kernel files carry zero comments and zero docstrings.
 - Output must stay bit-identical: the gate compares 64 greedy tokens.
@@ -90,7 +90,7 @@ def bindings(src_dir):
     return txt
 
 
-def slice_region(engine_src, region, src_dir):
+def slice_region(engine_src, region, src_dir, body_file="engine.mojo"):
     a, b = MARK[region]
     lines = engine_src.splitlines()
     ia = next(i for i, l in enumerate(lines) if a in l)
@@ -98,7 +98,7 @@ def slice_region(engine_src, region, src_dir):
     tbl = bindings(src_dir)
     if not tbl.strip():
         raise SystemExit("loop-propose: no kernel binding table found; refusing to prompt blind")
-    return (tbl + f"\nengine.mojo lines {ia+1}-{ib} (target region `{region}`):\n"
+    return (tbl + f"\n{body_file} lines {ia+1}-{ib} (target region `{region}`):\n"
             + "\n".join(lines[ia:ib]))
 
 
@@ -164,10 +164,14 @@ def main():
     shares = profile_shares(a.profile)
     region = a.region if a.region != "auto" else max(shares, key=lambda k: shares[k][1])
     prof_txt = "\n".join(f"  {k}: {v[0]*1000:.1f} ms  ({v[1]*100:.1f}%)" for k, v in shares.items())
+    # Split layout (2026-09-08): the per-window body lives in window.mojo and
+    # engine.mojo (the stopwatch) is no longer embedded. Legacy ggufs still
+    # carry the body inside engine.mojo.
+    body_file = "window.mojo" if (out / "src/window.mojo").exists() else "engine.mojo"
     prompt = (f"Engine source commit in this gguf: {meta['baro.kernel.commit']}\n"
               f"GPU time per decode run, by sub-block (BARO_PROFILE=1):\n{prof_txt}\n"
               f"Target region: `{region}` (largest share).\n\n"
-              + slice_region((out / "src/engine.mojo").read_text(), region, out / "src"))
+              + slice_region((out / "src" / body_file).read_text(), region, out / "src", body_file))
     # Tag-delimited, deliberately NOT diff-shaped: the old `===== f =====` banner
     # taught iter-001 cand-2 to answer in banners instead of a unified diff, and
     # the gate discarded it unparsed (receipt: parse / "no diff fence").

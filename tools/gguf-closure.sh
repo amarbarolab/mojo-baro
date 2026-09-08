@@ -16,7 +16,15 @@ if [ -f "$out/shim/CMakeLists.txt" ]; then
   cmake -S "$out/shim" -B "$out/shim-build" -DCMAKE_BUILD_TYPE=Release >/dev/null && cmake --build "$out/shim-build" -j"$(nproc)" >/dev/null \
     && echo "shim built from gguf: $(ls "$out"/shim-build/*.so)" || { echo "shim build FAILED"; exit 1; }
 fi
-./.venv/bin/mojo build "$out/engine.mojo" -I "$out" -o .work/engine-closure 2>&1 | grep -E "error" -A3 && exit 1 || true
+# Split layout (2026-09-08): no main() in the embedded sources; the harness is
+# serve/engine.mojo at the gguf's commit, from git, never from the gguf.
+entry="$out/engine.mojo"
+if [ -f "$out/window.mojo" ] && ! grep -q '^def main' "$out/engine.mojo" 2>/dev/null; then
+  kcommit=$(jq -r '.["baro.kernel.commit"]' "$out/meta.json")
+  git show "$kcommit:serve/engine.mojo" > "$out/harness.mojo" || { echo "no serve/engine.mojo at gguf commit $kcommit"; exit 1; }
+  entry="$out/harness.mojo"; echo "split layout: harness serve/engine.mojo@$kcommit"
+fi
+./.venv/bin/mojo build "$entry" -I "$out" -o .work/engine-closure 2>&1 | grep -E "error" -A3 && exit 1 || true
 ./.work/engine-closure > "$out/run.log"
 grep -E "tok/s|host_enqueue" "$out/run.log"
 tools/check-tokens.sh "$ref" "$out/run.log"

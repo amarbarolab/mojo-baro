@@ -7,7 +7,8 @@ Writes a NEW file — never touches the source GGUF. Adds string KV pairs:
 GGUF readers ignore unknown keys; tensor offsets are relative to the data
 region so only the header padding changes.
 
-Usage: tools/gguf-embed.py SRC.gguf DST.gguf kernels/*.mojo
+Usage: tools/gguf-embed.py SRC.gguf DST.gguf $(tools/embed-files.py)
+       (split layout, 2026-09-08: window.mojo + registry.mojo + kernel closure; never serve/engine.mojo)
 """
 import os
 import struct
