@@ -365,7 +365,7 @@ def rms_f32_phase[
         barrier()
 
 
-@no_inline
+@always_inline
 def delta_col[SsL: TensorLayout, KqL: TensorLayout, OmL: TensorLayout](
     mut SAll: TileTensor[f32, SsL, MutAnyOrigin],
     kq: TileTensor[f32, KqL, MutUntrackedOrigin, address_space = AddressSpace.SHARED],
