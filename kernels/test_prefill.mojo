@@ -7,6 +7,10 @@
    (amar_matmul_skinny_q4rowb MR=8 windows) on all rows (rel < 1e-4: both
    sides form exact products and accumulate in f32). ACC epilogue and the
    M-padding path (M=24) are covered.
+1b. amar_matmul_prefill_lds (the same maths on the LDS-pipelined schedule,
+   bench/pfgemm-protocol.md) bit-exact against amar_matmul_prefill_q4 / _q8:
+   both tile configs at M=1024, the M=24 padded path, the ACC epilogue and a
+   narrow n=32 (the ssm a/b projections) -- zero differing floats, q4 and q8.
 2. amar_attn_prefill (causal, online softmax, GQA 16/4) on synthetic Q/K/V:
    vs fp64 host softmax (rel < 1e-3) and vs amar_attn_decode over the same
    chunk (rel < 1e-5).
@@ -20,11 +24,12 @@ from std.memory import alloc
 from std.sys import has_accelerator
 
 from max.algorithm import parallelize
-from max.gpu.host import DeviceContext, DeviceBuffer
+from max.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
 from layout import TileTensor, TensorLayout, row_major
 
 from matmul_skinny import amar_matmul_skinny_q4rowb, amar_skinny_reduce, SM, ROW_WAVES, ROW_THREADS
 from matmul_prefill import amar_matmul_prefill_q4, amar_matmul_prefill_q8, amar_prefill_swiglu_bf16, PF_THREADS
+from matmul_prefill_lds import amar_matmul_prefill_lds, LDS_THREADS
 from attn import amar_attn_decode, amar_attn_prefill, HD, NQH, NKVH, PA_ROWS, KVT, TCAP, KVHSTR, kv_off
 from ssm import (
     amar_ssm_conv, amar_ssm_delta_step, amar_ssm_qk_l2norm, amar_ssm_gated_out_bf16,
@@ -177,12 +182,12 @@ def gather_rows(src: MutPointer[Float32, MutUntrackedOrigin], rows: MutPointer[I
 def run_q4[WTM: Int, WTN: Int, WAVES_M: Int, ACC: Bool](
     ctx: DeviceContext, A: TileTensor[bf16, type_of(a_layout), MutAnyOrigin],
     Q: TileTensor[u8, type_of(q4_layout), MutAnyOrigin], S: TileTensor[f16, type_of(s_layout), MutAnyOrigin],
-    C: TileTensor[f32, type_of(c_layout), MutAnyOrigin], m: Int,
+    C: TileTensor[f32, type_of(c_layout), MutAnyOrigin], m: Int, n: Int = N,
 ) raises:
     comptime BM = WAVES_M * WTM * 16
     comptime BN = (8 // WAVES_M) * WTN * 16
     ctx.enqueue_function[amar_matmul_prefill_q4[WTM, WTN, WAVES_M, ACC, type_of(a_layout), type_of(q4_layout), type_of(s_layout), type_of(c_layout)]](
-        A, Q, S, C, Int32(m), Int32(N), Int32(K), grid_dim=(ceildiv(N, BN), ceildiv(m, BM)), block_dim=PF_THREADS,
+        A, Q, S, C, Int32(m), Int32(n), Int32(K), grid_dim=(ceildiv(n, BN), ceildiv(m, BM)), block_dim=PF_THREADS,
     )
 
 
@@ -313,6 +318,23 @@ def test_gemm(ctx: DeviceContext) raises:
     ctx.synchronize()
     check("q8 wmma 16x256 M=24", c_h.unsafe_ptr(), want_s, MSMALL * N, 1e-3)
 
+    both_q4[4, 2, 2, 4, 4, 2, 2, False](ctx, A, Q4, S4, C, c_d, c_h, c2_h, "q4 lds 128x128 M=1024 vs wmma 128x128", MBIG, N)
+    both_q4[2, 4, 2, 2, 4, 2, 2, False](ctx, A, Q4, S4, C, c_d, c_h, c2_h, "q4 lds 64x128 M=1024 vs wmma 128x128", MBIG, N)
+    both_q4[4, 2, 2, 4, 2, 2, 1, False](ctx, A, Q4, S4, C, c_d, c_h, c2_h, "q4 lds 128x128 M=24 (padded) vs wmma 32x256", MSMALL, N)
+    both_q4[4, 2, 2, 4, 4, 2, 2, False](ctx, A, Q4, S4, C, c_d, c_h, c2_h, "q4 lds 128x128 M=1024 n=32 vs wmma", MBIG, 32)
+    both_q8[4, 2, 2, 4, 4, 2, 2, False](ctx, A, Q8, S8, C, c_d, c_h, c2_h, "q8 lds 128x128 M=1024 vs wmma 128x128", MBIG)
+    both_q8[4, 2, 2, 4, 1, 2, 1, False](ctx, A, Q8, S8, C, c_d, c_h, c2_h, "q8 lds 128x128 M=24 (padded) vs wmma 16x256", MSMALL)
+    ctx.enqueue_memset(c_d, 0)
+    run_q4[4, 2, 2, False](ctx, A, Q4, S4, C, MBIG)
+    run_q4[4, 2, 2, True](ctx, A, Q4, S4, C, MBIG)
+    ctx.enqueue_copy(dst_buf=c_h, src_buf=c_d)
+    ctx.enqueue_memset(c_d, 0)
+    run_q4[4, 2, 2, False](ctx, A, Q4, S4, C, MBIG)
+    run_lds[u8, type_of(q4_layout), 4, 2, 2, 4, True](ctx, A, Q4, S4, C, MBIG)
+    ctx.enqueue_copy(dst_buf=c2_h, src_buf=c_d)
+    ctx.synchronize()
+    check_exact("q4 lds ACC epilogue vs wmma ACC", c2_h.unsafe_ptr(), c_h.unsafe_ptr(), MBIG * N)
+
     comptime g_layout = row_major[MSMALL, N]()
     var G = view_f32(ctx, c_d, 0, MSMALL * N, g_layout)
     var U = view_f32(ctx, c2_d, 0, MSMALL * N, g_layout)
@@ -333,7 +355,7 @@ def test_gemm(ctx: DeviceContext) raises:
         sw_want[unsafe_offset=i] = Float32(g / (1 + exp(-g)) * u)
         sw_got[unsafe_offset=i] = o_h[i].cast[f32]()
     check("prefill swiglu bf16 vs host", sw_got, sw_want, MSMALL * N, 1e-2, 1e-1)
-    print("PASS: prefill GEMM (q4, q8, configs, padding, ACC) + swiglu")
+    print("PASS: prefill GEMM (q4, q8, configs, padding, ACC, lds bit-exact) + swiglu")
 
 
 comptime AT_M = 21
@@ -629,6 +651,65 @@ def test_ssm(ctx: DeviceContext) raises:
                 ow[unsafe_offset=(r * NH_V + h) * SSTATE + j] = Float32(o)
     check("ssm delta chunk vs fp64 host recurrence", oA_h.unsafe_ptr(), ow, SS_M * NH_V * SSTATE, 1e-3)
     print("PASS: ssm chunk kernels")
+
+
+def run_lds[WDT: DType, QL: TensorLayout, WM: Int, WN: Int, TM: Int, TN: Int, ACC: Bool](
+    ctx: DeviceContext, A: TileTensor[bf16, type_of(a_layout), MutAnyOrigin],
+    Q: TileTensor[WDT, QL, MutAnyOrigin], S: TileTensor[f16, type_of(s_layout), MutAnyOrigin],
+    C: TileTensor[f32, type_of(c_layout), MutAnyOrigin], m: Int, n: Int = N,
+) raises:
+    comptime BM = WM * TM * 16
+    comptime BN = WN * TN * 16
+    ctx.enqueue_function[amar_matmul_prefill_lds[WDT, WM, WN, TM, TN, ACC, type_of(a_layout), QL, type_of(s_layout), type_of(c_layout)]](
+        A, Q, S, C, Int32(m), Int32(n), Int32(K), grid_dim=(ceildiv(n, BN), ceildiv(m, BM)), block_dim=LDS_THREADS,
+    )
+
+
+def check_exact(name: String, got: MutPointer[Float32, MutUntrackedOrigin],
+                want: MutPointer[Float32, MutUntrackedOrigin], n: Int) raises:
+    var bad = 0
+    var first = -1
+    for i in range(n):
+        if got[unsafe_offset=i] != want[unsafe_offset=i]:
+            if first < 0:
+                first = i
+            bad += 1
+    if bad > 0:
+        print(name, "differing:", bad, "first at", first, "got", got[unsafe_offset=first], "want", want[unsafe_offset=first])
+        raise Error("bit-exact failure: " + name)
+    print(name, "bit-exact over", n)
+
+
+def both_q4[WM: Int, WN: Int, TM: Int, TN: Int, WTM: Int, WTN: Int, WAVES_M: Int, ACC: Bool](
+    ctx: DeviceContext, A: TileTensor[bf16, type_of(a_layout), MutAnyOrigin],
+    Q4: TileTensor[u8, type_of(q4_layout), MutAnyOrigin], S4: TileTensor[f16, type_of(s_layout), MutAnyOrigin],
+    C: TileTensor[f32, type_of(c_layout), MutAnyOrigin], c_d: DeviceBuffer[f32],
+    c_h: HostBuffer[f32], c2_h: HostBuffer[f32], name: String, m: Int, n: Int,
+) raises:
+    ctx.enqueue_memset(c_d, 0)
+    run_q4[WTM, WTN, WAVES_M, ACC](ctx, A, Q4, S4, C, m, n)
+    ctx.enqueue_copy(dst_buf=c_h, src_buf=c_d)
+    ctx.enqueue_memset(c_d, 0)
+    run_lds[u8, type_of(q4_layout), WM, WN, TM, TN, ACC](ctx, A, Q4, S4, C, m, n)
+    ctx.enqueue_copy(dst_buf=c2_h, src_buf=c_d)
+    ctx.synchronize()
+    check_exact(name, c2_h.unsafe_ptr(), c_h.unsafe_ptr(), MBIG * N)
+
+
+def both_q8[WM: Int, WN: Int, TM: Int, TN: Int, WTM: Int, WTN: Int, WAVES_M: Int, ACC: Bool](
+    ctx: DeviceContext, A: TileTensor[bf16, type_of(a_layout), MutAnyOrigin],
+    Q8: TileTensor[i8, type_of(q8_layout), MutAnyOrigin], S8: TileTensor[f16, type_of(s_layout), MutAnyOrigin],
+    C: TileTensor[f32, type_of(c_layout), MutAnyOrigin], c_d: DeviceBuffer[f32],
+    c_h: HostBuffer[f32], c2_h: HostBuffer[f32], name: String, m: Int,
+) raises:
+    ctx.enqueue_memset(c_d, 0)
+    run_q8[WTM, WTN, WAVES_M, ACC](ctx, A, Q8, S8, C, m)
+    ctx.enqueue_copy(dst_buf=c_h, src_buf=c_d)
+    ctx.enqueue_memset(c_d, 0)
+    run_lds[i8, type_of(q8_layout), WM, WN, TM, TN, ACC](ctx, A, Q8, S8, C, m)
+    ctx.enqueue_copy(dst_buf=c2_h, src_buf=c_d)
+    ctx.synchronize()
+    check_exact(name, c2_h.unsafe_ptr(), c_h.unsafe_ptr(), MBIG * N)
 
 
 def main() raises:
