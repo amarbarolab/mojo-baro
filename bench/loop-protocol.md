@@ -21,7 +21,7 @@ greedy tokens identical on every run, and on the second fixture when
 `LOOP_PROMPT2` is set; median of 3 `tok/s_gen` read back from the engine's own
 output >= champion + 2% with spread < 5%, **where champion = the median
 `tok/s_gen` of the gate's own build of the iteration's pristine sources, timed
-in the same gate run** (P-D, 2026-09-08 evening; the `gguf-closure` run stays as
+in the same gate run** (P-D, 2026-09-08, after iteration 006; the `gguf-closure` run stays as
 the identity check of the gguf and its tok/s is recorded, never compared);
 **the claimed decode saving shows in
 the gate's own wall clock**: median(champion `wall_s`) - median(candidate
@@ -445,7 +445,7 @@ was deferred once for the skeleton test; the skeleton fixed the echo and did
 not produce a mechanism. Widening the region is next unless the maintainer prefers a
 different proposer.
 
-## Iteration 007 preregistration (2026-09-08 evening) — in-gate denominator, megakernel region
+## Iteration 007 preregistration (2026-09-08, after 006) — in-gate denominator, megakernel region
 
 Two variables, both forced by what 006 showed, neither a proposer change:
 
