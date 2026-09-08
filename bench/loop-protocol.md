@@ -481,3 +481,29 @@ inside `ffn_phases` (fewer passes over the q8/q4 rows, a fused pass, a barrier
 removed) that passes identity is the result that matters, landed or not. If
 007 produces no mechanism either, the next move is the proposer, not the
 region.
+
+## Iteration 007 result (2026-09-08) — the megakernel is beyond the proposer
+
+`tools/loop-run.sh` end to end (`.work/loop/007/run.log`, gate `f875a8e`),
+`/props` read back as in 006, prompt 18.0k chars (`ffn_phases` + helpers),
+4/4 branches finished on `stop` (7472 / 3826 / 5028 / 1696 completion
+tokens). **0/4 produced a diff fence.** All four spent the answer tracing
+the device code in prose (parameter counts of `row_dot_a`, the `g` loop
+bounds, `G_F = FFN // ROW_WAVES`) and stopped; cand-1 wrote a hunk in the
+open (`gen = Ctr.ptr.unsafe_offset(1)` -> `(2)`, a counter-slot change that
+would have broken the grid barrier) without a fence; cand-3 declared the
+code clean and predicted 0. Every candidate failed at parse.
+
+Champion in-gate: 123.4 / 130.3 / 124.2 tok/s_gen, median 124.17, wall
+1.785 s; closure of the same gguf 130.26. Spread of the unchanged binary
+5.5 % across three runs directly after the proposer server released the GPU
+-- the in-gate denominator (P-D) is the right pair, but three runs are not
+enough right after a 17 GB model unload; a candidate would have to beat a
+possibly-cold champion. Add a warm-up run before the timed three next time.
+
+Predictions: real-line edits >= 3/4 -- **falsified** (0/4 diffs at all);
+`# noqa` class cannot land -- untested (nothing reached perf); 0-1 `stamp`
+touches -- 0. Seven iterations, 0 survivors, no mechanism proposed. The
+worth-it rule's answer is now unambiguous: the region is not the limit, the
+proposer is. Next move is a stronger proposer (or a code-tuned one) on the
+same gate, not an eighth region.
