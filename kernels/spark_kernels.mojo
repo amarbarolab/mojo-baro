@@ -304,7 +304,9 @@ def amar_argmax_final[
     Pv: TileTensor[f32, VLayout, MutAnyOrigin],
     Pi: TileTensor[DType.int32, ILayout, MutAnyOrigin],
     Out: TileTensor[DType.int32, OLayout, MutAnyOrigin],
+    Pred: TileTensor[DType.int32, OLayout, MutAnyOrigin],
     wpos: Int32,
+    forced: Int32,
 ):
     comptime assert Pv.flat_rank == 1 and Pi.flat_rank == 1 and Out.flat_rank == 1
     if thread_idx.x != 0:
@@ -317,4 +319,5 @@ def amar_argmax_final[
         if v > bv or (v == bv and ix < bi):
             bv = v
             bi = ix
-    Out[Int(wpos)] = rebind[Out.ElementType](bi)
+    Pred[Int(wpos)] = rebind[Pred.ElementType](bi)
+    Out[Int(wpos)] = rebind[Out.ElementType](forced if forced >= 0 else bi)

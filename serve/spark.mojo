@@ -254,6 +254,12 @@ def main() raises:
     var X = TileTensor(x_d, x_l)
     var Xb = TileTensor(xb_d, xb_l)
     var Toks = TileTensor(toks_d, toks_l)
+    var pred_d = ctx.enqueue_create_buffer[DType.int32](TMAX)
+    var Pred = TileTensor(pred_d, toks_l)
+    var force = List[Int]()
+    var force_path = getenv("BARO_FORCE", "")
+    if force_path != "":
+        force = read_prompt(force_path)
     var Qkv1 = TileTensor(qkv_d, qkv1_l)
     var X1 = TileTensor(x_d, h1_l)
     var Dummy = TileTensor(dummy_d, dummy_l)
@@ -311,7 +317,9 @@ def main() raises:
             ctx.enqueue_function[k_rms](X, OutNorm, Xb, Int32(H), Float32(1e-6), grid_dim=1, block_dim=256)
             ctx.enqueue_function[k_head](Xb, Woq, Wos, Logits1, Dummy, Int32(VOCAB), Int32(H), grid_dim=ceildiv(VOCAB, ROW_WAVES), block_dim=ROW_THREADS)
             ctx.enqueue_function[k_argmax](Logits1, Amv, Ami, Int32(VOCAB), grid_dim=AM_NB, block_dim=256)
-            ctx.enqueue_function[k_argmax_final](Amv, Ami, Toks, Int32(pos + 1), grid_dim=1, block_dim=32)
+            var fi = pos + 1 - n_prompt
+            var forced = Int32(force[fi]) if fi < len(force) else Int32(-1)
+            ctx.enqueue_function[k_argmax_final](Amv, Ami, Toks, Pred, Int32(pos + 1), forced, grid_dim=1, block_dim=32)
     ctx.synchronize()
     var dt = Float64(perf_counter_ns() - t_gen_start) / 1e9
     ctx.enqueue_copy(dst_buf=toks_h, src_buf=toks_d)
@@ -320,4 +328,15 @@ def main() raises:
     for i in range(n_prompt, n_total):
         s += String(Int(toks_h[i])) + " "
     print("generated:", s)
+    if len(force) > 0:
+        ctx.enqueue_copy(dst_buf=toks_h, src_buf=pred_d)
+        ctx.synchronize()
+        var ps = String("")
+        var agree = 0
+        for i in range(n_prompt, n_total):
+            ps += String(Int(toks_h[i])) + " "
+            if i - n_prompt < len(force) and Int(toks_h[i]) == force[i - n_prompt]:
+                agree += 1
+        print("predicted:", ps)
+        print("forced agreement:", agree, "/", min(gen_n, len(force)))
     print("tok/s_gen:", Float64(gen_n) / dt, "(", gen_n, "steps,", dt, "s )")
