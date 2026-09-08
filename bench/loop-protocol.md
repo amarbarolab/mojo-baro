@@ -21,8 +21,10 @@ greedy tokens identical on every run, and on the second fixture when
 `LOOP_PROMPT2` is set; median of 3 `tok/s_gen` read back from the engine's own
 output >= champion + 2% with spread < 5%; **the claimed decode saving shows in
 the gate's own wall clock**: median(champion `wall_s`) - median(candidate
-`wall_s`) >= 0.5 x (63/champion - 63/median `tok/s_gen`), both walls measured
-by the same gate run around the whole process; **no kernel family with more
+`wall_s`) >= 0.5 x (63/champion - 63/median `tok/s_gen`), where this
+`champion` is the gate's own build of the iteration's sources (its in-gate
+`tok/s_gen` median), both walls measured by the same gate run around the whole
+process; **no kernel family with more
 scratch or more spills than the champion build of the same sources, none new
 with any** (`tools/isa-spills.py`). The candidate's own `PREDICT` line is its
 preregistration and is recorded in the receipt. Server (port 8083) must be

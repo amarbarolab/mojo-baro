@@ -126,8 +126,13 @@ for d in "$dir"/cand-*.diff; do
   # Plausibility (rule 2026-09-08): the claimed decode saving must show in the
   # gate's own clock. Champion and candidate wall_s come from the same gate run.
   wmed=$(printf '%s\n' "${w[@]}" | sort -n | sed -n 2p)
-  plaus=$(awk -v cw="$cwall" -v ww="$wmed" -v c="$champ" -v m="$med" 'BEGIN{print ((cw-ww) >= 0.5*(63/c-63/m)) ? 1 : 0}')
-  [ "$plaus" = 1 ] || { fail perf "tok/s_gen $med claims $(awk -v c="$champ" -v m="$med" 'BEGIN{printf "%.3f", 63/c-63/m}') s of decode saved, wall clock moved $(awk -v cw="$cwall" -v ww="$wmed" 'BEGIN{printf "%.3f", cw-ww}') s (champion wall $cwall, candidate $wmed)"; continue; }
+  # Both sides of the plausibility term come from THIS gate run: the champion
+  # binary's own tok/s_gen median against its own wall. Using the CHAMPION_TOKPS
+  # argument here (another session's median) against the in-gate wall mixed two
+  # references -- the split-layout dry run with a nonsense argument of 60 rejected
+  # a benign +0.15% candidate for "0.567 s of decode saved".
+  plaus=$(awk -v cw="$cwall" -v ww="$wmed" -v c="$ctok" -v m="$med" 'BEGIN{print ((cw-ww) >= 0.5*(63/c-63/m)) ? 1 : 0}')
+  [ "$plaus" = 1 ] || { fail perf "tok/s_gen $med claims $(awk -v c="$ctok" -v m="$med" 'BEGIN{printf "%.3f", 63/c-63/m}') s of decode saved vs the in-gate champion $ctok, wall clock moved $(awk -v cw="$cwall" -v ww="$wmed" 'BEGIN{printf "%.3f", cw-ww}') s (champion wall $cwall, candidate $wmed)"; continue; }
   # stage 4: ISA -- no kernel family with more scratch or more spills than the
   # champion build of the same sources, none new with any (rule 2026-09-08; the
   # absolute form rejected the champion itself: delta-step variants spill).
