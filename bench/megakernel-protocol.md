@@ -272,3 +272,38 @@ of once plus its `CurB` slice; that is < 1 us per phase.
    VGPR/spill census recorded as a receipt, not a fitness function. If the
    real-pack median is < +1 % the round is a no-op and is reverted with the
    numbers in the log.
+
+**Result (2026-09-08, same day): no-op by rule 3, reverted; fold parked on
+branch `lane-fold` @ `239c065`.** Prediction 1 held: mega-gate 13/13 PASS,
+identity 20/20 on the A/B, q4 vs ref 64/64. Prediction 2 failed: 20-prompt
+q4 no-spec, interleaved per prompt in one stint (`bench/ab-prompts.sh` with
+`AB_ENGINE_B`, sclk med 3012 MHz, 290 W / -100 mV):
+
+| arm | median tok/s_gen | spread |
+|---|---|---|
+| `.work/engine-split` (champion `37bca40`) | 130.65 | 8.2% |
+| fold | 127.29 | 0.7% |
+
+ratio 0.974. `BARO_PROFILE=5`, last token, median of 5 alternating runs
+(us): split ssm 2375 / attn 639 / ffn 3839 / head 636 / total 7509; fold
+ssm 2797 / attn 601 / ffn 3671 / head 633 / total 7705. The fold did what
+it was built for: rmsc slots ssm 97 -> 70, ffn 124 -> 86, attn 39 -> 24,
+and the ffn GEMM/down/post slots 2312/1327/62 -> 2282/1265/43 (about
+-250 us per token in the phases it touches). The delta phase (stamps 4>5,
+code untouched) went **464 -> 1036 us**: the token kernel's scratch went
+352 -> 740 B (spills 355 -> 423), the q4 variant's `scratch_load` count 75
+-> 286. Third sighting of the delta allocation lottery (392 -> 219 -> 471
+-> 525 -> 464 -> 1036 across builds with the same delta code).
+
+Pin attempt in the same stint: the register-column delta body as a
+`@no_inline` device function (`delta_col`). The call is real
+(`s_swappc_b64`, `scratch_load` back to 62) and the delta phase returned to
+665 us, but the ffn GEMM/down slots went 2310/1331 -> 2492/1588 (+440 us),
+total 8035 us. Both variants lose to the champion; stopped after two.
+
+Reading: the fold is worth ~+3 % once the delta phase's register allocation
+is pinned by something that does not perturb the GEMM loops. Next action:
+check whether `mega_token` carries `rocdl.flat_work_group_size` /
+`waves_per_eu` (the board rule: LLVM caps VGPRs at 192 without it), pin the
+delta phase there, re-measure the champion alone, then re-apply the fold
+from `lane-fold`.
