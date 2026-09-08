@@ -28,6 +28,7 @@ comptime N_ATT_T = 1
 comptime SLOTS = 4
 comptime TM = 64
 comptime POS = 9
+comptime ATT_SPLIT = 0
 comptime ITERS = 100
 comptime u8 = DType.uint8
 comptime u32 = DType.uint32
@@ -474,7 +475,7 @@ def run_case[MRT: Int, Q4: Bool](ctx: DeviceContext, mut wbuf: DeviceBuffer[u8],
                 wbuf.unsafe_ptr(), Off, XM_, CurB, ResB, Qkvm, Zm, Araw, Braw, Eg, Beta, Conv, So, CsM, SsM,
                 Qfm, Kflat, Vflat, Q, Gate, Ao, kcM.unsafe_ptr(), vcM.unsafe_ptr(), Pg1, Pu1, FgB, Ctr, prof_d.unsafe_ptr(), dbg_d.unsafe_ptr(),
                 ToksM, DtokM, HnM, hmax_d.unsafe_ptr(), hidx_d.unsafe_ptr(),
-                Int32(ring), Int32(SLOTS), Int32(POS), Int32(M), Int32(0), Int32(1),
+                Int32(ring), Int32(SLOTS), Int32(POS), Int32(M), Int32(0), Int32(1), Int32(ATT_SPLIT),
                 grid_dim=MEGA_G, block_dim=ROW_THREADS,
             )
         else:
@@ -482,7 +483,7 @@ def run_case[MRT: Int, Q4: Bool](ctx: DeviceContext, mut wbuf: DeviceBuffer[u8],
                 wbuf.unsafe_ptr(), Off, XM_, CurB, ResB, Qkvm, Zm, Araw, Braw, Eg, Beta, Conv, So, CsM, SsM,
                 Qfm, Kflat, Vflat, Q, Gate, Ao, kcM.unsafe_ptr(), vcM.unsafe_ptr(), Pg1, Pu1, FgB, Ctr, prof_d.unsafe_ptr(), dbg_d.unsafe_ptr(),
                 ToksM, DtokM, HnM, hmax_d.unsafe_ptr(), hidx_d.unsafe_ptr(),
-                Int32(ring), Int32(SLOTS), Int32(POS), Int32(M), Int32(0), Int32(2),
+                Int32(ring), Int32(SLOTS), Int32(POS), Int32(M), Int32(0), Int32(2), Int32(ATT_SPLIT),
                 grid_dim=MEGA_G_WIN, block_dim=ROW_THREADS,
             )
 
@@ -492,7 +493,7 @@ def run_case[MRT: Int, Q4: Bool](ctx: DeviceContext, mut wbuf: DeviceBuffer[u8],
             wbuf.unsafe_ptr(), Off, XM_, CurB, ResB, Qkvm, Zm, Araw, Braw, Eg, Beta, Conv, So, CsM, SsM,
             Qfm, Kflat, Vflat, Q, Gate, Ao, kcM.unsafe_ptr(), vcM.unsafe_ptr(), Pg1, Pu1, FgB, Ctr, prof_d.unsafe_ptr(), dbg_d.unsafe_ptr(),
             ToksM, DtokM, HnM, hmax_d.unsafe_ptr(), hidx_d.unsafe_ptr(),
-            Int32(ring), Int32(SLOTS), Int32(POS), Int32(M), Int32(0), Int32(1 if MRT == 1 else 2),
+            Int32(ring), Int32(SLOTS), Int32(POS), Int32(M), Int32(0), Int32(1 if MRT == 1 else 2), Int32(ATT_SPLIT),
             grid_dim=grid, block_dim=ROW_THREADS,
         )
 

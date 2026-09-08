@@ -259,6 +259,10 @@ def main() raises:
     var tpages = ceildiv(tmax, KVPAGE)
     var kvpool = tpages * N_ATT * NKVH * KVHSTR
     var kvpool1 = tpages * NKVH * KVHSTR
+    var att_split = atol(getenv("BARO_ATT_SPLIT_T", String(TMAX)))
+    if getenv("BARO_ATT_SPLIT", "0") == "1":
+        att_split = 0
+    print("att split:", att_split)
     var pf_chunk = min(atol(getenv("BARO_PREFILL_C", String(CP))), CP)
     if pf_chunk < PF_MIN:
         pf_chunk = PF_MIN
@@ -477,7 +481,7 @@ def main() raises:
         # stage sum exceeds the unsynchronized sub-block time; compare stages
         # within an arm and the same stage across m, never add these into a budget.
         var pf4 = getenv("BARO_PROFILE", "0") == "4"
-        var cfg = WindowCfg(pack_q4=pack_q4, draft_q4=draft_q4, q4_off=q4_off, e=e, kcfg=kcfg, spec=spec, spec_dbg=spec_dbg, serve=serve, req_id=req_id, prof=prof, pf2=pf2, pf3=pf3, pf4=pf4, dump=dump, mega=mega, mega_win=mega_win, dot3=dot3, pf_chunk=pf_chunk, pf_rows=pf_rows, pf_tail=pf_tail, n_total=n_total, n_prompt=len(prompt))
+        var cfg = WindowCfg(pack_q4=pack_q4, draft_q4=draft_q4, q4_off=q4_off, e=e, kcfg=kcfg, spec=spec, spec_dbg=spec_dbg, serve=serve, req_id=req_id, prof=prof, pf2=pf2, pf3=pf3, pf4=pf4, dump=dump, mega=mega, att_split=att_split, mega_win=mega_win, dot3=dot3, pf_chunk=pf_chunk, pf_rows=pf_rows, pf_tail=pf_tail, n_total=n_total, n_prompt=len(prompt))
         wst.reset(t0)
         var prefill_done = False
         # The stopwatch stays here, in the harness that is never embedded in a

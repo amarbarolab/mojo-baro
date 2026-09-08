@@ -49,30 +49,19 @@ def amar_head_rmsnorm[
 
 
 @always_inline
-def attn_head_body[
-    QLayout: TensorLayout, KLayout: TensorLayout, OLayout: TensorLayout,
+def attn_head_span[
+    QLayout: TensorLayout, KLayout: TensorLayout,
     QsL: TensorLayout, ScL: TensorLayout, RdL: TensorLayout, NAT: Int
 ](
     Q: TileTensor[f32, QLayout, MutAnyOrigin],
     Kc: TileTensor[KVT, KLayout, MutAnyOrigin],
     Vc: TileTensor[KVT, KLayout, MutAnyOrigin],
-    mut O: TileTensor[f32, OLayout, MutAnyOrigin],
     mut qs: TileTensor[f32, QsL, MutUntrackedOrigin, address_space = AddressSpace.SHARED],
     mut scores: TileTensor[f32, ScL, MutUntrackedOrigin, address_space = AddressSpace.SHARED],
     mut red: TileTensor[f32, RdL, MutUntrackedOrigin, address_space = AddressSpace.SHARED],
-    qrow: Int, kvh: Int, T: Int, tid: Int, lane: Int, scale: Float32, att_i: Int,
-):
-    # One decode head (q row qrow against kv head kvh over T positions), shared
-    # by amar_attn_decode and the megakernel's attention phase so both paths
-    # compute the same bits (bench/attn-latency-protocol.md). Online softmax
-    # over chunks of HD positions: `scores` holds one chunk, never T, so the
-    # kernel has no compile-time context bound. The KV pool is
-    # [page][layer][kv head][KVPAGE][HD] -- every stride is comptime and the
-    # page count is not a stride, which is what lets capacity be a runtime
-    # allocation. The chunk is HD positions = HD // KVPAGE whole pages, so the
-    # page base is hoisted out of both inner loops. Threads >= HD (a 512-thread
-    # megakernel block) only take part in the barriers.
-    comptime assert Q.flat_rank == 2 and Kc.flat_rank == 1 and Vc.flat_rank == 1 and O.flat_rank == 2
+    qrow: Int, kvh: Int, t_lo: Int, t_hi: Int, tid: Int, lane: Int, scale: Float32, att_i: Int,
+) -> SIMD[f32, 4]:
+    comptime assert Q.flat_rank == 2 and Kc.flat_rank == 1 and Vc.flat_rank == 1
     comptime assert qs.flat_rank == 1 and scores.flat_rank == 1 and red.flat_rank == 1
     var wave = tid // WARP_SIZE
     if tid < HD:
@@ -84,17 +73,15 @@ def attn_head_body[
     var m_run = Float32(-3.4e38)
     var l_run = Float32(0)
     var o = Float32(0)
-    var t0 = 0
-    while t0 < T:
+    var t0 = t_lo
+    while t0 < t_hi:
         barrier()
         var s = Float32(-3.4e38)
         if tid < HD:
             var t = t0 + tid
-            if t < T:
+            if t < t_hi:
                 var kb = kv_off[NAT](t, att_i, kvh)
                 var Kr = TileTensor(kp.unsafe_offset(kb), row_major[HD]()).vectorize[8]()
-                # 8-wide loads of K and q, scalar accumulation in the same order
-                # as the element loop (bench/attn-latency-protocol.md A1)
                 var acc: Float32 = 0
                 for d8 in range(HD // 8):
                     var k8 = rebind[SIMD[KVT, 8]](Kr[d8]).cast[f32]()
@@ -129,7 +116,7 @@ def attn_head_body[
         m_run = m_new
         o = o * alpha
         if tid < HD:
-            var n = T - t0
+            var n = t_hi - t0
             if n > HD:
                 n = HD
             comptime PGSTR = NAT * NKVH * KVHSTR
@@ -150,9 +137,30 @@ def attn_head_body[
                 o += rebind[Scalar[f32]](scores[tt]) * vp[unsafe_offset=pb].cast[f32]()
                 tt += 1
         t0 += HD
+    return SIMD[f32, 4](m_run, l_run, o, 0)
+
+
+@always_inline
+def attn_head_body[
+    QLayout: TensorLayout, KLayout: TensorLayout, OLayout: TensorLayout,
+    QsL: TensorLayout, ScL: TensorLayout, RdL: TensorLayout, NAT: Int
+](
+    Q: TileTensor[f32, QLayout, MutAnyOrigin],
+    Kc: TileTensor[KVT, KLayout, MutAnyOrigin],
+    Vc: TileTensor[KVT, KLayout, MutAnyOrigin],
+    mut O: TileTensor[f32, OLayout, MutAnyOrigin],
+    mut qs: TileTensor[f32, QsL, MutUntrackedOrigin, address_space = AddressSpace.SHARED],
+    mut scores: TileTensor[f32, ScL, MutUntrackedOrigin, address_space = AddressSpace.SHARED],
+    mut red: TileTensor[f32, RdL, MutUntrackedOrigin, address_space = AddressSpace.SHARED],
+    qrow: Int, kvh: Int, T: Int, tid: Int, lane: Int, scale: Float32, att_i: Int,
+):
+    comptime assert O.flat_rank == 2
+    var res = attn_head_span[NAT=NAT](Q, Kc, Vc, qs, scores, red, qrow, kvh, 0, T, tid, lane, scale, att_i)
     if tid < HD:
-        var inv = 1 / l_run
-        O[qrow, tid] = rebind[O.ElementType](o * inv)
+        var inv = 1 / res[1]
+        O[qrow, tid] = rebind[O.ElementType](res[2] * inv)
+
+
 
 
 def amar_attn_decode[

@@ -540,4 +540,61 @@ the same stint; `arm.txt` first for the A/B.
 PASS; P-E4 within band; P-E3 recorded against its predictions (32768 >= 70
 is the hard floor, the three numbers are the claim).
 
-**Result.** (filled after the gated run)
+**Result.** PASS on the gate, recorded 2026-09-08 (`.work/m0d/stint.txt`,
+exclusive GPU; ref = `.work/engine-m0c` (a86516b), new = `.work/engine-m0d`).
+
+P-E1 fingerprint, two builds: (1) head body inlined in both branches, 13511
+instructions; (2) re-spelled to one `attn_head_span` call shared by both
+paths, **12977** instructions, vgpr 249, spill 0, `isa-loops` dual
+122 / 84 / 84 / 61. The count band (12746 ± 60) is missed by construction:
+the partial write and the merge are +231 new instructions that no spelling
+removes. The loop class, which is what the band was guarding, is faster in
+every column (115/80/80/60 before). Recorded as a deviation and the GPU
+stint was run; the question stands in `.work/briefs/status-chat.md`.
+
+| receipt | M0c | M0d | source |
+|---|---|---|---|
+| test_mega_block (split forced, `ATT_SPLIT = 0`) | PASS | PASS, bit-identical to the launch path, m=1 q4/q8 and m=3 q8 | `.work/m0d/test_mega_block.log` |
+| test_attn_block | PASS | PASS | `.work/m0d/test_attn_block.log` |
+| one-shot q4 / q8 default (split off at T <= 1088) | 64/64 | **bit-exact** vs M0c, 137.6 / 81.3 | `.work/m0d/one-*-new.log` |
+| one-shot q4 / q8 forced split | - | 64/64 vs model-ref tokens, 136.8 / 80.9 | `.work/m0d/one-*-split.log` |
+| 20-prompt A/B default | 133.24 | 133.22, ratio 1.000, identity 20/20 | `.work/m0d/ab/results.txt` |
+| 20-prompt A/B forced split vs unsplit (same binary) | 136.22 | 136.13, ratio 0.999, identity 20/20 | `.work/m0d/ab-split/results.txt` |
+| merge-gate | ALL PASS | ALL PASS | `.work/merge-gate.txt` 11:55 |
+
+Long context, `BARO_TMAX=102400`, default threshold 1088 (split on):
+
+| T | tok/s_gen M0c | M0d | predicted | GENERATED vs M0c | prefill_s | mega fail |
+|---|---|---|---|---|---|---|
+| 8192 | 89.4 | **117.5** | >= 115 | identical | 8.30 (8.33) | 0 |
+| 32768 | 45.7 | **85.0** | >= 90, floor 70 | identical | 50.24 (50.46) | 0 |
+| 100000 | 19.2 | **48.7** | ~55 | differs from token 11 | 298.6 (298.3) | 0 |
+
+Verdict against the frozen predictions:
+- P-E1: count band missed (explained above), loop class held.
+- P-E2 held on every frozen receipt: default path bit-exact; forced split
+  64/64 on both packs and 20/20; 8192 and 32768 byte-identical to M0c.
+  At 100000 (not in the prediction) the two summation orders diverge at
+  token 11 of 64. Both continuations loop on the docs text (the prompt has
+  no question); a low-margin distribution is where a merge-order
+  difference flips an argmax. No 100k reference decode exists to
+  arbitrate; recorded as an observation. Whether the model itself is sound
+  at 100k is M5's RULER question (llama.cpp niah_single is 100 % at 32k,
+  nothing measured beyond).
+- P-E3: 8192 held (117.5 >= 115); 32768 above the floor, below the
+  prediction (85.0 vs >= 90); 100000 below (48.7 vs ~55). The attention
+  cost per token went 3.7 -> 1.0 ms at 8k, 14.4 -> 4.3 ms at 32k, 44.6 ->
+  13.0 ms at 100k: a 3.3-3.7x cut against the 6x a perfect split over
+  6 spans would give. The remainder is the extra grid barrier plus the
+  merge (~0.3 ms) and the per-block chunk loop itself, which is still one
+  position per thread with four barriers per 256 positions. The next
+  lever is inside the block (both halves of the 512-thread block in
+  flight, or two chunks per iteration), not more spans.
+- P-E4 held: ratio 1.000.
+- P-E5 held: fail word 0 everywhere, prefill_s unchanged.
+
+Observation, not promoted: the M0d schedule's one-shot at T ~ 70 reads
+136-137.6 on both the default and forced paths (M0c 133.7), and the
+same-binary A/B medians read 136.1-136.2 while the cross-binary A/B read
+133.2. The 20-prompt A/B against M0c is the P4 number (1.000); the 136s
+are the lottery being kind on this build and are not claimed.
