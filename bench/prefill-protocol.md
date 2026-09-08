@@ -256,3 +256,59 @@ other way. The identity gate for a non-bit-exact path is therefore the
 model-ref agreement (as for the q8 and q4 rounds): 2/2 checked, plus
 first-token identity 20/20 and the 64-token identity on the four protocol
 prompts.
+
+### R5. Int8 MMQ prefill GEMM on an LDS-pipelined schedule, bf16 on the same schedule (frozen 2026-09-08, before any build or timed run)
+
+Lane int8 (`~/Brain/mojo-baro/briefs/2026-09-08-lane-int8.md`). Two new
+kernels in `kernels/matmul_mmq.mojo`, one schedule: 8 waves 4x2, wave tile
+2x4 (128x128 block) and 2x2 over 2x4 waves (64x128), BLK_K 32 = one q4
+block per K-step, two LDS buffers, register-staged global prefetch one
+K-step ahead, XOR-swizzled LDS rows, one barrier per K-step -- the
+`kernels/matmul_wmma_pipe.mojo` structure (wmma-fp16-protocol R3).
+
+- **mmq** (`amar_quant_q8` + `amar_matmul_mmq_q4q8`): activations
+  quantised once per input to int8 per 32-block (`d8 = amax/127`,
+  round-to-nearest), stored with `d8` (f32) and `nu = -8 * sum(q)` (i32)
+  in accumulator order; the GEMM stages int8 activation rows and the q4
+  nibbles unpacked to unsigned int8 in LDS, two
+  `v_wmma_i32_16x16x16_iu8` per 16x16 tile per block with `nu` as the
+  first C-input, epilogue `acc += f32(t) * (d8 * d4)`.
+- **bf16-lds** (`amar_matmul_prefill_q4_lds`): the R4 kernel's maths
+  (nibble -> bf16 by `f32x16_to_bf16_trunc`, `acc = fma(t, d4, acc)`) on
+  the same schedule; dequant done by the loader into LDS.
+
+Bench: `bench/bench_prefill.mojo`, same shape / NBUF=8 / ITERS=16 / median
+of 5 as R2-R4; correctness before timing: bf16-lds vs row loop rel < 1e-4
+(floored metric), mmq vs bf16-lds relative Frobenius < 1e-2 and
+max|a-b|/rms(b) < 5e-2. Parity (`kernels/test_mmq.mojo`): quantiser
+bit-exact vs host; mmq vs fp64 host dot over the same q8 codes < 1e-3
+floored (predicted < 1e-4); bf16-lds vs `amar_matmul_prefill_q4` < 1e-4.
+
+Predicted, us per GEMM (first build; R4 bf16 column is the measured bar):
+
+| n | bf16 R4 | bf16-lds | mmq | mmq vs R4 | mmq TOPS |
+|---|---|---|---|---|---|
+| 16 | 435-470 | 440 (R2 cfg) | 400 | 1.1x | 4.0 |
+| 64 | 512 | 380 | 320 | 1.6x | 16 |
+| 128 | 645 | 390 | 300 | 2.15x | 43 |
+| 256 | 1629 | 600 | 470 | 3.5x | 55 |
+| 512 | 2451 | 1100 | 850 | 2.9x | 61 |
+| 1024 | 4183 | 2100 | 1600 | 2.6x | 64 |
+
+Issue model behind the table, per K-step per wave, wave tile 2x4: bf16-lds
+16 WMMA x 32 clk + ~214 VALU = ~726 clk; mmq 16 x 16 + ~312 VALU = ~570
+clk, so mmq / bf16-lds = 1.27x on the same schedule; the schedule itself is
+predicted to recover most of R4's 2.9x stall residual (R4's ISA receipt:
+378 VALU + 512 WMMA clk per K-block against 4183 us measured = 2.9x over
+issue). Gate: mmq <= 1226 us at n=512 and <= 2092 us at n=1024.
+Falsifiers: bf16-lds / R4 < 1.3x at n=1024 = the schedule did not transfer
+(check bank conflicts / VGPR / blocks per WGP before touching the dtype);
+mmq / bf16-lds < 1.1x = the f32 epilogue is the bound; > 1.6x = the bf16
+side of the issue model is undercounted. Quantiser cost reported beside
+the GEMM (predicted < 15 us at n=1024), not added: one quantise serves
+every GEMM on that layer input.
+
+Sub-rounds, each preregistered below before its build: R5a two-deep
+prefetch (PGR2; +11% on the dense kernel), R5b BLK_K 64 (two q4 blocks per
+barrier), R5c small-n shapes. Stop after two consecutive sub-rounds with
+no gain (driver ruling, status file).
