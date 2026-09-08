@@ -9,6 +9,7 @@ from layout import TileTensor, TensorLayout, row_major
 from attn import KVT, HD, NQH, NKVH, KVPAGE, KVHSTR, amar_kv_append
 from elementwise import amar_rmsnorm_cast, amar_argmax_pos
 from matmul_skinny import amar_matmul_skinny_q8row, amar_skinny_reduce, amar_skinny_reduce_add, ROW_WAVES, ROW_THREADS
+from tokenizer import Tokenizer
 from spark_kernels import (
     amar_embed_lookup_f32, amar_rope_plain, amar_attn_decode_swa,
     amar_head_gate_mul_cast, amar_skinny_reduce_gelu_par_bf16,
@@ -194,7 +195,21 @@ def main() raises:
     var ctx = DeviceContext()
     var packdir = getenv("BARO_PACK", ".work/spark/pack-q8")
     var gen_n = atol(getenv("BARO_GEN", "64"))
-    var prompt = read_prompt(getenv("BARO_PROMPT", packdir + "/prompt-tokens.txt"))
+    var prompt: List[Int]
+    var text_path = getenv("BARO_PROMPT_TEXT", "")
+    if text_path != "":
+        var gguf = getenv("BARO_GGUF", "")
+        if gguf == "":
+            raise Error("BARO_PROMPT_TEXT needs BARO_GGUF (tokenizer source)")
+        var text: String
+        with open(text_path, "r") as f:
+            text = f.read()
+        var t0 = perf_counter_ns()
+        var tok = Tokenizer(gguf)
+        prompt = tok.encode(text)
+        print("tokenized", len(prompt), "ids in", Float64(perf_counter_ns() - t0) / 1e9, "s (mojo tokenizer,", tok.pre, ")")
+    else:
+        prompt = read_prompt(getenv("BARO_PROMPT", packdir + "/prompt-tokens.txt"))
     var n_prompt = len(prompt)
     var n_total = n_prompt + gen_n
     if n_total > TMAX:
