@@ -10,7 +10,11 @@
 # Usage: bench/ruler/run-baseline.sh ARM SIZE [SIZE ...]
 #   ARM  = bf16 | k8v4
 #   SIZE = 4096 | 8192 | 16384 | 32768 | 65536 | 131072
-# N = 25 at 4096-32768, N = 10 at 65536/131072 (brief's own scope gate).
+# N = 25 at 4096-32768, N = 10 at 65536/131072 (brief's own scope gate);
+# LIMIT=N overrides (arm B ran at N=10, amendment 2026-09-08).
+# Parallel slots: -np NP (4 through 32k, 2 at 64k, 1 at 128k) with -c scaled
+# per slot and run.py --workers NP; -ub 2048. Accuracy gate is unaffected;
+# wall_ms per prompt is no longer comparable with the -np 1 runs.
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 
@@ -36,17 +40,19 @@ cleanup() {
 trap cleanup EXIT
 
 for size in "$@"; do
-  limit=25
+  limit=25; np=4
   case $size in
-    65536|131072) limit=10 ;;
+    65536) limit=10; np=2 ;;
+    131072) limit=10; np=1 ;;
   esac
-  ctx=$((size + MAX_TOKENS + 256))
+  limit=${LIMIT:-$limit}
+  ctx=$(( (size + MAX_TOKENS + 256) * np ))
   dst="$OUT/$ARM/$size"
   mkdir -p "$dst"
 
   $HOME/.local/bin/gpu-wait run --priority 50 --vram 8 --preemptible -- \
     "$HOME/llama.cpp/build/bin/llama-server" -m "$MODEL" -c "$ctx" -ngl 99 -fa on \
-    -b 2048 -ub 512 -t 8 -np 1 "${ctk_flags[@]}" --host 127.0.0.1 --port "$PORT" \
+    -b 4096 -ub 2048 -t 8 -np "$np" "${ctk_flags[@]}" --host 127.0.0.1 --port "$PORT" \
     > "$dst/server.log" 2>&1 &
   srv_wrapper=$!
 
@@ -64,11 +70,12 @@ for size in "$@"; do
   # wrapper process, whose own argv also contains this substring
   srv_pid=$(pgrep -f "^$HOME/llama.cpp/build/bin/llama-server -m $MODEL -c $ctx " | head -1)
 
-  echo "=== arm=$ARM size=$size limit=$limit ctx=$ctx pid=$srv_pid ===" | tee -a "$dst/run.log"
+  echo "=== arm=$ARM size=$size limit=$limit ctx=$ctx np=$np ub=2048 pid=$srv_pid ===" | tee -a "$dst/run.log"
+  python3 -c 'import json,sys; d=json.load(open(sys.argv[1]))["default_generation_settings"]; print("props: n_ctx=%s" % d["n_ctx"])' "$dst/props.json" | tee -a "$dst/run.log"
   t0=$(date +%s)
   ./.venv/bin/python3 bench/ruler/run.py --base-url "http://127.0.0.1:$PORT/v1" --model qwythos \
     --prompts bench/ruler/prompts --out "$dst/responses" --sizes "$size" --max-tokens "$MAX_TOKENS" \
-    --limit "$limit" | tee -a "$dst/run.log"
+    --limit "$limit" --workers "$np" | tee -a "$dst/run.log"
   rc=${PIPESTATUS[0]}
   t1=$(date +%s)
   echo "wall_s=$((t1 - t0)) rc=$rc" | tee -a "$dst/run.log"

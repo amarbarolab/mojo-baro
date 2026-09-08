@@ -3,13 +3,14 @@
 over bench/ruler/gen.py's prompt sets and save every raw response.
 
 Both llama-server and our future baro-serve speak this surface
-(serve/PROTOCOL.md "HTTP surface"). Concurrency 1, temperature 0, resumable
+(serve/PROTOCOL.md "HTTP surface"). Concurrency --workers (default 1; match
+the server's -np), temperature 0, resumable
 (skips ids whose metrics record already exists -- rerun after a crash/kill
 picks up where it left off).
 
 Usage: bench/ruler/run.py --base-url http://127.0.0.1:PORT/v1 --model NAME
        [--prompts DIR] [--out DIR] [--tasks t1,t2] [--sizes 4096,...]
-       [--max-tokens N] [--stream]
+       [--max-tokens N] [--stream] [--workers K]
 
 Writes OUTDIR/<task>_<size>/<id>.raw.json (full API response),
 OUTDIR/<task>_<size>/<id>.response.txt (completion text used by score.py),
@@ -20,6 +21,7 @@ import argparse
 import json
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import requests
@@ -86,6 +88,7 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=None)
     ap.add_argument("--limit", type=int, default=None, help="only the first N examples per (task,size) file")
     ap.add_argument("--stream", action="store_true")
+    ap.add_argument("--workers", type=int, default=1, help="concurrent requests (= server -np)")
     a = ap.parse_args()
 
     prompts_dir, out_dir = Path(a.prompts), Path(a.out)
@@ -106,24 +109,30 @@ def main():
                     if line.strip():
                         done.add(json.loads(line)["id"])
             max_tokens = a.max_tokens or (TOKENS_TO_GENERATE.get(task, 128) + 32)
-            with open(src) as f, open(metrics_path, "a") as mf:
+            rows = []
+            with open(src) as f:
                 for i, line in enumerate(f):
                     if a.limit is not None and i >= a.limit:
                         break
                     row = json.loads(line)
-                    if row["id"] in done:
-                        continue
-                    text, raw, prompt_tokens, wall_ms, ttft_ms = run_one(
-                        a.base_url, a.model, row["prompt"], max_tokens, a.stream)
-                    (dst / f"{row['id']}.response.txt").write_text(text)
-                    (dst / f"{row['id']}.raw.json").write_text(json.dumps(raw, ensure_ascii=False))
-                    rec = {"id": row["id"], "prompt_tokens": prompt_tokens,
-                           "wall_ms": round(wall_ms, 1),
-                           "ttft_ms": round(ttft_ms, 1) if ttft_ms is not None else None}
+                    if row["id"] not in done:
+                        rows.append(row)
+
+            def work(row):
+                text, raw, prompt_tokens, wall_ms, ttft_ms = run_one(
+                    a.base_url, a.model, row["prompt"], max_tokens, a.stream)
+                (dst / f"{row['id']}.response.txt").write_text(text)
+                (dst / f"{row['id']}.raw.json").write_text(json.dumps(raw, ensure_ascii=False))
+                return {"id": row["id"], "prompt_tokens": prompt_tokens,
+                        "wall_ms": round(wall_ms, 1),
+                        "ttft_ms": round(ttft_ms, 1) if ttft_ms is not None else None}
+
+            # metrics written from the main thread only, in completion order
+            with open(metrics_path, "a") as mf, ThreadPoolExecutor(a.workers) as ex:
+                for rec in ex.map(work, rows):
                     mf.write(json.dumps(rec) + "\n")
                     mf.flush()
-                    print(f"{row['id']}: prompt_tokens={prompt_tokens} wall_ms={rec['wall_ms']}")
-
+                    print(f"{rec['id']}: prompt_tokens={rec['prompt_tokens']} wall_ms={rec['wall_ms']}")
 
 if __name__ == "__main__":
     main()

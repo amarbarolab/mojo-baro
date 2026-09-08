@@ -216,3 +216,14 @@ bench/ruler/score.py .work/ruler-<format>/ --json .work/ruler-<format>/table.jso
 
 A format ships only if its `effective_length` in `table.json` matches
 bf16's for every task, not just the aggregate.
+
+### Amendment 2026-09-08 12:5x (before arm B / 64k / 128k ran)
+
+Arm A bf16 4k-32k ran as frozen (`-np 1 -ub 512`, N=25). Everything after
+runs with parallel slots to cut wall time (the maintainer, "do 1-3"): `-np 4 -b 4096
+-ub 2048` with `-c` scaled per slot (`-np 2` at 64k, 1 at 128k) and
+`run.py --workers NP`; arm B at **N=10** (`LIMIT=10`) at every size. The gate
+is accuracy at temperature 0, which none of these flags change; per-prompt
+`wall_ms` from these runs is NOT comparable with the arm-A 4k-32k rows and is
+not used. Receipt per run: `/props` `n_ctx` echoed into `run.log` next to
+the `np=` line.
