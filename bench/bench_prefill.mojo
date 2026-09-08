@@ -1,9 +1,13 @@
 """Prefill GEMM arms on the ffn shape (N=12288, K=4096, Q4_0 from the q4
 pack), bench/prefill-protocol.md kernel table: bf16-WMMA prefill kernel vs
 the decode-path wave-per-row kernel looped in 8-row windows (its register
-ceiling), n = 16 .. 1024 activation rows. NBUF weight copies rotate so the
-weight stream is cold (8 x 28 MB > 96 MB Infinity Cache). Correctness gate
-(WMMA vs row loop, rel < 1e-4) before any timing is printed.
+ceiling), n = 16 .. 1024 activation rows, plus (R5) the LDS-pipelined
+schedule instantiated for bf16 (bf16-lds) and for int8 activations (mmq,
+with the q8 quantiser timed separately as `quant`). NBUF weight copies
+rotate so the weight stream is cold (8 x 28 MB > 96 MB Infinity Cache).
+Correctness gates before any timing is printed: WMMA vs row loop rel <
+1e-4, bf16-lds vs row loop rel < 1e-4, mmq vs bf16-lds relative Frobenius
+< 1e-2 and max|a-b|/rms(b) < 5e-2.
 """
 from std.math import ceildiv
 from std.sys import has_accelerator
@@ -14,6 +18,7 @@ from layout import TileTensor, TensorLayout, row_major
 
 from matmul_skinny import amar_matmul_skinny_q4rowb, amar_skinny_reduce, SM, ROW_WAVES, ROW_THREADS
 from matmul_prefill import amar_matmul_prefill_q4, PF_THREADS
+from matmul_mmq import amar_quant_q8, amar_matmul_lds_q4, MMQ_THREADS, QT_THREADS
 
 comptime K = 4096
 comptime N = 12288
@@ -30,11 +35,14 @@ comptime c8_layout = row_major[SM, N]()
 comptime q4_layout = row_major[N, K // 2]()
 comptime s_layout = row_major[N, K // 32]()
 comptime p_layout = row_major[1, SM, N]()
+comptime d_layout = row_major[K // 32, MMAX]()
 
 comptime bf16 = DType.bfloat16
 comptime f16 = DType.float16
 comptime f32 = DType.float32
 comptime u8 = DType.uint8
+comptime i8 = DType.int8
+comptime i32 = DType.int32
 
 
 def load_into(
@@ -136,6 +144,89 @@ def wmma_dispatch(cfg: Int, ctx: DeviceContext, A: TileTensor[bf16, type_of(a_la
         wmma_launch[4, 2, 2](ctx, A, Q, S, C, m)
 
 
+def lds_launch[ADT: DType, WM: Int, WN: Int, TM: Int, TN: Int](
+    ctx: DeviceContext, A: TileTensor[ADT, type_of(a_layout), MutAnyOrigin],
+    Ad: TileTensor[f32, type_of(d_layout), MutAnyOrigin], An: TileTensor[i32, type_of(d_layout), MutAnyOrigin],
+    Q: TileTensor[u8, type_of(q4_layout), MutAnyOrigin], S: TileTensor[f16, type_of(s_layout), MutAnyOrigin],
+    C: TileTensor[f32, type_of(c_layout), MutAnyOrigin], m: Int,
+) raises:
+    comptime BM = WM * TM * 16
+    comptime BN = WN * TN * 16
+    ctx.enqueue_function[amar_matmul_lds_q4[ADT, WM, WN, TM, TN, False, type_of(a_layout), type_of(d_layout), type_of(d_layout), type_of(q4_layout), type_of(s_layout), type_of(c_layout)]](
+        A, Ad, An, Q, S, C, Int32(m), Int32(N), Int32(K), grid_dim=(ceildiv(N, BN), ceildiv(m, BM)), block_dim=MMQ_THREADS,
+    )
+
+
+def lds_dispatch[ADT: DType](cfg: Int, ctx: DeviceContext, A: TileTensor[ADT, type_of(a_layout), MutAnyOrigin],
+                 Ad: TileTensor[f32, type_of(d_layout), MutAnyOrigin], An: TileTensor[i32, type_of(d_layout), MutAnyOrigin],
+                 Q: TileTensor[u8, type_of(q4_layout), MutAnyOrigin], S: TileTensor[f16, type_of(s_layout), MutAnyOrigin],
+                 C: TileTensor[f32, type_of(c_layout), MutAnyOrigin], m: Int) raises:
+    if cfg == 0:
+        lds_launch[ADT, 2, 4, 2, 2](ctx, A, Ad, An, Q, S, C, m)
+    else:
+        lds_launch[ADT, 4, 2, 2, 4](ctx, A, Ad, An, Q, S, C, m)
+
+
+def lds_cfg_name(cfg: Int) -> String:
+    if cfg == 0:
+        return "WM2xWN4 TM2xTN2 tile64x128 BLK_K32 lds2buf"
+    return "WM4xWN2 TM2xTN4 tile128x128 BLK_K32 lds2buf"
+
+
+def lds_grid(cfg: Int, m: Int) -> String:
+    var bm = 64 if cfg == 0 else 128
+    return "grid=(" + String(ceildiv(N, 128)) + "," + String(ceildiv(m, bm)) + ") block=" + String(MMQ_THREADS)
+
+
+def lds_cfg_for(m: Int) -> Int:
+    return 0 if m <= 64 else 1
+
+
+def quant_launch(ctx: DeviceContext, A: TileTensor[bf16, type_of(a_layout), MutAnyOrigin],
+                 Aq: TileTensor[i8, type_of(a_layout), MutAnyOrigin], Ad: TileTensor[f32, type_of(d_layout), MutAnyOrigin],
+                 An: TileTensor[i32, type_of(d_layout), MutAnyOrigin], m: Int, mpad: Int) raises:
+    ctx.enqueue_function[amar_quant_q8[type_of(a_layout), type_of(a_layout), type_of(d_layout), type_of(d_layout)]](
+        A, Aq, Ad, An, Int32(m), Int32(K), Int32(mpad), grid_dim=ceildiv(mpad * (K // 32), QT_THREADS), block_dim=QT_THREADS,
+    )
+
+
+def frob_gate(name: String, got: HostBuffer[f32], want: HostBuffer[f32], n: Int) raises:
+    var se = Float64(0)
+    var sw = Float64(0)
+    var worst = Float64(0)
+    for i in range(n):
+        var b = Float64(want[i])
+        var e = abs(Float64(got[i]) - b)
+        se += e * e
+        sw += b * b
+        worst = max(worst, e)
+    var rms = (sw / Float64(n)) ** 0.5
+    var rf = (se / sw) ** 0.5
+    print(name, "rel_frobenius", rf, "max_abs/rms", worst / rms)
+    if rf > 1e-2 or worst / rms > 5e-2:
+        raise Error("mmq vs bf16-lds mismatch: " + name)
+
+
+def floored_gate(name: String, got: HostBuffer[f32], want: HostBuffer[f32], n: Int, gate: Float64) raises:
+    var worst = Float64(0)
+    for i in range(n):
+        var e = abs(Float64(got[i]) - Float64(want[i])) / (abs(Float64(want[i])) + 1e-2)
+        if e > worst:
+            worst = e
+    if worst > gate:
+        raise Error(name + " mismatch: " + String(worst))
+
+
+def timed(ctx: DeviceContext, m: Int, arm: String, cfg: String, launch: String, meds: List[Float64]) raises:
+    var med = median5(meds)
+    var mn = meds[0]
+    var mx = meds[0]
+    for i in range(len(meds)):
+        mn = min(mn, meds[i])
+        mx = max(mx, meds[i])
+    print(m, arm, cfg, launch, med, mn, mx, Float64(2 * m) * Float64(N) * Float64(K) / med / 1e6)
+
+
 def cfg_for(m: Int) -> Int:
     if m <= 16:
         return 0
@@ -175,6 +266,7 @@ def main() raises:
     var a_h = ctx.enqueue_create_host_buffer[bf16](MMAX * K)
     var c_h = ctx.enqueue_create_host_buffer[f32](MMAX * N)
     var c2_h = ctx.enqueue_create_host_buffer[f32](MMAX * N)
+    var c3_h = ctx.enqueue_create_host_buffer[f32](MMAX * N)
     ctx.synchronize()
     load_into(".work/engine-pack-q4/pack.bin", q_h.unsafe_ptr(), Q4BYTES, pack_offset("blk.0.ffn_gate.weight"))
     var st = UInt64(99)
@@ -185,6 +277,10 @@ def main() raises:
     var c_d = ctx.enqueue_create_buffer[f32](MMAX * N)
     var c2_d = ctx.enqueue_create_buffer[f32](MMAX * N)
     var p_d = ctx.enqueue_create_buffer[f32](SM * N)
+    var c3_d = ctx.enqueue_create_buffer[f32](MMAX * N)
+    var aq_d = ctx.enqueue_create_buffer[i8](MMAX * K)
+    var ad_d = ctx.enqueue_create_buffer[f32](MMAX * (K // 32))
+    var an_d = ctx.enqueue_create_buffer[i32](MMAX * (K // 32))
     for b in range(NBUF):
         var dst = DeviceBuffer[u8](ctx, q_d.unsafe_ptr().unsafe_offset(b * Q4BYTES), Q4BYTES, owning=False)
         ctx.enqueue_copy(dst_buf=dst, src_buf=q_h)
@@ -193,6 +289,10 @@ def main() raises:
     var A = TileTensor(a_d, a_layout)
     var C = TileTensor(c_d, c_layout)
     var P = TileTensor(p_d, p_layout)
+    var C3 = TileTensor(c3_d, c_layout)
+    var Aq = TileTensor(aq_d, a_layout)
+    var Ad = TileTensor(ad_d, d_layout)
+    var An = TileTensor(an_d, d_layout)
     print("shape N", N, "K", K, "q4 bytes/copy", Q4BYTES, "NBUF", NBUF, "ITERS", ITERS, "REPEATS", REPEATS)
     print("n arm config launch us_per_gemm(median) min max tflops")
     var ns: List[Int] = [16, 32, 64, 128, 256, 512, 1024]
@@ -212,6 +312,16 @@ def main() raises:
                 worst = e
         if worst > 1e-4:
             raise Error("wmma vs rowloop mismatch at n=" + String(m) + ": " + String(worst))
+        var lcfg = lds_cfg_for(m)
+        var mpad = ceildiv(m, 128) * 128
+        quant_launch(ctx, A, Aq, Ad, An, m, mpad)
+        lds_dispatch[bf16](lcfg, ctx, A, Ad, An, q0[0], q0[1], C, m)
+        lds_dispatch[i8](lcfg, ctx, Aq, Ad, An, q0[0], q0[1], C3, m)
+        ctx.enqueue_copy(dst_buf=c_h, src_buf=c_d)
+        ctx.enqueue_copy(dst_buf=c3_h, src_buf=c3_d)
+        ctx.synchronize()
+        floored_gate("bf16-lds vs rowloop at n=" + String(m), c_h, c2_h, m * N, 1e-4)
+        frob_gate("mmq vs bf16-lds at n=" + String(m), c3_h, c_h, m * N)
         for c in range(4):
             var meds = List[Float64]()
             for _ in range(REPEATS):
@@ -245,4 +355,35 @@ def main() raises:
             mn2 = min(mn2, meds2[i])
             mx2 = max(mx2, meds2[i])
         print(m, "rowloop", "q4rowb MR8 x" + String(ceildiv(m, SM)) + " passes", "grid=" + String(ceildiv(N, ROW_WAVES)) + " block=" + String(ROW_THREADS), med2, mn2, mx2, Float64(2 * m) * Float64(N) * Float64(K) / med2 / 1e6)
+        for c in range(2):
+            var meds3 = List[Float64]()
+            for _ in range(REPEATS):
+                ctx.synchronize()
+                var t0 = perf_counter_ns()
+                for it in range(ITERS):
+                    var qb = q_tensors(ctx, q_d, it % NBUF)
+                    lds_dispatch[bf16](c, ctx, A, Ad, An, qb[0], qb[1], C, m)
+                ctx.synchronize()
+                meds3.append(Float64(perf_counter_ns() - t0) / 1e3 / ITERS)
+            timed(ctx, m, "bf16-lds", lds_cfg_name(c), lds_grid(c, m), meds3)
+        for c in range(2):
+            var meds4 = List[Float64]()
+            for _ in range(REPEATS):
+                ctx.synchronize()
+                var t0 = perf_counter_ns()
+                for it in range(ITERS):
+                    var qb = q_tensors(ctx, q_d, it % NBUF)
+                    lds_dispatch[i8](c, ctx, Aq, Ad, An, qb[0], qb[1], C3, m)
+                ctx.synchronize()
+                meds4.append(Float64(perf_counter_ns() - t0) / 1e3 / ITERS)
+            timed(ctx, m, "mmq", lds_cfg_name(c), lds_grid(c, m), meds4)
+        var meds5 = List[Float64]()
+        for _ in range(REPEATS):
+            ctx.synchronize()
+            var t0 = perf_counter_ns()
+            for it in range(ITERS):
+                quant_launch(ctx, A, Aq, Ad, An, m, mpad)
+            ctx.synchronize()
+            meds5.append(Float64(perf_counter_ns() - t0) / 1e3 / ITERS)
+        timed(ctx, m, "quant", "q8 per-32-block mpad=" + String(mpad), "grid=" + String(ceildiv(mpad * (K // 32), QT_THREADS)) + " block=" + String(QT_THREADS), meds5)
     print("correct: true")
