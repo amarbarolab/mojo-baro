@@ -28,7 +28,10 @@ def w_str(out, s):
 def src_key(k):
     """Kernel/engine sources are keyed by basename (engine imports them flat);
     anything else keeps its repo-relative path so the closure can rebuild it."""
-    rel = k.resolve().relative_to(Path(__file__).resolve().parent.parent).as_posix()
+    root = Path(__file__).resolve().parent.parent
+    if not k.resolve().is_relative_to(root):
+        return f"{k.resolve().parent.name}/{k.name}"  # external package: <pkg>/<file>
+    rel = k.resolve().relative_to(root).as_posix()
     return k.name if rel.startswith(("kernels/", "serve/")) else rel
 
 
@@ -49,6 +52,11 @@ def main():
     new_kv = [("baro.kernel.arch", "gfx1100"),
               ("baro.kernel.commit", commit),
               ("baro.kernel.files", ",".join(src_key(k) for k in kfiles))]
+    for pkg in sorted({k.resolve().parent for k in kfiles if not k.resolve().is_relative_to(Path(__file__).resolve().parent.parent)}):
+        c = subprocess.run(["git", "-C", str(pkg), "rev-parse", "--short", "HEAD"], capture_output=True, text=True).stdout.strip()
+        dirty = subprocess.run(["git", "-C", str(pkg), "status", "--short"], capture_output=True, text=True).stdout.strip()
+        assert not dirty, f"{pkg} dirty"
+        new_kv.append((f"baro.kernel.ext.{pkg.name}.commit", c))
     if os.environ.get("BARO_KERNEL_PARENT"):
         new_kv.append(("baro.kernel.parent", os.environ["BARO_KERNEL_PARENT"]))
     for k in kfiles:

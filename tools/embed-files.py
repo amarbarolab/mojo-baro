@@ -6,29 +6,43 @@ embedded -- tools/gguf-closure.sh and tools/loop-gate.sh take it from git at the
 gguf's own commit (exchange/scorer-integrity-report.md, P-A, 2026-09-08).
 
     tools/gguf-embed.py SRC.gguf DST.gguf $(tools/embed-files.py)
+    tools/embed-files.py --arch spark   # serve/spark.mojo closure (spark.mojo itself is the
+                                        # harness, taken from git); external packages
+                                        # (uregex, minja) come in whole, as absolute paths
 """
 import re, sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+EXT = {"uregex": Path.home() / "Projects/mojo-uregex/src/uregex",
+       "minja": Path.home() / "Projects/mojo-minja/src/minja"}
+ARCH = {"qwythos": (["serve/window.mojo", "serve/registry.mojo"], "serve/engine.mojo"),
+        "spark": (["serve/spark.mojo"], "serve/spark.mojo")}
 
 
 def closure(roots):
-    seen, todo = [], list(roots)
+    seen, ext, todo = [], [], list(roots)
     while todo:
         f = todo.pop(0)
         if f in seen:
             continue
         seen.append(f)
-        for m in re.finditer(r"^from (\w+) import|^import (\w+)", (ROOT / f).read_text(), re.M):
+        text = (ROOT / f).read_text() if isinstance(f, str) else f.read_text()
+        for m in re.finditer(r"^from (\w+)[.\w]* import|^import (\w+)", text, re.M):
             mod = m.group(1) or m.group(2)
             for cand in (f"kernels/{mod}.mojo", f"serve/{mod}.mojo"):
                 if (ROOT / cand).exists() and cand not in seen:
                     todo.append(cand)
-    return sorted(seen)
+            if mod in EXT:
+                for p in sorted(EXT[mod].glob("*.mojo")):
+                    if p not in seen and p not in todo:
+                        todo.append(p)
+    return sorted(x for x in seen if isinstance(x, str)) + sorted(str(x) for x in seen if not isinstance(x, str))
 
 
 if __name__ == "__main__":
-    files = closure(["serve/window.mojo", "serve/registry.mojo"])
+    arch = sys.argv[sys.argv.index("--arch") + 1] if "--arch" in sys.argv else "qwythos"
+    roots, harness = ARCH[arch]
+    files = [f for f in closure(roots) if f != harness]
     assert "serve/engine.mojo" not in files
     print("\n".join(files) if "-1" in sys.argv else " ".join(files))
