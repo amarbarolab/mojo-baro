@@ -134,7 +134,11 @@ scaling target (`Mythos-5-1M` in the name).
 Common flags: `-ngl 99 -fa on -b 2048 -ub 512 -t 8 -np 1 --host 127.0.0.1`
 (from `tools/llama-mtp-prompts.sh`, minus MTP; `-np 1` pins one KV slot so
 `-c` isn't silently divided — read back from `/props`
-`default_generation_settings.n_ctx`). `-c <size>+512` per size. Every
+`default_generation_settings.n_ctx`). `-c <size>+max_tokens+256` per size
+(not RULER's own small per-task budget -- see "Reasoning-model finding"
+above; a first version of this script used `+512` and got HTTP 400s from
+llama.cpp once prompt+max_tokens exceeded the context, fixed same session).
+Every
 launch through `gpu-wait run --priority 50 --vram 20`; server killed
 between sizes; `/props` saved next to each run's outputs as the P1 receipt.
 
