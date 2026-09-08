@@ -3,7 +3,7 @@ from std.gpu.primitives import warp
 from std.math import cos, exp, log, sin, tanh
 from max.gpu.memory import AddressSpace
 from layout import TileTensor, TensorLayout, row_major, stack_allocation
-from attn import KVT, HD, NQH, NKVH, attn_head_span
+from attn import KVT, HD, NQH, NKVH, attn_head_span, kv_off
 from matmul_skinny import dtype, SPLITK, ROW_WAVES
 
 comptime f32 = DType.float32
@@ -181,3 +181,71 @@ def amar_gemv_q8[
             var g = rebind[Scalar[f32]](C[row])
             var gelu = 0.5 * g * (1 + tanh(0.7978845608028654 * g * (1 + 0.044715 * g * g)))
             Ob[row] = rebind[Ob.ElementType]((gelu * total).cast[DType.bfloat16]())
+
+
+def amar_rope_kv_append[
+    NROT_: Int, NAT: Int, CLayout: TensorLayout, NLayout: TensorLayout
+](
+    Kc: TileTensor[KVT, CLayout, MutAnyOrigin],
+    Vc: TileTensor[KVT, CLayout, MutAnyOrigin],
+    K: TileTensor[f32, NLayout, MutAnyOrigin],
+    V: TileTensor[f32, NLayout, MutAnyOrigin],
+    pos: Int32,
+    freq_base: Float32,
+    att_i: Int32,
+):
+    comptime assert Kc.flat_rank == 1 and K.flat_rank == 2
+    var h = block_idx.x
+    var which = Int(block_idx.y)
+    var d = Int(thread_idx.x)
+    var cb = kv_off[NAT](Int(pos), Int(att_i), Int(h)) + d
+    if which == 1:
+        Vc.ptr[unsafe_offset=cb] = rebind[Scalar[KVT]](rebind[Scalar[f32]](V[h, d]).cast[KVT]())
+        return
+    var val = rebind[Scalar[f32]](K[h, d])
+    if d < NROT_:
+        var half = NROT_ // 2
+        var j = d if d < half else d - half
+        var theta = Float32(Int(pos)) * exp(
+            Float32(-2 * j) / Float32(NROT_) * log(freq_base)
+        )
+        var c = cos(theta)
+        var s = sin(theta)
+        var x0 = rebind[Scalar[f32]](K[h, j])
+        var x1 = rebind[Scalar[f32]](K[h, j + half])
+        val = x0 * c - x1 * s if d < half else x0 * s + x1 * c
+    Kc.ptr[unsafe_offset=cb] = rebind[Scalar[KVT]](val.cast[KVT]())
+
+
+def amar_attn_decode_swa_gated[
+    QLayout: TensorLayout, KLayout: TensorLayout, GLayout: TensorLayout, OLayout: TensorLayout, NAT: Int
+](
+    Q: TileTensor[f32, QLayout, MutAnyOrigin],
+    Kc: TileTensor[KVT, KLayout, MutAnyOrigin],
+    Vc: TileTensor[KVT, KLayout, MutAnyOrigin],
+    Gate: TileTensor[f32, GLayout, MutAnyOrigin],
+    O: TileTensor[DType.bfloat16, OLayout, MutAnyOrigin],
+    t_len: Int32,
+    win: Int32,
+    scale: Float32,
+    att_i: Int32,
+):
+    comptime assert Q.flat_rank == 2 and Kc.flat_rank == 1 and Gate.flat_rank == 1 and O.flat_rank == 2
+    var h = Int(block_idx.x)
+    var r = Int(block_idx.y)
+    var tid = Int(thread_idx.x)
+    var kvh = h // (NQH // NKVH)
+    var T = Int(t_len) + r
+    var t_lo = 0
+    if Int(win) > 0 and T > Int(win):
+        t_lo = T - Int(win)
+    var qrow = r * NQH + h
+    var qs = stack_allocation[f32, address_space = AddressSpace.SHARED](row_major[HD]())
+    var scores = stack_allocation[f32, address_space = AddressSpace.SHARED](row_major[HD]())
+    var red = stack_allocation[f32, address_space = AddressSpace.SHARED](row_major[HD // WARP_SIZE]())
+    var res = attn_head_span[NAT=NAT](Q, Kc, Vc, qs, scores, red, qrow, kvh, t_lo, T, tid, Int(lane_id()), scale, Int(att_i))
+    if tid < HD:
+        var inv = 1 / res[1]
+        var g = rebind[Scalar[f32]](Gate[h])
+        var o = res[2] * inv
+        O[qrow, tid] = rebind[O.ElementType]((o * (1 / (1 + exp(-g)))).cast[DType.bfloat16]())
