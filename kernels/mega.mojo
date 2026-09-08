@@ -13,7 +13,7 @@ from layout import TileTensor, TensorLayout, row_major, stack_allocation
 from elementwise import EW_THREADS
 from matmul_skinny import ROW_WAVES, ROW_THREADS, q4_dot_blocks, bf16x16_to_f32
 from ssm import CONV, KDIM, NH_K, NH_V, SSTATE, SSM_EPS
-from attn import HD, NQH, NKVH, MAX_T, NROT, YARN_LOW, YARN_HIGH, FREQ_BASE, FREQ_SCALE, MSCALE, attn_head_body
+from attn import HD, NQH, NKVH, NROT, YARN_LOW, YARN_HIGH, FREQ_BASE, FREQ_SCALE, MSCALE, attn_head_body
 
 comptime u32 = DType.uint32
 comptime f32 = DType.float32
@@ -805,7 +805,7 @@ def attn_phases[
         row_major[HD]()
     )
     var scores = stack_allocation[f32, address_space = AddressSpace.SHARED](
-        row_major[MAX_T]()
+        row_major[HD]()
     )
 
     comptime if LDSA:

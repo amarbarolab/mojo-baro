@@ -9,7 +9,6 @@ comptime f32 = DType.float32
 comptime HD = 256
 comptime NQH = 16
 comptime NKVH = 4
-comptime MAX_T = 1088
 
 
 def amar_head_rmsnorm[
@@ -54,83 +53,83 @@ def attn_head_body[
 ):
     # One decode head (q row qrow against kv head kvh over T positions), shared
     # by amar_attn_decode and the megakernel's attention phase so both paths
-    # compute the same bits (bench/attn-latency-protocol.md). Threads >= HD
-    # (a 512-thread megakernel block) only take part in the barriers.
+    # compute the same bits (bench/attn-latency-protocol.md). Online softmax
+    # over chunks of HD positions: `scores` holds one chunk, never T, so the
+    # kernel has no compile-time context bound. Threads >= HD (a 512-thread
+    # megakernel block) only take part in the barriers.
     comptime assert Q.flat_rank == 2 and Kc.flat_rank == 3 and Vc.flat_rank == 3 and O.flat_rank == 2
     comptime assert qs.flat_rank == 1 and scores.flat_rank == 1 and red.flat_rank == 1
     var wave = tid // WARP_SIZE
     if tid < HD:
         qs[tid] = rebind[qs.ElementType](Q[qrow, tid])
     barrier()
-    var local_max = Float32(-3.4e38)
     var Kv = Kc.vectorize[1, 1, 8]()
     var qv = qs.vectorize[8]()
-    if tid < HD:
-        var t = tid
-        while t < T:
-            # 8-wide loads of K and q, scalar accumulation in the same order
-            # as the element loop (bench/attn-latency-protocol.md A1)
-            var acc: Float32 = 0
-            for d8 in range(HD // 8):
-                var k8 = rebind[SIMD[f32, 8]](Kv[kvh, t, d8])
-                var q8 = rebind[SIMD[f32, 8]](qv[d8])
-                comptime for j in range(8):
-                    acc += q8[j] * k8[j]
-            scores[t] = rebind[scores.ElementType](acc * scale)
-            t += HD
-    barrier()
-    if tid < HD:
-        var t = tid
-        while t < T:
-            var sc = rebind[Scalar[f32]](scores[t])
-            if sc > local_max:
-                local_max = sc
-            t += HD
-        var wmax = warp.max(local_max)
-        if lane == 0:
-            red[wave] = rebind[red.ElementType](wmax)
-    barrier()
-    var row_max = Float32(-3.4e38)
-    if tid < HD:
+    var m_run = Float32(-3.4e38)
+    var l_run = Float32(0)
+    var o = Float32(0)
+    var t0 = 0
+    while t0 < T:
+        barrier()
+        var s = Float32(-3.4e38)
+        if tid < HD:
+            var t = t0 + tid
+            if t < T:
+                # 8-wide loads of K and q, scalar accumulation in the same order
+                # as the element loop (bench/attn-latency-protocol.md A1)
+                var acc: Float32 = 0
+                for d8 in range(HD // 8):
+                    var k8 = rebind[SIMD[f32, 8]](Kv[kvh, t, d8])
+                    var q8 = rebind[SIMD[f32, 8]](qv[d8])
+                    comptime for j in range(8):
+                        acc += q8[j] * k8[j]
+                s = acc * scale
+            scores[tid] = rebind[scores.ElementType](s)
+            var wmax = warp.max(s)
+            if lane == 0:
+                red[wave] = rebind[red.ElementType](wmax)
+        barrier()
+        var cmax = Float32(-3.4e38)
         comptime for w in range(HD // WARP_SIZE):
             var sc = rebind[Scalar[f32]](red[w])
-            if sc > row_max:
-                row_max = sc
-    barrier()
-    if tid < HD:
-        var partial: Float32 = 0
-        var t = tid
-        while t < T:
-            var e = exp(rebind[Scalar[f32]](scores[t]) - row_max)
-            scores[t] = rebind[scores.ElementType](e)
-            partial += e
-            t += HD
-        var wsum = warp.sum(partial)
-        if lane == 0:
-            red[wave] = rebind[red.ElementType](wsum)
-    barrier()
-    var inv: Float32 = 0
-    if tid < HD:
-        var total: Float32 = 0
+            if sc > cmax:
+                cmax = sc
+        var m_new = max(m_run, cmax)
+        var alpha = exp(m_run - m_new)
+        barrier()
+        if tid < HD:
+            var e = exp(s - m_new)
+            scores[tid] = rebind[scores.ElementType](e)
+            var wsum = warp.sum(e)
+            if lane == 0:
+                red[wave] = rebind[red.ElementType](wsum)
+        barrier()
+        var csum = Float32(0)
         comptime for w in range(HD // WARP_SIZE):
-            total += rebind[Scalar[f32]](red[w])
-        inv = 1 / total
-    barrier()
+            csum += rebind[Scalar[f32]](red[w])
+        l_run = l_run * alpha + csum
+        m_run = m_new
+        o = o * alpha
+        if tid < HD:
+            var n = T - t0
+            if n > HD:
+                n = HD
+            var tt = 0
+            while tt + 8 <= n:
+                var v = InlineArray[Float32, 8](uninitialized=True)
+                var sc = InlineArray[Float32, 8](uninitialized=True)
+                comptime for j in range(8):
+                    v[j] = rebind[Scalar[f32]](Vc[kvh, t0 + tt + j, tid])
+                    sc[j] = rebind[Scalar[f32]](scores[tt + j])
+                comptime for j in range(8):
+                    o += sc[j] * v[j]
+                tt += 8
+            while tt < n:
+                o += rebind[Scalar[f32]](scores[tt]) * rebind[Scalar[f32]](Vc[kvh, t0 + tt, tid])
+                tt += 1
+        t0 += HD
     if tid < HD:
-        var o: Float32 = 0
-        var tt = 0
-        while tt + 8 <= T:
-            var v = InlineArray[Float32, 8](uninitialized=True)
-            var sc = InlineArray[Float32, 8](uninitialized=True)
-            comptime for j in range(8):
-                v[j] = rebind[Scalar[f32]](Vc[kvh, tt + j, tid])
-                sc[j] = rebind[Scalar[f32]](scores[tt + j])
-            comptime for j in range(8):
-                o += sc[j] * v[j]
-            tt += 8
-        while tt < T:
-            o += rebind[Scalar[f32]](scores[tt]) * rebind[Scalar[f32]](Vc[kvh, tt, tid])
-            tt += 1
+        var inv = 1 / l_run
         O[qrow, tid] = rebind[O.ElementType](o * inv)
 
 
@@ -152,7 +151,7 @@ def amar_attn_decode[
     var T = Int(t_len) + r
     var qrow = r * NQH + h
     var qs = stack_allocation[f32, address_space = AddressSpace.SHARED](row_major[HD]())
-    var scores = stack_allocation[f32, address_space = AddressSpace.SHARED](row_major[MAX_T]())
+    var scores = stack_allocation[f32, address_space = AddressSpace.SHARED](row_major[HD]())
     var red = stack_allocation[f32, address_space = AddressSpace.SHARED](row_major[HD // WARP_SIZE]())
     var O_ = O
     attn_head_body(Q, Kc, Vc, O_, qs, scores, red, qrow, kvh, T, tid, Int(lane_id()), scale)

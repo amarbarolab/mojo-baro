@@ -22,7 +22,7 @@ from matmul_prefill import (
 from mega import amar_mega_token, amar_mega_window, MEGA_G, MEGA_G_WIN
 from attn import (
     amar_head_rmsnorm, amar_attn_decode, amar_gate_mul_cast, amar_qgate_split, amar_rope_yarn, amar_kv_append,
-    amar_attn_prefill, HD, NQH, NKVH, MAX_T, PA_ROWS,
+    amar_attn_prefill, HD, NQH, NKVH, PA_ROWS,
 )
 
 comptime H = 4096
@@ -269,7 +269,6 @@ def delta_dispatch(
     O: TileTensor[f32, type_of(om_layout), MutAnyOrigin],
     ring: Int32, ssm_i: Int32, slots: Int32, m: Int,
 ) raises:
-    comptime assert TMAX <= MAX_T
     comptime DL = type_of(ssall_layout)
     comptime CL = type_of(convm_layout)
     comptime GL = type_of(g32m_layout)

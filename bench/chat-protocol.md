@@ -91,7 +91,53 @@ is its receipt.
 table above; 20-prompt A/B (`bench/ab-prompts.sh`, `AB_ENGINE_B`, `arm.txt`
 read first) within P-A2.
 
-**Result.** (filled after the gated run)
+**Result.** PASS, 2026-09-08.
+
+Arms: A = `.work/engine-base`, built by `mojo build` from `git archive HEAD`
+(b64821b, pre-change) in the same stint; B = `.work/engine`, built from the
+working tree in the same stint. `arm.txt`: `power_cap_uW=290000000`,
+`vddgfx=-100mV`, both arms `BARO_PACK=.work/engine-pack-q4`.
+
+| receipt | base | M0a | source |
+|---|---|---|---|
+| 20-prompt median tok/s_gen (P4) | 132.68 (spread 9.9 %) | 132.99 (spread 5.1 %) | `bench/ab-prompts.sh` `.work/ab-m0a` |
+| 20-prompt identity B == A | - | 20/20 PASS | same |
+| one-shot q4 identity | PASS 64/64 | PASS 64/64 | merge-gate |
+| one-shot q4 tok/s_gen | 134.53 | 132.90 | merge-gate |
+| one-shot q8 identity | PASS 64/64 | PASS 64/64 | merge-gate |
+| one-shot q8 tok/s_gen | 77.05 | 82.51 | merge-gate |
+| prefill p0512 tok/s_gen (T ~ 575) | 118.87 | 128.03 | merge-gate |
+| mtp k=2 identity | 20/20 | 20/20 | merge-gate |
+| test_server.sh | ALL PASS | ALL PASS | merge-gate |
+| mega fail word | 0 | 0 | engine stdout |
+
+ISA receipt (`tools/isa-receipt.py`, same two binaries), the mechanism:
+
+| kernel | `group_segment_fixed_size` base -> M0a | vgpr | vgpr spill |
+|---|---|---|---|
+| `amar_attn_decode` | 5408 -> 2080 | 26 -> 39 | 0 -> 0 |
+| `amar_mega_token` q4 | 31264 -> 27936 | 239 -> 239 | 0 -> 0 |
+| `amar_mega_token` q8 | 6688 -> 3360 | 256 -> 256 | 78 -> 76 |
+| `amar_mega_window` | 6816 -> 3488 | 192 -> 192 | 7 -> 7 |
+
+-3328 B of LDS per block is exactly the 4352 - 1024 the score array gave back.
+
+Verdict against the frozen predictions:
+- P-A1 held: every identity check PASS (q4 64/64, q8 64/64, mtp 20/20,
+  A/B 20/20, server suite ALL PASS).
+- P-A2 held: +0.2 % on the 20-prompt median, inside the +-2 % band. The
+  spread also halved (9.9 % -> 5.1 %).
+- P-A3 not triggered.
+- P-A4 held: `mega fail word: 0` on every run.
+
+Unpredicted, and larger than the gated metric: **q8 decode +7.1 %** (77.05 ->
+82.51) and **q4 at T ~ 575 +7.7 %** (118.87 -> 128.03). Both are LDS-occupancy
+effects the prediction did not anticipate -- P-A2 assumed the 31 KB budget made
+the saving occupancy-neutral, which is true for the q4 megakernel (27936 B is
+still one block per allocation granule) but false for the q8 megakernel, where
+6688 -> 3360 B changes how many blocks fit. Recorded as an observation, not
+promoted: neither number is a 20-prompt median, and the q8 path is not this
+lane's champion.
 
 ---
 
