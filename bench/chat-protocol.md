@@ -203,7 +203,60 @@ and `mega fail word` all read back from the run's own output.
 **Gate.** `tools/merge-gate.sh` ALL PASS on the chosen default; 20-prompt A/B
 against the M0a binary within P-B3; P-B1 exact.
 
-**Result.** (filled after the gated run)
+**Result.** GATE NOT MET, recorded 2026-09-08. The build is complete and
+identity-clean but is not committed; the working tree carries it and
+`.work/briefs/status-chat.md` has the handover.
+
+Arms: A = `.work/engine-m0a`, built from `4027b6e` in the same stint;
+B = the working tree, `KVT = float32`, layer-in-page layout.
+
+| receipt | M0a | M0b tree | source |
+|---|---|---|---|
+| q4 one-shot identity | PASS 64/64 | PASS 64/64 | `tools/check-tokens.sh` |
+| tok/s_gen at T ~ 70, 3 runs | 133.26 / 133.59 / 133.54 | 133.26 / 133.59 / 133.54 | engine stdout |
+| tok/s_gen at T ~ 575 (`p0512`), 2 runs | 129.00 / 128.85 | **116.74 / 116.80** | engine stdout |
+| `prefill_s` at T ~ 575 | 0.4175 / 0.5479 | 0.4211 / 0.4255 | engine stdout |
+| `mega fail word` | 0 | 0 | engine stdout |
+
+- P-B1 held on tokens: identity PASS everywhere measured, and an earlier
+  20-prompt A/B of an intermediate M0b build was 20/20 identical to M0a.
+  Bit-exactness at the buffer level was not separately checked.
+- P-B3 **failed**: -9.5 % at T ~ 575, well outside the 2 % band. The
+  prediction reasoned only about KV *bytes* (correctly negligible at
+  T <= 1088) and never about the instruction budget the layout change spends,
+  which is where the loss is.
+- P-B2 not run. q8 identity, the merge gate and the dtype arms not run.
+
+**Mechanism, measured.** The q4 megakernel is on an instruction-footprint
+cliff. `tools/isa-receipt.py --hist` on `mega_amar_mega_token` (q4 code
+object), four builds with identical semantics:
+
+| decode-attention V-loop form | instructions | tok/s_gen at T ~ 70 |
+|---|---|---|
+| M0a, 8-wide unrolled | 12727 | 133.2 |
+| unrolled over the chunk's 2 pages | 12905 | 127.4 |
+| scalar, longer address expression | 12671 | 133.5 |
+| scalar, algebraically simplified address | 12742 | 127.3 |
+
+The last two compute the same address and differ by 71 instructions and 5 %.
+Keeping the megakernel under the cliff forced the scalar V loop, and the
+scalar V loop is what costs 9.5 % once T is large enough for the V
+accumulation to matter. Both cannot hold inside one megakernel, so the fix is
+the separate GQA-grouped decode kernel design §4 already specifies (split-K
+over page spans, (m, l, O) partials, one merge workgroup per head) rather than
+another attempt inside `attn_phases`.
+
+**Falsified along the way** (both recorded so they are not retried):
+- token-major `[t][kvh][HD]` costs 3.9 % at T ~ 70 — it loses kv-head
+  locality, putting consecutive tokens of one head 4 KB apart instead of 1 KB.
+- page-major with a **runtime** per-layer stride costs 5 % and takes
+  `sgpr_spill_count` from 69 to 74: the stride argument stays live across the
+  whole 32-layer loop. Layer-inside-the-page makes every stride comptime and
+  is the only variant that keeps capacity out of the address arithmetic.
+- **Cache-set aliasing is not the problem.** Layer-in-page puts the four kv
+  heads exactly 128 KB apart, so 8 KB of padding per head block was added to
+  break the power-of-two stride: 126.6 tok/s before, 126.6 after. `KVPAD` is
+  dead weight and should go back to 0 with a re-measurement.
 
 ---
 
