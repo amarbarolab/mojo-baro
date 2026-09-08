@@ -598,3 +598,82 @@ Observation, not promoted: the M0d schedule's one-shot at T ~ 70 reads
 same-binary A/B medians read 136.1-136.2 while the cross-binary A/B read
 133.2. The 20-prompt A/B against M0c is the P4 number (1.000); the 136s
 are the lottery being kind on this build and are not claimed.
+
+---
+
+## M1a — prefix checkpoints for one sequence (frozen 2026-09-08, before its build)
+
+**Where the state lives (read from source).** Per request the engine memsets
+conv state, delta state, both KV pools and the counters
+(`serve/engine.mojo` serve loop), then prefills the whole prompt. The SSM
+state is `csall_layout = [SLOTS, N_SSM, 3, CONV]` f32 (1.77 MB per slot) and
+`ssall_layout = [SLOTS, N_SSM, NH_V, SSTATE, SSTATE]` f32 (50.3 MB per
+slot), `SLOTS = KMAX + 1 = 9`, ring index `st.ring` advancing by the rows
+processed; the slot holding the state *after* position p is `ring` after
+that step. The KV cache is one pool, position-addressed through `kv_off`,
+so for a single sequence the KV for tokens `[0, p)` is already in place
+when the next request shares that prefix; only what a replay overwrites
+changes. The design's 26.25 MiB figure assumed 16 v-heads; the real
+checkpoint is **52.1 MB** (conv + delta) per position.
+
+**Change.**
+- `serve/prefix.mojo` (new, host side): `Checkpoint {pos, hash, gen,
+  conv_h, ssm_h}` in pinned host buffers; `hash = sha256(canonical bytes of
+  tokens[0:pos])` computed on the host in Mojo (a 64-bit FNV-1a over the
+  little-endian i32 ids is the first cut, upgraded to SHA-256 in M1b when
+  cross-process reproducibility matters: this step is in-process only).
+  A `Chain` of at most `BARO_CKPT` (default 8) checkpoints ordered by pos,
+  each valid for the prefix it hashes; `lookup(tokens) -> best` returns the
+  checkpoint with the largest `pos <= len(tokens) - 1` whose hash matches
+  `tokens[0:pos]`.
+- Boundaries where a checkpoint is taken: prompt end (after prefill, before
+  the first generated token), and every 1024 tokens of prefill as the
+  periodic safety net. Role boundaries and branch points are M1b (they
+  need the template renderer and a second sequence).
+- Restore: copy `conv_h`/`ssm_h` into the ring slot the replay will read
+  from, set `st.pos = pos`, `st.ring` accordingly, skip the memsets of KV
+  (the pool keeps `[0, pos)`), prefill only `tokens[pos:]`. If no match,
+  today's path (memset, full prefill).
+- Save: `enqueue_copy` device -> pinned host of the two slot regions,
+  once per boundary; the copy is off the critical path of the response
+  (issued after the boundary, synchronised before the next request).
+- Receipts in the `done` line: `"cached": <pos restored, 0 if none>`,
+  `"prefill_rows": <rows actually prefilled>`; the engine prints
+  `checkpoints: cap 8, bytes 52.1 MB each` at start (P1 read-back).
+- Server: passes `cached` through in `usage` as `baro.cached_tokens`.
+
+**Not in this step.** Radix pages / multiple sequences, salt, retention
+priorities, branch-point snapshots, cancel semantics, `prefix_churn`
+(M1b). Cross-process reproducible hashes (M1b). Any kernel change.
+
+**Predictions.**
+- P-F1 Byte-exact restore, test `kernels/test_prefix.mojo` (new,
+  `run-tests.sh`): for prompt A||B (A = 1088 tokens of `p8192.tokens`,
+  B = the next 64), cold(A||B) vs restore(A)+replay(B) give
+  `memcmp`-equal conv, delta, KV pages and next-token logits at the
+  positions 0 / 1 / 1023 / 1024 / 1025 / 1087 / 1088 / 1151; a mutation at
+  token 0, at pos-1, at pos+1 and at the last token of A misses the
+  checkpoint (lookup returns none or an earlier one); a corrupted hash
+  fails restoration. Falsifier: any byte difference, which means the
+  ring/slot bookkeeping or the KV memset assumption is wrong.
+- P-F2 Engine identity: q4/q8 one-shots and the 20-prompt A/B are
+  bit-exact vs `48a48b1` (one-shot mode takes no checkpoints; the serve
+  path with a cold cache is today's path).
+- P-F3 Serve path, two requests with the 7,914-token DeerFlow system
+  prompt prefix (tap replay from `.work/chat/tap.jsonl`): request 2
+  reports `cached` >= 7,900 and `prefill_rows` < 200; its wall TTFT
+  (prefill_s + restore) < 60 ms at the 8k prefix, from 8.3 s cold.
+  Restore copy predicted ~2 ms (52 MB at PCIe 4 x16).
+- P-F4 20-prompt A/B median within ±2 % of `48a48b1` (decode untouched;
+  the fingerprint must be unchanged since no kernel changes).
+- P-F5 Memory: 8 checkpoints = 417 MB pinned host, printed at start;
+  `mega fail word: 0`.
+
+**Verification before timing (P1).** `checkpoints:` line, `cached` and
+`prefill_rows` in the `done` line of each request, `TMAX:`, fingerprint
+unchanged (12977 / dual 122/84/84/61) read before the stint.
+
+**Gate.** P-F1 all positions and mutations; merge-gate ALL PASS; P-F2
+exact; P-F3 both numbers; P-F4 within band.
+
+**Result.** (filled after the gated run)
