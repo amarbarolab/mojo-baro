@@ -22,5 +22,29 @@ llama.cpp master's (b10860) own kernel, or is the 1.20x decode win all launch co
 - Verdict rule: if ours < theirs on all three big shapes, the kernel hook into llama.cpp is
   worth an M; if within +-10 % the decode win is launch-path only and the hook is closed.
 
-## Result
-(filled after the run)
+## Result (2026-09-08 ~20:15, one stint, 290 W / -100 mV, llama.cpp b10860, engine c29f4a5)
+
+Per-kernel median us from rocprofv3 (`.work/ggml-prof/`, `.work/spark/prof2/`); ggml's
+`quantize_q8_1` (1.5-2.8 us) is an extra launch on their side and is not in the ratio.
+
+| shape | ggml mul_mat_vec_q | ours amar_gemv_q8 | ours/ggml |
+|---|---|---|---|
+| headgate 16x2560 | 3.24 | 3.71 | 1.15 |
+| o 2560x4096 | 18.60 | 15.71 | 0.85 |
+| qkv 6144x2560 | 31.64 | 21.18 | 0.67 |
+| ffn_gate 10240x2560 | 43.96 | 33.60 | 0.76 |
+| down 2560x10240 | **24.04** | **33.60** | **1.40** |
+| lmhead 131072x2560 | 499.5 | 388.2 | 0.78 |
+
+Prediction: ggml on ffn_gate predicted 30-40 us, measured 44 (slower than predicted); ratio
+predicted 0.9-1.15 on the big shapes, measured 0.67-0.78 on two of three -- ours is faster
+than predicted relative to theirs. Miss: `down` (K=10240, N=2560) -- theirs 1.40x faster.
+Ours is one wave per row: 2560 rows = 2560 waves over 96 CUs (~27 waves/CU, 4 waves per
+block => ~7 blocks/CU), too little in flight to hide the 10 KB-per-row stream; their
+kernel spreads long rows over more threads. Wall us/iter in the harness (52-88 us) is
+graph-compute overhead per call, not kernel time.
+
+Verdict: on 4 of 6 shapes ours is faster (0.67-0.85), so the ggml hook is worth an M for
+those shapes only; **the actionable finding is on our side**: `down` is occupancy-limited
+and a split-K (2-4 way, atomic or 2-stage) on K=10240 should recover ~10 us/layer =
+~0.36 ms/token (~5 %). Goes into the round-2 brief ahead of the argmax item.
