@@ -170,3 +170,12 @@ Gate (ref = `llama-tokenize` on the source GGUF + Spark ids from llama-server
 `serve/spark.mojo` takes `BARO_PROMPT_TEXT=<file> BARO_GGUF=<gguf>` and tokenizes
 in-process; `BARO_PROMPT=<ids>` still works. The Python tool above stays as the
 oracle-side builder for HF `tokenizer.json` consumers.
+
+### Chat templates (2026-09-08)
+
+`serve/spark.mojo` renders `tokenizer.chat_template` in-process with
+[`mojo-minja`](~/Projects/mojo-minja) (`-I ~/Projects/mojo-minja/src`):
+`BARO_CHAT=<case.json> BARO_GGUF=<gguf>` where the JSON is
+`{"messages": [...], "add_generation_prompt": true, "enable_thinking": false, ...}`.
+Oracle `tools/spark-chat-ref.sh` (llama-server `/apply-template` → `/tokenize` →
+greedy 64); gate = engine ids identical (Spark: 25 prompt ids, 43/43 generated).

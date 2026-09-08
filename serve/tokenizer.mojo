@@ -101,6 +101,7 @@ struct Tokenizer(Movable):
     var special_ids: List[Int]
     var bos_id: Int
     var eos_id: Int
+    var pad_id: Int
     var add_bos: Bool
     var chat_template: String
     var b2u: List[Int]
@@ -117,6 +118,7 @@ struct Tokenizer(Movable):
         self.special_ids = List[Int]()
         self.bos_id = -1
         self.eos_id = -1
+        self.pad_id = -1
         self.add_bos = False
         self.chat_template = String("")
         self.b2u = List[Int]()
@@ -194,6 +196,8 @@ struct Tokenizer(Movable):
                     self.bos_id = v
                 elif key == "tokenizer.ggml.eos_token_id":
                     self.eos_id = v
+                elif key == "tokenizer.ggml.padding_token_id":
+                    self.pad_id = v
                 elif key == "tokenizer.ggml.add_bos_token":
                     self.add_bos = v == 1
         if model != "gpt2":
@@ -273,6 +277,9 @@ struct Tokenizer(Movable):
                 best = k
                 best_len = n
         return best
+
+    def token_str(self, id: Int) -> String:
+        return self.tokens[id] if id >= 0 and id < len(self.tokens) else String("")
 
     def encode(self, text: String, add_special: Bool = True) raises -> List[Int]:
         var out = List[Int]()

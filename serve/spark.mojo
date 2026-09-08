@@ -10,6 +10,7 @@ from attn import KVT, HD, NQH, NKVH, KVPAGE, KVHSTR, amar_kv_append
 from elementwise import amar_rmsnorm_cast, amar_argmax_pos
 from matmul_skinny import amar_matmul_skinny_q8row, amar_skinny_reduce, amar_skinny_reduce_add, ROW_WAVES, ROW_THREADS
 from tokenizer import Tokenizer
+from minja import render_chat
 from spark_kernels import (
     amar_embed_lookup_f32, amar_rope_plain, amar_attn_decode_swa,
     amar_head_gate_mul_cast, amar_skinny_reduce_gelu_par_bf16,
@@ -197,15 +198,23 @@ def main() raises:
     var gen_n = atol(getenv("BARO_GEN", "64"))
     var prompt: List[Int]
     var text_path = getenv("BARO_PROMPT_TEXT", "")
-    if text_path != "":
+    var chat_path = getenv("BARO_CHAT", "")
+    if text_path != "" or chat_path != "":
         var gguf = getenv("BARO_GGUF", "")
         if gguf == "":
-            raise Error("BARO_PROMPT_TEXT needs BARO_GGUF (tokenizer source)")
-        var text: String
-        with open(text_path, "r") as f:
-            text = f.read()
+            raise Error("BARO_PROMPT_TEXT / BARO_CHAT need BARO_GGUF (tokenizer + template source)")
         var t0 = perf_counter_ns()
         var tok = Tokenizer(gguf)
+        var text: String
+        if chat_path != "":
+            var case_json: String
+            with open(chat_path, "r") as f:
+                case_json = f.read()
+            text = render_chat(tok.chat_template, case_json, tok.token_str(tok.bos_id), tok.token_str(tok.eos_id), tok.token_str(tok.pad_id))
+            print("chat template rendered:", text.byte_length(), "bytes (mojo-minja)")
+        else:
+            with open(text_path, "r") as f:
+                text = f.read()
         prompt = tok.encode(text)
         print("tokenized", len(prompt), "ids in", Float64(perf_counter_ns() - t0) / 1e9, "s (mojo tokenizer,", tok.pre, ")")
     else:

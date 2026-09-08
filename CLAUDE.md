@@ -12,6 +12,6 @@
 - Perf claims require the preregistration flow in `bench/coldcache-protocol.md`
   style: freeze predictions by commit BEFORE running; single-buffer GEMM
   timings at W >= 96 MB are invalid (Infinity Cache contamination).
-- Mojo builds that touch `serve/tokenizer.mojo` need `-I ~/Projects/mojo-uregex/src` (regex engine, own repo).
+- Mojo builds that touch `serve/tokenizer.mojo` / `serve/spark.mojo` need `-I ~/Projects/mojo-uregex/src -I ~/Projects/mojo-minja/src` (regex engine + chat-template renderer, own repos).
 - Verify: `./run-tests.sh`, `./bench/run.py [bench-src.mojo]`, parity tests
   in `kernels/test_*.mojo` (build AOT into `.work/`, `-I kernels`).
