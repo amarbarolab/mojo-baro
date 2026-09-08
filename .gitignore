@@ -1,4 +1,4 @@
-.venv/
+.venv
 .work/
 target/
 build/
