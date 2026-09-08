@@ -84,14 +84,18 @@ def main():
     w = w / w.sum()
 
     # --- routed experts ---
+    # h is rounded to bf16 before the down projection: the engine stores
+    # activations bf16 between the two skinny GEMVs, and ssm-ref.py models the
+    # same rounding on `gated`. Without it the reference measures a precision
+    # choice rather than whether the kernel implements the block.
     out = np.zeros(H, dtype=np.float32)
     for j in range(TOPK):
         e = int(idx[j])
-        h = silu(x @ wg[e].T) * (x @ wu[e].T)
+        h = to_bf16(silu(x @ wg[e].T) * (x @ wu[e].T))
         out += w[j] * (h @ wd[e].T)
 
     # --- shared expert, sigmoid-gated ---
-    hs = silu(x @ wgs.T) * (x @ wus.T)
+    hs = to_bf16(silu(x @ wgs.T) * (x @ wus.T))
     shared = (hs @ wds.T) * sigmoid(np.float32(x @ wsg))
     y = out + shared
 
