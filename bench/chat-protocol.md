@@ -347,13 +347,76 @@ long-context effect it is for can be measured.
 
 ---
 
-## M0c — runtime T end to end
+## M0c — runtime T end to end (frozen 2026-09-08, before its build)
 
-**Change (to be preregistered in full before its build).** `TMAX` moves from a
-comptime constant to a runtime capacity (env + per-request), the token buffer
-and page pool size with it, `amar_attn_prefill` chunking extends past CP, and
-the engine's overflow path returns llama.cpp's `exceed_context_size` shape
-instead of raising.
+**Where the ceiling lives after M0b.** `serve/registry.mojo:36` `TMAX = 1088`
+sizes `TPAGES`/`KVPOOL`/`KVPOOL1` and `toks_layout`; `serve/engine.mojo`
+allocates `toks_d` (286), the four KV pools (326-329), the host token buffer
+(446), rejects `len(prompt) + n > TMAX` in both the serve loop (389) and the
+one-shot path (441), and prints `TMAX:` (435). The kernels carry no T. The
+prefill loop already walks the prompt in chunks of `pf_chunk <= CP = 1024`
+(`serve/window.mojo:572`), so no kernel change is expected.
 
-**Gate.** TTFT table at 8k / 32k / 100k vs llama.cpp on the same prompts;
-identity at T <= 1088 unchanged.
+**Change.**
+- `TMAX` becomes a runtime capacity `tcap`: env `BARO_TMAX` (default 1088,
+  the identity reference) read once at start; `TPAGES = ceildiv(tcap,
+  KVPAGE)` and the two pool sizes computed from it; token buffers sized
+  `tcap`. The ready JSON and the `TMAX:` line print the runtime value (P1
+  receipt). No per-request capacity yet: one process, one capacity.
+- Overflow: both checks return llama.cpp's error shape instead of a bare
+  string. Serve mode: `{"error":{"code":400,"message":"the request exceeds
+  the available context size, try increasing it","type":
+  "exceed_context_size_error","n_prompt_tokens":N,"n_ctx":C}}`; one-shot
+  mode prints the same object and exits 2. `baro-serve` maps it to HTTP 400
+  verbatim.
+- Long prompt files: `bench/prefill-prompts/p8192.tokens`, `p32768.tokens`,
+  `p100000.tokens`, produced by `tools/baro-tokenize encode` over a fixed
+  text (this repo's `docs/*.md` concatenated, then `~/llama.cpp/docs/*.md`,
+  truncated to the exact count) and committed with their sha256 in this
+  section's Result.
+
+**Not in this step.** Per-request capacity, page table, checkpoints (M1);
+the GQA-grouped decode kernel (M0d, only if P-D5 demands it); the int8
+prefill GEMM (lane int8).
+
+**Predictions.**
+- P-D1 At `BARO_TMAX=1088` the binary is bit-exact against `9d3b228`'s
+  build: `GENERATED` byte-identical on all 20 `bench/mtp-prompts/`, q4 and
+  q8 one-shots 64/64, mtp 20/20. Only allocation sizes and error strings
+  change. Falsifier: any difference, which would mean a size leaked into
+  the address arithmetic after all.
+- P-D2 20-prompt median within ±2 % of `9d3b228` (same stint), fingerprint
+  in class (12727 ± 40, dual ≥ 105, 80/80/60 ± 2, spill 0). The megakernel
+  source does not change, so the fingerprint is expected identical.
+- P-D3 TTFT table, `prefill_s` from the run at `BARO_TMAX=102400`,
+  `BARO_PREFILL_C=1024`: predicted from the measured p0512 rate
+  (511 rows in 0.42 s, of which ~0.05 s is fixed) as ~0.75 ms/row, linear
+  in chunks: 8192 → ~6 s, 32768 → ~24 s, 100000 → ~75 s. llama.cpp
+  `--pure Q4_0` on the same token files (`tools/llama-ref-run.sh`,
+  `/props` read back) predicted ~2.4× faster (int8 MMQ prefill). Recorded
+  as the gap the int8 lane owes; not gated.
+- P-D4 Memory: at `BARO_TMAX=102400`, f32 KV = 2 × 102400 × 8 × 4 × 256 ×
+  4 B = 6.7 GB; with the 6.2 GB pack the engine prints its ready line and
+  runs the 100000-token prompt plus 64 generated tokens with `mega fail
+  word: 0`. Falsifier: allocation failure or a residency fault, which
+  would move K8/V4 forward from M5.
+- P-D5 Decode after a 32768-token prompt (`tok/s_gen` of the 64 tokens):
+  predicted ≥ 100 tok/s_gen (KV read per token at T=32k is 2 × 32768 × 4 ×
+  256 × 4 B × 8 layers = 2.1 GB, ~2.3 ms at 900 GB/s on top of the 7.4 ms
+  token). At T=100000: predicted ~60 tok/s_gen (6.5 GB per token). Reading
+  rule: below 80 at T=32k triggers the M0d preregistration (design §4
+  decode kernel); above it M0d waits for M5.
+- P-D6 `mega fail word: 0` on every run; the overflow request returns the
+  JSON shape above in both modes (`tools/test_server.sh` gains one
+  oversize case).
+
+**Verification before timing (P1).** `TMAX:` and the ready JSON `tmax` field
+read back from every run; `prompt tokens:` equals the file's word count;
+`prefill chunk:` 1024; rebuild in the same stint; `arm.txt` first for the
+A/B; llama.cpp `/props` saved beside its timings.
+
+**Gate.** P-D1 exact; `tools/merge-gate.sh` ALL PASS at the default 1088;
+P-D2 within band; P-D3/P-D4/P-D5 tables filled (P-D4 must hold; P-D3 and
+P-D5 are recorded against their predictions, not gated); P-D6.
+
+**Result.** (filled after the gated run)
