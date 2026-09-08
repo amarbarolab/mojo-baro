@@ -3,6 +3,7 @@
 # bench/spark-ab-protocol.md: arm A = .work/spark/spark-engine on bench/mtp-prompts/p*.txt
 # (BARO_PROMPT_TEXT), arm B = llama.cpp master fast config on the same text. Run inside
 # gpu-wait (priority 90); engine and server never overlap (A finishes before B starts).
+# KV=f16 (default, fastest bar per llama-bench 2026-09-08) or q8_0.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 model=$1; out=$2; port=${3:-8098}; eng=.work/spark/spark-engine
@@ -13,7 +14,7 @@ for tf in bench/mtp-prompts/p*.txt; do
   p=$(basename "$tf" .txt)
   env BARO_PROMPT_TEXT="$tf" BARO_GGUF="$model" BARO_PACK=.work/spark/pack-q8 BARO_GEN=64 "$eng" > "$out/$p.A.log" 2>&1
 done
-~/llama.cpp-master/build/bin/llama-server -m "$model" -c 4096 -ngl 99 -fa on -ctk q8_0 -ctv q8_0 -b 2048 -ub 512 -t 8 \
+~/llama.cpp-master/build/bin/llama-server -m "$model" -c 4096 -ngl 99 -fa on -ctk ${KV:-f16} -ctv ${KV:-f16} -b 2048 -ub 512 -t 8 \
   --host 127.0.0.1 --port "$port" > "$out/server.log" 2>&1 &
 pid=$!
 for i in $(seq 1 180); do curl -sf "http://127.0.0.1:$port/health" >/dev/null 2>&1 && break; sleep 1; done
