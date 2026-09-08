@@ -312,3 +312,24 @@ Sub-rounds, each preregistered below before its build: R5a two-deep
 prefetch (PGR2; +11% on the dense kernel), R5b BLK_K 64 (two q4 blocks per
 barrier), R5c small-n shapes. Stop after two consecutive sub-rounds with
 no gain (driver ruling, status file).
+
+### R5a. Uniform loader (frozen 2026-09-08, before its build; R5 attempt 1 was void -- shared GPU -- and is being re-run first)
+
+ISA receipt of the R5 kernels (`.work/isa-r5`, status file): the int8
+128x128 K-loop is ~350 instructions of which ~120 are `v_cndmask` /
+`s_and_saveexec` / `s_cbranch_exec*` from per-thread loader guards
+(`gr < M`, `tid < BN`, the two scale-thread ranges); bf16-lds carries the
+same guards. R5a removes them: A rows clamped to `M-1` (padded rows compute
+garbage that the epilogue's `r < M` never stores), the B column's 16 nibble
+bytes split over two threads (8 B each: all 256 threads load, unpack half a
+block, store 8 B int8 / 16 B bf16 per half), one 4-byte scale word per
+thread (waves 0-3 `d8`, waves 4-7 `nu`, wave-uniform). Same LDS layout,
+same maths, parity gates unchanged (bf16-lds must stay bit-exact with the
+R4 kernel; mmq vs fp64 unchanged).
+
+Predicted: **+5% on both mmq and bf16-lds at n >= 512** (the dense fp16
+kernel's ALIGNED step, which removed its edge branches, gave +6%);
+falsifier: < +2% on both = the exec-mask ops were hidden behind the WMMA
+issue and the loop is bound elsewhere (LDS or the epilogue). Measured in
+the same quiet window as the R5 re-run, same bench binary layout
+(`.work/bench_prefill_r5a`), R5 binary interleaved.
