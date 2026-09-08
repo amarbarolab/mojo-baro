@@ -48,3 +48,26 @@ Verdict: on 4 of 6 shapes ours is faster (0.67-0.85), so the ggml hook is worth 
 those shapes only; **the actionable finding is on our side**: `down` is occupancy-limited
 and a split-K (2-4 way, atomic or 2-stage) on K=10240 should recover ~10 us/layer =
 ~0.36 ms/token (~5 %). Goes into the round-2 brief ahead of the argmax item.
+
+## Correction (2026-09-08 ~21:00) — the first table's ggml arm was Infinity-Cache-hot
+
+The harness re-ran ONE 28 MB weight 220 times per shape; 28 MB fits the 96 MB IC, so the
+`down` row (24.0 us = 1.16 TB/s, above HBM peak) was cache, not kernel. Harness now rotates
+8 disjoint weight copies per shape (222 MB > IC; lm-head alone is 357 MB). Cold re-run, same
+stint as our trace:
+
+| shape | ggml cold | ours | ours/ggml |
+|---|---|---|---|
+| headgate 16x2560 | 3.28 | 3.71 | 1.13 |
+| o 2560x4096 | 18.50 | 15.71 | 0.85 |
+| qkv 6144x2560 | 27.88 | 21.18 | 0.76 |
+| ffn_gate 10240x2560 | 42.64 | 33.60 | 0.79 |
+| down 2560x10240 | 34.42 | 33.60 | 0.98 |
+| lmhead 131072x2560 | 498.9 | 388.2 | 0.78 |
+
+The `down` inversion is gone (parity). Chasing it before this correction: split-K KS=2/4/5
+(37-40 us, slower: the K-tail loop loses the 4-unroll, and summation order changes flipped
+gate tokens — text pos 38 / chat pos 2), LDS-staged bf16 activation (44.5 us, slower, LDS
+occupancy). Both reverted, both closed. Verdict stands: ours faster on 5/6 shapes (0.76-0.85
+on the ones that carry bytes), ggml hook not worth it; nothing to fix on `down`.
+Ledger: `m.ledger/mojo-baro.md` 2026-09-08.
