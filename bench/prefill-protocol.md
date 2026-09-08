@@ -333,3 +333,21 @@ falsifier: < +2% on both = the exec-mask ops were hidden behind the WMMA
 issue and the loop is bound elsewhere (LDS or the epilogue). Measured in
 the same quiet window as the R5 re-run, same bench binary layout
 (`.work/bench_prefill_r5a`), R5 binary interleaved.
+
+### R5-abl. Where the K-loop time goes (receipt, not an arm; frozen 2026-09-08 before its run)
+
+`bench/bench_prefill_abl.mojo` built six times with `ABL` in
+`kernels/matmul_mmq.mojo` = 0 (none), 1 (B global load replaced by a
+per-step constant), 2 (A global load replaced), 3 (per-block epilogue
+replaced by one packed add: int8 loses cvt + mul + fma, bf16 loses the d4
+fma), 4 (no barrier), 5 (int8 d8/nu LDS staging replaced by constants).
+128x128 config, n = 256 / 512 / 1024, same rotation. Output is wrong by
+construction; only the time is read. rocprofv3 hangs under this runtime
+(wmma-fp16-protocol R2 step P), so this is the profile.
+
+Predicted, us relative to ABL 0 at n=1024: no-B -10% (bf16) / -10% (mmq);
+no-A -5% / -5%; no-epilogue -3% (bf16) / **-25% (mmq)**; no-barrier
+-8% / -8%; no-scales (mmq) -5%. Reading rule: the largest drop names the
+next sub-round's lever; a drop < 3% retires that lever. If no-epilogue on
+mmq is < 10%, the int8 kernel is bound by its loads/LDS, not by the
+epilogue, and the WMMA-rate receipt alone explains the loss.
