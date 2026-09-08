@@ -149,6 +149,50 @@ def stage_a[CBL: TensorLayout, AfL: TensorLayout, BF: Bool = False](
         t += ROW_THREADS
     barrier()
 
+@always_inline
+def stage_rms[XL: TensorLayout, GL: TensorLayout, AfL: TensorLayout](
+    mut X: TileTensor[f32, XL, MutAnyOrigin],
+    Gn: TileTensor[f32, GL, MutAnyOrigin],
+    mut Af: TileTensor[f32, AfL, MutUntrackedOrigin, address_space = AddressSpace.SHARED],
+):
+    comptime assert X.flat_rank == 2 and Gn.flat_rank == 1 and Af.flat_rank == 1
+    var tid = Int(thread_idx.x)
+    var lane = Int(lane_id())
+    var wave = tid // WARP_SIZE
+    var sums = stack_allocation[f32, address_space = AddressSpace.SHARED](
+        row_major[EW_THREADS // WARP_SIZE]()
+    )
+    var partial: Float32 = 0
+    if tid < EW_THREADS:
+        var i = tid
+        while i < H:
+            var v = rebind[Scalar[f32]](X[0, i])
+            partial += v * v
+            i += EW_THREADS
+        var wsum = warp.sum(partial)
+        if lane == 0:
+            sums[wave] = rebind[sums.ElementType](wsum)
+    barrier()
+    var total: Float32 = 0
+    comptime for w in range(EW_THREADS // WARP_SIZE):
+        total += rebind[Scalar[f32]](sums[w])
+    var scale = rsqrt(total / Float32(H) + RMS_EPS)
+    var nb = H // 32
+    var Xv8 = X.vectorize[1, 8]()
+    var Gv8 = Gn.vectorize[8]()
+    var Afv = Af.vectorize[4]()
+    comptime assert Afv.flat_rank == 1
+    var t = tid
+    while t * 8 < H:
+        var i0 = t * 8
+        var blk = i0 // 32
+        var c = (i0 % 32) // 4
+        var v = (rebind[SIMD[f32, 8]](Xv8[0, t]) * scale * rebind[SIMD[f32, 8]](Gv8[t])).cast[bf16]().cast[f32]()
+        Afv[c * nb + blk] = rebind[Afv.ElementType](v.slice[4, offset=0]())
+        Afv[(c + 1) * nb + blk] = rebind[Afv.ElementType](v.slice[4, offset=4]())
+        t += ROW_THREADS
+    barrier()
+
 
 @always_inline
 def q4_dot_lds[
@@ -322,6 +366,30 @@ def rms_f32_phase[
 
 
 @always_inline
+def delta_col[SsL: TensorLayout, KqL: TensorLayout, OmL: TensorLayout](
+    mut SAll: TileTensor[f32, SsL, MutAnyOrigin],
+    kq: TileTensor[f32, KqL, MutUntrackedOrigin, address_space = AddressSpace.SHARED],
+    mut So: TileTensor[f32, OmL, MutAnyOrigin],
+    eg: Float32, beta: Float32, vj: Float32,
+    rs: Int, ws: Int, si: Int, h: Int, j: Int, r: Int,
+):
+    comptime assert SAll.flat_rank == 5 and kq.flat_rank == 2 and So.flat_rank == 3
+    var col = SIMD[f32, SSTATE]()
+    comptime for i in range(SSTATE):
+        col[i] = rebind[Scalar[f32]](SAll[rs, si, h, i, j])
+    var sk: Float32 = 0
+    comptime for i in range(SSTATE):
+        sk += col[i] * eg * rebind[Scalar[f32]](kq[1, i])
+    var d = (vj - sk) * beta
+    var o: Float32 = 0
+    comptime for i in range(SSTATE):
+        var s = col[i] * eg + rebind[Scalar[f32]](kq[1, i]) * d
+        SAll[ws, si, h, i, j] = rebind[SAll.ElementType](s)
+        o += s * rebind[Scalar[f32]](kq[0, i])
+    So[r, h, j] = rebind[So.ElementType](o)
+
+
+@always_inline
 def ssm_phases[
     MR: Int, RELOAD: Bool, Q4: Bool,
     XL: TensorLayout, GL: TensorLayout, CBL: TensorLayout, AfL: TensorLayout,
@@ -392,13 +460,14 @@ def ssm_phases[
     )
 
     stamp(prof, pbase + 12)
-    rmsc_phase[MR](X, Gn, CurB, M)
-    if not grid_barrier(ctr, gen, fail):
-        return False
+    comptime if LDSA:
+        stage_rms(X, Gn, Af)
+    else:
+        rmsc_phase[MR](X, Gn, CurB, M)
+        if not grid_barrier(ctr, gen, fail):
+            return False
     stamp(prof, pbase + 1)
 
-    comptime if LDSA:
-        stage_a(CurB, Af, H)
     g = bid
     while g < G_QKV + G_Z + G_AB + G_AB:
         if g < G_QKV:
@@ -507,19 +576,7 @@ def ssm_phases[
                 var beta = rebind[Scalar[f32]](Beta[r, h])
                 var vj = rebind[Scalar[f32]](Conv[r, 2 * KDIM + h * SSTATE + j])
                 comptime if not RELOAD:
-                    var col = SIMD[f32, SSTATE]()
-                    comptime for i in range(SSTATE):
-                        col[i] = rebind[Scalar[f32]](SAll[rs, si, h, i, j])
-                    var sk: Float32 = 0
-                    comptime for i in range(SSTATE):
-                        sk += col[i] * eg * rebind[Scalar[f32]](kq[1, i])
-                    var d = (vj - sk) * beta
-                    var o: Float32 = 0
-                    comptime for i in range(SSTATE):
-                        var s = col[i] * eg + rebind[Scalar[f32]](kq[1, i]) * d
-                        SAll[ws, si, h, i, j] = rebind[SAll.ElementType](s)
-                        o += s * rebind[Scalar[f32]](kq[0, i])
-                    So[r, h, j] = rebind[So.ElementType](o)
+                    delta_col(SAll, kq, So, eg, beta, vj, rs, ws, si, h, j, r)
                 else:
                     comptime CHK = 32
                     var sk: Float32 = 0
@@ -625,13 +682,14 @@ def ffn_phases[
     var fail = Ctr.ptr.unsafe_offset(2)
     var g = 0
 
-    rmsc_phase[MR](X, Gn, CurB, M)
-    if not grid_barrier(ctr, gen, fail):
-        return False
+    comptime if LDSA:
+        stage_rms(X, Gn, Af)
+    else:
+        rmsc_phase[MR](X, Gn, CurB, M)
+        if not grid_barrier(ctr, gen, fail):
+            return False
     stamp(prof, pbase + 1)
 
-    comptime if LDSA:
-        stage_a(CurB, Af, H)
     g = bid
     while g < G_F + G_F:
         if g < G_F:
@@ -750,13 +808,14 @@ def attn_phases[
         row_major[MAX_T]()
     )
 
-    rmsc_phase[MR](X, Gn, CurB, M)
-    if not grid_barrier(ctr, gen, fail):
-        return False
+    comptime if LDSA:
+        stage_rms(X, Gn, Af)
+    else:
+        rmsc_phase[MR](X, Gn, CurB, M)
+        if not grid_barrier(ctr, gen, fail):
+            return False
     stamp(prof, pbase + 1)
 
-    comptime if LDSA:
-        stage_a(CurB, Af, H)
     g = bid
     while g < G_Q + G_KV + G_KV:
         if g < G_Q:
@@ -1073,9 +1132,12 @@ def mega_body[
     var ho1 = Int(rebind[Scalar[i64]](off[w + 1]))
     if fold_head == 2:
         rms_f32_phase(X_, wf[H](wbuf, ho0), Hn_, M)
-    rmsc_phase[MR](X_, wf[H](wbuf, ho0), CurB_, M)
-    if not grid_barrier(ctrh, genh, fail):
-        return
+    comptime if LDSA:
+        stage_rms(X_, wf[H](wbuf, ho0), Af)
+    else:
+        rmsc_phase[MR](X_, wf[H](wbuf, ho0), CurB_, M)
+        if not grid_barrier(ctrh, genh, fail):
+            return
     stamp(prof, 16 * NL + 1)
     var Whq = wq[VOCAB, H, Q4](wbuf, ho1)
     var Whs = ws[VOCAB, H, Q4](wbuf, ho1)
@@ -1086,8 +1148,6 @@ def mega_body[
     var nblk = Int(grid_dim.x)
     var bv = InlineArray[Float32, MR](fill=Float32(-3.4e38))
     var bi = InlineArray[Int32, MR](fill=Int32(0))
-    comptime if LDSA:
-        stage_a(CurB_, Af, H)
     var g = bid
     while g < VOCAB // ROW_WAVES:
         var row = g * ROW_WAVES + wave

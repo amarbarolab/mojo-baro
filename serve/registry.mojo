@@ -138,7 +138,7 @@ comptime mega_token_k = amar_mega_token[
     TMAX, N_LAYERS,
 ]
 comptime mega_token_q4_k = amar_mega_token[
-    1, False, True, type_of(xm_layout), type_of(xm_layout),
+    1, True, True, type_of(xm_layout), type_of(xm_layout),
     type_of(qfm_layout), type_of(g32m_layout), type_of(convm_layout), type_of(om_layout),
     type_of(csall_layout), type_of(ssall_layout),
     type_of(qfm_layout), type_of(kvm_flat), type_of(qm_layout), type_of(xflat_layout),
