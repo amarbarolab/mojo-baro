@@ -37,6 +37,14 @@ launch path uses (no fresh multi-hundred-MB allocation per call).
 
 Final signature (HARNESS adopts verbatim):
     realign_expected_embedding(ctx, mut b: WindowBufs, mut e_dev: DeviceBuffer[f32], pack_q4: Bool) raises
+
+Round 3: HARNESS's L8-raw arm (and E9 before it) reads b.hn_d directly for
+the post-final-norm hidden and ships it as f32 -- also dead under mega=True
+(same fold_head==2 gate, kernels/mega.mojo:1182). final_norm_hidden below
+reuses step 1's b.x_d row read but through rms_h2 (amar_rmsnorm, f32 in/out,
+registry.mojo:181) instead of rmsc_h2 (amar_rmsnorm_cast, casts to bf16) --
+the raw arm wants the un-rounded value, so no bf16 anywhere in this path:
+    final_norm_hidden(ctx, mut b: WindowBufs, mut h_dev: DeviceBuffer[f32]) raises
 """
 from std.math import ceildiv
 
@@ -96,4 +104,17 @@ def realign_expected_embedding(
     ctx.enqueue_function[realign_reduce_k](
         TileTensor(part_d, part_layout), TileTensor(e_dev, h_layout), Int32(H),
         grid_dim=ceildiv(H, 256), block_dim=256,
+    )
+
+
+def final_norm_hidden(
+    ctx: DeviceContext,
+    mut b: WindowBufs,
+    mut h_dev: DeviceBuffer[f32],
+) raises:
+    ctx.enqueue_function[rms_h2](
+        row_f32(ctx, b.x_d, 0, H, h2_layout),
+        tens_f32(ctx, b.wbuf, b.off[HEAD_NORM_IDX], H, h_layout),
+        TileTensor(h_dev, h2_layout),
+        Int32(H), Float32(1e-6), grid_dim=1, block_dim=256,
     )

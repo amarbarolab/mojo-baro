@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
-"""REALIGN oracle (round 2): numpy-only, end-to-end check of
-e_dev == softmax(rmsnorm(x0, output_norm.weight) @ output.weight.T) @ W_emb.
+"""REALIGN oracle (round 3): numpy-only, end-to-end check of
+e_dev == softmax(rmsnorm(x0, output_norm.weight) @ output.weight.T) @ W_emb,
+plus (round 3) h_dev == rmsnorm(x0, output_norm.weight) in plain f32 -- the
+post-final-norm hidden HARNESS's L8-raw/E9 arms ship, no bf16 cast anywhere
+in this path (unlike the head GEMM's curb, which the GPU casts to bf16
+before the matmul -- see to_bf16 below, still needed for the e check).
 
 Reads the raw f32 dumps kernels/test_realign.mojo writes to
-.work/realign-dump/<prompt>-{x0,e}.f32 -- x0 is the pre-final-norm hidden
-state (WindowBufs.x_d row 0) at the point realign_expected_embedding was
-called, e is its computed output -- and recomputes logits and e entirely
-independently off the pack's own weights (token_embd.weight bf16,
-output_norm.weight f32, output.weight q4_0). Never touches the GPU, never
-reads a Mojo-side logits/hn dump (there isn't one: see serve/realign.mojo's
-docstring for why b.logits_d/b.hn_d are not usable as of round 2).
+.work/realign-dump/<prompt>-{x0,e,h}.f32 -- x0 is the pre-final-norm hidden
+state (WindowBufs.x_d row 0) at the point realign_expected_embedding /
+final_norm_hidden were called, e and h are their computed outputs -- and
+recomputes both independently off the pack's own weights (token_embd.weight
+bf16, output_norm.weight f32, output.weight q4_0). Never touches the GPU,
+never reads a Mojo-side logits/hn dump (there isn't one: see
+serve/realign.mojo's docstring for why b.logits_d/b.hn_d are not usable).
 
 Usage: tools/realign_oracle.py [--pack DIR] [--dump DIR] [PROMPT ...]
 """
@@ -121,34 +125,42 @@ def main() -> int:
     norm_w = load_norm(packdir, idx, "output_norm.weight", H)
     head_w = dequant_q4_0(packdir, idx, "output.weight", VOCAB, H)
 
-    print("prompt | argmax_tok | nearest_emb_tok(cos) | max|e_diff|/max|e| | verdict")
-    print("-------+------------+----------------------+---------------------+--------")
+    print("prompt | argmax_tok | nearest_emb_tok(cos) | max|e_diff|/max|e| | max|h_diff|/max|h| | verdict")
+    print("-------+------------+----------------------+---------------------+---------------------+--------")
 
-    worst = 0.0
+    worst_e = 0.0
+    worst_h = 0.0
     for pname in args.prompts:
         x0 = np.fromfile(dumpdir / f"{pname}-x0.f32", dtype=np.float32)
         e_got = np.fromfile(dumpdir / f"{pname}-e.f32", dtype=np.float32)
-        if x0.shape[0] != H or e_got.shape[0] != H:
-            raise ValueError(f"{pname}: bad dump shapes x0={x0.shape} e={e_got.shape}")
+        h_got = np.fromfile(dumpdir / f"{pname}-h.f32", dtype=np.float32)
+        if x0.shape[0] != H or e_got.shape[0] != H or h_got.shape[0] != H:
+            raise ValueError(f"{pname}: bad dump shapes x0={x0.shape} e={e_got.shape} h={h_got.shape}")
 
-        curb = to_bf16(rmsnorm(x0, norm_w, EPS))
+        h_ref = rmsnorm(x0, norm_w, EPS)
+        max_abs_h = float(np.max(np.abs(h_ref))) or 1.0
+        diff_h = float(np.max(np.abs(h_got - h_ref))) / max_abs_h
+        worst_h = max(worst_h, diff_h)
+
+        curb = to_bf16(h_ref)
         logits = head_w @ curb
         probs = softmax(logits.astype(np.float64)).astype(np.float32)
         e_ref = probs @ emb_table
 
         max_abs_e = float(np.max(np.abs(e_ref))) or 1.0
-        diff = float(np.max(np.abs(e_got - e_ref))) / max_abs_e
-        worst = max(worst, diff)
+        diff_e = float(np.max(np.abs(e_got - e_ref))) / max_abs_e
+        worst_e = max(worst_e, diff_e)
 
         argmax_tok = int(np.argmax(logits))
         nn_tok, nn_cos = nearest_embedding(e_got, emb_table)
 
-        verdict = "PASS" if diff <= 1e-3 else "FAIL"
-        print(f"{pname} | {argmax_tok} | {nn_tok} ({nn_cos:.4f}) | {diff:.6e} | {verdict}")
+        verdict = "PASS" if diff_e <= 1e-3 and diff_h <= 1e-4 else "FAIL"
+        print(f"{pname} | {argmax_tok} | {nn_tok} ({nn_cos:.4f}) | {diff_e:.6e} | {diff_h:.6e} | {verdict}")
 
-    print("-------------------------------------------------------------------------")
-    print(f"worst max|e_diff|/max|e| = {worst:.6e} (threshold 1e-3)")
-    return 0 if worst <= 1e-3 else 1
+    print("-----------------------------------------------------------------------------------------------")
+    print(f"worst max|e_diff|/max|e| = {worst_e:.6e} (threshold 1e-3)")
+    print(f"worst max|h_diff|/max|h| = {worst_h:.6e} (threshold 1e-4)")
+    return 0 if worst_e <= 1e-3 and worst_h <= 1e-4 else 1
 
 
 if __name__ == "__main__":

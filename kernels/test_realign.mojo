@@ -1,13 +1,13 @@
-"""REALIGN live test (round 2): for 5 real prompts on .work/engine-pack-q4,
+"""REALIGN live test (round 3): for 5 real prompts on .work/engine-pack-q4,
 prefill through the prompt under mega=True (the E9/HARNESS configuration --
 bench_latent_handoff.mojo runs every latent step through the megakernel),
-call realign_expected_embedding on the final row, and dump the row's
-pre-final-norm hidden (b.x_d, the one buffer every path keeps current) and
-e to .work/realign-dump/ for tools/realign_oracle.py (numpy) to recompute
-logits and e independently off the dumped hidden state and the pack's own
-weights -- never against a Mojo-side logits dump, since realign_expected_embedding
-no longer exposes logits at all (see serve/realign.mojo's docstring for why
-b.logits_d/b.hn_d are not usable here).
+call realign_expected_embedding and final_norm_hidden on the final row, and
+dump the row's pre-final-norm hidden (b.x_d), e, and the f32 post-final-norm
+hidden (h, round 3) to .work/realign-dump/ for tools/realign_oracle.py
+(numpy) to recompute independently off the dumped hidden state and the
+pack's own weights -- never against a Mojo-side logits/hn_d dump (see
+serve/realign.mojo's docstring for why b.logits_d/b.hn_d are not usable
+here).
 """
 from std.ffi import c_ssize_t, external_call
 from std.math import ceildiv
@@ -19,7 +19,7 @@ from max.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
 from layout import TileTensor, row_major
 from registry import *
 from window import *
-from realign import realign_expected_embedding
+from realign import realign_expected_embedding, final_norm_hidden
 from realign_kernels import amar_realign_gather, amar_realign_reduce, REALIGN_SPLIT
 
 
@@ -296,8 +296,10 @@ def main() raises:
     prompt_names.append("p05-math")
 
     var e_dev = ctx.enqueue_create_buffer[f32](H)
+    var h_dev = ctx.enqueue_create_buffer[f32](H)
     var x0_h = ctx.enqueue_create_host_buffer[f32](H)
     var e_h = ctx.enqueue_create_host_buffer[f32](H)
+    var h_h = ctx.enqueue_create_host_buffer[f32](H)
 
     print("REALIGN_SPLIT (gather row-split over VOCAB):", REALIGN_SPLIT)
     print("prompt | prefill_toks | realign_us")
@@ -323,6 +325,7 @@ def main() raises:
         ctx.synchronize()
         var t0 = perf_counter_ns()
         realign_expected_embedding(ctx, bufs, e_dev, pack_q4)
+        final_norm_hidden(ctx, bufs, h_dev)
         ctx.synchronize()
         var dt_us = Float64(perf_counter_ns() - t0) / 1e3
 
@@ -331,10 +334,12 @@ def main() raises:
             src_buf=DeviceBuffer[f32](ctx, bufs.x_d.unsafe_ptr(), H, owning=False),
         )
         ctx.enqueue_copy(dst_buf=e_h, src_buf=e_dev)
+        ctx.enqueue_copy(dst_buf=h_h, src_buf=h_dev)
         ctx.synchronize()
 
         dump_f32(".work/realign-dump/" + pname + "-x0.f32", x0_h, H)
         dump_f32(".work/realign-dump/" + pname + "-e.f32", e_h, H)
+        dump_f32(".work/realign-dump/" + pname + "-h.f32", h_h, H)
 
         var line = pname + " | " + String(plen) + " | " + String(dt_us)
         print(line)
