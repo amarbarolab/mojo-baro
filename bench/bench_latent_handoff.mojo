@@ -25,7 +25,7 @@ from max.gpu.host import DeviceContext, DeviceBuffer
 from registry import *
 from window import *
 from latent_harness import load_pack, alloc_bufs, Pack
-from realign import realign_expected_embedding
+from realign import realign_expected_embedding, final_norm_hidden
 from tokenizer import Tokenizer
 
 from grammar.automaton import Automaton
@@ -349,25 +349,28 @@ def collect_latent_raw(
     ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: WindowState,
     latent_host: HostBuffer[f32], k: Int,
 ) raises:
+    # Round 3: b.hn_d is never written under mega=True (kernels/mega.mojo
+    # gates the write on fold_head==2; every launch here passes 1), so
+    # reading it directly ships a stale earlier-chunk vector. final_norm_hidden
+    # re-derives the current post-final-norm hidden from b.x_d instead.
     for s in range(k):
-        var h_slice = DeviceBuffer[f32](ctx, b.hn_d.unsafe_ptr(), H, owning=False)
         var latent_dev = ctx.enqueue_create_buffer[f32](H)
+        final_norm_hidden(ctx, b, latent_dev)
         var host_dst = latent_host.create_sub_buffer[f32](s * H, H)
-        ctx.enqueue_copy(dst_buf=host_dst, src_buf=h_slice)
-        ctx.enqueue_copy(dst_buf=latent_dev, src_buf=h_slice)
+        ctx.enqueue_copy(dst_buf=host_dst, src_buf=latent_dev)
         ctx.synchronize()
         step_latent_raw(ctx, b, cfg, st, latent_dev)
 
 
 def collect_latent_soft(
     ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: WindowState,
-    latent_host: HostBuffer[f32], k: Int,
+    latent_host: HostBuffer[f32], k: Int, pack_q4: Bool,
 ) raises:
     # never falls back to raw hn_d on failure -- the caller catches the raise
     # (REALIGN not merged) and records the arm as errored.
     for s in range(k):
         var e_dev = ctx.enqueue_create_buffer[f32](H)
-        realign_expected_embedding(ctx, b, e_dev)
+        realign_expected_embedding(ctx, b, e_dev, pack_q4)
         var host_dst = latent_host.create_sub_buffer[f32](s * H, H)
         ctx.enqueue_copy(dst_buf=host_dst, src_buf=e_dev)
         ctx.synchronize()
@@ -698,7 +701,7 @@ def main() raises:
                     if arm == "L8-raw":
                         collect_latent_raw(ctx, bufsA, cfgA, wstA, latent_hA, k)
                     else:
-                        collect_latent_soft(ctx, bufsA, cfgA, wstA, latent_hA, k)
+                        collect_latent_soft(ctx, bufsA, cfgA, wstA, latent_hA, k, pack_q4)
                     ctx.synchronize()
                     var producer_s = Float64(perf_counter_ns() - t0a) / 1e9
 
