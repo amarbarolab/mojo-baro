@@ -112,3 +112,69 @@ so they never reach the lds kernel; anything else is a harness change).
 llama.cpp bars (chat-protocol M0c, `prompt_ms`): 2.59 s at 8192, 12.8 s
 at 32768 -- not re-run here; the gap after this round is predicted 2.3x /
 3.3x, still the attention and the non-GEMM chunk work, not the GEMM.
+
+## Result (2026-09-10, stage 2, engine `10d6ca5` on `lane-pfgemm`)
+
+Ran by the resumer from the 13:36 handoff: `.work/pfgemm-stage2.sh`, every
+job through `gpu-wait --priority 90 --vram 23`, queue empty before each timed
+batch (`.work/logs/gpu-list-*.txt` all read `(no jobs)`), power cap
+290000000 uW, vddgfx offset -100mV. Summary line file `.work/logs/stage2.txt`.
+
+**Timed, q4 pack, `BARO_TMAX=102400`, chunk 1024, 64 generated tokens.**
+
+| length | main (stage 1) | lds median (min-max) | predicted | gate | measured ratio |
+|---|---|---|---|---|---|
+| 512 | 0.415 (1 run) | 0.309 (1 run) | - | - | 1.34x |
+| 8192 | 8.32 | **6.279** (6.266-6.298) | 5.95 | <= 6.6 **PASS** | **1.33x** |
+| 32768 | 51.40 | **43.333** (43.157-43.406) | 41.6 | <= 44 **PASS** | **1.19x** |
+| 100000 | 297.30 (1 run, this stint) | **276.74** (1 run) | ~275 | - | 1.07x |
+
+Both gates pass; neither prediction is reached, and the miss has one cause.
+The prediction divided the R4 GEMM time by 1.86, the R5 kernel-level ratio
+measured on `lane-int8`. In this stint the same bench (try 2, queue empty,
+`.work/logs/bench-prefill-2.log`) reads 4343 us vs 2539 us at n=1024 = **1.71x**,
+and the engine's own profile reads 0.515 s -> 0.3115 s per 1024-row chunk =
+**1.65x in situ**. The in-situ number tracks this stint's kernel bench, not
+R5's 1.86x; 1.65x against the >= 1.5x the gate needed is the whole result.
+
+**GEMM share, `BARO_PROFILE=1` on the lds binary** (`.work/logs/ldsprof-*.log`,
+serialized, prefill_s 6.369 / 43.469 against 6.279 / 43.333 unprofiled, so
+serialization costs ~1 %):
+
+| length | chunks | gemm_s | chunk_s | share | share on R4 |
+|---|---|---|---|---|---|
+| 8192 | 8 | 3.056 | 6.359 | **0.481** | 0.614 |
+| 32768 | 32 | 12.977 | 43.456 | **0.299** | 0.409 |
+
+Kernel level this stint, us per GEMM, ffn shape, wmma 128x128 / bf16-lds
+128x128: n=128 644 / 967 (**0.67x**, lds loses, which is what `PF_LDS_MIN = 128`
+is for), n=256 2491 / 1769 (1.41x), n=512 3246 / 2509 (1.29x, min-max
+2929-3540 vs 1879-2548 = noisy), n=1024 4343 / 2539 (1.71x).
+
+**Identity (gate 3).** `GENERATED` main == lds PASS at 512, 8192, 32768 and
+100000; lds run 1 == run 3 PASS at 8192 and 32768. `mega fail word: 0` on
+every run.
+
+**Decode A/B (gate 4).** `.work/ab-pfgemm/arm.txt`:
+`engA=./.work/engine-main engB=./.work/engine shaA=87d7b7c3cd4dfb4d
+shaB=7043dfe0974a6f20` (two binaries, as required after the AB_ENGINE_B
+drop). main median 135.96 tok/s_gen spread 2.2 %, lds median 135.91 spread
+1.0 %, ratio 1.000, identity fails none. Decode is untouched, as designed.
+
+**Merge gate (gate 2): exit 0 but NOT green.** Two reds, both harness, named
+here rather than swept:
+- `ci-checks.sh` exit 1, "dangling reference in the docs" — a doc link, not a
+  build or a kernel.
+- one-shot q8 "ref file not found: `.work/engine-pack/ref-tokens-64.txt`" —
+  this worktree carries `engine-pack-q8`, not `engine-pack`, so the q8 arm of
+  the gate never ran. The q8 path is untested in this round.
+
+Everything else in the gate is green: engine and test builds, run-tests
+(64 kernels, 36 in registry, 0 orphans), test_prefill, one-shot q4 64/64
+at 136.4 tok/s_gen, p0512, mtp 20/20, and the whole server suite (ALL PASS).
+
+**Open before this merges.** The two gate reds above; `docs/KERNELS.md` and
+`docs/BASELINE.md` not updated; no Brain note. The merge itself is the maintainer's
+call, and the next kernel lever off this result (the non-GEMM chunk work now
+holds 52 % at 8k and 70 % at 32k) belongs to a fable lane, not to this
+recording.
