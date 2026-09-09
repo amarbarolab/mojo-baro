@@ -1,0 +1,469 @@
+# latent.mojo — LatentOS IPC engine sidecar for mojo-baro (03 §1, §2).
+# Implements mint_latent and ingest_latent for byte-exact SSM checkpoints and KV pages.
+
+from std.memory import Pointer, unsafe_memset, unsafe_memcpy
+from std.memory.alloc import unsafe_alloc
+from max.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
+
+import latentos
+import latentos.sys as sys
+import latentos.proto as proto
+import latentos.ipc as ipc
+
+from registry import CONV_SLOT, SSM_SLOT, N_ATT, NKVH, KVPAGE, KVHSTR
+from prefix import Checkpoint, Chain, CKPT_BYTES, f32
+
+comptime BytePtr = Pointer[UInt8, MutUntrackedOrigin]
+
+# KV cache geometry constants (03 §2)
+# 8 layers × 4 heads × (128 tokens * 256 dim) = 1,048,576 floats per page
+comptime PGSTR = N_ATT * NKVH * KVHSTR
+comptime PAGE_K_BYTES = PGSTR * 4       # 4,194,304 bytes (4 MiB)
+comptime PAGE_V_BYTES = PGSTR * 4       # 4,194,304 bytes (4 MiB)
+comptime PAGE_KV_BYTES = 2 * PAGE_K_BYTES # 8,388,608 bytes (8 MiB / 128-token page = 64 KiB / token)
+
+# ==============================================================================
+# SSM Checkpoint Mint & Ingest (50.25 MiB)
+# ==============================================================================
+
+def mint_checkpoint_latent(
+    ckpt: Checkpoint,
+    weights_uuid: InlineArray[UInt8, 16] = InlineArray[UInt8, 16](fill=0),
+    role_sha: InlineArray[UInt8, 32] = InlineArray[UInt8, 32](fill=0),
+    runtime_sha: InlineArray[UInt8, 32] = InlineArray[UInt8, 32](fill=0),
+) raises -> Tuple[proto.LatentHeader, Int32]:
+    """Mints an immutable, sealed memfd from an in-memory Checkpoint and returns (LatentHeader, fd).
+    Mint order (03 §4): write -> munmap -> fcntl(F_ADD_SEALS) -> export.
+    """
+    if not ckpt.valid:
+        raise Error("Cannot mint invalid checkpoint")
+
+    var minted = ipc.mint_memfd_rw("latent-ssm-ckpt", CKPT_BYTES)
+    var mfd = minted[0]
+    var dst = minted[1]
+
+    # Copy CONV_SLOT (2,359,296 bytes) and SSM_SLOT (50,331,648 bytes)
+    var conv_bytes = CONV_SLOT * 4
+    var ssm_bytes = SSM_SLOT * 4
+
+    var src_conv = ckpt.conv_h.unsafe_ptr().unsafe_bitcast[UInt8]()
+    var src_ssm = ckpt.ssm_h.unsafe_ptr().unsafe_bitcast[UInt8]()
+
+    unsafe_memcpy(dest=dst, src=src_conv, count=conv_bytes)
+    unsafe_memcpy(dest=dst.unsafe_offset(conv_bytes), src=src_ssm, count=ssm_bytes)
+
+    # Seal the memfd before export
+    var sealed = ipc.seal_and_finalize(mfd, dst, CKPT_BYTES)
+    if not sealed:
+        _ = sys.sys_close(mfd)
+        raise Error("Failed to seal minted checkpoint memfd")
+
+    # Build 256-byte header
+    var header = proto.LatentHeader()
+    header.kind = UInt8(proto.KIND_SSM_CKPT)
+    header.dtype = UInt8(proto.DTYPE_F32)
+    header.pos_hi = UInt32(ckpt.pos)
+    header.prefix_hash = ckpt.hash
+    header.payload_len = UInt64(CKPT_BYTES)
+    header.weights_uuid = weights_uuid.copy()
+    header.role_sha = role_sha.copy()
+    header.runtime = runtime_sha.copy()
+
+    return (header^, mfd)
+
+def ingest_checkpoint_latent(
+    header: proto.LatentHeader,
+    fd: Int32,
+    mut ckpt: Checkpoint,
+) raises:
+    """Ingests a sealed memfd into an engine Checkpoint buffer for immediate zero-copy Chain restore.
+    """
+    if not header.is_valid():
+        _ = sys.sys_close(fd)
+        raise Error("Invalid LatentHeader in ingest_checkpoint_latent")
+
+    if header.kind != UInt8(proto.KIND_SSM_CKPT):
+        _ = sys.sys_close(fd)
+        raise Error("Header kind mismatch: expected SSM_CKPT, got " + header.kind_name())
+
+    if header.payload_len != UInt64(CKPT_BYTES):
+        _ = sys.sys_close(fd)
+        raise Error("Header payload length mismatch: expected " + String(CKPT_BYTES) + ", got " + String(header.payload_len))
+
+    # Zero-copy map of sealed payload
+    var src = ipc.map_readonly(fd, CKPT_BYTES)
+
+    var conv_bytes = CONV_SLOT * 4
+    var ssm_bytes = SSM_SLOT * 4
+
+    var dst_conv = ckpt.conv_h.unsafe_ptr().unsafe_bitcast[UInt8]()
+    var dst_ssm = ckpt.ssm_h.unsafe_ptr().unsafe_bitcast[UInt8]()
+
+    unsafe_memcpy(dest=dst_conv, src=src, count=conv_bytes)
+    unsafe_memcpy(dest=dst_ssm, src=src.unsafe_offset(conv_bytes), count=ssm_bytes)
+
+    # Release mapping and descriptor
+    _ = sys.sys_munmap(src, CKPT_BYTES)
+    _ = sys.sys_close(fd)
+
+    # Update checkpoint metadata
+    ckpt.pos = Int(header.pos_hi)
+    ckpt.hash = header.prefix_hash
+    ckpt.valid = True
+    ckpt.pending = False
+
+def mint_chain_slot(
+    chain: Chain,
+    slot_idx: Int,
+    weights_uuid: InlineArray[UInt8, 16] = InlineArray[UInt8, 16](fill=0),
+    role_sha: InlineArray[UInt8, 32] = InlineArray[UInt8, 32](fill=0),
+    runtime_sha: InlineArray[UInt8, 32] = InlineArray[UInt8, 32](fill=0),
+) raises -> Tuple[proto.LatentHeader, Int32]:
+    """Mints a checkpoint from an active slot in Chain."""
+    if slot_idx < 0 or slot_idx >= len(chain.items):
+        raise Error("Invalid slot_idx in mint_chain_slot: " + String(slot_idx))
+    return mint_checkpoint_latent(chain.items[slot_idx], weights_uuid, role_sha, runtime_sha)
+
+def ingest_into_chain(
+    mut chain: Chain,
+    header: proto.LatentHeader,
+    fd: Int32,
+) raises -> Int:
+    """Ingests a sealed checkpoint memfd directly into an engine Chain slot, returning the slot index."""
+    if chain.cap == 0 or len(chain.items) == 0:
+        _ = sys.sys_close(fd)
+        raise Error("Chain has zero capacity")
+
+    # Match existing pos or find first non-valid slot
+    var idx = -1
+    for i in range(len(chain.items)):
+        if chain.items[i].valid and chain.items[i].pos == Int(header.pos_hi):
+            idx = i
+            break
+    if idx < 0:
+        for i in range(len(chain.items)):
+            if not chain.items[i].valid and not chain.items[i].pending:
+                idx = i
+                break
+    if idx < 0:
+        # Evict oldest (smallest pos)
+        idx = 0
+        for i in range(1, len(chain.items)):
+            if chain.items[i].pos < chain.items[idx].pos:
+                idx = i
+
+    chain.gen += 1
+    chain.items[idx].gen = chain.gen
+    ingest_checkpoint_latent(header, fd, chain.items[idx])
+    return idx
+
+# ==============================================================================
+# KV Cache Pool Mint & Ingest (64 KiB / token)
+# ==============================================================================
+
+def mint_kv_page_host(
+    src_k: BytePtr,
+    src_v: BytePtr,
+    page_idx: Int,
+    num_pages: Int = 1,
+    prefix_hash: UInt64 = 0,
+    weights_uuid: InlineArray[UInt8, 16] = InlineArray[UInt8, 16](fill=0),
+    role_sha: InlineArray[UInt8, 32] = InlineArray[UInt8, 32](fill=0),
+    runtime_sha: InlineArray[UInt8, 32] = InlineArray[UInt8, 32](fill=0),
+) raises -> Tuple[proto.LatentHeader, Int32]:
+    """Mints sealed memfd from host-accessible K and V page buffers."""
+    var total_bytes = num_pages * PAGE_KV_BYTES
+    var minted = ipc.mint_memfd_rw("latent-kv-pages", total_bytes)
+    var mfd = minted[0]
+    var dst = minted[1]
+
+    var k_bytes = num_pages * PAGE_K_BYTES
+    var v_bytes = num_pages * PAGE_V_BYTES
+
+    unsafe_memcpy(dest=dst, src=src_k, count=k_bytes)
+    unsafe_memcpy(dest=dst.unsafe_offset(k_bytes), src=src_v, count=v_bytes)
+
+    var sealed = ipc.seal_and_finalize(mfd, dst, total_bytes)
+    if not sealed:
+        _ = sys.sys_close(mfd)
+        raise Error("Failed to seal KV page memfd")
+
+    var header = proto.LatentHeader()
+    header.kind = UInt8(proto.KIND_KV_PAGES)
+    header.dtype = UInt8(proto.DTYPE_F32)
+    header.pos_lo = UInt32(page_idx * KVPAGE)
+    header.pos_hi = UInt32((page_idx + num_pages) * KVPAGE)
+    header.prefix_hash = prefix_hash
+    header.payload_len = UInt64(total_bytes)
+    header.weights_uuid = weights_uuid.copy()
+    header.role_sha = role_sha.copy()
+    header.runtime = runtime_sha.copy()
+
+    return (header^, mfd)
+
+def ingest_kv_page_host(
+    header: proto.LatentHeader,
+    fd: Int32,
+    dst_k: BytePtr,
+    dst_v: BytePtr,
+) raises:
+    """Ingests a sealed KV page memfd into host-accessible destination buffers."""
+    if not header.is_valid():
+        _ = sys.sys_close(fd)
+        raise Error("Invalid LatentHeader in ingest_kv_page_host")
+
+    if header.kind != UInt8(proto.KIND_KV_PAGES):
+        _ = sys.sys_close(fd)
+        raise Error("Header kind mismatch: expected KV_PAGES, got " + header.kind_name())
+
+    var total_bytes = Int(header.payload_len)
+    var num_pages = (Int(header.pos_hi) - Int(header.pos_lo)) // KVPAGE
+    if num_pages < 1 or total_bytes != num_pages * PAGE_KV_BYTES:
+        _ = sys.sys_close(fd)
+        raise Error("Payload length does not match page range: " + String(total_bytes))
+
+    var src = ipc.map_readonly(fd, total_bytes)
+    var k_bytes = num_pages * PAGE_K_BYTES
+    var v_bytes = num_pages * PAGE_V_BYTES
+
+    unsafe_memcpy(dest=dst_k, src=src, count=k_bytes)
+    unsafe_memcpy(dest=dst_v, src=src.unsafe_offset(k_bytes), count=v_bytes)
+
+    _ = sys.sys_munmap(src, total_bytes)
+    _ = sys.sys_close(fd)
+
+def mint_kv_latent(
+    ctx: DeviceContext,
+    kc_d: DeviceBuffer[f32],
+    vc_d: DeviceBuffer[f32],
+    page_idx: Int,
+    num_pages: Int = 1,
+    prefix_hash: UInt64 = 0,
+    weights_uuid: InlineArray[UInt8, 16] = InlineArray[UInt8, 16](fill=0),
+    role_sha: InlineArray[UInt8, 32] = InlineArray[UInt8, 32](fill=0),
+    runtime_sha: InlineArray[UInt8, 32] = InlineArray[UInt8, 32](fill=0),
+) raises -> Tuple[proto.LatentHeader, Int32]:
+    """Extracts KV cache pages from device memory into a sealed LatentOS memfd."""
+    var total_floats = num_pages * PGSTR
+    var host_k = ctx.enqueue_create_host_buffer[f32](total_floats)
+    var host_v = ctx.enqueue_create_host_buffer[f32](total_floats)
+
+    var kc_slice = DeviceBuffer[f32](ctx, kc_d.unsafe_ptr().unsafe_offset(page_idx * PGSTR), total_floats, owning=False)
+    var vc_slice = DeviceBuffer[f32](ctx, vc_d.unsafe_ptr().unsafe_offset(page_idx * PGSTR), total_floats, owning=False)
+
+    ctx.enqueue_copy(dst_buf=host_k, src_buf=kc_slice)
+    ctx.enqueue_copy(dst_buf=host_v, src_buf=vc_slice)
+    ctx.synchronize()
+
+    var src_k = host_k.unsafe_ptr().unsafe_bitcast[UInt8]()
+    var src_v = host_v.unsafe_ptr().unsafe_bitcast[UInt8]()
+
+    return mint_kv_page_host(
+        src_k, src_v, page_idx, num_pages, prefix_hash,
+        weights_uuid, role_sha, runtime_sha
+    )
+
+def ingest_kv_latent(
+    ctx: DeviceContext,
+    mut kc_d: DeviceBuffer[f32],
+    mut vc_d: DeviceBuffer[f32],
+    header: proto.LatentHeader,
+    fd: Int32,
+) raises:
+    """Ingests a sealed LatentOS KV page memfd directly into GPU attention KV cache."""
+    if not header.is_valid() or header.kind != UInt8(proto.KIND_KV_PAGES):
+        if fd >= 0:
+            _ = sys.sys_close(fd)
+        raise Error("Invalid LatentHeader in ingest_kv_latent")
+
+    var page_idx = Int(header.pos_lo) // KVPAGE
+    var num_pages = (Int(header.pos_hi) - Int(header.pos_lo)) // KVPAGE
+    var total_floats = num_pages * PGSTR
+
+    var host_k = ctx.enqueue_create_host_buffer[f32](total_floats)
+    var host_v = ctx.enqueue_create_host_buffer[f32](total_floats)
+
+    var dst_k = host_k.unsafe_ptr().unsafe_bitcast[UInt8]()
+    var dst_v = host_v.unsafe_ptr().unsafe_bitcast[UInt8]()
+
+    ingest_kv_page_host(header, fd, dst_k, dst_v)
+
+    var kc_slice = DeviceBuffer[f32](ctx, kc_d.unsafe_ptr().unsafe_offset(page_idx * PGSTR), total_floats, owning=False)
+    var vc_slice = DeviceBuffer[f32](ctx, vc_d.unsafe_ptr().unsafe_offset(page_idx * PGSTR), total_floats, owning=False)
+
+    ctx.enqueue_copy(dst_buf=kc_slice, src_buf=host_k)
+    ctx.enqueue_copy(dst_buf=vc_slice, src_buf=host_v)
+    ctx.synchronize()
+
+
+# ==============================================================================
+# HIDDEN Vector Latent Mint & Ingest (8 steps, 16 KiB/step f32, 8 KiB/step bf16)
+# ==============================================================================
+
+def mint_hidden_latent(
+    src_h: BytePtr,
+    num_steps: Int = 8,
+    dtype: Int = proto.DTYPE_F32,
+    weights_uuid: InlineArray[UInt8, 16] = InlineArray[UInt8, 16](fill=0),
+    role_sha: InlineArray[UInt8, 32] = InlineArray[UInt8, 32](fill=0),
+    runtime_sha: InlineArray[UInt8, 32] = InlineArray[UInt8, 32](fill=0),
+) raises -> Tuple[proto.LatentHeader, Int32]:
+    """Mints sealed memfd from hidden state vectors."""
+    var bytes_per_step = 8192 if dtype == proto.DTYPE_BF16 else 16384
+    var total_bytes = num_steps * bytes_per_step
+    var minted = ipc.mint_memfd_rw("latent-hidden", total_bytes)
+    var mfd = minted[0]
+    var dst = minted[1]
+
+    unsafe_memcpy(dest=dst, src=src_h, count=total_bytes)
+
+    var sealed = ipc.seal_and_finalize(mfd, dst, total_bytes)
+    if not sealed:
+        _ = sys.sys_close(mfd)
+        raise Error("Failed to seal hidden latent memfd")
+
+    var header = proto.LatentHeader()
+    header.kind = UInt8(proto.KIND_HIDDEN)
+    header.dtype = UInt8(dtype)
+    header.pos_lo = 0
+    header.pos_hi = UInt32(num_steps)
+    header.payload_len = UInt64(total_bytes)
+    header.weights_uuid = weights_uuid.copy()
+    header.role_sha = role_sha.copy()
+    header.runtime = runtime_sha.copy()
+
+    return (header^, mfd)
+
+def ingest_hidden_latent(
+    header: proto.LatentHeader,
+    fd: Int32,
+    dst_h: BytePtr,
+) raises:
+    """Ingests a sealed hidden vector memfd into host destination buffer."""
+    if not header.is_valid() or header.kind != UInt8(proto.KIND_HIDDEN):
+        if fd >= 0:
+            _ = sys.sys_close(fd)
+        raise Error("Invalid LatentHeader in ingest_hidden_latent")
+
+    var total_bytes = Int(header.payload_len)
+    var src = ipc.map_readonly(fd, total_bytes)
+    unsafe_memcpy(dest=dst_h, src=src, count=total_bytes)
+
+    _ = sys.sys_munmap(src, total_bytes)
+    _ = sys.sys_close(fd)
+
+# ==============================================================================
+# Engine IPC Client Daemon Connection
+# ==============================================================================
+
+struct EngineLatentClient:
+    """IPC client in the engine process talking to latentos-agent."""
+    var agent_sock: Int32
+
+    def __init__(out self, agent_sock: Int32):
+        self.agent_sock = agent_sock
+
+    def export_checkpoint(self, ckpt: Checkpoint) raises -> Bool:
+        """Mints a checkpoint into a sealed memfd and exports it to latentos-agent."""
+        var res = mint_checkpoint_latent(ckpt)
+        var header = res[0].copy()
+        var fd = res[1]
+        var ok = ipc.send_handle(self.agent_sock, header, fd)
+        _ = sys.sys_close(fd)
+        return ok
+
+    def import_checkpoint(self, mut ckpt: Checkpoint) raises -> Bool:
+        """Receives a checkpoint handle from latentos-agent and ingests it into ckpt."""
+        var res = ipc.recv_handle(self.agent_sock)
+        var header = res[0].copy()
+        var fd = res[1]
+        if fd < 0 or not header.is_valid():
+            if fd >= 0:
+                _ = sys.sys_close(fd)
+            return False
+        ingest_checkpoint_latent(header, fd, ckpt)
+        return True
+
+    def export_chain_slot(self, chain: Chain, slot_idx: Int) raises -> Bool:
+        """Mints a checkpoint from Chain and exports it to latentos-agent."""
+        var res = mint_chain_slot(chain, slot_idx)
+        var header = res[0].copy()
+        var fd = res[1]
+        var ok = ipc.send_handle(self.agent_sock, header, fd)
+        _ = sys.sys_close(fd)
+        return ok
+
+    def import_into_chain(self, mut chain: Chain) raises -> Int:
+        """Receives a checkpoint from latentos-agent and ingests it into Chain, returning the slot index."""
+        var res = ipc.recv_handle(self.agent_sock)
+        var header = res[0].copy()
+        var fd = res[1]
+        if fd < 0 or not header.is_valid():
+            if fd >= 0:
+                _ = sys.sys_close(fd)
+            return -1
+        return ingest_into_chain(chain, header, fd)
+
+    def export_kv_pages(
+        self,
+        ctx: DeviceContext,
+        kc_d: DeviceBuffer[f32],
+        vc_d: DeviceBuffer[f32],
+        page_idx: Int,
+        num_pages: Int = 1,
+        prefix_hash: UInt64 = 0,
+    ) raises -> Bool:
+        """Mints KV pages from GPU memory and exports them to latentos-agent."""
+        var res = mint_kv_latent(ctx, kc_d, vc_d, page_idx, num_pages, prefix_hash)
+        var header = res[0].copy()
+        var fd = res[1]
+        var ok = ipc.send_handle(self.agent_sock, header, fd)
+        _ = sys.sys_close(fd)
+        return ok
+
+    def import_kv_pages(
+        self,
+        ctx: DeviceContext,
+        mut kc_d: DeviceBuffer[f32],
+        mut vc_d: DeviceBuffer[f32],
+    ) raises -> Bool:
+        """Receives KV pages from latentos-agent and ingests them into GPU KV cache."""
+        var res = ipc.recv_handle(self.agent_sock)
+        var header = res[0].copy()
+        var fd = res[1]
+        if fd < 0 or not header.is_valid():
+            if fd >= 0:
+                _ = sys.sys_close(fd)
+            return False
+        ingest_kv_latent(ctx, kc_d, vc_d, header, fd)
+        return True
+
+    def export_hidden(
+        self,
+        src_h: BytePtr,
+        num_steps: Int = 8,
+        dtype: Int = proto.DTYPE_F32,
+    ) raises -> Bool:
+        """Mints HIDDEN vectors and exports them to latentos-agent."""
+        var res = mint_hidden_latent(src_h, num_steps, dtype)
+        var header = res[0].copy()
+        var fd = res[1]
+        var ok = ipc.send_handle(self.agent_sock, header, fd)
+        _ = sys.sys_close(fd)
+        return ok
+
+    def import_hidden(
+        self,
+        dst_h: BytePtr,
+    ) raises -> Bool:
+        """Receives HIDDEN vectors from latentos-agent and ingests them into dst_h."""
+        var res = ipc.recv_handle(self.agent_sock)
+        var header = res[0].copy()
+        var fd = res[1]
+        if fd < 0 or not header.is_valid():
+            if fd >= 0:
+                _ = sys.sys_close(fd)
+            return False
+        ingest_hidden_latent(header, fd, dst_h)
+        return True
+
