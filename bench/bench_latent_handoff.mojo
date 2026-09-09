@@ -29,7 +29,7 @@ from realign import realign_expected_embedding
 from tokenizer import Tokenizer
 
 from grammar.automaton import Automaton
-from grammar.json_value import parse_json_file, JSONDoc, JSONValue, JKindString, JKindNumber, JKindArray, JKindObject
+from grammar.json_value import parse_json_file, JSONDoc, JSONValue, JKindNull, JKindBool, JKindString, JKindNumber, JKindArray, JKindObject
 from grammar.json_schema import compile_root_schema, str_bytes
 from grammar.vocab import Vocab, load_vocab
 from grammar.trie import TokenTrie, TrieNode, build_trie
@@ -83,6 +83,135 @@ def strip_ws(s: String) -> String:
     while hi > lo and (b[hi - 1] == 32 or b[hi - 1] == 9 or b[hi - 1] == 10 or b[hi - 1] == 13):
         hi -= 1
     return String(StringSlice(unsafe_from_utf8=Span(b)[lo:hi]))
+
+
+def extend_ids(mut dst: List[Int], src: List[Int]):
+    for i in range(len(src)):
+        dst.append(src[i])
+
+
+def bytes_match_pat(b: Span[UInt8, _], i: Int, pat: String) -> Bool:
+    var pb = pat.as_bytes()
+    var m = len(pb)
+    if i + m > len(b):
+        return False
+    for j in range(m):
+        if b[i + j] != pb[j]:
+            return False
+    return True
+
+
+def strip_think_and_fences(s: String) -> String:
+    # round 2 defect 1: B wraps answers as "<think>...</think>\n```json\n{...}\n```".
+    # Drop <think>...</think> spans (unterminated -> drop to end, an exhausted
+    # ans_max budget) and every ``` fence marker before anything else looks at
+    # the text.
+    var b = s.as_bytes()
+    var n = len(b)
+    var out = List[UInt8]()
+    var i = 0
+    while i < n:
+        if bytes_match_pat(b, i, "<think>"):
+            var j = i + 7
+            var found = False
+            while j < n:
+                if bytes_match_pat(b, j, "</think>"):
+                    i = j + 8
+                    found = True
+                    break
+                j += 1
+            if found:
+                continue
+            break
+        if bytes_match_pat(b, i, "```"):
+            i += 3
+            continue
+        out.append(b[i])
+        i += 1
+    return String(StringSlice(unsafe_from_utf8=Span(out)))
+
+
+def extract_json_object(s: String) -> String:
+    # First balanced {...} object in s (string-literal aware, so a brace
+    # inside a JSON string value doesn't unbalance the scan). Falls back to
+    # the whitespace-trimmed input if no complete object is found, so a bad
+    # sample fails the schema/parse check downstream instead of raising here.
+    var b = s.as_bytes()
+    var n = len(b)
+    var start = -1
+    for i in range(n):
+        if b[i] == 123:
+            start = i
+            break
+    if start < 0:
+        return strip_ws(s)
+    var depth = 0
+    var in_str = False
+    var esc = False
+    var end = -1
+    var i = start
+    while i < n:
+        var c = b[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif c == 92:
+                esc = True
+            elif c == 34:
+                in_str = False
+        else:
+            if c == 34:
+                in_str = True
+            elif c == 123:
+                depth += 1
+            elif c == 125:
+                depth -= 1
+                if depth == 0:
+                    end = i
+                    break
+        i += 1
+    if end < 0:
+        return strip_ws(s)
+    return String(StringSlice(unsafe_from_utf8=Span(b)[start : end + 1]))
+
+
+def strip_for_math(text: String) -> String:
+    return strip_think_and_fences(text)
+
+
+def strip_for_json(text: String) -> String:
+    return extract_json_object(strip_think_and_fences(text))
+
+
+def json_value_to_string(doc: JSONDoc, idx: Int) -> String:
+    if idx < 0:
+        return String("null")
+    var v = doc.get(idx)
+    if v.kind == JKindNull:
+        return String("null")
+    elif v.kind == JKindBool:
+        return String("true") if v.b else String("false")
+    elif v.kind == JKindNumber:
+        return v.s
+    elif v.kind == JKindString:
+        return String("\"") + json_escape(v.s) + "\""
+    elif v.kind == JKindArray:
+        var s = String("[")
+        for i in range(len(v.arr)):
+            if i > 0:
+                s += ","
+            s += json_value_to_string(doc, v.arr[i])
+        s += "]"
+        return s
+    elif v.kind == JKindObject:
+        var s = String("{")
+        for i in range(len(v.obj_keys)):
+            if i > 0:
+                s += ","
+            s += "\"" + json_escape(v.obj_keys[i]) + "\":" + json_value_to_string(doc, v.obj_vals[i])
+        s += "}"
+        return s
+    return String("null")
 
 
 @fieldwise_init
@@ -243,6 +372,31 @@ def apply_latent_to_receiver(
         step_latent_raw(ctx, b, cfg, st, latent_dev)
 
 
+def append_known_tokens(
+    ctx: DeviceContext, mut b: WindowBufs, mut wst: WindowState,
+    pack_q4: Bool, q4_off: Int, e: Int, known_ids: List[Int], tmax: Int,
+) raises:
+    # Feeds real, already-known token ids (the turn-boundary reopener, the
+    # no-think opener) through the SAME engine state a latent arm already
+    # built via step_latent_raw, continuing from wst.pos rather than
+    # resetting -- unlike run_fresh_generate, which restarts from scratch and
+    # is used instead for arms 0/T (b_context is just a longer id list there).
+    if len(known_ids) == 0:
+        return
+    var base_pos = wst.pos
+    var target = base_pos + len(known_ids)
+    var host = ctx.enqueue_create_host_buffer[DType.int32](len(known_ids))
+    ctx.synchronize()
+    for i in range(len(known_ids)):
+        host[i] = Int32(known_ids[i])
+    var dst = DeviceBuffer[DType.int32](ctx, b.toks_d.unsafe_ptr() + base_pos, len(known_ids), owning=False)
+    ctx.enqueue_copy(dst_buf=dst, src_buf=host)
+    ctx.synchronize()
+    var cfg = make_cfg(pack_q4, q4_off, e, 0, 0, target, target + 1)
+    while wst.pos < target:
+        step_window(ctx, b, cfg, wst)
+
+
 def greedy_tokenize(trie: TokenTrie, text_bytes: List[UInt8]) raises -> List[Int]:
     var out: List[Int] = []
     var pos = 0
@@ -319,11 +473,12 @@ def ids_to_json(ids: List[Int]) -> String:
     return s
 
 
-def arm_json(name: String, producer_s: Float64, receiver_s: Float64, ids: List[Int], text: String, schema_valid: Int, error: String) -> String:
+def arm_json(name: String, producer_s: Float64, receiver_s: Float64, ids: List[Int], text: String, scored_text: String, schema_valid: Int, error: String) -> String:
     var s = String("{\"arm\":\"") + name + "\",\"producer_s\":" + String(producer_s)
     s += ",\"receiver_s\":" + String(receiver_s)
     s += ",\"generated_ids\":" + ids_to_json(ids)
     s += ",\"answer_text\":\"" + json_escape(text) + "\""
+    s += ",\"scored_text\":\"" + json_escape(scored_text) + "\""
     if schema_valid < 0:
         s += ",\"schema_valid\":null"
     else:
@@ -340,6 +495,7 @@ def main() raises:
     comptime assert has_accelerator(), "Requires GPU"
     var args = argv()
     var n_items = 40
+    var ids_arg = String("")
     var arms_arg = String("0,T,L8-raw,L8-soft,L32-soft")
     var out_prefix = String("results/e8/topology1-q4")
     var i = 1
@@ -347,6 +503,13 @@ def main() raises:
         var a = String(args[i])
         if a == "--items" and i + 1 < len(args):
             n_items = atol(String(args[i + 1]))
+            i += 2
+        elif a == "--ids" and i + 1 < len(args):
+            # round 2: `--items N` can only take the first N items in file
+            # order (all 20 json then all 20 math) -- this selects specific
+            # ids by name, e.g. json_01,json_02,...,math_01,... for the
+            # mixed-type smoke the coordinator asked for.
+            ids_arg = String(args[i + 1])
             i += 2
         elif a == "--arms" and i + 1 < len(args):
             arms_arg = String(args[i + 1])
@@ -357,7 +520,10 @@ def main() raises:
         else:
             i += 1
     var arms = arms_arg.split(",")
-    var ans_max = atol(getenv("BARO_E8_ANS_MAX", "128"))
+    var want_ids = ids_arg.split(",")
+    var use_ids = ids_arg != ""
+    var ans_max = atol(getenv("BARO_E8_ANS_MAX", "256"))
+    var nothink = getenv("BARO_E8_NOTHINK", "1") == "1"
     var packdir = getenv("BARO_PACK", ".work/engine-pack-q4")
     var gguf_path = getenv(
         "BARO_E8_GGUF",
@@ -409,19 +575,48 @@ def main() raises:
     var vp = ArcPointer(vocab^)
     var tp = ArcPointer(trie^)
 
+    # round 2 defect 4/5: every arm hands B off at the same assistant-turn
+    # boundary, and (BARO_E8_NOTHINK=1 default) with B's own CoT suppressed --
+    # the only reasoning channel under test is the handoff, not B re-thinking
+    # from scratch. Computed once via the real tokenizer/BPE so these match
+    # however <|im_end|>/<|im_start|> and "assistant"/"<think>" actually tokenize.
+    var turn_ids = tok.encode(String("<|im_end|>\n<|im_start|>assistant\n"), add_special=False)
+    var nothink_ids = tok.encode(String("<think>\n\n</think>\n\n"), add_special=False)
+    print("turn_ids:", ids_to_json(turn_ids), " nothink:", nothink, " nothink_ids:", ids_to_json(nothink_ids))
+
     var wstA = WindowState(pos=0, pos_prev=0, ring=0, n_drafted=0, n_accepted=0, n_spec_windows=0, n_dumped=0, tp=0, tq=0, pf_att=0, pf_ssm=0, pf_ffn=0, pf_head=0, pf_proc=0, pf_draft=0, fc=[0, 0, 0, 0, 0, 0], pc=[0, 0, 0, 0, 0, 0, 0, 0], p3=[0, 0, 0, 0])
     var wstB = WindowState(pos=0, pos_prev=0, ring=0, n_drafted=0, n_accepted=0, n_spec_windows=0, n_dumped=0, tp=0, tq=0, pf_att=0, pf_ssm=0, pf_ffn=0, pf_head=0, pf_proc=0, pf_draft=0, fc=[0, 0, 0, 0, 0, 0], pc=[0, 0, 0, 0, 0, 0, 0, 0], p3=[0, 0, 0, 0])
 
     var doc = parse_json_file("bench/data/e8_tasks.json")
     var root = doc.get(doc.root)
     var n_avail = len(root.arr)
-    var n_run = n_items if n_items < n_avail else n_avail
+    var run_indices = List[Int]()
+    if use_ids:
+        for wi in range(len(want_ids)):
+            var wid = String(want_ids[wi])
+            var found = -1
+            for j in range(n_avail):
+                if get_str(doc, root.arr[j], "id") == wid:
+                    found = root.arr[j]
+                    break
+            if found < 0:
+                print("WARNING: --ids requested unknown id", wid, "-- skipping")
+            else:
+                run_indices.append(found)
+    else:
+        var n_run = n_items if n_items < n_avail else n_avail
+        for j in range(n_run):
+            run_indices.append(root.arr[j])
 
-    var out = String("{\"topology\":\"topology1-q4\",\"pack\":\"") + packdir + "\",\"transport\":\"in-process host copy (memfd transport is E7's, not measured here)\",\"items\":["
+    var out = String("{\"topology\":\"topology1-q4\",\"pack\":\"") + packdir + "\""
+    out += ",\"transport\":\"in-process host copy (memfd transport is E7's, not measured here)\""
+    out += ",\"turn_boundary_note\":\"arm 0 already ends at the assistant turn boundary (full_prompt); arms T/L8-raw/L8-soft/L32-soft append <|im_end|>\\n<|im_start|>assistant\\n as real ids after the handoff (A's trimmed CoT ids for T, the k latent-injection steps for the L arms) before B generates, so every arm starts B at the same turn boundary\""
+    out += ",\"nothink\":" + ("true" if nothink else "false")
+    out += ",\"items\":["
     var first_item = True
 
-    for it in range(n_run):
-        var idx = root.arr[it]
+    for it in range(len(run_indices)):
+        var idx = run_indices[it]
         var task_id = get_str(doc, idx, "id")
         var task_type = get_str(doc, idx, "type")
         var schema_file = get_str(doc, idx, "schema_file")
@@ -431,7 +626,9 @@ def main() raises:
         if not first_item:
             out += ","
         first_item = False
-        out += "{\"id\":\"" + json_escape(task_id) + "\",\"type\":\"" + json_escape(task_type) + "\",\"arms\":["
+        out += "{\"id\":\"" + json_escape(task_id) + "\",\"type\":\"" + json_escape(task_type) + "\""
+        out += ",\"expected\":" + json_value_to_string(doc, doc.get_field(idx, "expected"))
+        out += ",\"arms\":["
         var first_arm = True
 
         for arm_i in range(len(arms)):
@@ -443,27 +640,40 @@ def main() raises:
 
             try:
                 if arm == "0":
-                    var r = run_fresh_generate(ctx, bufsB, wstB, pack_q4, q4_off, eB, tokens, ans_max, tmax)
+                    var b_context = tokens.copy()
+                    if nothink:
+                        extend_ids(b_context, nothink_ids)
+                    var r = run_fresh_generate(ctx, bufsB, wstB, pack_q4, q4_off, eB, b_context, ans_max, tmax)
                     var ans_ids = trim_at_stop(r.ids, stops)
                     var text = tok.decode(ans_ids)
                     var sv = -1
+                    var scored = String("")
                     if task_type == "json":
-                        sv = 1 if check_schema_valid(schema_file, text, vp, tp) else 0
-                    out += arm_json(arm, 0.0, r.elapsed_s, r.ids, text, sv, "")
+                        scored = strip_for_json(text)
+                        sv = 1 if check_schema_valid(schema_file, scored, vp, tp) else 0
+                    else:
+                        scored = strip_for_math(text)
+                    out += arm_json(arm, 0.0, r.elapsed_s, r.ids, text, scored, sv, "")
 
                 elif arm == "T":
                     var rA = run_fresh_generate(ctx, bufsA, wstA, pack_q4, q4_off, eA, tokens, COT_MAX, tmax)
                     var cot_ids = trim_at_stop(rA.ids, stops)
                     var b_context = tokens.copy()
-                    for j in range(len(cot_ids)):
-                        b_context.append(cot_ids[j])
+                    extend_ids(b_context, cot_ids)
+                    extend_ids(b_context, turn_ids)
+                    if nothink:
+                        extend_ids(b_context, nothink_ids)
                     var rB = run_fresh_generate(ctx, bufsB, wstB, pack_q4, q4_off, eB, b_context, ans_max, tmax)
                     var ans_ids = trim_at_stop(rB.ids, stops)
                     var text = tok.decode(ans_ids)
                     var sv = -1
+                    var scored = String("")
                     if task_type == "json":
-                        sv = 1 if check_schema_valid(schema_file, text, vp, tp) else 0
-                    out += arm_json(arm, rA.elapsed_s, rB.elapsed_s, rB.ids, text, sv, "")
+                        scored = strip_for_json(text)
+                        sv = 1 if check_schema_valid(schema_file, scored, vp, tp) else 0
+                    else:
+                        scored = strip_for_math(text)
+                    out += arm_json(arm, rA.elapsed_s, rB.elapsed_s, rB.ids, text, scored, sv, "")
 
                 elif arm == "L8-raw" or arm == "L8-soft" or arm == "L32-soft":
                     var k = K32 if arm == "L32-soft" else K8
@@ -481,7 +691,10 @@ def main() raises:
                     var t0b = perf_counter_ns()
                     var cfgB = run_to_prompt_end(ctx, bufsB, wstB, pack_q4, q4_off, eB, tokens, tmax)
                     apply_latent_to_receiver(ctx, bufsB, cfgB, wstB, latent_hA, k)
-                    var start_pos = len(tokens) + k
+                    append_known_tokens(ctx, bufsB, wstB, pack_q4, q4_off, eB, turn_ids, tmax)
+                    if nothink:
+                        append_known_tokens(ctx, bufsB, wstB, pack_q4, q4_off, eB, nothink_ids, tmax)
+                    var start_pos = wstB.pos
                     var cfg_gen = make_cfg(pack_q4, q4_off, eB, 0, 0, start_pos, start_pos + ans_max)
                     while wstB.pos < start_pos + ans_max - 1:
                         step_window(ctx, bufsB, cfg_gen, wstB)
@@ -491,14 +704,18 @@ def main() raises:
                     var ans_ids = trim_at_stop(gen_ids, stops)
                     var text = tok.decode(ans_ids)
                     var sv = -1
+                    var scored = String("")
                     if task_type == "json":
-                        sv = 1 if check_schema_valid(schema_file, text, vp, tp) else 0
-                    out += arm_json(arm, producer_s, receiver_s, gen_ids, text, sv, "")
+                        scored = strip_for_json(text)
+                        sv = 1 if check_schema_valid(schema_file, scored, vp, tp) else 0
+                    else:
+                        scored = strip_for_math(text)
+                    out += arm_json(arm, producer_s, receiver_s, gen_ids, text, scored, sv, "")
 
                 else:
-                    out += arm_json(arm, 0.0, 0.0, List[Int](), "", -1, "unknown arm " + arm)
+                    out += arm_json(arm, 0.0, 0.0, List[Int](), "", "", -1, "unknown arm " + arm)
             except e:
-                out += arm_json(arm, 0.0, 0.0, List[Int](), "", -1, String(e))
+                out += arm_json(arm, 0.0, 0.0, List[Int](), "", "", -1, String(e))
 
         out += "]}"
 

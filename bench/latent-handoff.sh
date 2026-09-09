@@ -1,13 +1,18 @@
 #!/usr/bin/env bash
-# usage: bench/latent-handoff.sh [--items N] [--arms a,b,c] [--out PREFIX]
+# usage: bench/latent-handoff.sh [--items N] [--ids id1,id2,...] [--arms a,b,c] [--out PREFIX]
 # E8 HARNESS (exchange/e8-lane-plan-2026-09-09.md item HARNESS): builds the
 # dual-engine evaluator, runs it under the GPU waiting room, then scores the
 # raw dump with bench/e8_score.py. Default: all 40 items, all 5 arms,
 # results/e8/topology1-q4-<date>. Smoke: --items 4 --arms 0,T,L8-raw.
+# --ids picks specific item ids (round 2: --items N can't express a mix like
+# json_01..04 + math_01..04) and is passed straight through to the binary,
+# which selects those ids in the given order instead of the first N in file
+# order; --ids overrides --items when both are given.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 items=40
+ids=""
 arms="0,T,L8-raw,L8-soft,L32-soft"
 date_tag=$(date +%Y-%m-%d)
 out_prefix="results/e8/topology1-q4-${date_tag}"
@@ -15,11 +20,17 @@ out_prefix="results/e8/topology1-q4-${date_tag}"
 while [ $# -gt 0 ]; do
   case "$1" in
     --items) items="$2"; shift 2 ;;
+    --ids) ids="$2"; shift 2 ;;
     --arms) arms="$2"; shift 2 ;;
     --out) out_prefix="$2"; shift 2 ;;
     *) echo "unknown arg: $1" >&2; exit 1 ;;
   esac
 done
+
+bin_args=(--items "$items" --arms "$arms" --out "$out_prefix")
+if [ -n "$ids" ]; then
+  bin_args=(--ids "$ids" --arms "$arms" --out "$out_prefix")
+fi
 
 mkdir -p .work results/e8
 rm -f .work/e8-vram-ready.marker
@@ -38,7 +49,7 @@ echo "VRAM before both loads: ${vram_before}"
 # it in the background and poll the marker bench_latent_handoff.mojo writes
 # once both packs are resident, so the "after" reading is taken mid-run.
 gpu-wait run --priority 30 --vram 14 -- \
-  .work/bench_latent_handoff --items "$items" --arms "$arms" --out "$out_prefix" &
+  .work/bench_latent_handoff "${bin_args[@]}" &
 job_pid=$!
 
 waited=0
