@@ -310,7 +310,17 @@ impl Acc {
 
 fn stats_json(s: &protocol::DoneStats) -> Value {
     json!({"prefill_s": s.prefill_s, "decode_s": s.decode_s, "tok_s_gen": s.tok_s,
-           "drafted": s.drafted, "accepted": s.accepted})
+           "drafted": s.drafted, "accepted": s.accepted,
+           "cached": s.cached, "prefill_rows": s.prefill_rows, "restore_s": s.restore_s})
+}
+
+/// OpenAI `usage` plus the engine's prefix-checkpoint receipt (M1a):
+/// `baro.cached_tokens` = prompt tokens restored from a checkpoint,
+/// `baro.prefill_rows` = prompt rows actually replayed.
+fn usage_json(n_prompt: usize, n_completion: usize, stats: &Value) -> Value {
+    json!({"prompt_tokens": n_prompt, "completion_tokens": n_completion, "total_tokens": n_prompt + n_completion,
+           "baro": {"cached_tokens": stats.get("cached").cloned().unwrap_or(Value::Null),
+                    "prefill_rows": stats.get("prefill_rows").cloned().unwrap_or(Value::Null)}})
 }
 
 /// Collect a whole request (non-streaming).
@@ -426,7 +436,7 @@ async fn completions(State(app): State<Shared>, Json(r): Json<CompletionReq>) ->
             ChunkKind::Finish { reason, stats, tokens } => json!({
                 "id": id, "object": "text_completion", "created": created, "model": model,
                 "choices": [{"index": 0, "text": "", "finish_reason": reason}],
-                "usage": {"prompt_tokens": n_prompt, "completion_tokens": tokens.len(), "total_tokens": n_prompt + tokens.len()},
+                "usage": usage_json(n_prompt, tokens.len(), &stats),
                 "tokens": tokens, "timings": stats}),
         });
         return Ok(sse.into_response());
@@ -435,7 +445,7 @@ async fn completions(State(app): State<Shared>, Json(r): Json<CompletionReq>) ->
     Ok(Json(json!({
         "id": id, "object": "text_completion", "created": now(), "model": model,
         "choices": [{"index": 0, "text": text_out, "tokens": acc.tokens, "finish_reason": acc.finish_reason(), "logprobs": null}],
-        "usage": {"prompt_tokens": n_prompt, "completion_tokens": acc.tokens.len(), "total_tokens": n_prompt + acc.tokens.len()},
+        "usage": usage_json(n_prompt, acc.tokens.len(), &stats),
         "timings": stats,
     }))
     .into_response())
@@ -514,7 +524,7 @@ async fn chat_completions(State(app): State<Shared>, Json(r): Json<ChatReq>) -> 
             ChunkKind::Finish { reason, stats, tokens } => json!({
                 "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
                 "choices": [{"index": 0, "delta": {}, "finish_reason": reason}],
-                "usage": {"prompt_tokens": n_prompt, "completion_tokens": tokens.len(), "total_tokens": n_prompt + tokens.len()},
+                "usage": usage_json(n_prompt, tokens.len(), &stats),
                 "timings": stats}),
         });
         return Ok(sse.into_response());
@@ -523,7 +533,7 @@ async fn chat_completions(State(app): State<Shared>, Json(r): Json<ChatReq>) -> 
     Ok(Json(json!({
         "id": id, "object": "chat.completion", "created": now(), "model": model,
         "choices": [{"index": 0, "message": {"role": "assistant", "content": text_out}, "tokens": acc.tokens, "finish_reason": acc.finish_reason()}],
-        "usage": {"prompt_tokens": n_prompt, "completion_tokens": acc.tokens.len(), "total_tokens": n_prompt + acc.tokens.len()},
+        "usage": usage_json(n_prompt, acc.tokens.len(), &stats),
         "timings": stats,
     }))
     .into_response())

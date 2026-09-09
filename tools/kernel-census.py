@@ -46,6 +46,16 @@ def render(kernels):
     for name, k in sorted(kernels.items(), key=lambda kv: (kv[1]["file"], kv[0])):
         r = ", ".join(roles.get(name, [])) or ("gemm_q8 dispatch" if name == "amar_matmul_skinny_q8row" else "")
         out.append(f"| `{name}` | `{k['file']}` | `{k['params']}` | {r} | {', '.join(k['used'])} |")
+    out += ["", "## Tests", "",
+            "Every `kernels/test_*.mojo`, the gate script that runs it, and its first docstring line.", "",
+            "| test | run by | covers |", "|---|---|---|"]
+    gates = {g: (ROOT / g).read_text() for g in ("run-tests.sh", "tools/merge-gate.sh", "tools/mega-gate.sh") if (ROOT / g).exists()}
+    for t in sorted(KDIR.glob("test_*.mojo")):
+        src = t.read_text()
+        doc = re.match(r'\s*"""(.*?)(?:\n\n|""")', src, re.S)
+        first = " ".join(doc.group(1).split()) if doc else ""
+        by = ", ".join(g for g, gs in gates.items() if t.stem in gs) or "manual"
+        out.append(f"| `{t.name}` | {by} | {first} |")
     return "\n".join(out) + "\n"
 
 kernels = scan()

@@ -22,6 +22,8 @@ from registry import *
 
 
 from window import *
+from harness import *
+from prefix import *
 
 
 def read_line(fd: Int) raises -> Optional[String]:
@@ -122,41 +124,13 @@ def main() raises:
     comptime assert has_accelerator(), "Requires a GPU"
     var ctx = DeviceContext()
     var packdir = getenv("BARO_PACK", ".work/engine-pack-q4")
-    var PACK = packdir + "/pack.bin"
-
-    # --- offset table from the pack index (tools/engine-pack.py order) ----
-    var off = List[Int]()
-    var total = 0
-    var q4_off = 0
-    var have_q4_draft = False
-    var pack_q4 = False
-    with open(packdir + "/index.txt", "r") as f:
-        for line in f.read().splitlines():
-            var parts = line.split(" ")
-            if len(parts) < 4:
-                continue
-            var n = Int(parts[3])
-            var dt = String(parts[1])
-            off.append(Int(parts[2]))
-            if dt == "bf16":
-                total += n * B2
-            elif dt == "f32":
-                total += n * B4
-            elif dt == "q8":
-                total += n + (n // 32) * 2
-            elif dt == "q4":
-                if String(parts[0]) == "output.weight.q4draft":
-                    # trailing entry (tools/engine-pack.py --q4-draft): the draft
-                    # head's own q4 copy of output.weight, appended after the
-                    # trunk order -- excluded from the blk.32 index math below.
-                    q4_off = Int(parts[2])
-                    have_q4_draft = True
-                else:
-                    # --q4 pack: every 2D trunk weight is ggml Q4_0
-                    pack_q4 = True
-                total += n // 2 + (n // 32) * 2
-            else:
-                raise Error("unknown pack dtype " + dt)
+    var pack = load_pack(ctx, packdir)
+    var wbuf = pack.wbuf
+    var off = pack.off.copy()
+    var q4_off = pack.q4_off
+    var have_q4_draft = pack.have_q4_draft
+    var pack_q4 = pack.pack_q4
+    var e = pack.e
     var draft_q4 = getenv("BARO_DRAFT_Q4", "0") == "1" and have_q4_draft
     print("BARO_DRAFT_Q4:", draft_q4)
     var dot3 = getenv("BARO_DOT", "0") == "1" and not pack_q4
@@ -169,56 +143,6 @@ def main() raises:
     var pf5 = getenv("BARO_PROFILE", "0") == "5"
     var dump_path = getenv("BARO_DUMP", "")
     var dump = dump_path != ""
-    var e = len(off) - (1 if have_q4_draft else 0) - 15
-
-    # --- load pack into one device buffer -----------------------------------
-    print("loading pack:", total, "bytes")
-    var wbuf = ctx.enqueue_create_buffer[DType.uint8](total)
-    comptime CHUNK = 1 << 28
-    comptime RSPLIT = 4
-    var stage0 = ctx.enqueue_create_host_buffer[DType.uint8](CHUNK)
-    var stage1 = ctx.enqueue_create_host_buffer[DType.uint8](CHUNK)
-    ctx.synchronize()
-    var t_load = perf_counter_ns()
-    with open(PACK, "r") as f:
-        var fd = f._get_raw_fd()
-        var done = 0
-        var flip = False
-        while done < total:
-            var want = min(CHUNK, total - done)
-            var stage = stage1 if flip else stage0
-            var sptr = stage.unsafe_ptr()
-            var rerr = List[Int64](unsafe_uninit_length=RSPLIT)
-            var rerr_ptr = rerr.unsafe_ptr()
-            def rchunk(t: Int) {imm fd, imm want, imm done, imm sptr, imm rerr_ptr}:
-                var lo = want * t // RSPLIT
-                var hi = want * (t + 1) // RSPLIT
-                var got = lo
-                while got < hi:
-                    var n = external_call["pread", c_ssize_t](
-                        fd, sptr.unsafe_offset(got), hi - got, Int64(done + got)
-                    )
-                    if n <= 0:
-                        rerr_ptr[t] = 1
-                        return
-                    got += Int(n)
-                rerr_ptr[t] = 0
-            parallelize(rchunk, RSPLIT)
-            for t in range(RSPLIT):
-                if rerr[t] != 0:
-                    raise Error("short read")
-            # The in-flight copy sources the OTHER stage: sync only after this
-            # read has overlapped it, and always before this stage is enqueued.
-            ctx.synchronize()
-            var dslice = DeviceBuffer[DType.uint8](
-                ctx, wbuf.unsafe_ptr() + done, want, owning=False
-            )
-            var hslice = stage.create_sub_buffer[DType.uint8](0, want) if want != CHUNK else stage
-            ctx.enqueue_copy(dst_buf=dslice, src_buf=hslice)
-            done += want
-            flip = not flip
-    ctx.synchronize()
-    print("pack loaded in", Float64(perf_counter_ns() - t_load) / 1e9, "s")
 
     var serve = getenv("BARO_SERVE", "0") == "1"
     print("BARO_SERVE:", serve)
@@ -256,9 +180,6 @@ def main() raises:
     var tmax = atol(getenv("BARO_TMAX", String(TMAX)))
     if tmax < CP + PF_MIN:
         tmax = CP + PF_MIN
-    var tpages = ceildiv(tmax, KVPAGE)
-    var kvpool = tpages * N_ATT * NKVH * KVHSTR
-    var kvpool1 = tpages * NKVH * KVHSTR
     var att_split = atol(getenv("BARO_ATT_SPLIT_T", String(TMAX)))
     if getenv("BARO_ATT_SPLIT", "0") == "1":
         att_split = 0
@@ -270,110 +191,15 @@ def main() raises:
     var spec_env = getenv("BARO_SPEC", "0") == "1"
     print("BARO_SPEC:", spec_env)
     var spec_dbg = getenv("BARO_SPEC_DBG", "0") == "1"
-    var dtok_h = ctx.enqueue_create_host_buffer[DType.int32](KMAX + 1)
-    var win_h = ctx.enqueue_create_host_buffer[DType.int32](KMAX + 1)
+    var bufs = alloc_bufs(ctx, pack, tmax)
+    var toks_d = bufs.toks_d
 
-    # --- activations / state -------------------------------------------------
-    var x_d = ctx.enqueue_create_buffer[f32](MROWS * H)
-    var curb_d = ctx.enqueue_create_buffer[bf16](MROWS * H)
-    var qkv_d = ctx.enqueue_create_buffer[f32](MROWS * CONV)
-    var z_d = ctx.enqueue_create_buffer[f32](MROWS * H)
-    var eg_d = ctx.enqueue_create_buffer[f32](MROWS * NH_V)
-    var beta_d = ctx.enqueue_create_buffer[f32](MROWS * NH_V)
-    var conv_d = ctx.enqueue_create_buffer[f32](MROWS * CONV)
-    var so_d = ctx.enqueue_create_buffer[f32](MROWS * NH_V * SSTATE)
-    var resb_d = ctx.enqueue_create_buffer[bf16](MROWS * H)
-    var qf_d = ctx.enqueue_create_buffer[f32](MROWS * QF)
-    var q_d = ctx.enqueue_create_buffer[f32](MROWS * NQH * HD)
-    var gate_d = ctx.enqueue_create_buffer[f32](MROWS * H)
-    var k_d = ctx.enqueue_create_buffer[f32](MROWS * KV)
-    var v_d = ctx.enqueue_create_buffer[f32](MROWS * KV)
-    var ao_d = ctx.enqueue_create_buffer[f32](MROWS * NQH * HD)
-    var fgb_d = ctx.enqueue_create_buffer[bf16](MROWS * FFN)
-    var aq_d = ctx.enqueue_create_buffer[DType.int8](MROWS * FFN)
-    var asc_d = ctx.enqueue_create_buffer[DType.float16](MROWS * (FFN // 32))
-    var logits_d = ctx.enqueue_create_buffer[f32](MROWS * VOCAB)
-    var toks_d = ctx.enqueue_create_buffer[DType.int32](tmax)
-    var hn_d = ctx.enqueue_create_buffer[f32](MROWS * H)
-    var de_d = ctx.enqueue_create_buffer[f32](MROWS * H)
-    var hd_d = ctx.enqueue_create_buffer[f32](MROWS * H)
-    var mh_d = ctx.enqueue_create_buffer[f32](H)
-    var cc_d = ctx.enqueue_create_buffer[bf16](MROWS * QF)
-    var dtok_d = ctx.enqueue_create_buffer[DType.int32](KMAX + 1)
-
-    var p_qf_d = ctx.enqueue_create_buffer[f32](SPLITK * SM * QF)
-    var p_h_d = ctx.enqueue_create_buffer[f32](SPLITK * SM * H)
-    var p_kv_d = ctx.enqueue_create_buffer[f32](SPLITK * SM * KV)
-    var p_32_d = ctx.enqueue_create_buffer[f32](SPLITK * SM * NH_V)
-    var p_32b_d = ctx.enqueue_create_buffer[f32](SPLITK * SM * NH_V)
-    var p_ffn_d = ctx.enqueue_create_buffer[f32](SPLITK * SM * FFN)
-    var p_ffn2_d = ctx.enqueue_create_buffer[f32](SPLITK * SM * FFN)
-    var p_v_d = ctx.enqueue_create_buffer[f32](SPLITK * SM * VOCAB)
-
-    var xp_d = ctx.enqueue_create_buffer[f32](CP * H)
-    var curbp_d = ctx.enqueue_create_buffer[bf16](CP * H)
-    var qkvp_d = ctx.enqueue_create_buffer[f32](CP * CONV)
-    var zp_d = ctx.enqueue_create_buffer[f32](CP * H)
-    var arp_d = ctx.enqueue_create_buffer[f32](CP * NH_V)
-    var brp_d = ctx.enqueue_create_buffer[f32](CP * NH_V)
-    var egp_d = ctx.enqueue_create_buffer[f32](CP * NH_V)
-    var betap_d = ctx.enqueue_create_buffer[f32](CP * NH_V)
-    var convp_d = ctx.enqueue_create_buffer[f32](CP * CONV)
-    var sop_d = ctx.enqueue_create_buffer[f32](CP * NH_V * SSTATE)
-    var resbp_d = ctx.enqueue_create_buffer[bf16](CP * H)
-    var qfp_d = ctx.enqueue_create_buffer[f32](CP * QF)
-    var qp_d = ctx.enqueue_create_buffer[f32](CP * NQH * HD)
-    var gatep_d = ctx.enqueue_create_buffer[f32](CP * H)
-    var kp_d = ctx.enqueue_create_buffer[f32](CP * KV)
-    var vp_d = ctx.enqueue_create_buffer[f32](CP * KV)
-    var aop_d = ctx.enqueue_create_buffer[f32](CP * NQH * HD)
-    var gp_d = ctx.enqueue_create_buffer[f32](CP * FFN)
-    var up_d = ctx.enqueue_create_buffer[f32](CP * FFN)
-    var fgbp_d = ctx.enqueue_create_buffer[bf16](CP * FFN)
-
-    var convstate_d = ctx.enqueue_create_buffer[f32](SLOTS * CONV_SLOT)
-    var sstate_d = ctx.enqueue_create_buffer[f32](SLOTS * SSM_SLOT)
-    var kc_d = ctx.enqueue_create_buffer[KVT](kvpool)
-    var vc_d = ctx.enqueue_create_buffer[KVT](kvpool)
-    var kc32_d = ctx.enqueue_create_buffer[KVT](kvpool1)
-    var vc32_d = ctx.enqueue_create_buffer[KVT](kvpool1)
-    ctx.enqueue_memset(convstate_d, 0)
-    ctx.enqueue_memset(sstate_d, 0)
-    ctx.enqueue_memset(kc_d, 0)
-    ctx.enqueue_memset(vc_d, 0)
-    ctx.enqueue_memset(kc32_d, 0)
-    ctx.enqueue_memset(vc32_d, 0)
-    ctx.synchronize()
-    var off_h = ctx.enqueue_create_host_buffer[DType.int64](512)
-    ctx.synchronize()
-    for i in range(512):
-        off_h[i] = Int64(off[i]) if i < len(off) else 0
-    var off_d = ctx.enqueue_create_buffer[DType.int64](512)
-    ctx.enqueue_copy(dst_buf=off_d, src_buf=off_h)
-    var araw_d = ctx.enqueue_create_buffer[f32](MROWS * NH_V)
-    var braw_d = ctx.enqueue_create_buffer[f32](MROWS * NH_V)
-    var ctr_d = ctx.enqueue_create_buffer[DType.uint32](3)
-    var prof_d = ctx.enqueue_create_buffer[DType.int64](16 * N_LAYERS + 4)
-    ctx.enqueue_memset(ctr_d, 0)
-    ctx.enqueue_memset(prof_d, 0)
-    var dbg_d = ctx.enqueue_create_buffer[f32](2 * N_LAYERS * H)
-    var hmax_d = ctx.enqueue_create_buffer[f32](MEGA_MR * MEGA_G_WIN)
-    var hidx_d = ctx.enqueue_create_buffer[DType.int32](MEGA_MR * MEGA_G_WIN)
-    var dump_h = ctx.enqueue_create_host_buffer[f32](GEN_N * 2 * N_LAYERS * H)
-    ctx.synchronize()
-    var ConvStateAll = TileTensor(convstate_d, csall_layout)
-    var SStateAll = TileTensor(sstate_d, ssall_layout)
-
-    # --- kernel bindings -----------------------------------------------------
-
-
-
-
-
-    var stream_h = ctx.enqueue_create_host_buffer[DType.int32](KMAX + 1)
-    ctx.synchronize()
     var wst = WindowState(pos=0, pos_prev=0, ring=0, n_drafted=0, n_accepted=0, n_spec_windows=0, n_dumped=0, tp=0, tq=0, pf_att=0, pf_ssm=0, pf_ffn=0, pf_head=0, pf_proc=0, pf_draft=0, fc=[0, 0, 0, 0, 0, 0], pc=[0, 0, 0, 0, 0, 0, 0, 0], p3=[0, 0, 0, 0])
-    var bufs = WindowBufs(wbuf=wbuf.copy(), off=off.copy(), dtok_h=dtok_h.copy(), win_h=win_h.copy(), x_d=x_d.copy(), curb_d=curb_d.copy(), qkv_d=qkv_d.copy(), z_d=z_d.copy(), eg_d=eg_d.copy(), beta_d=beta_d.copy(), conv_d=conv_d.copy(), so_d=so_d.copy(), resb_d=resb_d.copy(), qf_d=qf_d.copy(), q_d=q_d.copy(), gate_d=gate_d.copy(), k_d=k_d.copy(), v_d=v_d.copy(), ao_d=ao_d.copy(), fgb_d=fgb_d.copy(), aq_d=aq_d.copy(), asc_d=asc_d.copy(), logits_d=logits_d.copy(), toks_d=toks_d.copy(), hn_d=hn_d.copy(), de_d=de_d.copy(), hd_d=hd_d.copy(), cc_d=cc_d.copy(), dtok_d=dtok_d.copy(), p_qf_d=p_qf_d.copy(), p_h_d=p_h_d.copy(), p_kv_d=p_kv_d.copy(), p_32_d=p_32_d.copy(), p_32b_d=p_32b_d.copy(), p_ffn_d=p_ffn_d.copy(), p_ffn2_d=p_ffn2_d.copy(), p_v_d=p_v_d.copy(), xp_d=xp_d.copy(), curbp_d=curbp_d.copy(), qkvp_d=qkvp_d.copy(), zp_d=zp_d.copy(), arp_d=arp_d.copy(), brp_d=brp_d.copy(), egp_d=egp_d.copy(), betap_d=betap_d.copy(), convp_d=convp_d.copy(), sop_d=sop_d.copy(), resbp_d=resbp_d.copy(), qfp_d=qfp_d.copy(), qp_d=qp_d.copy(), gatep_d=gatep_d.copy(), kp_d=kp_d.copy(), vp_d=vp_d.copy(), aop_d=aop_d.copy(), gp_d=gp_d.copy(), up_d=up_d.copy(), fgbp_d=fgbp_d.copy(), convstate_d=convstate_d.copy(), sstate_d=sstate_d.copy(), kvpool=kvpool, kc_d=kc_d.copy(), vc_d=vc_d.copy(), kc32_d=kc32_d.copy(), vc32_d=vc32_d.copy(), off_d=off_d.copy(), araw_d=araw_d.copy(), braw_d=braw_d.copy(), ctr_d=ctr_d.copy(), prof_d=prof_d.copy(), dbg_d=dbg_d.copy(), hmax_d=hmax_d.copy(), hidx_d=hidx_d.copy(), dump_h=dump_h.copy(), stream_h=stream_h.copy())
+    var ckpt_cap = atol(getenv("BARO_CKPT", "8")) if serve else 0
+    if ckpt_cap < 0:
+        ckpt_cap = 0
+    var chain = Chain(ctx, ckpt_cap)
+    print("checkpoints: cap", ckpt_cap, ", bytes", Float64(CKPT_BYTES) / 1e6, "MB each, period", CKPT_PERIOD)
     var req_id = 0
     if serve:
         print("{\"ready\":true,\"tmax\":" + String(tmax) + ",\"mrows\":" + String(MROWS) + ",\"kmax\":" + String(KMAX) + ",\"spec_k\":" + String(kcfg) + ",\"kv\":\"" + String(KVT) + "\",\"pack\":\"" + packdir + "\"}")
@@ -384,6 +210,9 @@ def main() raises:
         var prompt = List[Int]()
         var gen_n = GEN_N
         var spec = spec_env
+        var ckpt_idx = -1
+        var cached = 0
+        var restore_s = 0.0
         if serve:
             var line_in = read_line(0)
             if not line_in:
@@ -405,15 +234,29 @@ def main() raises:
             if req_has_spec:
                 spec = req_spec
             print("prompt tokens:", len(prompt), " n:", gen_n, " spec:", spec)
-            ctx.enqueue_memset(convstate_d, 0)
-            ctx.enqueue_memset(sstate_d, 0)
-            ctx.enqueue_memset(kc_d, 0)
-            ctx.enqueue_memset(vc_d, 0)
-            ctx.enqueue_memset(kc32_d, 0)
-            ctx.enqueue_memset(vc32_d, 0)
-            ctx.enqueue_memset(ctr_d, 0)
-            ctx.enqueue_memset(prof_d, 0)
+            # M1a prefix checkpoint: restore the SSM slot for the longest
+            # hashed prefix and keep the KV pool (position addressed, [0, cached)
+            # still in place); the draft KV is never prefilled, so it is zeroed
+            # exactly as on the cold path. A miss is today's path.
+            # spec mode replays at least one prompt row so the draft head's
+            # hidden rows (hn_d) are fresh: the checkpoint at len-1 is skipped.
+            ckpt_idx = chain.lookup(prompt, len(prompt) - 1 if spec else len(prompt))
+            cached = chain.pos_of(ckpt_idx)
+            chain.invalidate_above(cached)
+            var t_restore = perf_counter_ns()
+            if ckpt_idx >= 0:
+                chain.restore(ctx, bufs.convstate_d, bufs.sstate_d, 0, ckpt_idx)
+            else:
+                ctx.enqueue_memset(bufs.convstate_d, 0)
+                ctx.enqueue_memset(bufs.sstate_d, 0)
+                ctx.enqueue_memset(bufs.kc_d, 0)
+                ctx.enqueue_memset(bufs.vc_d, 0)
+            ctx.enqueue_memset(bufs.kc32_d, 0)
+            ctx.enqueue_memset(bufs.vc32_d, 0)
+            ctx.enqueue_memset(bufs.ctr_d, 0)
+            ctx.enqueue_memset(bufs.prof_d, 0)
             ctx.synchronize()
+            restore_s = Float64(perf_counter_ns() - t_restore) / 1e9
         else:
             var prompt_path = getenv("BARO_PROMPT", packdir + "/prompt-tokens.txt")
             print("prompt file:", prompt_path)
@@ -437,12 +280,13 @@ def main() raises:
 
         var pf_rows = 0
         var pf_tail = 0
-        if pf_on and len(prompt) - 1 >= PF_MIN:
+        if pf_on and len(prompt) - 1 - cached >= PF_MIN:
             pf_rows = len(prompt) - 1
-            pf_tail = pf_rows % MROWS
+            pf_tail = (pf_rows - cached) % MROWS
             if pf_tail == 0:
                 pf_tail = MROWS
-        print("TMAX:", tmax, " kv dtype:", String(KVT), " prefill chunk:", pf_chunk, " prefill rows:", pf_rows)
+        var prefill_rows = len(prompt) - 1 - cached
+        print("TMAX:", tmax, " kv dtype:", String(KVT), " prefill chunk:", pf_chunk, " prefill rows:", pf_rows, " cached:", cached, " replay rows:", prefill_rows)
 
         # --- decode loop ---------------------------------------------------------
 
@@ -483,11 +327,15 @@ def main() raises:
         var pf4 = getenv("BARO_PROFILE", "0") == "4"
         var cfg = WindowCfg(pack_q4=pack_q4, draft_q4=draft_q4, q4_off=q4_off, e=e, kcfg=kcfg, spec=spec, spec_dbg=spec_dbg, serve=serve, req_id=req_id, prof=prof, pf2=pf2, pf3=pf3, pf4=pf4, dump=dump, mega=mega, att_split=att_split, mega_win=mega_win, dot3=dot3, pf_chunk=pf_chunk, pf_rows=pf_rows, pf_tail=pf_tail, n_total=n_total, n_prompt=len(prompt))
         wst.reset(t0)
+        wst.pos = cached
+        wst.pos_prev = cached
         var prefill_done = False
         # The stopwatch stays here, in the harness that is never embedded in a
         # gguf: step_window cannot reach t0, t_prefill_end or dt (P-A, 2026-09-08).
         while wst.pos < n_total - 1:
             step_window(ctx, bufs, cfg, wst)
+            if ckpt_cap > 0 and wst.pos > cached and wst.pos < len(prompt) and (wst.pos == len(prompt) - 1 or wst.pos % CKPT_PERIOD == 0):
+                chain.save(ctx, bufs.convstate_d, bufs.sstate_d, wst.ring, wst.pos, prompt)
             if not prefill_done and wst.pos >= len(prompt):
                 ctx.synchronize()
                 t_prefill_end = perf_counter_ns()
@@ -495,23 +343,24 @@ def main() raises:
 
         var t_host = Float64(perf_counter_ns() - t0) / 1e9
         ctx.synchronize()
+        chain.commit()
         var dt = Float64(perf_counter_ns() - t0) / 1e9
         print("host_enqueue_s:", t_host, " gpu_total_s:", dt)
         var flw = ctx.enqueue_create_host_buffer[DType.uint32](3)
-        ctx.enqueue_copy(dst_buf=flw, src_buf=ctr_d)
+        ctx.enqueue_copy(dst_buf=flw, src_buf=bufs.ctr_d)
         ctx.synchronize()
         print("mega fail word:", flw[2], "" if flw[2] == 0 else " NOT-RESIDENT: a grid barrier timed out, tokens after it are invalid")
         if dump:
             ctx.synchronize()
             with open(dump_path, "w") as f:
-                var dpp = dump_h.unsafe_ptr().unsafe_bitcast[UInt8]()
+                var dpp = bufs.dump_h.unsafe_ptr().unsafe_bitcast[UInt8]()
                 f.write_bytes(Span[UInt8](unsafe_ptr=dpp, length=wst.n_dumped * 2 * N_LAYERS * H * 4))
             print("dumped", wst.n_dumped, "tokens x", N_LAYERS, "layers to", dump_path)
         if pf5:
             var ph = ctx.enqueue_create_host_buffer[DType.int64](16 * N_LAYERS + 4)
-            ctx.enqueue_copy(dst_buf=ph, src_buf=prof_d)
+            ctx.enqueue_copy(dst_buf=ph, src_buf=bufs.prof_d)
             var fl = ctx.enqueue_create_host_buffer[DType.uint32](3)
-            ctx.enqueue_copy(dst_buf=fl, src_buf=ctr_d)
+            ctx.enqueue_copy(dst_buf=fl, src_buf=bufs.ctr_d)
             ctx.synchronize()
             var sub_ssm = 0.0
             var sub_att = 0.0
@@ -613,6 +462,7 @@ def main() raises:
             var done_line = String("{\"id\":") + String(req_id) + ",\"done\":true,\"n\":" + String(len(generated))
             done_line += ",\"prefill_s\":" + String(prefill_s) + ",\"decode_s\":" + String(decode_s)
             done_line += ",\"tok_s\":" + String(Float64(gen_n - 1) / decode_s if gen_n > 1 else 0.0)
+            done_line += ",\"cached\":" + String(cached) + ",\"prefill_rows\":" + String(prefill_rows) + ",\"restore_s\":" + String(restore_s) + ",\"checkpoints\":" + String(chain.count_valid())
             if spec:
                 done_line += ",\"drafted\":" + String(wst.n_drafted) + ",\"accepted\":" + String(wst.n_accepted) + ",\"k\":" + String(kcfg)
             print(done_line + "}")
@@ -622,17 +472,17 @@ def main() raises:
         # the last trunk hidden row, attended at position 0 (arm A: empty draft
         # KV, identical to the 2026-09-01 validation dump; arm B: draft KV holds
         # the run, so only arm A's DRAFT line is the receipt).
-        var hn_last = DeviceBuffer[f32](ctx, hn_d.unsafe_ptr(), H, owning=False)
+        var hn_last = DeviceBuffer[f32](ctx, bufs.hn_d.unsafe_ptr(), H, owning=False)
         blk32_forward(ctx, wbuf, off, e, 1, 0, n_total - 1, True, hn_last,
-            x_d, curb_d, qf_d, q_d, k_d, v_d, gate_d, ao_d, resb_d, fgb_d, p_qf_d, p_kv_d, p_h_d,
-            p_ffn_d, p_ffn2_d, p_v_d, logits_d, cc_d, de_d, hd_d, kc32_d, vc32_d, toks_d, dtok_d,
+            bufs.x_d, bufs.curb_d, bufs.qf_d, bufs.q_d, bufs.k_d, bufs.v_d, bufs.gate_d, bufs.ao_d, bufs.resb_d, bufs.fgb_d, bufs.p_qf_d, bufs.p_kv_d, bufs.p_h_d,
+            bufs.p_ffn_d, bufs.p_ffn2_d, bufs.p_v_d, bufs.logits_d, bufs.cc_d, bufs.de_d, bufs.hd_d, bufs.kc32_d, bufs.vc32_d, toks_d, bufs.dtok_d,
             False, wst.p3, False, 0, pack_q4)
         var last_tok = generated[len(generated) - 1]
         ctx.synchronize()
         var draft_logits_h = ctx.enqueue_create_host_buffer[f32](VOCAB)
         ctx.enqueue_copy(
             dst_buf=draft_logits_h,
-            src_buf=DeviceBuffer[f32](ctx, logits_d.unsafe_ptr(), VOCAB, owning=False),
+            src_buf=DeviceBuffer[f32](ctx, bufs.logits_d.unsafe_ptr(), VOCAB, owning=False),
         )
         # h_nextn is dumped too: tools/draft-ref.py's numpy reference needs the
         # EXACT f32 hidden state the GPU consumed, or a mismatch says nothing about
@@ -640,12 +490,12 @@ def main() raises:
         var hn_h = ctx.enqueue_create_host_buffer[f32](H)
         ctx.enqueue_copy(
             dst_buf=hn_h,
-            src_buf=DeviceBuffer[f32](ctx, hn_d.unsafe_ptr(), H, owning=False),
+            src_buf=DeviceBuffer[f32](ctx, bufs.hn_d.unsafe_ptr(), H, owning=False),
         )
         var dtok1_h = ctx.enqueue_create_host_buffer[DType.int32](1)
         ctx.enqueue_copy(
             dst_buf=dtok1_h,
-            src_buf=DeviceBuffer[DType.int32](ctx, dtok_d.unsafe_ptr(), 1, owning=False),
+            src_buf=DeviceBuffer[DType.int32](ctx, bufs.dtok_d.unsafe_ptr(), 1, owning=False),
         )
         ctx.synchronize()
 

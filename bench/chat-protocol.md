@@ -676,4 +676,59 @@ unchanged (12977 / dual 122/84/84/61) read before the stint.
 **Gate.** P-F1 all positions and mutations; merge-gate ALL PASS; P-F2
 exact; P-F3 both numbers; P-F4 within band.
 
-**Result.** (filled after the gated run)
+**Result (2026-09-10, `7b4b9d0` on `lane-chat`). The gate is NOT met: P-F3
+misses both of its numbers. Everything else passes.**
+
+P-F1 byte-exact restore: PASS on 2026-09-08 (`kernels/test_prefix.mojo`, all
+positions and all four mutations, megakernel and window paths).
+
+P-F2 / P-F4 engine identity and A/B (2026-09-10 01:12, queue empty,
+`.work/m1a/ab/arm.txt`): `engA=./.work/engine engB=.work/m1a/engine`
+shaA 644c23560ed499d4 shaB dfd578701f8b9f90, power cap 290000000 uW,
+vddgfx -100mV, both arms `BARO_MEGA=1`. champ median 136.97 tok/s_gen
+spread 0.5 %, m1a median 136.98 spread 0.6 %, **ratio 1.000**, identity
+fails none. Checkpointing costs the decode path nothing.
+
+Merge gate (01:12-01:14, `.work/merge-gate.txt`): **ALL PASS** — engine and
+test builds, run-tests, ci-checks, test_prefill, one-shot q4 64/64 at 137.2
+and q8 64/64 at 81.6, p0512, mtp 20/20, and the full server suite.
+
+P-F5: engine prints `checkpoints: cap 8 , bytes 52.690944 MB each, period
+1024` = 421 MB pinned; `mega fail word: 0` on every request.
+
+**P-F3 tap replay** (`tools/tap-replay.py`, rows 0,1,2 x2 against baro-serve
+on the m1a engine, `BARO_TMAX=16384`, `.work/m1a/tap-replay.log`):
+
+| row | prompt_tokens | cached | prefill_rows | prefill_s | restore_s | wall_s |
+|---|---|---|---|---|---|---|
+| 0 (cold) | 5755 | 0 | 5754 | 5.229 | 0.003 | 5.279 |
+| 1 | 5770 | 5120 | 649 | 0.651 | 0.002 | 0.695 |
+| 2 | 5858 | 5120 | 737 | 0.722 | 0.002 | 0.766 |
+| 0 (2nd) | 5755 | 5120 | 634 | 0.616 | 0.002 | 0.659 |
+| 1 (2nd) | 5770 | 5120 | 649 | 0.652 | 0.002 | 0.696 |
+| 2 (2nd) | 5858 | 5120 | 737 | 0.721 | 0.002 | 0.762 |
+
+Frozen: `cached >= 7900`, `prefill_rows < 200`, wall TTFT `< 60 ms`.
+Measured: cached 5120, rows 634-737, wall 659-766 ms. **Both numbers
+missed.** Two separate reasons, neither of them the restore path:
+
+1. The fixture is not the 7,914-token prompt the prediction named — these
+   tap rows are 5,755-5,858 tokens. The prediction should have been read off
+   the fixture before it was frozen.
+2. The real miss: `cached` is 5120 = 5 x 1024, the periodic grid, not the
+   5,754-token prompt-end checkpoint that request 0 wrote. Request 1's ids
+   diverge from request 0's somewhere between 5120 and 5754, because the
+   re-rendered template replaces request 0's trailing generation prompt with
+   the assistant turn. So the end-of-prompt checkpoint is worth nothing for
+   the next turn of the same conversation, and every restore falls back to
+   the last 1024-boundary — up to 1023 replayed rows, whatever the prefix
+   length. **Role-boundary checkpoints, deferred to M1b, are exactly the fix
+   for this**, which the M1a design says in as many words; the frozen P-F3
+   simply predicted M1b's behaviour and measured M1a.
+
+What M1a does deliver, measured: multi-turn prefill **5.229 s -> 0.616-0.722 s,
+7.2-8.5x**, with a restore copy of 2.1-3.2 ms against the ~2 ms predicted,
+and no cost to decode. That is the honest claim. The 100x-class number needs
+M1b.
+
+Not run: nothing further; M1b preregistration is unwritten.

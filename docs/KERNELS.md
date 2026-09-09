@@ -83,3 +83,20 @@ must be reachable from `serve/registry.mojo`, a bench, or a test.
 | `amar_ssm_qk_l2norm` | `ssm.mojo` | `XLayout: TensorLayout` | l2_k | serve/registry.mojo, bench/bench_launch_floor.mojo, kernels/test_mega_block.mojo, kernels/test_prefill.mojo, kernels/test_ssm_block.mojo |
 | `amar_ssm_qk_l2norm_rows` | `ssm.mojo` | `XLayout: TensorLayout` | l2_p | serve/registry.mojo, kernels/test_prefill.mojo |
 | `amar_ssm_reduce_gates` | `ssm.mojo` | `PLayout: TensorLayout, GLayout: TensorLayout, DLayout: TensorLayout` | rgates_k | serve/registry.mojo, bench/bench_launch_floor.mojo, kernels/test_mega_block.mojo |
+
+## Tests
+
+Every `kernels/test_*.mojo`, the gate script that runs it, and its first docstring line.
+
+| test | run by | covers |
+|---|---|---|
+| `test_attn_block.mojo` | manual | Parity: one decode token through the qwen35 gated full-attention block (docs/qwen35-ssm-notes.md §7b) vs tools/attn-ref.py. Position 7 with 7 cached tokens. Gates mirror test_ssm_block: exact-path intermediates at 1e-3, values crossing a bf16 cast at wider gates (boundary flips, documented there). |
+| `test_elementwise.mojo` | manual | Host-reference checks for the elementwise/decode kernel pack. |
+| `test_gemm.mojo` | run-tests.sh | Numeric check: shim GEMM on gfx1100 vs a host reference. |
+| `test_gguf_gemm.mojo` | manual | Parity check: real Qwythos bf16 weight through skinny_wt vs numpy reference. |
+| `test_mega_block.mojo` | tools/mega-gate.sh | Stage 1+2+3 (+ multi-row window) gate of bench/megakernel-protocol.md. |
+| `test_prefill.mojo` | tools/merge-gate.sh | Parity for the prefill kernels (bench/prefill-protocol.md, lane prefill). |
+| `test_prefix.mojo` | run-tests.sh | Byte-exact prefix checkpoint restore (bench/chat-protocol.md M1a, P-F1). |
+| `test_q8_gemm.mojo` | manual | Milestone-6 checks: int8 dequant-in-kernel GEMM + fused SwiGLU epilogue. |
+| `test_ssm_block.mojo` | manual | Parity: one decode token through the qwen35 gated-delta-net block on GPU vs the numpy reference (tools/ssm-ref.py implementing docs/qwen35-ssm-notes.md). |
+| `test_ternary_gemm.mojo` | manual | Parity check for the three ternary wave-per-row GEMV kernels (matmul_ternary.mojo: q2b3row = Q2_B3/B3S, tq1row = TQ1_0, tq2row = TQ2_0) against the C reference codec. |
