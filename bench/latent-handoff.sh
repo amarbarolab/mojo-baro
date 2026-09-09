@@ -48,8 +48,17 @@ echo "VRAM before both loads: ${vram_before}"
 # does -- a reading taken after that call returns is just baseline again. Run
 # it in the background and poll the marker bench_latent_handoff.mojo writes
 # once both packs are resident, so the "after" reading is taken mid-run.
+# gpu-wait does NOT forward the caller's environment: a BARO_E8_* set on this
+# script's command line arrives empty inside the job, and the binary silently
+# falls back to its defaults. That produced two smoke runs at ans_max=256 while
+# 512 was requested (2026-09-09). Forward the arm-defining vars explicitly with
+# `env` so they cannot go inert, and let the binary read them back (PROTOCOL-RULES P1).
+e8_env=()
+for v in BARO_E8_ANS_MAX BARO_E8_TMAX BARO_E8_NOTHINK BARO_PACK BARO_E8_GGUF; do
+  [ -n "${!v-}" ] && e8_env+=("$v=${!v}")
+done
 gpu-wait run --priority 30 --vram 14 -- \
-  .work/bench_latent_handoff "${bin_args[@]}" &
+  env "${e8_env[@]}" .work/bench_latent_handoff "${bin_args[@]}" &
 job_pid=$!
 
 waited=0

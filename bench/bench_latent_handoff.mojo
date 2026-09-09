@@ -556,7 +556,7 @@ def main() raises:
     # engines, without touching serve/window.mojo's own KVPAGE/TMAX.
     var tmax = atol(getenv("BARO_E8_TMAX", "896"))
 
-    print("E8 HARNESS: items=", n_items, " arms=", arms_arg, " ans_max=", ans_max, " pack=", packdir)
+    print("E8 HARNESS: items=", n_items, " arms=", arms_arg, " ans_max=", ans_max, " tmax=", tmax, " pack=", packdir)
 
     var ctx = DeviceContext()
 
