@@ -1,0 +1,112 @@
+== 2026-09-06T10:11:01+02:00 commit 2099f03
+== tools/ci-checks.sh
+
+== kernel census (no orphaned kernels)
+54 kernels, 26 in registry, 0 orphans
+  OK  every amar_* kernel is reachable
+
+== docs/KERNELS.md is current
+  FAIL docs/KERNELS.md is stale; regenerate with tools/kernel-census.py
+--- .ci-kernels-before.md	2026-09-06 10:11:01.445882263 +0200
++++ docs/KERNELS.md	2026-09-06 10:11:01.630366669 +0200
+@@ -5,20 +5,20 @@
+ 
+ | kernel | file | template params | registry roles | used by |
+ |---|---|---|---|---|
+-| `amar_attn_decode` | `attn.mojo` | `QLayout: TensorLayout, KLayout: TensorLayout, OLayout: TensorLayout` | att_k | serve/registry.mojo, kernels/test_attn_block.mojo |
++| `amar_attn_decode` | `attn.mojo` | `QLayout: TensorLayout, KLayout: TensorLayout, OLayout: TensorLayout` | att_k | serve/registry.mojo, kernels/test_attn_block.mojo, kernels/test_mega_block.mojo |
+ | `amar_gate_mul` | `attn.mojo` | `XLayout: TensorLayout, GLayout: TensorLayout` |  | kernels/test_attn_block.mojo |
+-| `amar_gate_mul_cast` | `attn.mojo` | `XLayout: TensorLayout, GLayout: TensorLayout, OLayout: TensorLayout` | gmul_k | serve/registry.mojo |
+-| `amar_head_rmsnorm` | `attn.mojo` | `XLayout: TensorLayout, GLayout: TensorLayout` | hrms_q, hrms_kv | serve/registry.mojo, kernels/test_attn_block.mojo |
+-| `amar_kv_append` | `attn.mojo` | `CLayout: TensorLayout, NLayout: TensorLayout` | append_k | serve/registry.mojo, kernels/test_attn_block.mojo |
+-| `amar_qgate_split` | `attn.mojo` | `FLayout: TensorLayout, QLayout: TensorLayout, GLayout: TensorLayout` | split_k | serve/registry.mojo, kernels/test_attn_block.mojo |
+-| `amar_rope_yarn` | `attn.mojo` | `XLayout: TensorLayout` | rope_q, rope_k | serve/registry.mojo, kernels/test_attn_block.mojo |
+-| `amar_argmax_pos` | `elementwise.mojo` | `XLayout: TensorLayout, OLayout: TensorLayout` | argmax_k, argmax_d | serve/registry.mojo |
++| `amar_gate_mul_cast` | `attn.mojo` | `XLayout: TensorLayout, GLayout: TensorLayout, OLayout: TensorLayout` | gmul_k | serve/registry.mojo, kernels/test_mega_block.mojo |
++| `amar_head_rmsnorm` | `attn.mojo` | `XLayout: TensorLayout, GLayout: TensorLayout` | hrms_q, hrms_kv | serve/registry.mojo, kernels/test_attn_block.mojo, kernels/test_mega_block.mojo |
++| `amar_kv_append` | `attn.mojo` | `CLayout: TensorLayout, NLayout: TensorLayout` | append_k | serve/registry.mojo, kernels/test_attn_block.mojo, kernels/test_mega_block.mojo |
++| `amar_qgate_split` | `attn.mojo` | `FLayout: TensorLayout, QLayout: TensorLayout, GLayout: TensorLayout` | split_k | serve/registry.mojo, kernels/test_attn_block.mojo, kernels/test_mega_block.mojo |
++| `amar_rope_yarn` | `attn.mojo` | `XLayout: TensorLayout` | rope_q, rope_k | serve/registry.mojo, kernels/test_attn_block.mojo, kernels/test_mega_block.mojo |
+
+== python sources parse
+  OK  27 files
+
+== shell scripts parse
+
+== issue templates are valid yaml
+  OK  all .github yaml loads
+
+== protocol rules P1-P6 present
+  OK  P1-P6 all present
+
+== referenced protocol and doc files exist
+  184 referenced paths
+  OK  every referenced repo path resolves
+
+== hardware receipts are well-formed
+  OK  2 receipts consistent
+
+1 check(s) failed
+ci-checks exit=1
+== tools/test_tokenizer.py --pack .work/engine-pack-q4
+pack .work/engine-pack-q4: gpt2/qwen35 vocab=248320 add_bos=False
+ref  $HOME/Models/qwythos-9b-claude-mythos-5-1m-mtp-bf16/Qwythos-9B-Claude-Mythos-5-1M-MTP-Q4_0.gguf via $HOME/llama.cpp/build/bin/llama-tokenize
+== bench/mtp-prompts (ref = .tokens files)
+  20 prompts, 0 failures
+== hard set (ref = llama-tokenize)
+  41 cases, 0 failures
+PASS: 61 cases, 0 failures
+test_tokenizer exit=0
+== gpu-wait run --priority 60 --timeout 1800 -- ./run-tests.sh
+Failed to initialize Crashpad.  Crash reporting will not be available.  Cause: while locating crashpad handler: unable to locate crashpad handler executable
+$HOME/Projects/mojo-baro-lanes/tokenizer/kernels/test_gemm.mojo:12:18: warning: `alloc` without a `Layout` is deprecated, use the `Layout`-based `alloc` instead; as a temporary migration step, use `unsafe_alloc`
+    var a_host = alloc[Float16](M * K)
+                 ^~~~~
+<unknown>:0: note: 'alloc' declared here
+$HOME/Projects/mojo-baro-lanes/tokenizer/kernels/test_gemm.mojo:13:18: warning: `alloc` without a `Layout` is deprecated, use the `Layout`-based `alloc` instead; as a temporary migration step, use `unsafe_alloc`
+    var b_host = alloc[Float16](K * N)
+                 ^~~~~
+<unknown>:0: note: 'alloc' declared here
+$HOME/Projects/mojo-baro-lanes/tokenizer/kernels/test_gemm.mojo:14:18: warning: `alloc` without a `Layout` is deprecated, use the `Layout`-based `alloc` instead; as a temporary migration step, use `unsafe_alloc`
+    var c_host = alloc[Float16](M * N)
+                 ^~~~~
+<unknown>:0: note: 'alloc' declared here
+Imported from $HOME/Projects/mojo-baro-lanes/tokenizer/kernels/test_gemm.mojo:4:
+$HOME/Projects/mojo-baro-lanes/tokenizer/kernels/amarbaro.mojo:36:37: warning: 'UnsafePointer' is deprecated, use 'Pointer' instead
+    def upload(self, dst: Int, src: UnsafePointer[UInt8, MutUntrackedOrigin], bytes: Int) raises:
+                                    ^~~~~~~~~~~~~
+                                    Pointer
+<unknown>:0: note: 'UnsafePointer' declared here
+Imported from $HOME/Projects/mojo-baro-lanes/tokenizer/kernels/test_gemm.mojo:4:
+$HOME/Projects/mojo-baro-lanes/tokenizer/kernels/amarbaro.mojo:40:29: warning: 'UnsafePointer' is deprecated, use 'Pointer' instead
+    def download(self, dst: UnsafePointer[UInt8, MutUntrackedOrigin], src: Int, bytes: Int) raises:
+                            ^~~~~~~~~~~~~
+                            Pointer
+<unknown>:0: note: 'UnsafePointer' declared here
+Imported from $HOME/Projects/mojo-baro-lanes/tokenizer/kernels/test_gemm.mojo:4:
+$HOME/Projects/mojo-baro-lanes/tokenizer/kernels/amarbaro.mojo:24:54: warning: 'UnsafePointer' is deprecated, use 'Pointer' instead
+        var p = external_call["amarbaro_last_error", UnsafePointer[UInt8, MutUntrackedOrigin]]()
+                                                     ^~~~~~~~~~~~~
+                                                     Pointer
+<unknown>:0: note: 'UnsafePointer' declared here
+GEMM OK — 4 x 3 @ 3 x 2 matches host reference
+54 kernels, 26 in registry, 0 orphans
+run-tests exit=0
+== gpu-wait run --priority 60 --timeout 1800 -- env BARO_PACK=.work/engine-pack-q4 ./.work/engine (log .work/tokenizer-engine-q4.log)
+engine exit=0
+BARO_DRAFT_Q4: False
+BARO_DOT: False
+BARO_MEGA: True
+BARO_MEGA_WIN: False
+pack loaded in 0.44386345 s
+prompt file: .work/engine-pack-q4/prompt-tokens.txt
+prompt tokens: 5
+spec k: 2
+BARO_SPEC: False
+mega fail word: 0 
+tokens: 64  prefill_s: 0.04137832  decode_s: 0.48151645299999996
+tok/s_total: 122.39556274929527  tok/s_gen: 130.83665076756995
+== tools/check-tokens.sh .work/engine-pack-q4/ref-tokens-64.txt .work/tokenizer-engine-q4.log
+PASS: 64 tokens match
+check-tokens exit=0
+== 2026-09-06T10:11:43+02:00 done

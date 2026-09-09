@@ -1,0 +1,75 @@
+== run-tests.sh
+Failed to initialize Crashpad.  Crash reporting will not be available.  Cause: while locating crashpad handler: unable to locate crashpad handler executable
+$HOME/Projects/mojo-baro-lanes/prefill/kernels/test_gemm.mojo:12:18: warning: `alloc` without a `Layout` is deprecated, use the `Layout`-based `alloc` instead; as a temporary migration step, use `unsafe_alloc`
+    var a_host = alloc[Float16](M * K)
+                 ^~~~~
+<unknown>:0: note: 'alloc' declared here
+$HOME/Projects/mojo-baro-lanes/prefill/kernels/test_gemm.mojo:13:18: warning: `alloc` without a `Layout` is deprecated, use the `Layout`-based `alloc` instead; as a temporary migration step, use `unsafe_alloc`
+    var b_host = alloc[Float16](K * N)
+                 ^~~~~
+<unknown>:0: note: 'alloc' declared here
+$HOME/Projects/mojo-baro-lanes/prefill/kernels/test_gemm.mojo:14:18: warning: `alloc` without a `Layout` is deprecated, use the `Layout`-based `alloc` instead; as a temporary migration step, use `unsafe_alloc`
+    var c_host = alloc[Float16](M * N)
+                 ^~~~~
+<unknown>:0: note: 'alloc' declared here
+Imported from $HOME/Projects/mojo-baro-lanes/prefill/kernels/test_gemm.mojo:4:
+$HOME/Projects/mojo-baro-lanes/prefill/kernels/amarbaro.mojo:36:37: warning: 'UnsafePointer' is deprecated, use 'Pointer' instead
+    def upload(self, dst: Int, src: UnsafePointer[UInt8, MutUntrackedOrigin], bytes: Int) raises:
+                                    ^~~~~~~~~~~~~
+                                    Pointer
+<unknown>:0: note: 'UnsafePointer' declared here
+Imported from $HOME/Projects/mojo-baro-lanes/prefill/kernels/test_gemm.mojo:4:
+$HOME/Projects/mojo-baro-lanes/prefill/kernels/amarbaro.mojo:40:29: warning: 'UnsafePointer' is deprecated, use 'Pointer' instead
+    def download(self, dst: UnsafePointer[UInt8, MutUntrackedOrigin], src: Int, bytes: Int) raises:
+                            ^~~~~~~~~~~~~
+                            Pointer
+<unknown>:0: note: 'UnsafePointer' declared here
+Imported from $HOME/Projects/mojo-baro-lanes/prefill/kernels/test_gemm.mojo:4:
+$HOME/Projects/mojo-baro-lanes/prefill/kernels/amarbaro.mojo:24:54: warning: 'UnsafePointer' is deprecated, use 'Pointer' instead
+        var p = external_call["amarbaro_last_error", UnsafePointer[UInt8, MutUntrackedOrigin]]()
+                                                     ^~~~~~~~~~~~~
+                                                     Pointer
+<unknown>:0: note: 'UnsafePointer' declared here
+GEMM OK — 4 x 3 @ 3 x 2 matches host reference
+63 kernels, 35 in registry, 0 orphans
+run-tests exit 0
+== tools/ci-checks.sh
+
+== kernel census (no orphaned kernels)
+63 kernels, 35 in registry, 0 orphans
+  OK  every amar_* kernel is reachable
+
+== docs/KERNELS.md is current
+  OK  generated census matches the committed file
+
+== python sources parse
+  OK  25 files
+
+== shell scripts parse
+  OK  21 scripts
+
+== issue templates are valid yaml
+  OK  all .github yaml loads
+
+== protocol rules P1-P6 present
+  OK  P1-P6 all present
+
+== referenced protocol and doc files exist
+  195 referenced paths
+  OK  every referenced repo path resolves
+
+== hardware receipts are well-formed
+  OK  2 receipts consistent
+
+all non-GPU checks passed
+ci-checks exit 0
+== test_prefill
+q8 wmma 128x128 M=1024 vs fp64 host (32 rows) max_rel: 2.9655110152457444e-05 at 139262 got 0.00017446952 want 0.00017477125
+q8 wmma 16x256 M=24 max_rel: 2.300272118634568e-05 at 21658 got -0.00083318475 want -0.00083293556
+prefill swiglu bf16 vs host max_rel: 0.003563370293541032 at 65180 got 2.0625 want 2.0702334
+PASS: prefill GEMM (q4, q8, configs, padding, ACC) + swiglu
+PASS: prefill kernels
+test_prefill exit 0
+== check-tokens (default prompt, engine v2)
+PASS: 64 tokens match
+check-tokens exit 0

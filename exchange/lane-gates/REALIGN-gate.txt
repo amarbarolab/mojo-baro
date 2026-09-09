@@ -1,0 +1,154 @@
+=== run-tests.sh ===
+Failed to initialize Crashpad.  Crash reporting will not be available.  Cause: while locating crashpad handler: unable to locate crashpad handler executable
+$HOME/Projects/mojo-baro-lanes/REALIGN/kernels/test_gemm.mojo:12:18: warning: `alloc` without a `Layout` is deprecated, use the `Layout`-based `alloc` instead; as a temporary migration step, use `unsafe_alloc`
+    var a_host = alloc[Float16](M * K)
+                 ^~~~~
+<unknown>:0: note: 'alloc' declared here
+$HOME/Projects/mojo-baro-lanes/REALIGN/kernels/test_gemm.mojo:13:18: warning: `alloc` without a `Layout` is deprecated, use the `Layout`-based `alloc` instead; as a temporary migration step, use `unsafe_alloc`
+    var b_host = alloc[Float16](K * N)
+                 ^~~~~
+<unknown>:0: note: 'alloc' declared here
+$HOME/Projects/mojo-baro-lanes/REALIGN/kernels/test_gemm.mojo:14:18: warning: `alloc` without a `Layout` is deprecated, use the `Layout`-based `alloc` instead; as a temporary migration step, use `unsafe_alloc`
+    var c_host = alloc[Float16](M * N)
+                 ^~~~~
+<unknown>:0: note: 'alloc' declared here
+Imported from $HOME/Projects/mojo-baro-lanes/REALIGN/kernels/test_gemm.mojo:4:
+$HOME/Projects/mojo-baro-lanes/REALIGN/kernels/amarbaro.mojo:36:37: warning: 'UnsafePointer' is deprecated, use 'Pointer' instead
+    def upload(self, dst: Int, src: UnsafePointer[UInt8, MutUntrackedOrigin], bytes: Int) raises:
+                                    ^~~~~~~~~~~~~
+                                    Pointer
+<unknown>:0: note: 'UnsafePointer' declared here
+Imported from $HOME/Projects/mojo-baro-lanes/REALIGN/kernels/test_gemm.mojo:4:
+$HOME/Projects/mojo-baro-lanes/REALIGN/kernels/amarbaro.mojo:40:29: warning: 'UnsafePointer' is deprecated, use 'Pointer' instead
+    def download(self, dst: UnsafePointer[UInt8, MutUntrackedOrigin], src: Int, bytes: Int) raises:
+                            ^~~~~~~~~~~~~
+                            Pointer
+<unknown>:0: note: 'UnsafePointer' declared here
+Imported from $HOME/Projects/mojo-baro-lanes/REALIGN/kernels/test_gemm.mojo:4:
+$HOME/Projects/mojo-baro-lanes/REALIGN/kernels/amarbaro.mojo:24:54: warning: 'UnsafePointer' is deprecated, use 'Pointer' instead
+        var p = external_call["amarbaro_last_error", UnsafePointer[UInt8, MutUntrackedOrigin]]()
+                                                     ^~~~~~~~~~~~~
+                                                     Pointer
+<unknown>:0: note: 'UnsafePointer' declared here
+GEMM OK — 4 x 3 @ 3 x 2 matches host reference
+79 kernels, 35 in registry, 3 orphans
+ORPHAN: amar_attn_decode_swa spark_kernels.mojo
+ORPHAN: amar_head_gate_mul_cast spark_kernels.mojo
+ORPHAN: amar_skinny_reduce_gelu_par_bf16 spark_kernels.mojo
+EXIT: 1
+
+=== kernel-census --check ===
+79 kernels, 35 in registry, 3 orphans
+ORPHAN: amar_attn_decode_swa spark_kernels.mojo
+ORPHAN: amar_head_gate_mul_cast spark_kernels.mojo
+ORPHAN: amar_skinny_reduce_gelu_par_bf16 spark_kernels.mojo
+EXIT: 1
+
+=== test_realign build ===
+Failed to initialize Crashpad.  Crash reporting will not be available.  Cause: while locating crashpad handler: unable to locate crashpad handler executable
+                        rerr_ptr[t] = 1
+                        ~~~~~~~~^~~
+                rerr_ptr[t] = 0
+                ~~~~~~~~^~~
+            var dslice = DeviceBuffer[DType.uint8](ctx, wbuf.unsafe_ptr() + done, want, owning=False)
+                                                        ~~~~~~~~~~~~~~~~~~^~~~~~
+    var s = DeviceBuffer[f32](ctx, b.unsafe_ptr() + o, n, owning=False)
+                                   ~~~~~~~~~~~~~~~^~~
+                var hd_row = DeviceBuffer[f32](ctx, b.hd_d.unsafe_ptr() + hrow * H, H, owning=False)
+                                                    ~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~
+                ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr() + (2 * layer) * H, H, owning=False), src_buf=DeviceBuffer[f32](ctx, b.x_d.unsafe_ptr(), H, owning=False))
+                                                                ~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~
+                ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr() + (2 * layer + 1) * H, H, owning=False), src_buf=DeviceBuffer[f32](ctx, b.x_d.unsafe_ptr(), H, owning=False))
+                                                                ~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~
+            ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dump_h.unsafe_ptr() + st.n_dumped * 2 * N_LAYERS * H, 2 * N_LAYERS * H, owning=False), src_buf=b.dbg_d)
+                                                            ~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                ctx.enqueue_copy(dst_buf=b.win_h, src_buf=DeviceBuffer[DType.int32](ctx, b.toks_d.unsafe_ptr() + st.pos + 1, KMAX + 1, owning=False))
+                                                                                         ~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~
+                ctx.enqueue_copy(dst_buf=b.win_h, src_buf=DeviceBuffer[DType.int32](ctx, b.toks_d.unsafe_ptr() + st.pos + 1, KMAX + 1, owning=False))
+                                                                                         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~
+                    ctx.enqueue_copy(dst_buf=b.stream_h.create_sub_buffer[DType.int32](0, m), src_buf=DeviceBuffer[DType.int32](ctx, b.toks_d.unsafe_ptr() + st.pos + 1, m, owning=False))
+                                                                                                                                     ~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~
+                    ctx.enqueue_copy(dst_buf=b.stream_h.create_sub_buffer[DType.int32](0, m), src_buf=DeviceBuffer[DType.int32](ctx, b.toks_d.unsafe_ptr() + st.pos + 1, m, owning=False))
+                                                                                                                                     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~
+        (wbuf.unsafe_ptr() + o).unsafe_bitcast[Scalar[DType.bfloat16]](),
+         ~~~~~~~~~~~~~~~~~~^~~
+        (wbuf.unsafe_ptr() + o).unsafe_bitcast[Scalar[DType.float32]](),
+         ~~~~~~~~~~~~~~~~~~^~~
+        ctx, (wbuf.unsafe_ptr() + o).unsafe_bitcast[Scalar[DType.int8]](), n, owning=False
+              ~~~~~~~~~~~~~~~~~~^~~
+        ctx, (wbuf.unsafe_ptr() + o + n).unsafe_bitcast[Scalar[DType.float16]](), n // 32, owning=False
+              ~~~~~~~~~~~~~~~~~~^~~
+        ctx, (wbuf.unsafe_ptr() + o + n).unsafe_bitcast[Scalar[DType.float16]](), n // 32, owning=False
+              ~~~~~~~~~~~~~~~~~~~~~~^~~
+        ctx, (wbuf.unsafe_ptr() + o).unsafe_bitcast[Scalar[DType.uint8]](), n // 2, owning=False
+              ~~~~~~~~~~~~~~~~~~^~~
+        ctx, (wbuf.unsafe_ptr() + o + n // 2).unsafe_bitcast[Scalar[DType.float16]](), n // 32, owning=False
+              ~~~~~~~~~~~~~~~~~~^~~
+        ctx, (wbuf.unsafe_ptr() + o + n // 2).unsafe_bitcast[Scalar[DType.float16]](), n // 32, owning=False
+              ~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~
+                dbg[(2 * layer) * H + i] = rebind[Scalar[f32]](X_[0, i])
+                ~~~^~~~~~~~~~~~~~~~~~~~~
+                dbg[(2 * layer + 1) * H + i] = rebind[Scalar[f32]](X_[0, i])
+                ~~~^~~~~~~~~~~~~~~~~~~~~~~~~
+            hmax[r * nblk + bid] = pv
+            ~~~~^~~~~~~~~~~~~~~~
+            hidx[r * nblk + bid] = pi
+            ~~~~^~~~~~~~~~~~~~~~
+                    var v = hmax[r * nblk + k]
+                            ~~~~^~~~~~~~~~~~~~
+                    var ix = hidx[r * nblk + k]
+                             ~~~~^~~~~~~~~~~~~~
+    var s = DeviceBuffer[bf16](ctx, b.unsafe_ptr() + o, n, owning=False)
+                                    ~~~~~~~~~~~~~~~^~~
+        prof[idx] = llvm_intrinsic["llvm.amdgcn.s.sendmsg.rtn", Int64](Int32(131))
+        ~~~~^~~~~
+                pp[0] = res[0]
+                ~~^~~
+                pp[1] = res[1]
+                ~~^~~
+                pp[2 + tid] = res[2]
+                ~~^~~~~~~~~
+                mmax = max(mmax, pp[sp * PSTR])
+                                 ~~^~~~~~~~~~~
+                var wgt = exp(pp[sp * PSTR] - mmax)
+                              ~~^~~~~~~~~~~
+                l += wgt * pp[sp * PSTR + 1]
+                           ~~^~~~~~~~~~~~~~~
+                    o += wgt * pp[sp * PSTR + 2 + tid]
+                               ~~^~~~~~~~~~~~~~~~~~~~~
+    return TileTensor((wbuf + o).unsafe_bitcast[Scalar[u8 if Q4 else i8]](), row_major[N, (K // 2) if Q4 else K]())
+                       ~~~~~^~~
+    return TileTensor((wbuf + o + ((N * K // 2) if Q4 else (N * K))).unsafe_bitcast[Scalar[f16]](), row_major[N, K // 32]())
+                       ~~~~~^~~
+    return TileTensor((wbuf + o + ((N * K // 2) if Q4 else (N * K))).unsafe_bitcast[Scalar[f16]](), row_major[N, K // 32]())
+                       ~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    return TileTensor((wbuf + o).unsafe_bitcast[Scalar[f32]](), row_major[N]())
+                       ~~~~~^~~
+    return TileTensor((wbuf + o).unsafe_bitcast[Scalar[f32]](), row_major[N, M]())
+                       ~~~~~^~~
+EXIT: 0
+
+=== test_realign run (mega=True) ===
+REALIGN_SPLIT (gather row-split over VOCAB): 32
+prompt | prefill_toks | realign_us
+-------+--------------+-----------
+p01-water | 13 | 6729.273
+p02-python-fib | 15 | 6007.718
+p03-story | 20 | 6257.3
+p04-list-planets | 16 | 5957.848
+p05-math | 15 | 6060.239
+REALIGN test: dump complete -> .work/realign-dump/
+EXIT: 0
+
+=== realign_oracle.py (round 3: e + h) ===
+prompt | argmax_tok | nearest_emb_tok(cos) | max|e_diff|/max|e| | max|h_diff|/max|h| | verdict
+-------+------------+----------------------+---------------------+---------------------+--------
+p01-water | 279 | 279 (0.8743) | 1.399582e-05 | 6.926123e-08 | PASS
+p02-python-fib | 262 | 262 (0.9998) | 1.746604e-06 | 6.589098e-08 | PASS
+p03-story | 995 | 995 (0.6605) | 2.516562e-05 | 7.226048e-08 | PASS
+p04-list-planets | 42120 | 42120 (0.9944) | 5.871462e-05 | 2.906300e-08 | PASS
+p05-math | 220 | 220 (0.9541) | 5.589453e-06 | 9.849026e-08 | PASS
+-----------------------------------------------------------------------------------------------
+worst max|e_diff|/max|e| = 5.871462e-05 (threshold 1e-3)
+worst max|h_diff|/max|h| = 9.849026e-08 (threshold 1e-4)
+EXIT: 0

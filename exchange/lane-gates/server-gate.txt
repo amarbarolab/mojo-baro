@@ -1,0 +1,24 @@
+== gate 2026-09-06T10:19:51+02:00 commit 106b250
+run-tests.sh exit 0 : GEMM OK — 4 x 3 @ 3 x 2 matches host reference;54 kernels, 26 in registry, 0 orphans;
+ci-checks.sh exit 1 :   FAIL docs/KERNELS.md is stale; regenerate with tools/kernel-census.py;1 check(s) failed;
+one-shot q4 default exit 0 : PASS: 64 tokens match tok/s_gen: 118.18090769427681
+one-shot q8 exit 0 : PASS: 64 tokens match tok/s_gen: 80.03838559664379
+mtp-prompts.sh k=2 exit 0 : identity PASS 20/20 FAIL 0
+test_server.sh exit 0 :
+PASS clippy: no warnings
+PASS cargo-test: 9 passed
+PASS build: engine + baro-serve
+PASS start: http://127.0.0.1:44277 (pack loaded in 0.463876197 s)
+PASS health: {"limits":{"kmax":8,"mrows":8,"spec_k":2,"tmax":128},"pack":".work/engine-pack-q4","queue":0,"status":"ok","tokenizer":true}
+PASS models: engine-pack-q4
+PASS completion: PASS: 64 tokens match; tok/s_gen 130.8 prefill_s 0.0354
+PASS stream: PASS: 64 tokens match
+PASS queue: 2 concurrent requests both match ref; /health during: queue 2
+PASS tokenize: detokenize/tokenize roundtrip on the receipt prompt: 'The capital of France is'
+PASS completion-text: PASS: 64 tokens match; text ' Paris.\nThe capital of France is Paris.\n'
+PASS chat: length '1.  **Analyze the Request:** The user simply said "Say hello'
+PASS chat-stream: 16 delta chunks; streamed text == non-streamed text
+PASS reject: 400 prompt (5) + max_tokens (100000) exceeds the engine's context of 128 tokens
+PASS shutdown: server exit 0, engine child exited
+ALL PASS
+== end 2026-09-06T10:21:29+02:00
