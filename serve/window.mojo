@@ -309,17 +309,24 @@ def gemm_pw[
     A: TileTensor[bf16, AL, MutAnyOrigin],
     wbuf: DeviceBuffer[DType.uint8], o: Int, q4: Bool,
     C: TileTensor[f32, CL, MutAnyOrigin],
-    m: Int,
+    m: Int, prof: Bool, mut gemm_ns: Int,
 ) raises:
+    var t0 = 0
+    if prof:
+        ctx.synchronize()
+        t0 = perf_counter_ns()
     if q4:
         gemm_prefill_q4[ACC](ctx, A, tens_q4q(ctx, wbuf, o, N * K, row_major[N, K // 2]()), tens_q4s(ctx, wbuf, o, N * K, row_major[N, K // 32]()), C, m, N, K)
     else:
         gemm_prefill_q8[ACC](ctx, A, tens_q8q(ctx, wbuf, o, N * K, row_major[N, K]()), tens_q8s(ctx, wbuf, o, N * K, row_major[N, K // 32]()), C, m, N, K)
+    if prof:
+        ctx.synchronize()
+        gemm_ns += Int(perf_counter_ns() - t0)
 
 
 def prefill_forward(
     ctx: DeviceContext, wbuf: DeviceBuffer[DType.uint8], off: List[Int], pack_q4: Bool,
-    m: Int, pos: Int, ring: Int,
+    m: Int, pos: Int, ring: Int, prof: Bool,
     mut toks_d: DeviceBuffer[DType.int32], mut convstate_d: DeviceBuffer[f32], mut sstate_d: DeviceBuffer[f32],
     mut kc_d: DeviceBuffer[KVT], mut vc_d: DeviceBuffer[KVT],
     mut xp_d: DeviceBuffer[f32], mut curbp_d: DeviceBuffer[bf16], mut qkvp_d: DeviceBuffer[f32], mut zp_d: DeviceBuffer[f32],
@@ -339,6 +346,14 @@ def prefill_forward(
     var SStateAll = TileTensor(sstate_d, ssall_layout)
     var Xp = TileTensor(xp_d, xp_layout)
     var CurBp = TileTensor(curbp_d, xp_layout)
+    # BARO_PROFILE != 0: synchronize around every prefill GEMM and print the
+    # chunk's GEMM share (bench/pfgemm-protocol.md). Serialized, so chunk_s
+    # exceeds the unsynchronized chunk time; read the share, not the sum.
+    var gemm_ns = 0
+    var t_chunk = 0
+    if prof:
+        ctx.synchronize()
+        t_chunk = perf_counter_ns()
     ctx.enqueue_function[embed_p](Embd, Xp, Toks, Int32(pos), Int32(H), grid_dim=(ceildiv(H, 256), m), block_dim=256)
     var w = 1
     var ssm_i = 0
@@ -361,9 +376,9 @@ def prefill_forward(
             var Aopflat = TileTensor(aop_d, xpflat_layout)
             var AoBp = TileTensor(resbp_d, xpflat_layout)
             var AoBpm = TileTensor(resbp_d, xp_layout)
-            gemm_pw[QF, H, False](ctx, CurBp, wbuf, off[w + 1], pack_q4, Qfp, m)
-            gemm_pw[KV, H, False](ctx, CurBp, wbuf, off[w + 2], pack_q4, Kflat, m)
-            gemm_pw[KV, H, False](ctx, CurBp, wbuf, off[w + 3], pack_q4, Vflat, m)
+            gemm_pw[QF, H, False](ctx, CurBp, wbuf, off[w + 1], pack_q4, Qfp, m, prof, gemm_ns)
+            gemm_pw[KV, H, False](ctx, CurBp, wbuf, off[w + 2], pack_q4, Kflat, m, prof, gemm_ns)
+            gemm_pw[KV, H, False](ctx, CurBp, wbuf, off[w + 3], pack_q4, Vflat, m, prof, gemm_ns)
             ctx.enqueue_function[split_p](Qfp, Qp, Gatep, grid_dim=(NQH, m), block_dim=HD)
             ctx.enqueue_function[hrms_qp](Qp, Qn, Float32(1e-6), grid_dim=m * NQH, block_dim=HD)
             ctx.enqueue_function[hrms_kvp](Khd, Kn, Float32(1e-6), grid_dim=m * NKVH, block_dim=HD)
@@ -373,7 +388,7 @@ def prefill_forward(
             ctx.enqueue_function[append_p](Vc, Vhd, Int32(pos), Int32(att_i), grid_dim=(NKVH, m), block_dim=HD)
             ctx.enqueue_function[attp_k](Qp, Kc, Vc, Aop, Int32(pos), Int32(m), Float32(0.0625), Int32(att_i), grid_dim=(NKVH, ceildiv(m, PA_ROWS)), block_dim=256)
             ctx.enqueue_function[gmul_p](Aopflat, Gatep, AoBp, Int32(m * H), grid_dim=ceildiv(m * H, 256), block_dim=256)
-            gemm_pw[H, H, True](ctx, AoBpm, wbuf, off[w + 6], pack_q4, Xp, m)
+            gemm_pw[H, H, True](ctx, AoBpm, wbuf, off[w + 6], pack_q4, Xp, m, prof, gemm_ns)
             att_i += 1
             w += 7
         else:
@@ -390,27 +405,31 @@ def prefill_forward(
             var Convp = TileTensor(convp_d, convp_layout)
             var Sop = TileTensor(sop_d, op_layout)
             var ResBp = TileTensor(resbp_d, xp_layout)
-            gemm_pw[CONV, H, False](ctx, CurBp, wbuf, off[w + 1], pack_q4, Qkvp, m)
-            gemm_pw[H, H, False](ctx, CurBp, wbuf, off[w + 2], pack_q4, Zp, m)
-            gemm_pw[NH_V, H, False](ctx, CurBp, wbuf, off[w + 3], pack_q4, Arp, m)
-            gemm_pw[NH_V, H, False](ctx, CurBp, wbuf, off[w + 4], pack_q4, Brp, m)
+            gemm_pw[CONV, H, False](ctx, CurBp, wbuf, off[w + 1], pack_q4, Qkvp, m, prof, gemm_ns)
+            gemm_pw[H, H, False](ctx, CurBp, wbuf, off[w + 2], pack_q4, Zp, m, prof, gemm_ns)
+            gemm_pw[NH_V, H, False](ctx, CurBp, wbuf, off[w + 3], pack_q4, Arp, m, prof, gemm_ns)
+            gemm_pw[NH_V, H, False](ctx, CurBp, wbuf, off[w + 4], pack_q4, Brp, m, prof, gemm_ns)
             ctx.enqueue_function[gates_p](Arp, Brp, Egp, Betap, SsmA, DtB, Int32(m), grid_dim=ceildiv(m * NH_V, 256), block_dim=256)
             ctx.enqueue_function[conv_p](Qkvp, ConvStateAll, Cw, Convp, Int32(ring), Int32(ssm_i), Int32(SLOTS), Int32(m), grid_dim=ceildiv(CONV, 256), block_dim=256)
             ctx.enqueue_function[l2_p](Convp, Int32(m), grid_dim=(NH_V, m), block_dim=SSTATE)
             ctx.enqueue_function[delta_p](SStateAll, Convp, Egp, Betap, Sop, Int32(ring), Int32(ssm_i), Int32(SLOTS), Int32(m), grid_dim=NH_V, block_dim=SSTATE)
             ctx.enqueue_function[gated_p](Sop, Zp, Nw, ResBp, grid_dim=(NH_V, m), block_dim=SSTATE)
-            gemm_pw[H, H, True](ctx, ResBp, wbuf, off[w + 9], pack_q4, Xp, m)
+            gemm_pw[H, H, True](ctx, ResBp, wbuf, off[w + 9], pack_q4, Xp, m, prof, gemm_ns)
             ssm_i += 1
             w += 10
         ctx.enqueue_function[rmsc_p](Xp, tens_f32(ctx, wbuf, off[w], H, h_layout), CurBp, Int32(H), Float32(1e-6), grid_dim=m, block_dim=256)
         var Gp = TileTensor(gp_d, ffnp_layout)
         var Up = TileTensor(up_d, ffnp_layout)
         var FgBp = TileTensor(fgbp_d, ffnp_layout)
-        gemm_pw[FFN, H, False](ctx, CurBp, wbuf, off[w + 1], pack_q4, Gp, m)
-        gemm_pw[FFN, H, False](ctx, CurBp, wbuf, off[w + 2], pack_q4, Up, m)
+        gemm_pw[FFN, H, False](ctx, CurBp, wbuf, off[w + 1], pack_q4, Gp, m, prof, gemm_ns)
+        gemm_pw[FFN, H, False](ctx, CurBp, wbuf, off[w + 2], pack_q4, Up, m, prof, gemm_ns)
         ctx.enqueue_function[swiglu_p](Gp, Up, FgBp, Int32(m), Int32(FFN), grid_dim=ceildiv(m * FFN, 256), block_dim=256)
-        gemm_pw[H, FFN, True](ctx, FgBp, wbuf, off[w + 3], pack_q4, Xp, m)
+        gemm_pw[H, FFN, True](ctx, FgBp, wbuf, off[w + 3], pack_q4, Xp, m, prof, gemm_ns)
         w += 4
+    if prof:
+        ctx.synchronize()
+        var chunk_ns = Int(perf_counter_ns() - t_chunk)
+        print("prefill profile: rows", m, " gemm_s", Float64(gemm_ns) / 1e9, " chunk_s", Float64(chunk_ns) / 1e9, " share", Float64(gemm_ns) / Float64(chunk_ns))
 
 
 
@@ -572,7 +591,7 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
     var SStateAll = TileTensor(b.sstate_d, ssall_layout)
     if st.pos < cfg.pf_rows:
         var mc = min(cfg.pf_chunk, cfg.pf_rows - st.pos)
-        prefill_forward(ctx, b.wbuf, b.off, cfg.pack_q4, mc, st.pos, st.ring, b.toks_d, b.convstate_d, b.sstate_d, b.kc_d, b.vc_d,
+        prefill_forward(ctx, b.wbuf, b.off, cfg.pack_q4, mc, st.pos, st.ring, cfg.prof, b.toks_d, b.convstate_d, b.sstate_d, b.kc_d, b.vc_d,
             b.xp_d, b.curbp_d, b.qkvp_d, b.zp_d, b.arp_d, b.brp_d, b.egp_d, b.betap_d, b.convp_d, b.sop_d, b.resbp_d, b.qfp_d,
             b.qp_d, b.gatep_d, b.kp_d, b.vp_d, b.aop_d, b.gp_d, b.up_d, b.fgbp_d)
         st.ring = (st.ring + mc) % SLOTS

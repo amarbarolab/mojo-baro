@@ -1,9 +1,11 @@
 """Prefill GEMM arms on the ffn shape (N=12288, K=4096, Q4_0 from the q4
 pack), bench/prefill-protocol.md kernel table: bf16-WMMA prefill kernel vs
 the decode-path wave-per-row kernel looped in 8-row windows (its register
-ceiling), n = 16 .. 1024 activation rows. NBUF weight copies rotate so the
-weight stream is cold (8 x 28 MB > 96 MB Infinity Cache). Correctness gate
-(WMMA vs row loop, rel < 1e-4) before any timing is printed.
+ceiling), n = 16 .. 1024 activation rows, plus the LDS-pipelined schedule
+(bf16-lds, bench/pfgemm-protocol.md). NBUF weight copies rotate so the
+weight stream is cold (8 x 28 MB > 96 MB Infinity Cache). Correctness gates
+before any timing is printed: WMMA vs row loop rel < 1e-4, bf16-lds vs WMMA
+bit-exact.
 """
 from std.math import ceildiv
 from std.sys import has_accelerator
@@ -14,6 +16,7 @@ from layout import TileTensor, TensorLayout, row_major
 
 from matmul_skinny import amar_matmul_skinny_q4rowb, amar_skinny_reduce, SM, ROW_WAVES, ROW_THREADS
 from matmul_prefill import amar_matmul_prefill_q4, PF_THREADS
+from matmul_prefill_lds import amar_matmul_prefill_lds, LDS_THREADS
 
 comptime K = 4096
 comptime N = 12288
@@ -136,6 +139,58 @@ def wmma_dispatch(cfg: Int, ctx: DeviceContext, A: TileTensor[bf16, type_of(a_la
         wmma_launch[4, 2, 2](ctx, A, Q, S, C, m)
 
 
+def lds_launch[WM: Int, WN: Int, TM: Int, TN: Int](
+    ctx: DeviceContext, A: TileTensor[bf16, type_of(a_layout), MutAnyOrigin],
+    Q: TileTensor[u8, type_of(q4_layout), MutAnyOrigin], S: TileTensor[f16, type_of(s_layout), MutAnyOrigin],
+    C: TileTensor[f32, type_of(c_layout), MutAnyOrigin], m: Int,
+) raises:
+    comptime BM = WM * TM * 16
+    comptime BN = WN * TN * 16
+    ctx.enqueue_function[amar_matmul_prefill_lds[u8, WM, WN, TM, TN, False, type_of(a_layout), type_of(q4_layout), type_of(s_layout), type_of(c_layout)]](
+        A, Q, S, C, Int32(m), Int32(N), Int32(K), grid_dim=(ceildiv(N, BN), ceildiv(m, BM)), block_dim=LDS_THREADS,
+    )
+
+
+def lds_dispatch(cfg: Int, ctx: DeviceContext, A: TileTensor[bf16, type_of(a_layout), MutAnyOrigin],
+                 Q: TileTensor[u8, type_of(q4_layout), MutAnyOrigin], S: TileTensor[f16, type_of(s_layout), MutAnyOrigin],
+                 C: TileTensor[f32, type_of(c_layout), MutAnyOrigin], m: Int) raises:
+    if cfg == 0:
+        lds_launch[2, 4, 2, 2](ctx, A, Q, S, C, m)
+    else:
+        lds_launch[4, 2, 2, 4](ctx, A, Q, S, C, m)
+
+
+def lds_cfg_name(cfg: Int) -> String:
+    if cfg == 0:
+        return "WM2xWN4 TM2xTN2 tile64x128 BLK_K32 lds2buf"
+    return "WM4xWN2 TM2xTN4 tile128x128 BLK_K32 lds2buf"
+
+
+def lds_grid(cfg: Int, m: Int) -> String:
+    var bm = 64 if cfg == 0 else 128
+    return "grid=(" + String(ceildiv(N, 128)) + "," + String(ceildiv(m, bm)) + ") block=" + String(LDS_THREADS)
+
+
+def lds_cfg_for(m: Int) -> Int:
+    return 0 if m <= 64 else 1
+
+
+def exact_gate(name: String, got: HostBuffer[f32], want: HostBuffer[f32], n: Int) raises:
+    for i in range(n):
+        if got[i] != want[i]:
+            raise Error(name + " mismatch at " + String(i) + ": " + String(got[i]) + " vs " + String(want[i]))
+
+
+def timed(ctx: DeviceContext, m: Int, arm: String, cfg: String, launch: String, meds: List[Float64]) raises:
+    var med = median5(meds)
+    var mn = meds[0]
+    var mx = meds[0]
+    for i in range(len(meds)):
+        mn = min(mn, meds[i])
+        mx = max(mx, meds[i])
+    print(m, arm, cfg, launch, med, mn, mx, Float64(2 * m) * Float64(N) * Float64(K) / med / 1e6)
+
+
 def cfg_for(m: Int) -> Int:
     if m <= 16:
         return 0
@@ -192,6 +247,7 @@ def main() raises:
     ctx.synchronize()
     var A = TileTensor(a_d, a_layout)
     var C = TileTensor(c_d, c_layout)
+    var C2 = TileTensor(c2_d, c_layout)
     var P = TileTensor(p_d, p_layout)
     print("shape N", N, "K", K, "q4 bytes/copy", Q4BYTES, "NBUF", NBUF, "ITERS", ITERS, "REPEATS", REPEATS)
     print("n arm config launch us_per_gemm(median) min max tflops")
@@ -212,6 +268,11 @@ def main() raises:
                 worst = e
         if worst > 1e-4:
             raise Error("wmma vs rowloop mismatch at n=" + String(m) + ": " + String(worst))
+        for lc in range(2):
+            lds_dispatch(lc, ctx, A, q0[0], q0[1], C2, m)
+            ctx.enqueue_copy(dst_buf=c2_h, src_buf=c2_d)
+            ctx.synchronize()
+            exact_gate("bf16-lds cfg " + String(lc) + " vs wmma at n=" + String(m), c2_h, c_h, m * N)
         for c in range(4):
             var meds = List[Float64]()
             for _ in range(REPEATS):
@@ -245,4 +306,15 @@ def main() raises:
             mn2 = min(mn2, meds2[i])
             mx2 = max(mx2, meds2[i])
         print(m, "rowloop", "q4rowb MR8 x" + String(ceildiv(m, SM)) + " passes", "grid=" + String(ceildiv(N, ROW_WAVES)) + " block=" + String(ROW_THREADS), med2, mn2, mx2, Float64(2 * m) * Float64(N) * Float64(K) / med2 / 1e6)
+        for c in range(2):
+            var meds3 = List[Float64]()
+            for _ in range(REPEATS):
+                ctx.synchronize()
+                var t0 = perf_counter_ns()
+                for it in range(ITERS):
+                    var qb = q_tensors(ctx, q_d, it % NBUF)
+                    lds_dispatch(c, ctx, A, qb[0], qb[1], C, m)
+                ctx.synchronize()
+                meds3.append(Float64(perf_counter_ns() - t0) / 1e3 / ITERS)
+            timed(ctx, m, "bf16-lds", lds_cfg_name(c), lds_grid(c, m), meds3)
     print("correct: true")
