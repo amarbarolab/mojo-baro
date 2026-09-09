@@ -29,7 +29,7 @@ from realign import realign_expected_embedding
 from tokenizer import Tokenizer
 
 from grammar.automaton import Automaton
-from grammar.json_value import parse_json_file, JSONDoc, JSONValue, JKindNull, JKindBool, JKindString, JKindNumber, JKindArray, JKindObject
+from grammar.json_value import parse_json_file, parse_json_bytes, JSONDoc, JSONValue, JKindNull, JKindBool, JKindString, JKindNumber, JKindArray, JKindObject
 from grammar.json_schema import compile_root_schema, str_bytes
 from grammar.vocab import Vocab, load_vocab
 from grammar.trie import TokenTrie, TrieNode, build_trie
@@ -212,6 +212,20 @@ def json_value_to_string(doc: JSONDoc, idx: Int) -> String:
         s += "}"
         return s
     return String("null")
+
+
+def compact_json(sample: String) -> String:
+    # Round 3 defect: grammar/'s Automaton.add_literal compiles each
+    # structural literal with zero whitespace tolerance, so a schema-correct
+    # but pretty-printed answer (the model's default style) always failed
+    # the Matcher. Re-parse and re-serialize with json_value_to_string (no
+    # spaces, same form grammar/test_accept_known_good.mojo's fixtures use)
+    # before the schema check; scored_text in the output stays untouched.
+    try:
+        var doc = parse_json_bytes(str_bytes(sample))
+        return json_value_to_string(doc, doc.root)
+    except:
+        return strip_ws(sample)
 
 
 @fieldwise_init
@@ -434,7 +448,7 @@ def check_schema_valid(schema_path: String, sample: String, vp: ArcPointer[Vocab
         var a = Automaton()
         var rid = compile_root_schema(a, doc)
         var m = Matcher(a^, tp, vp)
-        var toks = greedy_tokenize(tp[], str_bytes(strip_ws(sample)))
+        var toks = greedy_tokenize(tp[], str_bytes(compact_json(sample)))
         for i in range(len(toks)):
             if not m.accept(toks[i]):
                 return False
