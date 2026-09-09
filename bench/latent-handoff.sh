@@ -2,7 +2,7 @@
 # usage: bench/latent-handoff.sh [--items N] [--ids id1,id2,...] [--arms a,b,c] [--out PREFIX]
 # E8 HARNESS (exchange/e8-lane-plan-2026-09-09.md item HARNESS): builds the
 # dual-engine evaluator, runs it under the GPU waiting room, then scores the
-# raw dump with bench/e8_score.py. Default: all 40 items, all 5 arms,
+# raw dump with bench/e8_score.py. Default: all 120 items, all 5 arms,
 # results/e8/topology1-q4-<date>. Smoke: --items 4 --arms 0,T,L8-raw.
 # --ids picks specific item ids (round 2: --items N can't express a mix like
 # json_01..04 + math_01..04) and is passed straight through to the binary,
@@ -11,7 +11,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-items=40
+items=120
 ids=""
 arms="0,T,L8-raw,L8-soft,L32-soft"
 date_tag=$(date +%Y-%m-%d)

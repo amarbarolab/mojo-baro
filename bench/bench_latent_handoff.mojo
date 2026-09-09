@@ -511,7 +511,7 @@ def arm_json(name: String, producer_s: Float64, receiver_s: Float64, ids: List[I
 def main() raises:
     comptime assert has_accelerator(), "Requires GPU"
     var args = argv()
-    var n_items = 40
+    var n_items = 120
     var ids_arg = String("")
     var arms_arg = String("0,T,L8-raw,L8-soft,L32-soft")
     var out_prefix = String("results/e8/topology1-q4")
@@ -546,14 +546,15 @@ def main() raises:
         "BARO_E8_GGUF",
         "$HOME/Models/qwythos-9b-claude-mythos-5-1m-mtp-bf16/Qwythos-9B-Claude-Mythos-5-1M-MTP-Q4_0-pure.gguf",
     )
-    # longest arm needs prompt + max(COT_MAX, K32) + ans_max; e8_tasks.json's
-    # longest prompt is 98 tokens (measured) -- 640 leaves headroom without
-    # paying registry.TMAX=1088's full KV-cache footprint. Two co-resident
-    # engines at TMAX measured 25.48/25.75 GB used (bench/latent-handoff.sh
-    # smoke run, 2026-09-09) -- 270 MB of headroom on a 24 GB card; this cuts
-    # the KV pool this harness allocates (per engine, tpages=ceildiv(tmax,128))
-    # without touching serve/window.mojo's own KVPAGE/TMAX.
-    var tmax = atol(getenv("BARO_E8_TMAX", "640"))
+    # longest arm needs prompt + max(COT_MAX, K32) + ans_max; round 4's
+    # e8_tasks.json is GSM8K-hard + schema-in-prompt, so the longest prompt is
+    # 228 tokens (measured, math_025) against round 3's 98: 228 + 300 + 256 =
+    # 784, and 896 is the next whole KV page (tpages=ceildiv(tmax,128)=7).
+    # Two co-resident engines at registry.TMAX=1088 measured 25.48/25.75 GB
+    # used (bench/latent-handoff.sh smoke run, 2026-09-09); at 64 KiB/token
+    # (E1) the two extra pages over round 3's 640 cost ~32 MiB across both
+    # engines, without touching serve/window.mojo's own KVPAGE/TMAX.
+    var tmax = atol(getenv("BARO_E8_TMAX", "896"))
 
     print("E8 HARNESS: items=", n_items, " arms=", arms_arg, " ans_max=", ans_max, " pack=", packdir)
 
