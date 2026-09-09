@@ -54,7 +54,7 @@ echo "VRAM before both loads: ${vram_before}"
 # 512 was requested (2026-09-09). Forward the arm-defining vars explicitly with
 # `env` so they cannot go inert, and let the binary read them back (PROTOCOL-RULES P1).
 e8_env=()
-for v in BARO_E8_ANS_MAX BARO_E8_TMAX BARO_E8_NOTHINK BARO_PACK BARO_E8_GGUF; do
+for v in BARO_E8_ANS_MAX BARO_E8_RECV_MAX BARO_E8_TMAX BARO_E8_NOTHINK BARO_PACK BARO_E8_GGUF; do
   [ -n "${!v-}" ] && e8_env+=("$v=${!v}")
 done
 gpu-wait run --priority 30 --vram 14 -- \

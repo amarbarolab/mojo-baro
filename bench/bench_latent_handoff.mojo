@@ -540,6 +540,13 @@ def main() raises:
     var want_ids = ids_arg.split(",")
     var use_ids = ids_arg != ""
     var ans_max = atol(getenv("BARO_E8_ANS_MAX", "256"))
+    # Budget-capped receiver (round 5). BARO_E8_RECV_MAX > 0 makes the handoff
+    # load-bearing: B answers in a short fixed budget with no working, so arm 0
+    # collapses toward guessing instead of silently re-deriving everything T
+    # carried. The round-4 pilot was void because arm 0 could reason from the
+    # prompt, giving T no private information and the gate no assay sensitivity
+    # (runs/latent-os/E8-pilot-2026-09-09.md). 0 keeps the pilot's behaviour.
+    var recv_max = atol(getenv("BARO_E8_RECV_MAX", "0"))
     var nothink = getenv("BARO_E8_NOTHINK", "1") == "1"
     var packdir = getenv("BARO_PACK", ".work/engine-pack-q4")
     var gguf_path = getenv(
@@ -556,7 +563,7 @@ def main() raises:
     # engines, without touching serve/window.mojo's own KVPAGE/TMAX.
     var tmax = atol(getenv("BARO_E8_TMAX", "896"))
 
-    print("E8 HARNESS: items=", n_items, " arms=", arms_arg, " ans_max=", ans_max, " tmax=", tmax, " pack=", packdir)
+    print("E8 HARNESS: items=", n_items, " arms=", arms_arg, " ans_max=", ans_max, " recv_max=", recv_max, " tmax=", tmax, " pack=", packdir)
 
     var ctx = DeviceContext()
 
@@ -602,6 +609,17 @@ def main() raises:
     var nothink_ids = tok.encode(String("<think>\n\n</think>\n\n"), add_special=False)
     print("turn_ids:", ids_to_json(turn_ids), " nothink:", nothink, " nothink_ids:", ids_to_json(nothink_ids))
 
+    # Same shape for every arm: [prompt] [payload or nothing] [recv turn] -> generate,
+    # so the arms still differ only in what crossed the gap.
+    var recv_math_ids = tok.encode(
+        String("<|im_end|>\n<|im_start|>user\nGive only the final integer answer, as: Answer: <number>. No working.<|im_end|>\n<|im_start|>assistant\n"),
+        add_special=False)
+    var recv_json_ids = tok.encode(
+        String("<|im_end|>\n<|im_start|>user\nGive only the JSON object. No explanation.<|im_end|>\n<|im_start|>assistant\n"),
+        add_special=False)
+    if recv_max > 0:
+        print("recv-capped: budget", recv_max, " math_ids", len(recv_math_ids), " json_ids", len(recv_json_ids))
+
     var wstA = WindowState(pos=0, pos_prev=0, ring=0, n_drafted=0, n_accepted=0, n_spec_windows=0, n_dumped=0, tp=0, tq=0, pf_att=0, pf_ssm=0, pf_ffn=0, pf_head=0, pf_proc=0, pf_draft=0, fc=[0, 0, 0, 0, 0, 0], pc=[0, 0, 0, 0, 0, 0, 0, 0], p3=[0, 0, 0, 0])
     var wstB = WindowState(pos=0, pos_prev=0, ring=0, n_drafted=0, n_accepted=0, n_spec_windows=0, n_dumped=0, tp=0, tq=0, pf_att=0, pf_ssm=0, pf_ffn=0, pf_head=0, pf_proc=0, pf_draft=0, fc=[0, 0, 0, 0, 0, 0], pc=[0, 0, 0, 0, 0, 0, 0, 0], p3=[0, 0, 0, 0])
 
@@ -641,6 +659,12 @@ def main() raises:
         var tokens = get_int_list(doc, idx, "tokens")
         print("=== item", task_id, "(" + task_type + ") n_tok=" + String(len(tokens)), "===")
 
+        var capped = recv_max > 0
+        var hand_ids = turn_ids.copy()
+        if capped:
+            hand_ids = recv_json_ids.copy() if task_type == "json" else recv_math_ids.copy()
+        var gen_budget = recv_max if capped else ans_max
+
         if not first_item:
             out += ","
         first_item = False
@@ -659,9 +683,11 @@ def main() raises:
             try:
                 if arm == "0":
                     var b_context = tokens.copy()
+                    if capped:
+                        extend_ids(b_context, hand_ids)
                     if nothink:
                         extend_ids(b_context, nothink_ids)
-                    var r = run_fresh_generate(ctx, bufsB, wstB, pack_q4, q4_off, eB, b_context, ans_max, tmax)
+                    var r = run_fresh_generate(ctx, bufsB, wstB, pack_q4, q4_off, eB, b_context, gen_budget, tmax)
                     var ans_ids = trim_at_stop(r.ids, stops)
                     var text = tok.decode(ans_ids)
                     var sv = -1
@@ -678,10 +704,10 @@ def main() raises:
                     var cot_ids = trim_at_stop(rA.ids, stops)
                     var b_context = tokens.copy()
                     extend_ids(b_context, cot_ids)
-                    extend_ids(b_context, turn_ids)
+                    extend_ids(b_context, hand_ids)
                     if nothink:
                         extend_ids(b_context, nothink_ids)
-                    var rB = run_fresh_generate(ctx, bufsB, wstB, pack_q4, q4_off, eB, b_context, ans_max, tmax)
+                    var rB = run_fresh_generate(ctx, bufsB, wstB, pack_q4, q4_off, eB, b_context, gen_budget, tmax)
                     var ans_ids = trim_at_stop(rB.ids, stops)
                     var text = tok.decode(ans_ids)
                     var sv = -1
@@ -709,16 +735,16 @@ def main() raises:
                     var t0b = perf_counter_ns()
                     var cfgB = run_to_prompt_end(ctx, bufsB, wstB, pack_q4, q4_off, eB, tokens, tmax)
                     apply_latent_to_receiver(ctx, bufsB, cfgB, wstB, latent_hA, k)
-                    append_known_tokens(ctx, bufsB, wstB, pack_q4, q4_off, eB, turn_ids, tmax)
+                    append_known_tokens(ctx, bufsB, wstB, pack_q4, q4_off, eB, hand_ids, tmax)
                     if nothink:
                         append_known_tokens(ctx, bufsB, wstB, pack_q4, q4_off, eB, nothink_ids, tmax)
                     var start_pos = wstB.pos
-                    var cfg_gen = make_cfg(pack_q4, q4_off, eB, 0, 0, start_pos, start_pos + ans_max)
-                    while wstB.pos < start_pos + ans_max - 1:
+                    var cfg_gen = make_cfg(pack_q4, q4_off, eB, 0, 0, start_pos, start_pos + gen_budget)
+                    while wstB.pos < start_pos + gen_budget - 1:
                         step_window(ctx, bufsB, cfg_gen, wstB)
                     ctx.synchronize()
                     var receiver_s = Float64(perf_counter_ns() - t0b) / 1e9
-                    var gen_ids = read_toks(ctx, bufsB, start_pos, start_pos + ans_max, tmax)
+                    var gen_ids = read_toks(ctx, bufsB, start_pos, start_pos + gen_budget, tmax)
                     var ans_ids = trim_at_stop(gen_ids, stops)
                     var text = tok.decode(ans_ids)
                     var sv = -1
