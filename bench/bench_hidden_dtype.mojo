@@ -11,6 +11,7 @@ from layout import TileTensor, row_major
 from registry import *
 from window import *
 from harness import load_pack, alloc_bufs, Pack
+from realign import final_norm_hidden
 
 def step_latent_raw(
     ctx: DeviceContext,
@@ -170,10 +171,14 @@ def main() raises:
         ctx.synchronize()
 
         for s in range(K_LATENT):
-            var h_slice = DeviceBuffer[f32](ctx, bufs.hn_d.unsafe_ptr(), H, owning=False)
+            # bufs.hn_d is never written under mega=True (kernels/mega.mojo:1182
+            # gates the write on fold_head==2; every launch here passes 1), so
+            # reading it ships a stale earlier-chunk vector -- this is what
+            # invalidated the 2026-09-09 E9 run. final_norm_hidden re-derives the
+            # post-final-norm hidden from b.x_d instead (serve/realign.mojo).
+            final_norm_hidden(ctx, bufs, latent_dev)
             var host_dst = latent_h.create_sub_buffer[f32](s * H, H)
-            ctx.enqueue_copy(dst_buf=host_dst, src_buf=h_slice)
-            ctx.enqueue_copy(dst_buf=latent_dev, src_buf=h_slice)
+            ctx.enqueue_copy(dst_buf=host_dst, src_buf=latent_dev)
             ctx.synchronize()
             step_latent_raw(ctx, bufs, cfg_prompt, wst, latent_dev)
         ctx.synchronize()
