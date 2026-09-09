@@ -12,12 +12,13 @@ attn_output q8 [2560,4096], ffn_norm f32, ffn_gate q8, ffn_up q8, ffn_down q8.
 
 Usage: tools/spark-pack.py MODEL-Q8_0.gguf OUTDIR
 """
+import os
 import sys
 from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, "$HOME/llama.cpp/gguf-py")
+sys.path.insert(0, os.path.expanduser("~/llama.cpp/gguf-py"))
 from gguf import GGUFReader  # noqa: E402
 
 N_LAYERS = 36

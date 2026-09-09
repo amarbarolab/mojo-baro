@@ -3,7 +3,7 @@
 CPU-only library: JSON-schema / regex -> byte-level pushdown automaton (PDA),
 token-mask fill against a real BPE vocab, accept/snapshot/rollback for
 speculative decoding. Built off the GPU per the M6 design (see
-`$HOME/Brain/mojo-baro/briefs/2026-09-08-lane-grammar.md`).
+`~/Brain/mojo-baro/briefs/2026-09-08-lane-grammar.md`).
 
 ## Build / run
 

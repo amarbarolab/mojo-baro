@@ -1,6 +1,6 @@
 # Lane prefill — report (2026-09-06)
 
-Worktree `$HOME/Projects/mojo-baro-lanes/prefill`, branch `lane-prefill`, six commits on top of `main` (`751bc3c`, unchanged during the lane). Working tree clean.
+Worktree `~/Projects/mojo-baro-lanes/prefill`, branch `lane-prefill`, six commits on top of `main` (`751bc3c`, unchanged during the lane). Working tree clean.
 
 ## What landed
 
@@ -86,7 +86,7 @@ No attribution trailers. Nothing committed from the main repo.
 
 - Parity references are fp64 computed inside `kernels/test_prefill.mojo` (the plan named the `tools/*-ref.py` numpy pattern); done in-test to stay inside the lane's file ownership. The numpy `tools/model-ref.py` was used unchanged for the end-to-end third opinion.
 - `kernels/test_prefill.mojo`'s "attn prefill vs amar_attn_decode" gate is 1e-3 relative with a 1e-2 floor (max observed 2.7e-4, at an output of magnitude 9e-5, i.e. 3e-6 absolute — f32 noise).
-- `$HOME/Projects/mojo-baro/.work/build-engine.log` (a throwaway build log in the main repo) was overwritten once at 10:35 through a `.work` symlink before I switched to `.work/build-engine-prefill.log`. No source or artifact in the main repo was touched.
+- `~/Projects/mojo-baro/.work/build-engine.log` (a throwaway build log in the main repo) was overwritten once at 10:35 through a `.work` symlink before I switched to `.work/build-engine-prefill.log`. No source or artifact in the main repo was touched.
 - `tools/model-ref.py` needs ~46 GB RAM (f32 dequant cache of the 9B pack); running it concurrently with anything else got two of my waiters killed for memory. Only p07 and p09 (the two divergent prompts) were run; p12/p15 already match `engine-base` in the final build.
 - The bench's n=16 timings moved between sessions (333-443 us in R2, 435-470 in R4) — latency-bound shape, not resolved.
 

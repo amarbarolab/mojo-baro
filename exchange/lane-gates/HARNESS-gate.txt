@@ -1,30 +1,30 @@
 Failed to initialize Crashpad.  Crash reporting will not be available.  Cause: while locating crashpad handler: unable to locate crashpad handler executable
-$HOME/Projects/mojo-baro-lanes/HARNESS/kernels/test_gemm.mojo:12:18: warning: `alloc` without a `Layout` is deprecated, use the `Layout`-based `alloc` instead; as a temporary migration step, use `unsafe_alloc`
+~/Projects/mojo-baro-lanes/HARNESS/kernels/test_gemm.mojo:12:18: warning: `alloc` without a `Layout` is deprecated, use the `Layout`-based `alloc` instead; as a temporary migration step, use `unsafe_alloc`
     var a_host = alloc[Float16](M * K)
                  ^~~~~
 <unknown>:0: note: 'alloc' declared here
-$HOME/Projects/mojo-baro-lanes/HARNESS/kernels/test_gemm.mojo:13:18: warning: `alloc` without a `Layout` is deprecated, use the `Layout`-based `alloc` instead; as a temporary migration step, use `unsafe_alloc`
+~/Projects/mojo-baro-lanes/HARNESS/kernels/test_gemm.mojo:13:18: warning: `alloc` without a `Layout` is deprecated, use the `Layout`-based `alloc` instead; as a temporary migration step, use `unsafe_alloc`
     var b_host = alloc[Float16](K * N)
                  ^~~~~
 <unknown>:0: note: 'alloc' declared here
-$HOME/Projects/mojo-baro-lanes/HARNESS/kernels/test_gemm.mojo:14:18: warning: `alloc` without a `Layout` is deprecated, use the `Layout`-based `alloc` instead; as a temporary migration step, use `unsafe_alloc`
+~/Projects/mojo-baro-lanes/HARNESS/kernels/test_gemm.mojo:14:18: warning: `alloc` without a `Layout` is deprecated, use the `Layout`-based `alloc` instead; as a temporary migration step, use `unsafe_alloc`
     var c_host = alloc[Float16](M * N)
                  ^~~~~
 <unknown>:0: note: 'alloc' declared here
-Imported from $HOME/Projects/mojo-baro-lanes/HARNESS/kernels/test_gemm.mojo:4:
-$HOME/Projects/mojo-baro-lanes/HARNESS/kernels/amarbaro.mojo:36:37: warning: 'UnsafePointer' is deprecated, use 'Pointer' instead
+Imported from ~/Projects/mojo-baro-lanes/HARNESS/kernels/test_gemm.mojo:4:
+~/Projects/mojo-baro-lanes/HARNESS/kernels/amarbaro.mojo:36:37: warning: 'UnsafePointer' is deprecated, use 'Pointer' instead
     def upload(self, dst: Int, src: UnsafePointer[UInt8, MutUntrackedOrigin], bytes: Int) raises:
                                     ^~~~~~~~~~~~~
                                     Pointer
 <unknown>:0: note: 'UnsafePointer' declared here
-Imported from $HOME/Projects/mojo-baro-lanes/HARNESS/kernels/test_gemm.mojo:4:
-$HOME/Projects/mojo-baro-lanes/HARNESS/kernels/amarbaro.mojo:40:29: warning: 'UnsafePointer' is deprecated, use 'Pointer' instead
+Imported from ~/Projects/mojo-baro-lanes/HARNESS/kernels/test_gemm.mojo:4:
+~/Projects/mojo-baro-lanes/HARNESS/kernels/amarbaro.mojo:40:29: warning: 'UnsafePointer' is deprecated, use 'Pointer' instead
     def download(self, dst: UnsafePointer[UInt8, MutUntrackedOrigin], src: Int, bytes: Int) raises:
                             ^~~~~~~~~~~~~
                             Pointer
 <unknown>:0: note: 'UnsafePointer' declared here
-Imported from $HOME/Projects/mojo-baro-lanes/HARNESS/kernels/test_gemm.mojo:4:
-$HOME/Projects/mojo-baro-lanes/HARNESS/kernels/amarbaro.mojo:24:54: warning: 'UnsafePointer' is deprecated, use 'Pointer' instead
+Imported from ~/Projects/mojo-baro-lanes/HARNESS/kernels/test_gemm.mojo:4:
+~/Projects/mojo-baro-lanes/HARNESS/kernels/amarbaro.mojo:24:54: warning: 'UnsafePointer' is deprecated, use 'Pointer' instead
         var p = external_call["amarbaro_last_error", UnsafePointer[UInt8, MutUntrackedOrigin]]()
                                                      ^~~~~~~~~~~~~
                                                      Pointer

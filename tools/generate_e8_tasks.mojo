@@ -481,10 +481,11 @@ def main() raises:
     var args = argv()
     var gguf = getenv(
         "BARO_E8_GGUF",
-        "$HOME/Models/qwythos-9b-claude-mythos-5-1m-mtp-bf16/Qwythos-9B-Claude-Mythos-5-1M-MTP-Q4_0-pure.gguf",
+        getenv("HOME", "")
+        + "/Models/qwythos-9b-claude-mythos-5-1m-mtp-bf16/Qwythos-9B-Claude-Mythos-5-1M-MTP-Q4_0-pure.gguf",
     )
     var gsm_path = getenv(
-        "E8_GSM8K_JSONL", "$HOME/Models/datasets/gsm8k/main/test.jsonl"
+        "E8_GSM8K_JSONL", getenv("HOME", "") + "/Models/datasets/gsm8k/main/test.jsonl"
     )
     var n_math = atol(getenv("E8_N_MATH", "100"))
     var min_steps = atol(getenv("E8_MIN_STEPS", "5"))

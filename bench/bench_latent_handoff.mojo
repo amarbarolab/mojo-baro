@@ -551,7 +551,8 @@ def main() raises:
     var packdir = getenv("BARO_PACK", ".work/engine-pack-q4")
     var gguf_path = getenv(
         "BARO_E8_GGUF",
-        "$HOME/Models/qwythos-9b-claude-mythos-5-1m-mtp-bf16/Qwythos-9B-Claude-Mythos-5-1M-MTP-Q4_0-pure.gguf",
+        getenv("HOME", "")
+        + "/Models/qwythos-9b-claude-mythos-5-1m-mtp-bf16/Qwythos-9B-Claude-Mythos-5-1M-MTP-Q4_0-pure.gguf",
     )
     # longest arm needs prompt + max(COT_MAX, K32) + ans_max; round 4's
     # e8_tasks.json is GSM8K-hard + schema-in-prompt, so the longest prompt is

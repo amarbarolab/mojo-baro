@@ -1,6 +1,6 @@
 # Lane REALIGN — build report
 
-Branch `lane-REALIGN`, worktree `$HOME/Projects/mojo-baro-lanes/REALIGN`, commit `3d7bfb2`.
+Branch `lane-REALIGN`, worktree `~/Projects/mojo-baro-lanes/REALIGN`, commit `3d7bfb2`.
 
 ## Files (all new, all in item scope)
 

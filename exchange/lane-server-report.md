@@ -1,6 +1,6 @@
 # Lane server — report (2026-09-06)
 
-Worktree `$HOME/Projects/mojo-baro-lanes/server`, branch `lane-server`, base `751bc3c`.
+Worktree `~/Projects/mojo-baro-lanes/server`, branch `lane-server`, base `751bc3c`.
 Plan item **server** of `~/Brain/mojo-baro/briefs/2026-09-06-engine-lanes.md`. All three sub-steps landed.
 
 ## What landed

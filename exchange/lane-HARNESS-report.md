@@ -1,7 +1,7 @@
 # Lane HARNESS -- report
 
 Item HARNESS (`exchange/e8-lane-plan-2026-09-09.md`), branch `lane-HARNESS`,
-worktree `$HOME/Projects/mojo-baro-lanes/HARNESS`.
+worktree `~/Projects/mojo-baro-lanes/HARNESS`.
 
 ## Blocker found and resolved before any HARNESS code
 

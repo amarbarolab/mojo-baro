@@ -1,6 +1,6 @@
 # Lane tokenizer — report (2026-09-06)
 
-Branch `lane-tokenizer` in `$HOME/Projects/mojo-baro-lanes/tokenizer`, two commits on top of `751bc3c`.
+Branch `lane-tokenizer` in `~/Projects/mojo-baro-lanes/tokenizer`, two commits on top of `751bc3c`.
 
 ## What landed
 
@@ -15,7 +15,7 @@ Findings worth knowing: `tokenizer.ggml.pre` is `qwen35`, not `qwen2` — llama.
 
 ## Gate
 
-Output: `$HOME/Projects/mojo-baro-lanes/tokenizer/.work/tokenizer-gate.txt` (run at commit `2099f03`; the second commit changed only docs/README/CLI and `tools/ci-checks.sh` was re-run after it with the same result).
+Output: `~/Projects/mojo-baro-lanes/tokenizer/.work/tokenizer-gate.txt` (run at commit `2099f03`; the second commit changed only docs/README/CLI and `tools/ci-checks.sh` was re-run after it with the same result).
 
 | step | command | result |
 |---|---|---|
@@ -38,7 +38,7 @@ Negative control for the test (run by hand): `llama-tokenize --no-parse-special`
 
 - `.work/tokenizer-gate.txt`, `.work/tokenizer-engine-q4.log`, `.work/tokenizer-build-engine.log` (worktree)
 - `.work/engine-pack-{q4,q8,q8d}/tokenizer.json`, `tokenizer-meta.json` (main repo `.work`, via the symlink — the item said "next to each pack"; two new files per pack, nothing existing touched)
-- Reference llama.cpp: `~/llama.cpp` at `ca3d5a3e1` (2026-08-28); GGUF `$HOME/Models/qwythos-9b-claude-mythos-5-1m-mtp-bf16/Qwythos-9B-Claude-Mythos-5-1M-MTP-Q4_0.gguf` (recorded in `tokenizer-meta.json` `source_gguf`)
+- Reference llama.cpp: `~/llama.cpp` at `ca3d5a3e1` (2026-08-28); GGUF `~/Models/qwythos-9b-claude-mythos-5-1m-mtp-bf16/Qwythos-9B-Claude-Mythos-5-1M-MTP-Q4_0.gguf` (recorded in `tokenizer-meta.json` `source_gguf`)
 
 ## Commits (lane branch only)
 

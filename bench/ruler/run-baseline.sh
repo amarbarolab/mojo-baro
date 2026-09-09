@@ -50,7 +50,7 @@ for size in "$@"; do
   dst="$OUT/$ARM/$size"
   mkdir -p "$dst"
 
-  $HOME/.local/bin/gpu-wait run --priority 50 --vram 8 --preemptible -- \
+  "$HOME/.local/bin/gpu-wait" run --priority 50 --vram 8 --preemptible -- \
     "$HOME/llama.cpp/build/bin/llama-server" -m "$MODEL" -c "$ctx" -ngl 99 -fa on \
     -b 4096 -ub 2048 -t 8 -np "$np" "${ctk_flags[@]}" --host 127.0.0.1 --port "$PORT" \
     > "$dst/server.log" 2>&1 &

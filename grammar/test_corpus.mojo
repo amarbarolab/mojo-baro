@@ -36,8 +36,8 @@ def sample_one(mut m: Matcher, vocab: Vocab, mut mask: Bitset) raises -> String:
 
 def validate_json(subprocess: PythonObject, env: PythonObject, schema_path: String, sample_text: String) raises -> Bool:
     var args = Python.list(
-        "$HOME/Projects/mojo-baro-lanes/grammar/.venv/bin/python3",
-        "$HOME/Projects/mojo-baro-lanes/grammar/grammar/tools/validate_json.py",
+        ".venv/bin/python3",
+        "grammar/tools/validate_json.py",
         schema_path,
     )
     var r = subprocess.run(args, input=PythonObject(sample_text), capture_output=PythonObject(True), text=PythonObject(True), env=env)

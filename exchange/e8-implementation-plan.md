@@ -66,12 +66,12 @@ Implement $e = \text{softmax}(W_{head} \cdot h_L) \cdot W_{emb}$ in `mojo-baro`:
 - Gather and accumulate weighted embeddings into $e \in \mathbb{R}^H$.
 
 ### 2. Multi-Agent Benchmark Harness
-- [NEW] [bench/bench_latent_handoff.mojo](file://$HOME/Projects/mojo-baro/bench/bench_latent_handoff.mojo): Full 5-arm evaluator supporting dual-engine co-residency, raw/soft continuous thought generation, and checkable scoring.
-- [NEW] [bench/latent-handoff.sh](file://$HOME/Projects/mojo-baro/bench/latent-handoff.sh): Command line wrapper for `gpu-wait run --priority 30 -- bench/latent-handoff.sh`.
-- [NEW] [bench/data/e8_tasks.json](file://$HOME/Projects/mojo-baro/bench/data/e8_tasks.json): 40 checkable evaluation items (20 structured JSON + 20 arithmetic).
+- [NEW] [bench/bench_latent_handoff.mojo](file://~/Projects/mojo-baro/bench/bench_latent_handoff.mojo): Full 5-arm evaluator supporting dual-engine co-residency, raw/soft continuous thought generation, and checkable scoring.
+- [NEW] [bench/latent-handoff.sh](file://~/Projects/mojo-baro/bench/latent-handoff.sh): Command line wrapper for `gpu-wait run --priority 30 -- bench/latent-handoff.sh`.
+- [NEW] [bench/data/e8_tasks.json](file://~/Projects/mojo-baro/bench/data/e8_tasks.json): 40 checkable evaluation items (20 structured JSON + 20 arithmetic).
 
 ### 3. Run Receipt
-- [NEW] [runs/latent-os/E8-2026-09-09.md](file://$HOME/AMDHQ/runs/latent-os/E8-2026-09-09.md): Formal receipt recording accuracies, wall-clock latencies, speedups, and final verdict on the thesis.
+- [NEW] [runs/latent-os/E8-2026-09-09.md](file://~/AMDHQ/runs/latent-os/E8-2026-09-09.md): Formal receipt recording accuracies, wall-clock latencies, speedups, and final verdict on the thesis.
 
 ---
 

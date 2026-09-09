@@ -23,6 +23,7 @@ interleaved per block instead:
   tq2:  64 qs then d LAST                          = 66 B/block
 interleave()/deinterleave() do this with numpy views, no Python loops.
 """
+import os
 import sys
 import types
 from pathlib import Path
@@ -45,8 +46,8 @@ ge = _load("gguf-extract")
 ep = _load("engine-pack")
 
 GGUF_PY_CANDIDATES = [
-    "$HOME/llama.cpp-b3s/gguf-py",
-    "/tmp/claude-1000/-home-user-Models/943b35df-4865-4d16-8c80-197091d43bd7/scratchpad/b3s-probe/gguf-py",
+    os.path.expanduser("~/llama.cpp-b3s/gguf-py"),
+    os.path.expanduser("~/llama.cpp/gguf-py"),
 ]
 
 # family -> (block weights, payload bytes, block bytes, scale-first, ggml type, LLAMA_FTYPE_MOSTLY_*)
