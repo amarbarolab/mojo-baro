@@ -1,7 +1,13 @@
-"""REALIGN live test: for 5 real prompts on .work/engine-pack-q4, prefill
-through the prompt, call realign_expected_embedding on the final row, and
-dump both the row's logits and e to .work/realign-dump/ for
-tools/realign_oracle.py (numpy) to check against softmax(logits) @ W_emb.
+"""REALIGN live test (round 2): for 5 real prompts on .work/engine-pack-q4,
+prefill through the prompt under mega=True (the E9/HARNESS configuration --
+bench_latent_handoff.mojo runs every latent step through the megakernel),
+call realign_expected_embedding on the final row, and dump the row's
+pre-final-norm hidden (b.x_d, the one buffer every path keeps current) and
+e to .work/realign-dump/ for tools/realign_oracle.py (numpy) to recompute
+logits and e independently off the dumped hidden state and the pack's own
+weights -- never against a Mojo-side logits dump, since realign_expected_embedding
+no longer exposes logits at all (see serve/realign.mojo's docstring for why
+b.logits_d/b.hn_d are not usable here).
 """
 from std.ffi import c_ssize_t, external_call
 from std.math import ceildiv
@@ -14,7 +20,7 @@ from layout import TileTensor, row_major
 from registry import *
 from window import *
 from realign import realign_expected_embedding
-from realign_kernels import amar_realign_copy_row, amar_realign_gather, amar_realign_reduce, REALIGN_SPLIT
+from realign_kernels import amar_realign_gather, amar_realign_reduce, REALIGN_SPLIT
 
 
 def read_prompt(path: String) raises -> List[Int]:
@@ -290,13 +296,12 @@ def main() raises:
     prompt_names.append("p05-math")
 
     var e_dev = ctx.enqueue_create_buffer[f32](H)
-    var logits_h = ctx.enqueue_create_host_buffer[f32](VOCAB)
+    var x0_h = ctx.enqueue_create_host_buffer[f32](H)
     var e_h = ctx.enqueue_create_host_buffer[f32](H)
-    var dtok1_h = ctx.enqueue_create_host_buffer[DType.int32](1)
 
     print("REALIGN_SPLIT (gather row-split over VOCAB):", REALIGN_SPLIT)
-    print("prompt | prefill_toks | argmax_tok | realign_us")
-    print("-------+--------------+------------+-----------")
+    print("prompt | prefill_toks | realign_us")
+    print("-------+--------------+-----------")
 
     for p_idx in range(len(prompt_names)):
         var pname = prompt_names[p_idx]
@@ -307,7 +312,7 @@ def main() raises:
         var cfg_prompt = WindowCfg(
             pack_q4=pack_q4, draft_q4=False, q4_off=q4_off, e=e, kcfg=2,
             spec=False, spec_dbg=False, serve=False, req_id=0, prof=False, pf2=False, pf3=False, pf4=False,
-            dump=False, mega=False, att_split=TMAX, mega_win=False, dot3=False, pf_chunk=1024,
+            dump=False, mega=True, att_split=TMAX, mega_win=False, dot3=False, pf_chunk=1024,
             pf_rows=0, pf_tail=0, n_total=plen, n_prompt=plen,
         )
         wst.reset(perf_counter_ns())
@@ -315,32 +320,23 @@ def main() raises:
             step_window(ctx, bufs, cfg_prompt, wst)
         ctx.synchronize()
 
-        var Logitsm = TileTensor(bufs.logits_d, vm_layout)
-        var Dtok = TileTensor(bufs.dtok_d, dtok_layout)
-        ctx.enqueue_function[argmax_d](Logitsm, Dtok, Int32(VOCAB), Int32(0), grid_dim=1, block_dim=256)
-        ctx.enqueue_copy(
-            dst_buf=dtok1_h,
-            src_buf=DeviceBuffer[DType.int32](ctx, bufs.dtok_d.unsafe_ptr(), 1, owning=False),
-        )
-        ctx.synchronize()
-
         ctx.synchronize()
         var t0 = perf_counter_ns()
-        realign_expected_embedding(ctx, bufs, e_dev)
+        realign_expected_embedding(ctx, bufs, e_dev, pack_q4)
         ctx.synchronize()
         var dt_us = Float64(perf_counter_ns() - t0) / 1e3
 
         ctx.enqueue_copy(
-            dst_buf=logits_h,
-            src_buf=DeviceBuffer[f32](ctx, bufs.logits_d.unsafe_ptr(), VOCAB, owning=False),
+            dst_buf=x0_h,
+            src_buf=DeviceBuffer[f32](ctx, bufs.x_d.unsafe_ptr(), H, owning=False),
         )
         ctx.enqueue_copy(dst_buf=e_h, src_buf=e_dev)
         ctx.synchronize()
 
-        dump_f32(".work/realign-dump/" + pname + "-logits.f32", logits_h, VOCAB)
+        dump_f32(".work/realign-dump/" + pname + "-x0.f32", x0_h, H)
         dump_f32(".work/realign-dump/" + pname + "-e.f32", e_h, H)
 
-        var line = pname + " | " + String(plen) + " | " + String(Int(dtok1_h[0])) + " | " + String(dt_us)
+        var line = pname + " | " + String(plen) + " | " + String(dt_us)
         print(line)
 
     print("REALIGN test: dump complete -> .work/realign-dump/")

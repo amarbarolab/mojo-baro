@@ -7,21 +7,6 @@ comptime bf16 = DType.bfloat16
 comptime REALIGN_SPLIT = 32
 
 
-def amar_realign_copy_row[
-    SLayout: TensorLayout, DLayout: TensorLayout
-](
-    Src: TileTensor[f32, SLayout, MutAnyOrigin],
-    Dst: TileTensor[f32, DLayout, MutAnyOrigin],
-    n: Int32,
-):
-    comptime assert Src.flat_rank == 2 and Dst.flat_rank == 2
-
-    var i = global_idx.x
-    if i >= Int(n):
-        return
-    Dst[0, i] = rebind[Dst.ElementType](rebind[Scalar[f32]](Src[0, i]))
-
-
 def amar_realign_gather[
     TLayout: TensorLayout, PLayout: TensorLayout, PartLayout: TensorLayout
 ](
