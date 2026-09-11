@@ -288,7 +288,17 @@ def main() raises:
         var stem = sub(tn, 0, tn.byte_length() - 5)
         var by = List[String]()
         for gi in range(len(gates)):
-            if gtext[gi].find(stem) >= 0:
+            var s = gtext[gi]
+            var p = s.find(stem)
+            while p >= 0:
+                var e = p + stem.byte_length()
+                if e >= s.byte_length():
+                    break
+                var c = Int(s.as_bytes()[e])
+                if not ((c >= 48 and c <= 57) or (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or c == 95):
+                    break
+                p = s.find(stem, e)
+            if p >= 0:
                 by.append(gates[gi])
         var bys = join(by, ", ") if len(by) > 0 else String("manual")
         out += String("| `", tn, "` | ", bys, " | ", docline(read(t)), " |\n")
