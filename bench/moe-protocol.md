@@ -209,4 +209,4 @@ the qwen35moe candidate rejected its compiled mega setting, and with
 lines. This is recorded in the lane report; the dedicated W2 kernel and full
 GPU test gates remain passing.
 
-Implementation commit: see the W2 lane commit recorded in the lane report.
+Implementation commit: `b5293b9`.
