@@ -7,6 +7,9 @@
 #            step_latent_raw, unmodified); B ingests them as a prefix, answers.
 #   L8-soft  same, each vector passed through serve/realign.mojo first.
 #   L32-soft same, 32 steps.
+#   KV       A decodes as in T, stopping at T's trim point; its KV pages and SSM
+#            checkpoint cross to B through sealed memfds (serve/latent.mojo); B
+#            restores them and answers without re-prefilling (LatentOS E12).
 # Soft arms call serve/realign.mojo's stub, which raises "REALIGN not merged"
 # until that lane's kernel lands -- caught per-arm, recorded as an error, never
 # silently downgraded to the raw vector.
@@ -27,6 +30,8 @@ from window import *
 from latent_harness import load_pack, alloc_bufs, Pack
 from realign import realign_expected_embedding, final_norm_hidden
 from tokenizer import Tokenizer
+from prefix import Chain, prefix_hash
+from latent import mint_kv_latent, ingest_kv_latent, mint_chain_slot, ingest_into_chain
 
 from grammar.automaton import Automaton
 from grammar.json_value import parse_json_file, parse_json_bytes, JSONDoc, JSONValue, JKindNull, JKindBool, JKindString, JKindNumber, JKindArray, JKindObject
@@ -297,6 +302,40 @@ def run_fresh_generate(
     return GenResult(generated^, dt)
 
 
+def run_generate_to_stop(
+    ctx: DeviceContext, mut b: WindowBufs, mut wst: WindowState,
+    pack_q4: Bool, q4_off: Int, e: Int, context: List[Int], gen_max: Int, tmax: Int, stops: List[Int],
+) raises -> GenResult:
+    # Same cfg as run_fresh_generate, so the same greedy ids as arm T's
+    # producer, but stops feeding at the first stop id: the SSM state cannot be
+    # rewound, so this is the only way to hold the state after exactly
+    # context + ids (T's trim point). Costs one 4-byte read-back per step.
+    var plen = len(context)
+    var pf = reset_and_load(ctx, b, context, tmax)
+    var cfg = make_cfg(pack_q4, q4_off, e, pf[0], pf[1], plen, plen + gen_max)
+    var tok_h = ctx.enqueue_create_host_buffer[DType.int32](1)
+    ctx.synchronize()
+    var ids = List[Int]()
+    var t0 = perf_counter_ns()
+    wst.reset(t0)
+    while wst.pos < plen:
+        step_window(ctx, b, cfg, wst)
+    while len(ids) < gen_max:
+        var cur = DeviceBuffer[DType.int32](ctx, b.toks_d.unsafe_ptr() + wst.pos, 1, owning=False)
+        ctx.enqueue_copy(dst_buf=tok_h, src_buf=cur)
+        ctx.synchronize()
+        var t = Int(tok_h[0])
+        if contains(stops, t):
+            break
+        ids.append(t)
+        step_window(ctx, b, cfg, wst)
+        if wst.pos != plen + len(ids):
+            raise Error("run_generate_to_stop: decode advanced to " + String(wst.pos) + ", expected " + String(plen + len(ids)))
+    ctx.synchronize()
+    var dt = Float64(perf_counter_ns() - t0) / 1e9
+    return GenResult(ids^, dt)
+
+
 def run_to_prompt_end(
     ctx: DeviceContext, mut b: WindowBufs, mut wst: WindowState,
     pack_q4: Bool, q4_off: Int, e: Int, context: List[Int], tmax: Int,
@@ -490,7 +529,7 @@ def ids_to_json(ids: List[Int]) -> String:
     return s
 
 
-def arm_json(name: String, producer_s: Float64, receiver_s: Float64, ids: List[Int], text: String, scored_text: String, schema_valid: Int, error: String) -> String:
+def arm_json(name: String, producer_s: Float64, receiver_s: Float64, ids: List[Int], text: String, scored_text: String, schema_valid: Int, error: String, extra: String = "") -> String:
     var s = String("{\"arm\":\"") + name + "\",\"producer_s\":" + String(producer_s)
     s += ",\"receiver_s\":" + String(receiver_s)
     s += ",\"generated_ids\":" + ids_to_json(ids)
@@ -504,6 +543,7 @@ def arm_json(name: String, producer_s: Float64, receiver_s: Float64, ids: List[I
         s += ",\"error\":null"
     else:
         s += ",\"error\":\"" + json_escape(error) + "\""
+    s += extra
     s += "}"
     return s
 
@@ -624,6 +664,14 @@ def main() raises:
     var wstA = WindowState(pos=0, pos_prev=0, ring=0, n_drafted=0, n_accepted=0, n_spec_windows=0, n_dumped=0, tp=0, tq=0, pf_att=0, pf_ssm=0, pf_ffn=0, pf_head=0, pf_proc=0, pf_draft=0, fc=[0, 0, 0, 0, 0, 0], pc=[0, 0, 0, 0, 0, 0, 0, 0], p3=[0, 0, 0, 0])
     var wstB = WindowState(pos=0, pos_prev=0, ring=0, n_drafted=0, n_accepted=0, n_spec_windows=0, n_dumped=0, tp=0, tq=0, pf_att=0, pf_ssm=0, pf_ffn=0, pf_head=0, pf_proc=0, pf_draft=0, fc=[0, 0, 0, 0, 0, 0], pc=[0, 0, 0, 0, 0, 0, 0, 0], p3=[0, 0, 0, 0])
 
+    # KV arm (E12): one pinned 50.25 MiB SSM slot per side, allocated once.
+    var kv_cap = 0
+    for j in range(len(arms)):
+        if String(arms[j]) == "KV":
+            kv_cap = 1
+    var chainA = Chain(ctx, kv_cap)
+    var chainB = Chain(ctx, kv_cap)
+
     var doc = parse_json_file("bench/data/e8_tasks.json")
     var root = doc.get(doc.root)
     var n_avail = len(root.arr)
@@ -718,7 +766,10 @@ def main() raises:
                         sv = 1 if check_schema_valid(schema_file, scored, vp, tp) else 0
                     else:
                         scored = strip_for_math(text)
-                    out += arm_json(arm, rA.elapsed_s, rB.elapsed_s, rB.ids, text, scored, sv, "")
+                    var t_ctx = tokens.copy()
+                    extend_ids(t_ctx, cot_ids)
+                    var t_extra = String(",\"handoff_pos\":") + String(len(t_ctx)) + ",\"handoff_hash\":\"" + String(prefix_hash(t_ctx, len(t_ctx))) + "\""
+                    out += arm_json(arm, rA.elapsed_s, rB.elapsed_s, rB.ids, text, scored, sv, "", t_extra)
 
                 elif arm == "L8-raw" or arm == "L8-soft" or arm == "L32-soft":
                     var k = K32 if arm == "L32-soft" else K8
@@ -756,6 +807,61 @@ def main() raises:
                     else:
                         scored = strip_for_math(text)
                     out += arm_json(arm, producer_s, receiver_s, gen_ids, text, scored, sv, "")
+
+                elif arm == "KV":
+                    var rA = run_generate_to_stop(ctx, bufsA, wstA, pack_q4, q4_off, eA, tokens, COT_MAX, tmax, stops)
+                    var a_ctx = tokens.copy()
+                    extend_ids(a_ctx, rA.ids)
+                    var hand_pos = len(a_ctx)
+                    if wstA.pos != hand_pos:
+                        raise Error("KV: producer at pos " + String(wstA.pos) + ", handoff at " + String(hand_pos))
+                    var hand_hash = prefix_hash(a_ctx, hand_pos)
+                    # KV pool is page-major (kernels/attn.mojo kv_off), so pages
+                    # [0, ceil(hand_pos/128)) hold exactly the prefix.
+                    var kv_pages = (hand_pos + KVPAGE - 1) // KVPAGE
+                    var t0m = perf_counter_ns()
+                    var kv = mint_kv_latent(ctx, bufsA.kc_d, bufsA.vc_d, 0, kv_pages, hand_hash)
+                    chainA.save(ctx, bufsA.convstate_d, bufsA.sstate_d, wstA.ring, hand_pos, a_ctx)
+                    ctx.synchronize()
+                    chainA.commit()
+                    if not chainA.items[0].valid or chainA.items[0].pos != hand_pos:
+                        raise Error("KV: SSM checkpoint not at the handoff position")
+                    var ck = mint_chain_slot(chainA, 0)
+                    var mint_s = Float64(perf_counter_ns() - t0m) / 1e9
+
+                    _ = reset_and_load(ctx, bufsB, a_ctx, tmax)
+                    var t0b = perf_counter_ns()
+                    ingest_kv_latent(ctx, bufsB.kc_d, bufsB.vc_d, kv[0], kv[1])
+                    var slot = ingest_into_chain(chainB, ck[0], ck[1])
+                    chainB.restore(ctx, bufsB.convstate_d, bufsB.sstate_d, 0, slot)
+                    ctx.synchronize()
+                    var ingest_s = Float64(perf_counter_ns() - t0b) / 1e9
+                    # serve/engine.mojo's restore contract: slot 0, ring 0, pos = pos_prev = cached.
+                    wstB.reset(t0b)
+                    wstB.pos = hand_pos
+                    wstB.pos_prev = hand_pos
+                    append_known_tokens(ctx, bufsB, wstB, pack_q4, q4_off, eB, hand_ids, tmax)
+                    if nothink:
+                        append_known_tokens(ctx, bufsB, wstB, pack_q4, q4_off, eB, nothink_ids, tmax)
+                    var start_pos = wstB.pos
+                    var cfg_gen = make_cfg(pack_q4, q4_off, eB, 0, 0, start_pos, start_pos + gen_budget)
+                    while wstB.pos < start_pos + gen_budget - 1:
+                        step_window(ctx, bufsB, cfg_gen, wstB)
+                    ctx.synchronize()
+                    var receiver_s = Float64(perf_counter_ns() - t0b) / 1e9
+                    var gen_ids = read_toks(ctx, bufsB, start_pos, start_pos + gen_budget, tmax)
+                    var ans_ids = trim_at_stop(gen_ids, stops)
+                    var text = tok.decode(ans_ids)
+                    var sv = -1
+                    var scored = String("")
+                    if task_type == "json":
+                        scored = strip_for_json(text)
+                        sv = 1 if check_schema_valid(schema_file, scored, vp, tp) else 0
+                    else:
+                        scored = strip_for_math(text)
+                    var kv_extra = String(",\"handoff_pos\":") + String(hand_pos) + ",\"handoff_hash\":\"" + String(hand_hash) + "\""
+                    kv_extra += ",\"kv_pages\":" + String(kv_pages) + ",\"mint_s\":" + String(mint_s) + ",\"ingest_s\":" + String(ingest_s)
+                    out += arm_json(arm, rA.elapsed_s, receiver_s, gen_ids, text, scored, sv, "", kv_extra)
 
                 else:
                     out += arm_json(arm, 0.0, 0.0, List[Int](), "", "", -1, "unknown arm " + arm)
