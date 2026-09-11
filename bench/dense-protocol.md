@@ -134,6 +134,29 @@ embedding_scale and residual_scale are both 1.0 in this checkpoint, so this run 
 exercise the pack-time weight-folding gap noted in step 2's predictions above -- that remains
 unverified for a hypothetical Granite checkpoint with non-unity multipliers.
 
+### Result: lily-cybersecurity-7b-v0.2-Q6_K (2026-09-11, `.work/dense/lily7b-run/`)
+
+Mistral-arch under `general.architecture = llama` (TOK's SPM tokenizer, `tokenizer.ggml.model
+= llama`, `add_bos true`), last of the four targets. Uses the now-confirmed llama/granite
+NORM rope, same as Llama-3.2-1B.
+
+| # | prediction | result |
+|---|---|---|
+| 1 | >=90% agreement, >=18/20 prompts | **PASS, 20/20**: range 62-64/64 (96.9-100%), two prompts ended early (5/5, 27/27) matching fully |
+| 2 | tok/s_gen positive/finite, no crash | **PASS**: 94.1-95.0 tok/s_gen across all 20 prompts |
+| 3 | chat smoke | **N/A as predicted**, not attempted |
+
+Verdict: all four dense-family targets now verified end to end. SPM tokenization (TOK) and
+NORM rope (this lane, fixed on Granite) both confirmed correct for the Mistral-family GGUF.
+
+## PROFILE step 3 summary: 4/4 targets PASS (Llama-3.2-1B, Qwen2.5-7B, Granite, Lily)
+
+All at >=95% forced agreement except Granite's first (rope-type bug, fixed) attempt. One
+repair round total across the whole step. Not exercised by any of the four real checkpoints:
+GRANITE_MULT's embedding/residual-scale pack-time folding (both multipliers are 1.0 in the
+one Granite checkpoint available), and the chat-completions smoke (spark.mojo has no Rust
+front protocol implementation, out of this lane's files).
+
 ## KATT: head dimension as a comptime parameter
 
 Scope: the attention kernels the Spark path calls, `amar_attn_decode_swa_gated` and
