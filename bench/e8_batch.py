@@ -64,8 +64,10 @@ def main():
     ap.add_argument("--batches", type=int, default=4)
     ap.add_argument("--prefix", default=f"results/e8/round4-{time.strftime('%Y-%m-%d')}")
     ap.add_argument("--arms", default=ARMS)
-    ap.add_argument("--ans-max", default="512")
-    ap.add_argument("--tmax", default="1088")
+    # Env wins over the old hardcoded defaults: E12-long set BARO_E8_TMAX and
+    # this script silently reset it to 1088 (rc=250 on the first 8k item).
+    ap.add_argument("--ans-max", default=os.environ.get("BARO_E8_ANS_MAX", "512"))
+    ap.add_argument("--tmax", default=os.environ.get("BARO_E8_TMAX", "1088"))
     ap.add_argument("--stop-after", type=int, default=0,
                     help="run at most N batches this invocation (0 = all); re-invoke with the same --prefix to continue, finished batches are skipped")
     ap.add_argument("--dry-run", action="store_true")
