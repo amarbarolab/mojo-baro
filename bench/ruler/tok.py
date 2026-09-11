@@ -22,7 +22,7 @@ def load(pack):
         raise SystemExit(f"tok.load: set BARO_GGUF to the tokenizer's GGUF (got {gguf!r})")
     if not CLI.exists():
         raise SystemExit(f"tok.load: build the CLI first: ./.venv/bin/mojo build tools/baro-tokenize.mojo "
-                         f"-I serve -I ~/Projects/mojo-uregex/src -o {CLI}")
+                         f"-I serve -I ~/Projects/mojo/mojo-uregex/src -o {CLI}")
 
     def count_many(texts):
         with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as f:
