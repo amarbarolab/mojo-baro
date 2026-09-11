@@ -110,4 +110,30 @@ written to `/tmp`.
 
 ## Result
 
-Pending probe and regression run.
+PASSED on 2026-09-12. `tools/moe-loader-probe .work/moe-w1/pack`:
+
+- `tensors resolved: 733`; `resolved bytes: 21005191680 pack bytes: 21005191680`
+  (exact match, matches the independent Python read).
+- `blk.0`: router 329850880; shared gate 331956224, shared up 484065280,
+  shared down 177741824; expert0 gate 178855936, expert0 up 333070336,
+  expert0 down 26746880 -- every one matches the registered prediction
+  exactly, and the last-expert (255) end-of-tensor check for gate/up/down
+  raised no FAIL.
+- Layers 34, 38, 39 `ffn_down_exps.weight`: dtype `q6_k`, expert0 offsets
+  13828560640 / 15869454336 / 16435647232, matching the tensor's own
+  recorded offset -- no FAIL.
+- Profile printout: `H 2048 QF 8192 KV 512 N_LAYERS 40 N_SSM 30 N_ATT 10
+  HD 256 NKVH 2`; host state `kvpool 5898240 kvpool1 589824 conv_slot 737280
+  ssm_slot 15728640 slots 9`.
+- `MOE LOADER PROBE: PASS`.
+
+Deviation from the original plan, disclosed: mid-lap, the maintainer asked for a pack/
+profile mismatch guard in `serve/harness.mojo`'s `load_pack` (not part of the
+original prediction above, added as an extra, in-scope finding -- see the
+lane report for the before/after receipt and the exact detection rule). That
+guard's own regression is the same `run-tests.sh` / `force-ab.sh` pair as
+this protocol's; both are reported together.
+
+Regression: `./run-tests.sh` exit 0. `bench/force-ab.sh` (main-built
+`38478b34aa4aaf4d` vs this-branch-built `bd850620005e0e8c56`, distinct
+hashes): 20/20 prompts, 64/64 each, min 100.0%, mean 100.0%, void none.
