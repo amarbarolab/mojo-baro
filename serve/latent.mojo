@@ -31,6 +31,7 @@ def mint_checkpoint_latent(
     weights_uuid: InlineArray[UInt8, 16] = InlineArray[UInt8, 16](fill=0),
     role_sha: InlineArray[UInt8, 32] = InlineArray[UInt8, 32](fill=0),
     runtime_sha: InlineArray[UInt8, 32] = InlineArray[UInt8, 32](fill=0),
+    tokenizer_sha: InlineArray[UInt8, 32] = InlineArray[UInt8, 32](fill=0),
 ) raises -> Tuple[proto.LatentHeader, Int32]:
     """Mints an immutable, sealed memfd from an in-memory Checkpoint and returns (LatentHeader, fd).
     Mint order (03 §4): write -> munmap -> fcntl(F_ADD_SEALS) -> export.
@@ -68,6 +69,7 @@ def mint_checkpoint_latent(
     header.weights_uuid = weights_uuid.copy()
     header.role_sha = role_sha.copy()
     header.runtime = runtime_sha.copy()
+    header.tokenizer_sha = tokenizer_sha.copy()
 
     return (header^, mfd)
 
@@ -118,11 +120,12 @@ def mint_chain_slot(
     weights_uuid: InlineArray[UInt8, 16] = InlineArray[UInt8, 16](fill=0),
     role_sha: InlineArray[UInt8, 32] = InlineArray[UInt8, 32](fill=0),
     runtime_sha: InlineArray[UInt8, 32] = InlineArray[UInt8, 32](fill=0),
+    tokenizer_sha: InlineArray[UInt8, 32] = InlineArray[UInt8, 32](fill=0),
 ) raises -> Tuple[proto.LatentHeader, Int32]:
     """Mints a checkpoint from an active slot in Chain."""
     if slot_idx < 0 or slot_idx >= len(chain.items):
         raise Error("Invalid slot_idx in mint_chain_slot: " + String(slot_idx))
-    return mint_checkpoint_latent(chain.items[slot_idx], weights_uuid, role_sha, runtime_sha)
+    return mint_checkpoint_latent(chain.items[slot_idx], weights_uuid, role_sha, runtime_sha, tokenizer_sha)
 
 def ingest_into_chain(
     mut chain: Chain,
@@ -170,6 +173,7 @@ def mint_kv_page_host(
     weights_uuid: InlineArray[UInt8, 16] = InlineArray[UInt8, 16](fill=0),
     role_sha: InlineArray[UInt8, 32] = InlineArray[UInt8, 32](fill=0),
     runtime_sha: InlineArray[UInt8, 32] = InlineArray[UInt8, 32](fill=0),
+    tokenizer_sha: InlineArray[UInt8, 32] = InlineArray[UInt8, 32](fill=0),
 ) raises -> Tuple[proto.LatentHeader, Int32]:
     """Mints sealed memfd from host-accessible K and V page buffers."""
     var total_bytes = num_pages * PAGE_KV_BYTES
@@ -198,6 +202,7 @@ def mint_kv_page_host(
     header.weights_uuid = weights_uuid.copy()
     header.role_sha = role_sha.copy()
     header.runtime = runtime_sha.copy()
+    header.tokenizer_sha = tokenizer_sha.copy()
 
     return (header^, mfd)
 
@@ -242,6 +247,7 @@ def mint_kv_latent(
     weights_uuid: InlineArray[UInt8, 16] = InlineArray[UInt8, 16](fill=0),
     role_sha: InlineArray[UInt8, 32] = InlineArray[UInt8, 32](fill=0),
     runtime_sha: InlineArray[UInt8, 32] = InlineArray[UInt8, 32](fill=0),
+    tokenizer_sha: InlineArray[UInt8, 32] = InlineArray[UInt8, 32](fill=0),
 ) raises -> Tuple[proto.LatentHeader, Int32]:
     """Extracts KV cache pages from device memory into a sealed LatentOS memfd."""
     var total_floats = num_pages * PGSTR
@@ -260,7 +266,7 @@ def mint_kv_latent(
 
     return mint_kv_page_host(
         src_k, src_v, page_idx, num_pages, prefix_hash,
-        weights_uuid, role_sha, runtime_sha
+        weights_uuid, role_sha, runtime_sha, tokenizer_sha
     )
 
 def ingest_kv_latent(
@@ -307,6 +313,7 @@ def mint_hidden_latent(
     weights_uuid: InlineArray[UInt8, 16] = InlineArray[UInt8, 16](fill=0),
     role_sha: InlineArray[UInt8, 32] = InlineArray[UInt8, 32](fill=0),
     runtime_sha: InlineArray[UInt8, 32] = InlineArray[UInt8, 32](fill=0),
+    tokenizer_sha: InlineArray[UInt8, 32] = InlineArray[UInt8, 32](fill=0),
 ) raises -> Tuple[proto.LatentHeader, Int32]:
     """Mints sealed memfd from hidden state vectors."""
     var bytes_per_step = 8192 if dtype == proto.DTYPE_BF16 else 16384
@@ -331,6 +338,7 @@ def mint_hidden_latent(
     header.weights_uuid = weights_uuid.copy()
     header.role_sha = role_sha.copy()
     header.runtime = runtime_sha.copy()
+    header.tokenizer_sha = tokenizer_sha.copy()
 
     return (header^, mfd)
 

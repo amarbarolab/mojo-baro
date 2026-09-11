@@ -33,6 +33,9 @@ from tokenizer import Tokenizer
 from prefix import Chain, prefix_hash
 from latent import mint_kv_latent, ingest_kv_latent, mint_chain_slot, ingest_into_chain
 from e13_projector import load_projector, apply_projector_k
+from identity import EngineIdentity, compute_engine_identity
+import latentos.proto as proto
+import latentos.sys as latentos_sys
 
 from grammar.automaton import Automaton
 from grammar.json_value import parse_json_file, parse_json_bytes, JSONDoc, JSONValue, JKindNull, JKindBool, JKindString, JKindNumber, JKindArray, JKindObject
@@ -631,6 +634,18 @@ def main() raises:
 
     print("--- loading tokenizer + grammar vocab ---")
     var tok = Tokenizer(gguf_path)
+
+    # U3 (docs/design/latent-os/09-roadmap.md "model universal" discussion):
+    # both engines in this harness share one process, so B's own identity IS
+    # A's; computed once here, never per handoff (identity.mojo docstring).
+    var mojo_baro_dir = getenv("BARO_MOJO_BARO_DIR", getenv("HOME", "") + "/Projects/mojo/mojo-baro")
+    var mojo_bin = getenv("BARO_MOJO_BIN", mojo_baro_dir + "/.venv/bin/mojo")
+    var receiver_identity = compute_engine_identity(gguf_path, mojo_baro_dir, mojo_bin, tok)
+    # KV-arm negative control (U3 goal 3's CHECK): flip one byte of one field
+    # in the MINTED header before B's ingest check, simulating a producer on
+    # a different model/tokenizer/build without needing two real GGUFs.
+    var force_mismatch_field = getenv("BARO_E8_FORCE_IDENTITY_MISMATCH", "")
+
     var stops = List[Int]()
     if tok.eos_id >= 0:
         stops.append(tok.eos_id)
@@ -907,42 +922,84 @@ def main() raises:
                     # KV pool is page-major (kernels/attn.mojo kv_off), so pages
                     # [0, ceil(hand_pos/128)) hold exactly the prefix.
                     var kv_pages = (hand_pos + KVPAGE - 1) // KVPAGE
+                    var zero32 = InlineArray[UInt8, 32](fill=0)
                     var t0m = perf_counter_ns()
-                    var kv = mint_kv_latent(ctx, bufsA.kc_d, bufsA.vc_d, 0, kv_pages, hand_hash)
+                    var kv = mint_kv_latent(ctx, bufsA.kc_d, bufsA.vc_d, 0, kv_pages, hand_hash, receiver_identity.weights_uuid, zero32, receiver_identity.runtime, receiver_identity.tokenizer_sha)
+                    var kv_header = kv[0].copy()
+                    var kv_fd = kv[1]
                     chainA.save(ctx, bufsA.convstate_d, bufsA.sstate_d, wstA.ring, hand_pos, a_ctx)
                     ctx.synchronize()
                     chainA.commit()
                     if not chainA.items[0].valid or chainA.items[0].pos != hand_pos:
                         raise Error("KV: SSM checkpoint not at the handoff position")
-                    var ck = mint_chain_slot(chainA, 0)
+                    var ck = mint_chain_slot(chainA, 0, receiver_identity.weights_uuid, zero32, receiver_identity.runtime, receiver_identity.tokenizer_sha)
+                    var ck_header = ck[0].copy()
+                    var ck_fd = ck[1]
                     var mint_s = Float64(perf_counter_ns() - t0m) / 1e9
+
+                    # U3 goal 3's negative-control knob: flip one byte of the
+                    # MINTED header (never the receiver's own identity) so the
+                    # check below refuses it exactly as a real cross-model
+                    # producer would be refused.
+                    if force_mismatch_field == "weights_uuid":
+                        kv_header.weights_uuid[0] = kv_header.weights_uuid[0] ^ 0xFF
+                    elif force_mismatch_field == "runtime":
+                        kv_header.runtime[0] = kv_header.runtime[0] ^ 0xFF
+                    elif force_mismatch_field == "sigma_id":
+                        kv_header.sigma_id[0] = kv_header.sigma_id[0] ^ 0xFF
+                    elif force_mismatch_field == "tokenizer_sha":
+                        kv_header.tokenizer_sha[0] = kv_header.tokenizer_sha[0] ^ 0xFF
+
+                    # Identity check BEFORE any B-side restore (U3 goal 2: "nothing
+                    # is restored" on mismatch): check the minted header against B's
+                    # own identity while B's buffers are still untouched.
+                    var fallback_field = String("")
+                    try:
+                        proto.check_identity(kv_header, receiver_identity.weights_uuid, receiver_identity.runtime, receiver_identity.sigma_id, receiver_identity.tokenizer_sha)
+                    except e:
+                        fallback_field = String(String(e).removeprefix("IDENTITY_MISMATCH:"))
+                        _ = latentos_sys.sys_close(kv_fd)
+                        _ = latentos_sys.sys_close(ck_fd)
 
                     var b_ctx = a_ctx.copy()
                     extend_ids(b_ctx, hand_ids)
                     if nothink:
                         extend_ids(b_ctx, nothink_ids)
                     var total = len(b_ctx)
-                    if total - 1 - hand_pos < MROWS:
-                        raise Error("KV: fewer than MROWS tokens after the handoff, the prefill tail would underflow")
-                    var pfB = reset_and_load(ctx, bufsB, b_ctx, tmax)
-                    var t0b = perf_counter_ns()
-                    ingest_kv_latent(ctx, bufsB.kc_d, bufsB.vc_d, kv[0], kv[1])
-                    var slot = ingest_into_chain(chainB, ck[0], ck[1])
-                    chainB.restore(ctx, bufsB.convstate_d, bufsB.sstate_d, 0, slot)
-                    ctx.synchronize()
-                    var ingest_s = Float64(perf_counter_ns() - t0b) / 1e9
-                    # serve/engine.mojo's restore contract (slot 0, ring 0, pos = pos_prev
-                    # = cached), then the rest of B's context in one batched prefill, the
-                    # way arm T prefills it; the smoke fed it row by row and measured that.
-                    wstB.reset(t0b)
-                    wstB.pos = hand_pos
-                    wstB.pos_prev = hand_pos
-                    var cfgB = make_cfg(pack_q4, q4_off, eB, pfB[0], pfB[1], total, total + gen_budget)
-                    while wstB.pos < total + gen_budget - 1:
-                        step_window(ctx, bufsB, cfgB, wstB)
-                    ctx.synchronize()
-                    var receiver_s = Float64(perf_counter_ns() - t0b) / 1e9
-                    var gen_ids = read_toks(ctx, bufsB, total, total + gen_budget, tmax)
+
+                    var receiver_s: Float64 = 0.0
+                    var ingest_s: Float64 = 0.0
+                    var gen_ids = List[Int]()
+                    if fallback_field != "":
+                        # Recipe fallback (U3 goal 3): B never touched the refused
+                        # handle; it answers from A's text CoT instead, same
+                        # context shape as arm T's producer-to-receiver handoff.
+                        var t0b = perf_counter_ns()
+                        var rB = run_fresh_generate(ctx, bufsB, wstB, pack_q4, q4_off, eB, b_ctx, gen_budget, tmax)
+                        receiver_s = rB.elapsed_s
+                        gen_ids = rB.ids.copy()
+                    else:
+                        if total - 1 - hand_pos < MROWS:
+                            raise Error("KV: fewer than MROWS tokens after the handoff, the prefill tail would underflow")
+                        var pfB = reset_and_load(ctx, bufsB, b_ctx, tmax)
+                        var t0b = perf_counter_ns()
+                        ingest_kv_latent(ctx, bufsB.kc_d, bufsB.vc_d, kv_header, kv_fd)
+                        var slot = ingest_into_chain(chainB, ck_header, ck_fd)
+                        chainB.restore(ctx, bufsB.convstate_d, bufsB.sstate_d, 0, slot)
+                        ctx.synchronize()
+                        ingest_s = Float64(perf_counter_ns() - t0b) / 1e9
+                        # serve/engine.mojo's restore contract (slot 0, ring 0, pos = pos_prev
+                        # = cached), then the rest of B's context in one batched prefill, the
+                        # way arm T prefills it; the smoke fed it row by row and measured that.
+                        wstB.reset(t0b)
+                        wstB.pos = hand_pos
+                        wstB.pos_prev = hand_pos
+                        var cfgB = make_cfg(pack_q4, q4_off, eB, pfB[0], pfB[1], total, total + gen_budget)
+                        while wstB.pos < total + gen_budget - 1:
+                            step_window(ctx, bufsB, cfgB, wstB)
+                        ctx.synchronize()
+                        receiver_s = Float64(perf_counter_ns() - t0b) / 1e9
+                        gen_ids = read_toks(ctx, bufsB, total, total + gen_budget, tmax)
                     var ans_ids = trim_at_stop(gen_ids, stops)
                     var text = tok.decode(ans_ids)
                     var sv = -1
@@ -954,6 +1011,10 @@ def main() raises:
                         scored = strip_for_math(text)
                     var kv_extra = String(",\"handoff_pos\":") + String(hand_pos) + ",\"handoff_hash\":\"" + String(hand_hash) + "\""
                     kv_extra += ",\"kv_pages\":" + String(kv_pages) + ",\"mint_s\":" + String(mint_s) + ",\"ingest_s\":" + String(ingest_s)
+                    if fallback_field != "":
+                        kv_extra += ",\"fallback\":\"" + fallback_field + "\""
+                    else:
+                        kv_extra += ",\"fallback\":null"
                     out += arm_json(arm, a_s, receiver_s, gen_ids, text, scored, sv, "", kv_extra)
 
                 else:
