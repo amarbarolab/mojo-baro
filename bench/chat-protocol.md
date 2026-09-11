@@ -1049,3 +1049,99 @@ numbers, not the design's borrowed millisecond figure.
 Verdict against the frozen predictions: P-H1 held. P-H2 held. P-H3 held.
 P-H4 held, and beat the directional prediction. P-H5 held. Falsifier not
 triggered.
+
+---
+
+## C3 — sampler host reference (frozen 2026-09-11, before its build)
+
+**Scope decision, flagged (CLAUDE.md §8: a plan item that is a design
+call).** KSAMP (sibling lane, `lane-KSAMP`, merged into this read as
+`git show lane-KSAMP:kernels/sample.mojo`) built and gated
+`amar_sample_row`/`amar_sample_probs`/`amar_spec_accept` as standalone
+kernels with **no engine wiring** ("greedy path untouched" -- KSAMP's own
+report). C3 mirrors that scope on the host side: a fully tested reference
+sampler module plus the Rust API/control-block parsing, but **not** a live
+per-token decode-loop hookup (copying `logits_d` to host and overriding the
+emitted token every sampled step). Reasons: (a) the frozen gates in the
+plan ("distribution test... same seed... temperature 0") are unit-level
+properties of the sampler function itself, exactly what KSAMP's own gate
+was: a kernel test, not a server test; (b) live wiring touches the decode
+loop's per-token control flow, the highest-risk surface for a silent
+regression in the untouched T=0 path, for a gate that does not ask for it;
+(c) the mid-turn correction confirms `amar_sample_row`/`amar_spec_accept`
+are the eventual call site's real interface -- matching semantics now is
+what makes wiring later small, which is the point of "keep the call site
+ready to switch." Deferred, not dropped: recorded as the next increment
+below.
+
+**Change.**
+- `serve/sample_ref.mojo` (new, host-only, no GPU): Philox4x32-10 (same
+  constants/rounds as `kernels/sample.mojo`'s `philox4x32`), `rng4`/
+  `rng_word`/`unif`/`gumbel` byte-for-byte the same transform, so a given
+  `(seed, counter, row, stream, index)` produces the identical draw the
+  kernel will once it is wired in. `sample_row_ref`: temperature <= 0 ->
+  greedy argmax (ties, lowest index), probability 1, identical code shape
+  to the champion's argmax; else cut order top-k -> top-p (mass at T=1) ->
+  min-p, via a full sort (`O(V log V)`, a reference is not required to be
+  `O(V)` like the kernel), then a Gumbel-max draw over the retained set at
+  the caller's own temperature, stream 0. `spec_accept_ref`: accept when
+  `u * p_d(x) < p_t(x)` (stream 1); else Gumbel-max over `max(0, p_t-p_d)`
+  (stream 2), falling back to a draw from `p_t` (stream 3) if the residual
+  is all zero.
+- Presence/frequency penalties (host-only preprocessing, not in KSAMP's
+  kernel interface): subtract `presence_penalty` once and
+  `frequency_penalty * count` from any vocab id that has appeared in this
+  response's own generated tokens so far, before the cut pipeline runs.
+- `serve/src/main.rs`: `temperature`, `top_p`, `top_k`, `min_p`, `seed`,
+  `presence_penalty`, `frequency_penalty`, `logprobs` parsed from
+  `/v1/completions` and `/v1/chat/completions`, carried in the request's
+  control block alongside `stop`/`ckpt` (new optional wire fields, all
+  absent/zero by default -- unparsed, the request is bit-for-bit today's
+  shape).
+
+**Not in this step.** The live decode-loop hookup (above). The GPU kernel
+(KSAMP, done). Sampling interacting with MTP speculation in one window
+(needs the hookup first).
+
+**Predictions (frozen before the build).**
+- P-I1 Temperature 0: `sample_row_ref` on real decode logits (dumped via
+  `BARO_DUMP`, or a fixture built the same way KSAMP's did) picks the exact
+  same token as the champion's own greedy argmax, on every row tested,
+  probability 1 exactly.
+- P-I2 Distribution: 10,000 draws per config from fixed synthetic logits
+  (same shape of configs as KSAMP's: plain T1 no truncation; T0.7/k20/p0.8;
+  T1.3/k12/p0.9/min-p0.05; T0.5/p0.6; a tie-heavy row with k12; a tie-heavy
+  row with p0.3), Pearson chi-square against the exact float64 target
+  distribution over the same retained set, pooled bins expected >= 5,
+  p = 0.001 critical value -- every config inside its critical value, 0
+  draws outside the retained set.
+- P-I3 Reproducibility: the same `(seed, counter)` gives the same token
+  10,000/10,000 times; a different seed changes a large majority (KSAMP's
+  own kernel measured 85-95% changed on two configs -- not exact-matched
+  here since the vocab/logits fixture differs, but same order).
+- P-I4 Speculation, mismatched draft: `spec_accept_ref`'s acceptance rate
+  matches `sum min(p_t, p_d)` within a few sigma of binomial noise at
+  10,000 draws; a two-sample chi-square between "spec on" (accept-or-
+  resample) and "spec off" (direct draws from `p_t`) shows no significant
+  difference (KSAMP's own bound: chi2 within its df's critical value).
+- P-I5 Wire: a request with none of the new fields set produces the exact
+  same `Request` line as before this item (byte-for-byte); a request with
+  them set carries them through to a point `serve/engine.mojo` can read
+  (parsed there behind a flag, not yet acted on for real decode -- scoped
+  out above).
+- Falsifier: any temperature-0 mismatch, any chi-square over its critical
+  value, a reproducibility failure, or a wire regression on the no-sampler-
+  fields path.
+
+**Verification before timing (P1).** None of this is GPU-timed (host-only,
+CPU reference); the only "before" receipt is the Philox KAT (zero, all-
+ones, pi vectors) checked before any distribution test is trusted, same
+discipline as `serve/prefix.mojo`'s SHA-256 KAT in C2.
+
+**Gate.** A new host-only test file (`kernels/test_sample_ref.mojo` or
+equivalent, buildable without `has_accelerator()`) exits 0 with every
+P-I1..P-I4 check PASS; `cargo test`/`clippy` green for the P-I5 wire
+addition; `run-tests.sh` and `tools/test_server.sh` unaffected (no default
+behaviour changes).
+
+**Result.** pending -- filled in after the gated run.
