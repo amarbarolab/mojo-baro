@@ -79,6 +79,18 @@ Frozen predictions, Llama-3.2-1B-Instruct-Q4_K_M:
 Kill: prediction 1 failing (under 18/20 prompts clearing 90%) after three repair attempts is
 reported as a real disagreement, not re-thresholded down to make it pass.
 
+### Result: Llama-3.2-1B-Instruct-Q4_K_M (2026-09-11, `bench/dense-run.sh`, `.work/dense/llama32-1b-run2/`)
+
+| # | prediction | result |
+|---|---|---|
+| 1 | >=90% agreement, >=18/20 prompts | **PASS, 20/20**: range 61-64/64 (95.3-100%), one prompt 25/25 (llama's own greedy completion ended at 25 tokens) |
+| 2 | tok/s_gen positive/finite, no crash | **PASS**: 451-458 tok/s_gen across all 20 prompts, no crash |
+| 3 | chat smoke | **N/A as predicted**, not attempted |
+
+Verdict: llama-arch (interleaved rope, tied embeddings, SiLU, no bias, no gate) is correct
+end to end through the new `--dense` packer and the profile-driven engine. Server:
+`llama-server -ngl 99 -fa on -ctk f16 -ctv f16`, native Q4_K_M (no requant).
+
 ## KATT: head dimension as a comptime parameter
 
 Scope: the attention kernels the Spark path calls, `amar_attn_decode_swa_gated` and
