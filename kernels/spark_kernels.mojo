@@ -175,7 +175,7 @@ def amar_bias_add[
 
 
 def amar_attn_decode_swa_gated[
-    QLayout: TensorLayout, KLayout: TensorLayout, GLayout: TensorLayout, OLayout: TensorLayout, NAT: Int, HD_: Int = HD, NQH_: Int = NQH, NKVH_: Int = NKVH
+    QLayout: TensorLayout, KLayout: TensorLayout, GLayout: TensorLayout, OLayout: TensorLayout, NAT: Int, HD_: Int = HD, NQH_: Int = NQH, NKVH_: Int = NKVH, HAS_GATE: Bool = True
 ](
     Q: TileTensor[f32, QLayout, MutAnyOrigin],
     Kc: TileTensor[KVT, KLayout, MutAnyOrigin],
@@ -203,9 +203,12 @@ def amar_attn_decode_swa_gated[
     var res = attn_head_span[NAT=NAT, HD_=HD_, NKVH_=NKVH_](Q, Kc, Vc, qs, scores, red, qrow, kvh, t_lo, T, tid, Int(lane_id()), scale, Int(att_i))
     if tid < HD_:
         var inv = 1 / res[1]
-        var g = rebind[Scalar[f32]](Gate[h])
         var o = res[2] * inv
-        O[qrow, tid] = rebind[O.ElementType]((o * (1 / (1 + exp(-g)))).cast[DType.bfloat16]())
+        comptime if HAS_GATE:
+            var g = rebind[Scalar[f32]](Gate[h])
+            O[qrow, tid] = rebind[O.ElementType]((o * (1 / (1 + exp(-g)))).cast[DType.bfloat16]())
+        else:
+            O[qrow, tid] = rebind[O.ElementType](o.cast[DType.bfloat16]())
 
 
 def amar_argmax_part[

@@ -194,6 +194,7 @@ def main() raises:
     var vocab = embd_dims[1]
     var tie_embed = not m.tensor_present("output.weight")
     var qkv_bias = m.tensor_present("blk.0.attn_q.bias")
+    var has_gate = m.tensor_present("blk.0.attn_gate.weight")
 
     var swa_key = arch + ".attention.sliding_window_pattern"
     var swa_win: Int
@@ -261,6 +262,7 @@ def main() raises:
     out += "comptime SWA_FULL_PHASE = " + String(swa_full_phase) + "\n"
     out += "comptime ROPE_NEOX = " + mojo_bool(rope_neox) + "\n"
     out += "comptime QKV_BIAS = " + mojo_bool(qkv_bias) + "\n"
+    out += "comptime HAS_GATE = " + mojo_bool(has_gate) + "\n"
     out += "comptime TIE_EMBED = " + mojo_bool(tie_embed) + "\n"
     out += "comptime ACTIVATION_GELU = " + mojo_bool(activation_gelu) + "\n"
     out += "comptime GRANITE_MULT = " + mojo_bool(granite_mult) + "\n"

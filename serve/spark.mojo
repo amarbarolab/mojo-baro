@@ -16,7 +16,7 @@ from spark_kernels import (
 )
 from profile import (
     H, FFN, VOCAB, N_LAYERS, NQH, NKVH, HD, NORM_EPS, NROT_FULL, BASE_FULL, NROT_SWA, BASE_SWA,
-    SWA_WIN, SWA_PERIOD, SWA_FULL_PHASE, ROPE_NEOX, QKV_BIAS, ATTN_SCALE, TMAX,
+    SWA_WIN, SWA_PERIOD, SWA_FULL_PHASE, ROPE_NEOX, QKV_BIAS, HAS_GATE, ATTN_SCALE, TMAX,
 )
 
 comptime f32 = DType.float32
@@ -27,14 +27,18 @@ comptime QKV = QDIM + 2 * KVDIM
 comptime KVHSTR = KVPAGE * HD + KVPAD
 comptime TPAGES = TMAX // KVPAGE
 comptime KVPOOL = TPAGES * N_LAYERS * NKVH * KVHSTR
+# Per-layer pack order: attn_norm, attn_qkv, [attn_qkv_bias], [attn_gate], attn_output,
+# ffn_norm, ffn_gate, ffn_up, ffn_down -- the two bracketed tensors are present only when
+# the model's recipe calls for them (spark2_5 has the gate, none of the others do).
 comptime OFF_QKV_BIAS = 2 if QKV_BIAS else -1
-comptime OFF_GATE = 3 if QKV_BIAS else 2
-comptime OFF_O = 4 if QKV_BIAS else 3
-comptime OFF_FFN_NORM = 5 if QKV_BIAS else 4
-comptime OFF_FFN_GATE = 6 if QKV_BIAS else 5
-comptime OFF_FFN_UP = 7 if QKV_BIAS else 6
-comptime OFF_DOWN = 8 if QKV_BIAS else 7
-comptime LSTRIDE = 9 if QKV_BIAS else 8
+comptime GATE_BASE = 2 + (1 if QKV_BIAS else 0)
+comptime OFF_GATE = GATE_BASE if HAS_GATE else -1
+comptime OFF_O = GATE_BASE + (1 if HAS_GATE else 0)
+comptime OFF_FFN_NORM = OFF_O + 1
+comptime OFF_FFN_GATE = OFF_O + 2
+comptime OFF_FFN_UP = OFF_O + 3
+comptime OFF_DOWN = OFF_O + 4
+comptime LSTRIDE = OFF_O + 5
 
 comptime x_l = row_major[1, H]()
 comptime xb_l = row_major[1, H]()
@@ -83,7 +87,7 @@ comptime k_rope_full = amar_rope_plain[NROT_FULL, type_of(q_l), NEOX=ROPE_NEOX]
 comptime k_rope_swa = amar_rope_plain[NROT_SWA, type_of(q_l), NEOX=ROPE_NEOX]
 comptime k_kv_full = amar_rope_kv_append[NROT_FULL, N_LAYERS, type_of(cache_l), type_of(kv_l), HD, NKVH, NEOX=ROPE_NEOX]
 comptime k_kv_swa = amar_rope_kv_append[NROT_SWA, N_LAYERS, type_of(cache_l), type_of(kv_l), HD, NKVH, NEOX=ROPE_NEOX]
-comptime k_att = amar_attn_decode_swa_gated[type_of(q_l), type_of(cache_l), type_of(gate_l), type_of(aob2_l), N_LAYERS, HD, NQH, NKVH]
+comptime k_att = amar_attn_decode_swa_gated[type_of(q_l), type_of(cache_l), type_of(gate_l), type_of(aob2_l), N_LAYERS, HD, NQH, NKVH, HAS_GATE=HAS_GATE]
 comptime k_gate = amar_gemv_q8[0, type_of(xb_l), type_of(q_gate), type_of(s_gate), type_of(gate_l), type_of(dummy_l)]
 comptime k_o = amar_gemv_q8[1, type_of(aob_l), type_of(q_o), type_of(s_o), type_of(h1_l), type_of(dummy_l)]
 comptime k_ffn_gate = amar_gemv_q8[0, type_of(xb_l), type_of(q_ffn), type_of(s_ffn), type_of(ffn1_l), type_of(dummy_l)]
@@ -313,7 +317,8 @@ def main() raises:
             else:
                 ctx.enqueue_function[k_rope_full](Q, Int32(pos), Int32(NQH), BASE_FULL, grid_dim=(NQH, 1), block_dim=NROT_FULL // 2)
                 ctx.enqueue_function[k_kv_full](Kc, Vc, K, V, Int32(pos), BASE_FULL, Int32(i), grid_dim=(NKVH, 2), block_dim=HD)
-            ctx.enqueue_function[k_gate](Xb, wq(ctx, wbuf, off[e + OFF_GATE], NQH * H, q_gate), ws(ctx, wbuf, off[e + OFF_GATE], NQH * H, s_gate), Gate, Dummy, Int32(NQH), Int32(H), grid_dim=ceildiv(NQH, ROW_WAVES), block_dim=ROW_THREADS)
+            comptime if HAS_GATE:
+                ctx.enqueue_function[k_gate](Xb, wq(ctx, wbuf, off[e + OFF_GATE], NQH * H, q_gate), ws(ctx, wbuf, off[e + OFF_GATE], NQH * H, s_gate), Gate, Dummy, Int32(NQH), Int32(H), grid_dim=ceildiv(NQH, ROW_WAVES), block_dim=ROW_THREADS)
             ctx.enqueue_function[k_att](Q, Kc, Vc, Gate, AoB2, Int32(pos + 1), Int32(SWA_WIN if swa else 0), ATTN_SCALE, Int32(i), grid_dim=(NQH, 1), block_dim=HD)
             ctx.enqueue_function[k_o](AoB, wq(ctx, wbuf, off[e + OFF_O], H * QDIM, q_o), ws(ctx, wbuf, off[e + OFF_O], H * QDIM, s_o), X1, Dummy, Int32(H), Int32(QDIM), grid_dim=ceildiv(H, ROW_WAVES), block_dim=ROW_THREADS)
             ctx.enqueue_function[k_rms](X, FfnNorm, Xb, Int32(H), NORM_EPS, grid_dim=1, block_dim=256)
