@@ -1,230 +1,174 @@
 # mojo-baro
 
-An inference stack for AMD RDNA3 (gfx1100 / RX 7900 XTX), with the GPU kernels
-written in [Mojo](https://www.modular.com/mojo).
+An LLM inference engine for AMD RDNA3 GPUs, with every GPU kernel written in
+[Mojo](https://www.modular.com/mojo). It serves chat over an OpenAI-compatible
+HTTP API and decodes at roughly 0.9x llama.cpp's speed on the same model file,
+on a single RX 7900 XTX.
 
-The point of the project is the kernels. RDNA3 is not the architecture the
-vendor libraries are tuned for — hipBLASLt's attention is on CDNA — and consumer
-cards are where most people actually have 24 GB of VRAM. This repo is an attempt
-to find out how much of that gap is real.
+The point of the project is the kernels. Consumer RDNA3 cards are where most
+people actually have 24 GB of VRAM, and they are not what the vendor libraries
+are tuned for. This repo measures how much of that gap is real, one
+preregistered round at a time.
 
-## Result: a cold-cache vendor beat at the decode shape
+**Have an AMD GPU that isn't a 7900 XTX?** Your card is the most useful thing
+you can contribute. See [docs/amd-family.md](docs/amd-family.md): fifteen
+minutes, no model weights needed.
 
-Single-token decode is bound by streaming weights out of HBM, not by compute.
-The shape that matters is a skinny GEMM: **M=1, K=4096, N=12288**, weights not
-resident in Infinity Cache.
+## What runs today
 
-| kernel | µs/launch (10 repeats) |
-|---|---|
-| `amar_matmul_skinny_v2` CPT=8 @ M=1 | 137.8 – 138.9 |
-| **`amar_matmul_skinny_m1` CPT=8** | **121.2 – 121.8** |
-| hipBLASLt f16 @ M=1 | 122.1 – 123.3 |
-
-The `m1` range sits strictly below the vendor's — margin ~1%, ranges disjoint.
-The mechanism is occupancy relief, not fewer bytes: specializing for M=1 drops
-the 8-row LDS staging and shrinks the accumulator from 64 lanes to `SIMD[CPT]`,
-so more waves stay resident. Byte traffic is identical between the two.
-
-Getting there took four preregistered rounds, three of which falsified their own
-predictions:
-
-| round | change | cold-cache result |
+| model | architecture | status |
 |---|---|---|
-| v1 | bf16 B-layout (transpose weights at load) | 194 µs, 517 GB/s (54% of peak) |
-| v2 | K-major q8 | 165 µs — **slower than modeled**; dequant ALU ate the byte win |
-| v3 | CPT=8 columns/thread, wide loads | 139 µs, 723 GB/s (75% of peak) |
-| v4 | M=1 specialization | 121 µs — below vendor |
-
-Reproduce: `./bench/run.py`, or `bench/bench_coldcache_m1.mojo` for the table
-above. The protocol — 8 rotating device buffers to defeat Infinity-Cache
-contamination, 1 s clock warm, 200 timed launches, 10 in-process repeats — is in
-[`bench/coldcache-protocol.md`](bench/coldcache-protocol.md), frozen before each
-run alongside its predictions and its falsifier.
-
-## Result: an fp16 WMMA GEMM ahead of hipBLASLt at every size tested
-
-The second kernel line is a square fp16 GEMM on RDNA3's WMMA units. The pipelined
-kernel runs 4x2 warps over a 128x128 block with two LDS buffers, one barrier per
-K-step, a two-deep global prefetch, XOR-swizzled A and transposed B — 188 VGPR,
-zero spills, 32 KB LDS.
-
-One block shape does not win everywhere: at small sizes the 128x128 tile cannot
-fill the GPU with workgroups. Tile geometry is therefore a kernel parameter and
-the launcher dispatches on how many blocks the grid would have — `>= 96` blocks
-takes 128x128 (8 waves), `>= 64` takes 64x128, below that 64x64 (4 waves).
-
-GFLOP/s, ten square sizes, ours vs hipBLASLt fp16 through the same shim, 10 s
-clock warm-up, every arm-defining parameter read back from the binary's own JSON:
-
-| size | 256 | 512 | 768 | 1024 | 1536 | 2048 | 2560 | 3072 | 3584 | 4096 |
-|---|---|---|---|---|---|---|---|---|---|---|
-| **ours** | 6372 | 30642 | 64204 | 74824 | 93632 | 91300 | 97974 | 99307 | 105786 | 90705 |
-| hipBLASLt | 6288 | 26324 | 54924 | 63623 | 69332 | 80203 | 87147 | 97224 | 85671 | 82437 |
-| ratio | 1.01 | 1.16 | 1.17 | 1.18 | 1.35 | 1.14 | 1.12 | 1.02 | 1.24 | 1.10 |
-
-Reproduce with `bench/fp16-templates.sh`. Before the dispatch landed the same
-kernel was *behind* the vendor at every size at or below 1024 (0.78–0.98x); the
-single 128x128 tile was the whole deficit.
-
-Warm-up is load-bearing and was worth more than any kernel change at the top
-end: at a 1 s warm-up the identical binary read 66k GFLOP/s at 4096³ instead of
-91k, because the clocks had not settled. Benches now warm for 10 s and log
-`warmup_s` in their receipts.
-
-Note that fp32 WMMA **does not exist** on gfx1100 — it is an ISA limitation, not
-a Mojo one, verified against `llvm-mc` and the LLVM builtin table. fp16 and fp32
-GEMM numbers in this repo are therefore not comparable to each other; they use
-different hardware inside the same chip.
-
-## How numbers get into this repo
-
-Every performance claim here is preregistered: the question, the instrument, the
-predicted range and the condition that would falsify it are committed **before**
-the run, and the result is recorded against them whether or not it agreed. Missed
-predictions stay in the file. `bench/run.py` gates on correctness before it will
-report throughput, and exits non-zero if any variant is numerically wrong.
-
-This is not ceremony. An earlier version of `docs/BASELINE.md` recorded our
-register-tiled GEMM as ~2× faster than hipBLASLt. It was measuring an *untuned*
-vendor call. Fixing three defects in our own shim — per-call workspace
-allocation, trusting the heuristic's ordering, never setting splitK/wgm — took
-hipBLASLt from 2497 to 5201 GFLOP/s and erased the lead completely.
-
-**A vendor baseline that looks easy to beat is a bug in your harness until proven
-otherwise.**
-
-## Engine status
-
-There is a working end-to-end decode engine (`serve/engine.mojo`) for a bf16
-Qwen-architecture GGUF: full-model greedy decode, 64 tokens **bit-identical** to
-llama.cpp on the same file, verified by `tools/check-tokens.sh` against a
-reference token-id array. It is a correctness vehicle for the kernels, not a
-product — no server, no batching, no sampler beyond greedy.
-
-### Tokenizer
-
-Text in, text out, bit-equal to llama.cpp: `serve/tokenizer.mojo` reads the
-byte-level BPE (vocab, merges, pre-tokenizer) from the GGUF header alone, regexes
-on [mojo-uregex](../mojo-uregex), and `tools/test_tokenizer_mojo.py` gates it — the 20
-`bench/mtp-prompts/` token files plus a 41-case hard set (unicode, CJK, emoji,
-code, whitespace, special tokens, chat template) against `llama-tokenize`, and
-`decode(encode(x)) == x`. `tools/baro-tokenize.mojo` encodes/decodes/counts, and
-`serve/spark.mojo` tokenizes in-process (`BARO_PROMPT_TEXT`). The Python builder
-and its gate live in `tools/retired/`. Contract: `docs/TOKENIZER.md`.
-
-### Throughput against llama.cpp
-
-The engine reports two numbers, and only one of them is comparable to anything.
-`tok/s_gen` divides `GEN_N - 1` by decode time alone, which is exactly what
-llama.cpp's `timings.predicted_per_second` measures; `tok/s_total` includes
-prefill and is reported for completeness only. Quoting `tok/s_total` against
-llama.cpp would flatter or damage us depending on prompt length, not on kernel
-quality.
-
-Measured on the same box and the same bf16 GGUF, 5-token prompt, 64 tokens,
-greedy, no speculative decode. Repeat rule from
-[`bench/decode-race-protocol.md`](bench/decode-race-protocol.md): 5 runs,
-discard the first, median of the remaining 4.
-
-| | tok/s | of HBM roof (53.6) |
-|---|---|---|
-| llama.cpp, no MTP | 44.1 | 82% |
-| **mojo-baro `tok/s_gen`** | **41.3** (41.04–41.38, 0.8% spread) | 77% |
-| llama.cpp, MTP speculative | 109.8 | — |
-
-2026-09-04, q8 weights (`bench/q8-protocol.md`, pack bit-equal to llama.cpp Q8_0):
-
-| | tok/s | of q8 HBM roof (93) |
-|---|---|---|
-| llama.cpp Q8_0, no MTP | 74.1 | 80% |
-| **mojo-baro q8 `tok/s_gen`** | **68.8** (68.64–68.82) | 74% |
-
-So the trunk decode path runs at **0.94x llama.cpp** with no speculative
-decode. Disclosed asymmetries, uncorrected: llama.cpp uses a q8_0 KV cache and
-ours is f32 (negligible at these context lengths), and llama.cpp's number came
-through an HTTP server while ours is measured in-process.
-
-2026-09-04, MTP speculative decode (`bench/mtp-protocol.md`, `BARO_SPEC=1`,
-k=4, draft = the model's own `blk.32` NextN head, verified in one k+1-row
-trunk window, greedy accept, output still bit-identical to the no-spec run):
-
-| | 5-token race prompt | 20 real prompts (median) |
-|---|---|---|
-| llama.cpp Q8_0, MTP speculative | 109.8 | 123.5 |
-| **mojo-baro q8 MTP `tok/s_gen`** | **145.6** (k=4) | **100.7** (k=2) |
-| mojo-baro / llama.cpp | 1.33x | 0.78x |
-
-Both engines produce the no-spec greedy tokens under speculation on the
-race prompt; on the 20-prompt set ours is identical on 20/20, llama.cpp's
-on 16/20. So: ahead on the preregistered race, behind on real text, where
-llama.cpp's draft loop turns 58% acceptance into 1.66x and ours turns 69%
-into 1.47x. The per-prompt tables, the k sweep and where the gap sits are
-in `bench/mtp-protocol.md` Result 2.
-
-## Layout
-
-```
-Python/app  →  Mojo (GPU kernels)  →  C++ shim (vendor SDK)  →  hipBLASLt
-                      ↑
-                    Rust (network/API shell) — NOT STARTED
-```
-
-All boundaries are C ABI. Rust talks only to Mojo's C surface; it must not bind
-the C++ shim directly, since two independent owners of one hipBLASLt context is a
-lifetime bug.
-
-| | |
-|---|---|
-| `kernels/` | Mojo GPU kernels + their parity tests |
-| `bench/` | benchmark harness and the frozen protocols |
-| `serve/` | the decode engine |
-| `shim/` | C++ hipBLASLt shim behind a C ABI |
-| `tools/` | GGUF loader/packer, numpy reference implementations, gates |
-| `docs/BASELINE.md` | **current truth** — every verified number and trap |
-
-## Building
-
-Requires ROCm 7.2, CMake, and [`uv`](https://docs.astral.sh/uv/). Nothing is
-installed machine-wide: `uv sync` creates a repo-local `.venv` from
-`pyproject.toml`, which pins `max[all]==26.5.0` (Mojo 1.0.0). Every script in
-this repo invokes `./.venv/bin/mojo` directly and never a system Mojo.
-
-```sh
-uv sync           # creates .venv with the pinned Mojo/MAX toolchain
-./run-tests.sh    # builds the shim, checks an fp16 GEMM through the C ABI
-./bench/run.py    # correctness gate, then throughput
-```
-
-Verified from a clean clone: `uv sync` then `./run-tests.sh` prints
-`GEMM OK — 4 x 3 @ 3 x 2 matches host reference` and exits 0.
+| Qwythos-9B | `qwen35` (hybrid SSM + attention, MTP head) | main engine: chat server, speculative decode, prefix checkpoints, RULER at 32k |
+| Ornith-1.5-9B | `qwen35` | same engine, packed from a Q4_K GGUF; 98.4% teacher-forced agreement with llama.cpp |
+| Spark-X2.5-4B | `spark2_5` (gated sliding-window attention) | its own engine, `serve/spark.mojo` |
+| RegesCore-35B | `qwen35moe` (256 experts, top 8) | MoE block kernel parity-gated on real weights; not wired into the engine yet |
 
 Model weights are not distributed with this repo.
 
-## Portability
+## Results
 
-Everything here is measured on one card. RDNA3 specifics are load-bearing —
-warp size **32**, not 64 as on CDNA; 64 KB LDS per block; tile and CPT
-parameters swept for this memory system. None of the results should be assumed
-to transfer to gfx942/gfx950 or to NVIDIA without re-sweeping.
+### Decode speed against llama.cpp
 
-That includes other RDNA3 cards. An RX 7900 XT is the same `gfx1100` target and
-the same ISA, so the kernels build and run unchanged, but it has 84 compute
-units instead of 96 and 80 MB of Infinity Cache instead of 96 MB — enough to
-move the tile-dispatch thresholds, which were swept to fill this card.
+Same box, same GGUF, 20-prompt medians unless noted
+([`bench/q8-protocol.md`](bench/q8-protocol.md),
+[`bench/ornith-protocol.md`](bench/ornith-protocol.md)).
 
-If you have an AMD GPU and fifteen minutes, `bench/report.sh` produces a
-receipt for the fp16 GEMM kernel against hipBLASLt on your machine. It needs no
-model weights:
+| model, weights | llama.cpp tok/s | mojo-baro tok/s | ratio |
+|---|---|---|---|
+| Qwythos-9B, q8 (5-token race prompt) | 74.1 | 68.8 | 0.94x |
+| Ornith-1.5-9B, from Q4_K_M | 88.8 | 80.8 | 0.91x |
+
+Speculative decode with the model's own MTP head is opt-in (`BARO_SPEC=1`) and
+output-identical to plain greedy decode on every prompt tested. On the q4 pack
+it gives 1.10x at k=2 ([`bench/mtp-protocol.md`](bench/mtp-protocol.md)).
+Prefill is the known weak spot: 2.5 to 3.3x slower than llama.cpp at 8k to 32k
+context.
+
+### A cold-cache vendor beat at the decode shape
+
+Single-token decode streams weights out of VRAM. The shape that matters is a
+skinny GEMM, **M=1, K=4096, N=12288**, with weights not resident in the 96 MB
+Infinity Cache ([`bench/coldcache-protocol.md`](bench/coldcache-protocol.md),
+10 repeats, 8 rotating buffers):
+
+| kernel | us per launch |
+|---|---|
+| `amar_matmul_skinny_v2` CPT=8 @ M=1 | 137.8 to 138.9 |
+| **`amar_matmul_skinny_m1` CPT=8** | **121.2 to 121.8** |
+| hipBLASLt f16 @ M=1 | 122.1 to 123.3 |
+
+The ranges do not overlap; the margin is about 1%. The mechanism is occupancy,
+not bytes: specialising for one row drops the 8-row LDS staging and shrinks the
+accumulator to `SIMD[CPT]`, so more waves stay resident. It took four
+preregistered rounds, three of which falsified their own predictions.
+
+### An fp16 WMMA GEMM ahead of hipBLASLt
+
+A pipelined square fp16 GEMM on RDNA3's WMMA units: two LDS buffers, one
+barrier per K-step, a two-deep global prefetch, XOR-swizzled A, 188 VGPR and no
+spills. Tile shape is picked per launch from how many blocks the grid would
+have, which is what closed the gap at small sizes
+([`bench/wmma-fp16-protocol.md`](bench/wmma-fp16-protocol.md), 10 s clock
+warm-up):
+
+| size | 256 | 512 | 768 | 1024 | 1536 | 2048 | 2560 | 3072 | 3584 |
+|---|---|---|---|---|---|---|---|---|---|
+| **ours, GFLOP/s** | 6372 | 30642 | 64204 | 74824 | 93632 | 91300 | 97974 | 99307 | 105786 |
+| hipBLASLt | 6288 | 26324 | 54924 | 63623 | 69332 | 80203 | 87147 | 97224 | 85671 |
+| ratio | 1.01 | 1.16 | 1.17 | 1.18 | 1.35 | 1.14 | 1.12 | 1.02 | 1.24 |
+
+These sizes fit in the Infinity Cache for both arms, so this is a warm-cache
+comparison. 4096³ is left out on purpose: its three buffers total 100.7 MB,
+just over the 96 MB cache, and the same binary read anywhere from 91k to 99k
+GFLOP/s depending on what else held the cache. fp32 WMMA does not exist on
+gfx1100 (an ISA limitation, checked against `llvm-mc`), so fp16 and fp32 GEMM
+numbers here are not comparable.
+
+## How numbers get into this repo
+
+Every performance claim is preregistered: the question, the instrument, the
+predicted range and the falsifier are committed **before** the run, and the
+result is recorded against them whether or not it agreed. Missed predictions
+stay in the file. Rules: [`bench/PROTOCOL-RULES.md`](bench/PROTOCOL-RULES.md).
+
+This is not ceremony. An early version of `docs/BASELINE.md` recorded a ~2x
+lead over hipBLASLt. It was measuring an untuned vendor call; fixing three
+defects in our own shim took hipBLASLt from 2497 to 5201 GFLOP/s and erased the
+lead. **A vendor baseline that looks easy to beat is a bug in your harness
+until proven otherwise.**
+
+## The server
+
+`baro-serve` (Rust, `serve/src/`) keeps one engine process alive and speaks
+the OpenAI API: `/v1/chat/completions` and `/v1/completions` with SSE
+streaming, `/v1/models`, `/v1/cancel`, `/tokenize`, `/detokenize`, `/health`.
+
+- Stop sequences and EOS are handled inside the engine; a request can be
+  cancelled mid-generation.
+- Each message boundary in a conversation is checkpointed, so a follow-up turn
+  prefills only the new message (2.7 to 8.3x faster than a grid-only cache on
+  the same multi-turn replay).
+- Sampling parameters (`temperature`, `top_p`, `top_k`, `min_p`, `seed`,
+  penalties, `logprobs`) are parsed and carried to the engine. The device
+  sampler kernels exist and are distribution-tested; they are not yet in the
+  decode loop, so generation is greedy today.
+- One request decodes at a time. Batching is the next design round.
+
+Contract between server and engine: [`serve/PROTOCOL.md`](serve/PROTOCOL.md).
+
+## Building
+
+Requires ROCm 7.2, CMake, Rust (for the server) and
+[`uv`](https://docs.astral.sh/uv/). Nothing is installed machine-wide: `uv sync`
+creates a repo-local `.venv` pinning `max[all]==26.5.0` (Mojo 1.0.0), and every
+script calls `./.venv/bin/mojo`, never a system Mojo.
 
 ```sh
-./bench/report.sh --check   # preflight: GPU, ROCm, hipBLASLt, toolchain
-./bench/report.sh           # ~15 min; writes results/report-<gfx>-<card>-<commit>.json
+uv sync            # repo-local .venv with the pinned Mojo/MAX toolchain
+./run-tests.sh     # builds the shim, runs the parity tests and the kernel census
+./bench/run.py     # correctness gate, then throughput
 ```
 
-Send it in via the [hardware report issue
-template](.github/ISSUE_TEMPLATE/hardware-report.yml) — including when it fails.
-Details in [CONTRIBUTING.md](CONTRIBUTING.md).
+Serving a model (after packing a GGUF with `tools/engine-pack.py`):
+
+```sh
+./.venv/bin/mojo build serve/engine.mojo -I kernels -o .work/engine
+(cd serve && cargo build --release)
+./serve/target/release/baro-serve --engine .work/engine --pack .work/engine-pack-q4 --port 8080
+```
+
+`tools/test_server.sh` is the end-to-end gate for that path.
+
+## Layout
+
+| | |
+|---|---|
+| `kernels/` | Mojo GPU kernels and their parity tests (`docs/KERNELS.md` lists all 85) |
+| `serve/` | the engines (`engine.mojo`, `spark.mojo`), tokenizer, prefix cache, and the Rust server |
+| `bench/` | benchmark harnesses and the frozen protocols |
+| `shim/` | C++ hipBLASLt shim behind a C ABI, the vendor reference arm |
+| `tools/` | GGUF packer, numpy reference implementations, gates |
+| `results/` | receipts |
+| `docs/BASELINE.md` | current truth: every verified number and trap |
+
+All boundaries are C ABI. The tokenizer is Mojo, bit-equal to llama.cpp on the
+same GGUF ([`docs/TOKENIZER.md`](docs/TOKENIZER.md)).
+
+## Portability
+
+Everything here is measured on one card, and RDNA3 specifics are load-bearing:
+warp size 32 (not 64 as on CDNA), 64 KB LDS per block, tile and CPT parameters
+swept for this card's 96 compute units and 96 MB Infinity Cache. Other RDNA3
+cards use the same ISA, so the kernels should build, but the tile-dispatch
+thresholds were swept to fill this card. Whether they hold elsewhere is
+unmeasured, which is exactly what [docs/amd-family.md](docs/amd-family.md) asks
+for help with.
+
+## Contributing
+
+[CONTRIBUTING.md](CONTRIBUTING.md) covers code changes and the preregistration
+flow. Hardware reports: [docs/amd-family.md](docs/amd-family.md).
 
 ## License
 
-Apache-2.0 — see [LICENSE](LICENSE). Copyright 2026 AmarBaro Labs.
+Apache-2.0, see [LICENSE](LICENSE). Copyright 2026 AmarBaro Labs.

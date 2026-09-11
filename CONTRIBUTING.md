@@ -6,13 +6,16 @@ do not have.
 Every performance number here was measured on one AMD RX 7900 XTX. The kernels
 target RDNA3 (`gfx1100`) and are tuned against that card's 96 compute units,
 96 MB Infinity Cache and 960 GB/s of bandwidth. Whether any of it holds on an
-RX 7900 XT, a 7800 XT, a W7900, or an RDNA4 card is unknown — not "probably
+RX 7900 XT, a 7800 XT, a W7900, or an RDNA4 card is unknown, not "probably
 fine", genuinely unmeasured.
 
 ## Send a hardware report
 
+Step-by-step guide per AMD family, with what to expect on your card:
+[docs/amd-family.md](docs/amd-family.md). The short version:
+
 Needs an AMD GPU, ROCm, and about fifteen minutes. **No model weights are
-required** — the fp16 GEMM benchmark is self-contained.
+required**: the fp16 GEMM benchmark is self-contained.
 
 ```sh
 git clone https://github.com/amarbaro/mojo-baro && cd mojo-baro
@@ -30,7 +33,7 @@ time. Prefer the full run when you can: the interesting disagreements have so
 far been at the small end, where filling the GPU is the constraint.
 
 **File the issue even if it fails.** A build error on gfx1201, a card that
-throttles, a hipBLASLt version that behaves differently — those are results. The
+throttles, a hipBLASLt version that behaves differently: those are results. The
 script writes a receipt marked `"valid": false` rather than nothing, and says
 why.
 
@@ -68,7 +71,7 @@ Read `bench/PROTOCOL-RULES.md` first, and `docs/BASELINE.md` for current truth.
 Performance claims follow the preregistration flow: the question, the
 instrument, the predicted range and the condition that would falsify it are
 committed **before** the run, and the result is recorded whether or not it
-agreed. Missed predictions stay in the file — three of the four cold-cache
+agreed. Missed predictions stay in the file: three of the four cold-cache
 rounds falsified their own predictions, and that history is the point.
 
 Kernel files (`kernels/matmul*.mojo`, `kernels/elementwise.mojo`) carry no
