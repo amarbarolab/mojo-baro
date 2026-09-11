@@ -9,6 +9,7 @@ from std.utils import StaticTuple
 from max.gpu.memory import AddressSpace
 from max.gpu.sync import barrier
 from layout import TileTensor, TensorLayout, row_major, stack_allocation
+from dattn import dattn_split_body, dattn_combine_body, dattn_nsplit
 
 from elementwise import EW_THREADS
 from matmul_skinny import ROW_WAVES, ROW_THREADS, q4_dot_blocks, bf16x16_to_f32
@@ -35,6 +36,7 @@ comptime KV = NKVH * HD
 comptime N_LAYERS = 32
 comptime VOCAB = 248320
 comptime ATT_SCALE = Float32(0.0625)
+comptime DATT_NLD = 4
 comptime RMS_EPS = Float32(1e-6)
 
 
@@ -909,57 +911,31 @@ def attn_phases[
         return False
     stamp(prof, pbase + 3)
 
-    comptime NSPLIT = max(MEGA_G // (MR * NQH), 1)
-    comptime PSTR = HD + 2
     var do_split = pos + 1 > att_split
-    var ns = NSPLIT if do_split else 1
-    if bid < M * NQH * ns:
-        var head = bid // ns
-        var sp = bid % ns
-        var r = head // NQH
-        var h = head % NQH
-        var qrow = r * NQH + h
-        var kvh = h // (NQH // NKVH)
-        var T = pos + 1 + r
-        var t_lo = 0
-        var t_hi = T
-        if do_split:
-            var P = (T + KVPAGE - 1) // KVPAGE
-            t_lo = (sp * P // NSPLIT) * KVPAGE
-            t_hi = min(((sp + 1) * P // NSPLIT) * KVPAGE, T)
-        var res = SIMD[f32, 4](-3.4e38, 0, 0, 0)
-        if t_lo < t_hi:
-            res = attn_head_span[NAT=NAT](Q, Kc, Vc, qs, scores, sums, qrow, kvh, t_lo, t_hi, tid, lane, ATT_SCALE, att_i)
-        if do_split:
-            var pp = Pg.ptr.unsafe_offset((head * NSPLIT + sp) * PSTR)
-            if tid == 0:
-                pp[0] = res[0]
-                pp[1] = res[1]
-            if tid < HD:
-                pp[2 + tid] = res[2]
-        elif tid < HD:
-            var inv = 1 / res[1]
-            Ao[qrow, tid] = rebind[Ao.ElementType](res[2] * inv)
-    if do_split:
-        if not grid_barrier(ctr, gen, fail):
-            return False
+    if not do_split:
         if bid < M * NQH:
             var r = bid // NQH
             var h = bid % NQH
             var qrow = r * NQH + h
-            var pp = Pg.ptr.unsafe_offset(bid * NSPLIT * PSTR)
-            var mmax = Float32(-3.4e38)
-            comptime for sp in range(NSPLIT):
-                mmax = max(mmax, pp[sp * PSTR])
-            var l = Float32(0)
-            var o = Float32(0)
-            comptime for sp in range(NSPLIT):
-                var wgt = exp(pp[sp * PSTR] - mmax)
-                l += wgt * pp[sp * PSTR + 1]
-                if tid < HD:
-                    o += wgt * pp[sp * PSTR + 2 + tid]
+            var kvh = h // (NQH // NKVH)
+            var T = pos + 1 + r
+            var res = attn_head_span[NAT=NAT](Q, Kc, Vc, qs, scores, sums, qrow, kvh, 0, T, tid, lane, ATT_SCALE, att_i)
             if tid < HD:
-                Ao[qrow, tid] = rebind[Ao.ElementType](o * (1 / l))
+                var inv = 1 / res[1]
+                Ao[qrow, tid] = rebind[Ao.ElementType](res[2] * inv)
+    else:
+        var ns = dattn_nsplit[HD, DATT_NLD, NKVH](pos + 1, M, MEGA_G)
+        if bid < M * NKVH * ns:
+            var r = bid // (NKVH * ns)
+            var rem = bid % (NKVH * ns)
+            dattn_split_body[HD, NQH, NKVH, KVT, NAT, DATT_NLD, False](
+                Q, Kc, Vc, Ao, Pg, rem // ns, rem % ns, r, ns, pos + 1 + r, ATT_SCALE, att_i, tid
+            )
+        if ns > 1:
+            if not grid_barrier(ctr, gen, fail):
+                return False
+            if bid < M * NQH:
+                dattn_combine_body[HD, MEGA_G](Pg, Ao, bid, ns, tid)
     if not grid_barrier(ctr, gen, fail):
         return False
     stamp(prof, pbase + 4)

@@ -1,3 +1,10 @@
+> **Caveat added 2026-09-11 (lane-dattn):** every row here timed 200 iterations per target
+> (op_bench default), which is shorter than the GPU clock ramp on the short targets. The three
+> decode-attention rows re-timed at 5000 iterations with warmup excluded, 10 repeats, spread
+> <= 0.9 % (`bench/dattn-confirm.sh`, `.work/dattn-confirm/c4`) read **37.29 / 28.24 / 41.32 us**
+> for fa_hd256_qwen35 / fa_hd64_granite / fa_hd128_qwen25, not 55.99 / 34.78 / 67.03. Treat
+> every short row below as an upper bound until it is re-timed the same way.
+
 | target | device us/iter | GB/s | % of 960 GB/s | TFLOPS | % of 122.8 TFLOPS | roofline % | cache-cold | top kernel |
 |---|---|---|---|---|---|---|---|---|
 | mmvq_q4K_qwen25_ffn_up | 66.90 | 572 | 59.6 | 2.03 | 1.7 | 59.6 | yes | mul_mat_vec_q |

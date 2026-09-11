@@ -75,6 +75,63 @@ more round only with a new frozen prediction.
 - R's rotation reads "BELOW": the R row is void, re-run, never compared.
 - Any run whose fail word or parameter echo is missing is void (repo `CLAUDE.md`).
 
-## Result
+## Result (2026-09-11, lane-dattn)
 
-(empty until the lane reports)
+**Verdict: BETWEEN, no land.** Ours beats R by 1.43x (S1), 1.70x (S2), 1.48x (S3). The land
+rule needs >= 1.5x on two shapes: only S2 clears it (S3 misses by 0.02, S1 by 0.07). Close
+negative needs < 1.1x on two shapes: none. Per this protocol: report, no land, one more round
+only with a new frozen prediction.
+
+Run: `bench/dattn-confirm.sh` confirmation c4, commit `7721fe0`, llama.cpp `1744c6bde`, one
+gpu-wait job: gates first (fail-closed), then 10 repeats alternating arm order. Arm O configs
+frozen by commit `ffc7684` from the stint-3 sweep. Device us per iteration: each arm's own
+kernels from the 21st main-kernel dispatch on, divided by the main-kernel count, from the trace.
+
+| shape | R us (spread) | O us (spread) | R/O | ideal us | O % of roof | R % of roof |
+|---|---|---|---|---|---|---|
+| S1 16/4/256 KV4096 | 37.29 (0.9 %) | 26.16 (1.0 %) | **1.43** | 17.5 | 67 | 47 |
+| S2 40/8/64 KV4096 | 28.24 (0.3 %) | 16.63 (1.5 %) | **1.70** | 8.7 | 52 | 31 |
+| S3 28/4/128 KV4096 | 41.32 (0.3 %) | 27.85 (0.6 %) | **1.48** | 8.7 | 31 | 21 |
+
+S1 scaling receipt (split vs exact):
+
+| KV | R us (spread) | O split us (spread) | R/O | O exact us (spread) |
+|---|---|---|---|---|
+| 512 | 36.91 (3.4 %) | 10.57 (1.9 %) | 3.49 | 28.63 (0.1 %) |
+| 1024 | VOID (37.6 %) | 11.45 (1.9 %) | - | 44.87 (0.1 %) |
+| 4096 | 37.29 (0.9 %) | 26.16 (1.0 %) | 1.43 | VOID (21.6 %) |
+| 16384 | 104.74 (0.2 %) | 84.75 (0.3 %) | 1.24 | not run |
+
+The split path beats the exact path at every length measured; there is no crossover in 512-16384.
+
+Frozen predictions against the result:
+
+| prediction | frozen | observed | |
+|---|---|---|---|
+| O S1 | 24-30 | 26.16 | HELD |
+| O S2 | 13-18 | 16.63 | HELD |
+| O S3 | 13-18 | 27.85 | MISSED |
+| R/O S1 | 1.9-2.3 | 1.43 | MISSED |
+| R/O S2 | 1.9-2.7 | 1.70 | MISSED |
+| R/O S3 | 3.7-5.2 | 1.48 | MISSED |
+
+Every ratio miss traces to R, not O: R's frozen receipts (55.99 / 34.78 / 67.03) were timed at
+200 iterations, targets shorter than the clock ramp; at 5000 iterations R reads 37.29 / 28.24 /
+41.32, 1.2-1.6x faster. The same defect voided confirmation run c3 (spread 15-37 %). The round's
+premise ("13-31 % of roofline") was measured the same way and overstated R's gap.
+
+Receipts (P3):
+
+| checked | read from | observed |
+|---|---|---|
+| O arm parameters | bench_dattn arm line per target | HD, NQH, NKVH, KVT=f16, KV, path, nsplit, nld, rot, span, grid, block, combine dims as frozen |
+| iterations | trace, main-kernel dispatch count | 5020 per target, both arms (5000 timed + 20 warmup) |
+| rotation | arm line, both arms | 402.7 MB every target, "exceeds" 4 x 96 MB |
+| O resources | trace | split S1 176 VGPR / 0 B scratch, S2 192 / 0, S3 192 / 316 B; LDS 8704 / 3072 / 7680 |
+| R resources | trace | flash_attn_ext_vec 216 / 96 / 136 VGPR, 0 scratch |
+| gate 2 | tools/dattn-ref.py | 760/760, worst 1.43e-5 (bound 2e-3) |
+| gate 3 | test_attn_block, rebuilt in the job | 0 of 4096 words differ |
+| engine gate | tools/mega-gate.sh in the job | ALL PASS (identity q8 / q8d / q4, spec 0/1, perf ratio 1.201) |
+| clocks | rocm-smi sampler, 0.5 s | busy sclk median 3296 MHz (662-3325), busy power median 157 W, cap 290 W |
+
+Report: `exchange/lane-dattn-report.md`.

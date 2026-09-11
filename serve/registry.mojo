@@ -20,7 +20,8 @@ from matmul_prefill import (
     amar_matmul_prefill_q4, amar_matmul_prefill_q8, amar_prefill_swiglu_bf16, PF_THREADS,
 )
 from matmul_prefill_lds import amar_matmul_prefill_lds, LDS_THREADS
-from mega import amar_mega_token, amar_mega_window, MEGA_G, MEGA_G_WIN
+from mega import amar_mega_token, amar_mega_window, MEGA_G, MEGA_G_WIN, DATT_NLD
+from dattn import amar_dattn_split, amar_dattn_combine, dattn_nsplit
 from attn import (
     amar_head_rmsnorm, amar_attn_decode, amar_gate_mul_cast, amar_qgate_split, amar_rope_yarn, amar_kv_append,
     amar_attn_prefill, HD, NQH, NKVH, KVT, TCAP, KVPAGE, KVHSTR, PA_ROWS,
@@ -124,6 +125,7 @@ comptime p_h = row_major[SPLITK, SM, H]()
 comptime p_kv = row_major[SPLITK, SM, KV]()
 comptime p_32 = row_major[SPLITK, SM, NH_V]()
 comptime p_ffn = row_major[SPLITK, SM, FFN]()
+comptime p_att_layout = row_major[SPLITK * SM * FFN]()
 comptime p_v = row_major[SPLITK, SM, VOCAB]()
 comptime c_qf = row_major[1, QF]()
 comptime c_h = row_major[1, H]()
@@ -211,6 +213,8 @@ comptime append_k = amar_kv_append[type_of(cache_layout), type_of(kvm_layout), N
 comptime append_1 = amar_kv_append[type_of(cache1_layout), type_of(kvm_layout), 1]
 comptime att_k = amar_attn_decode[type_of(qm_layout), type_of(cache_layout), type_of(qm_layout), N_ATT]
 comptime att_1 = amar_attn_decode[type_of(qm_layout), type_of(cache1_layout), type_of(qm_layout), 1]
+comptime datt_k = amar_dattn_split[HD, NQH, NKVH, KVT, N_ATT, DATT_NLD, False, type_of(qm_layout), type_of(cache_layout), type_of(qm_layout), type_of(p_att_layout)]
+comptime dcomb_k = amar_dattn_combine[HD, MEGA_G, type_of(p_att_layout), type_of(qm_layout)]
 comptime gmul_k = amar_gate_mul_cast[type_of(xflat_layout), type_of(xflat_layout), type_of(xflat_layout)]
 
 comptime rmsc_p = amar_rmsnorm_cast[type_of(xp_layout), type_of(h_layout), type_of(xp_layout)]
