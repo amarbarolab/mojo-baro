@@ -1202,3 +1202,57 @@ host, sampling, writing the token back) is still not built -- `serve/
 sample_ref.mojo` and `SampleParams` are the tested, ready-to-wire pieces;
 `serve/engine.mojo` parses every sampler field into `SampleParams` and does
 not yet read it. Next increment, not this one.
+
+---
+
+## C4 — engine pool (frozen 2026-09-11, before its build)
+
+**Change.** `serve/src/engine.rs`: `EnginePool` owns `BARO_POOL` (default
+1) `Engine` processes, each with its own pack load and its own request
+queue; the id counter moves from `Engine` to `EnginePool` (one counter for
+the whole pool, so ids stay unique across engines -- `cancel` and the
+API's `cmpl-<id>`/`chatcmpl-<id>` depend on that). `submit` routes to
+whichever engine has the fewest requests waiting or running, ties by
+lowest index; at the default pool size of 1 that is always engine 0, so
+routing is a no-op today. `cancel(id)` tries every engine (nothing records
+which engine an id landed on) -- at most one will have it as its
+`current`. `/health` gains `"pool":[q0, q1, ...]`, the per-engine queue
+depth `queue_depth`'s sum cannot distinguish "two engines each running
+one" from "one engine running both."
+
+**Not in this step.** Continuous batching (brief M2's option b -- needs
+per-sequence SSM slots and a batched decode GEMV, a different design).
+Per-request pool-size selection; `BARO_POOL` is a server-start knob.
+
+**Predictions (frozen before the build).**
+- P-J1 Identity: `BARO_POOL` unset (or `1`) behaves byte-for-byte as today
+  on every existing `tools/test_server.sh` case -- the pool-of-one routing
+  decision is unconditional (`engines[0]` always wins the "fewest queued"
+  comparison against itself), so this is a receipt, not a design bet.
+- P-J2 Two engines, two concurrent requests: with `BARO_POOL=2`, two
+  requests submitted back to back both show `queue` (per-request, at
+  submission) `<= 1` and `/health`'s `"pool"` field reads `[1, 1]` while
+  both are in flight -- neither request waits behind the other on the
+  same engine. `cancel` still finds and stops whichever engine is running
+  a given id.
+- P-J3 Aggregate throughput at pool size 1 vs 2, two clients each looping
+  N requests concurrently: recorded, not frozen (the design brief's own
+  qualifier -- decode is memory-bound, so a well-known limiting factor is
+  the two processes sharing one card's bandwidth; the plan's prediction is
+  "limited," not a number).
+- Falsifier: any change to the default (`BARO_POOL=1`) request line or
+  behaviour; two concurrent requests at pool size 2 that still serialise
+  onto one engine; a cancel that cannot find the engine actually running
+  the target id.
+
+**Verification before timing (P1).** `engine pool ready: N engine(s)`
+printed at start names the pool size read back; `/health`'s `"pool"`
+array read during the concurrency check; rebuild `baro-serve` in the same
+stint as any timed run.
+
+**Gate.** `tools/test_server.sh` ALL PASS at the default pool size
+(P-J1); a new pool-size-2 case in the same script (or a dedicated
+script) proving P-J2; P-J3's aggregate numbers recorded in the Result,
+whatever they are.
+
+**Result.** pending -- filled in after the gated run.
