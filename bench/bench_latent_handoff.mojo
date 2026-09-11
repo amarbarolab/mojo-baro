@@ -749,7 +749,10 @@ def main() raises:
                     out += arm_json(arm, 0.0, r.elapsed_s, r.ids, text, scored, sv, "")
 
                 elif arm == "T":
-                    var rA = run_fresh_generate(ctx, bufsA, wstA, pack_q4, q4_off, eA, tokens, COT_MAX, tmax)
+                    # Stop-aware since E12: run_fresh_generate always decoded COT_MAX
+                    # steps, so producer_s counted padding past the stop id
+                    # (runs/latent-os/E12-smoke-2026-09-11.md). Same greedy ids.
+                    var rA = run_generate_to_stop(ctx, bufsA, wstA, pack_q4, q4_off, eA, tokens, COT_MAX, tmax, stops)
                     var cot_ids = trim_at_stop(rA.ids, stops)
                     var b_context = tokens.copy()
                     extend_ids(b_context, cot_ids)
@@ -829,27 +832,32 @@ def main() raises:
                     var ck = mint_chain_slot(chainA, 0)
                     var mint_s = Float64(perf_counter_ns() - t0m) / 1e9
 
-                    _ = reset_and_load(ctx, bufsB, a_ctx, tmax)
+                    var b_ctx = a_ctx.copy()
+                    extend_ids(b_ctx, hand_ids)
+                    if nothink:
+                        extend_ids(b_ctx, nothink_ids)
+                    var total = len(b_ctx)
+                    if total - 1 - hand_pos < MROWS:
+                        raise Error("KV: fewer than MROWS tokens after the handoff, the prefill tail would underflow")
+                    var pfB = reset_and_load(ctx, bufsB, b_ctx, tmax)
                     var t0b = perf_counter_ns()
                     ingest_kv_latent(ctx, bufsB.kc_d, bufsB.vc_d, kv[0], kv[1])
                     var slot = ingest_into_chain(chainB, ck[0], ck[1])
                     chainB.restore(ctx, bufsB.convstate_d, bufsB.sstate_d, 0, slot)
                     ctx.synchronize()
                     var ingest_s = Float64(perf_counter_ns() - t0b) / 1e9
-                    # serve/engine.mojo's restore contract: slot 0, ring 0, pos = pos_prev = cached.
+                    # serve/engine.mojo's restore contract (slot 0, ring 0, pos = pos_prev
+                    # = cached), then the rest of B's context in one batched prefill, the
+                    # way arm T prefills it; the smoke fed it row by row and measured that.
                     wstB.reset(t0b)
                     wstB.pos = hand_pos
                     wstB.pos_prev = hand_pos
-                    append_known_tokens(ctx, bufsB, wstB, pack_q4, q4_off, eB, hand_ids, tmax)
-                    if nothink:
-                        append_known_tokens(ctx, bufsB, wstB, pack_q4, q4_off, eB, nothink_ids, tmax)
-                    var start_pos = wstB.pos
-                    var cfg_gen = make_cfg(pack_q4, q4_off, eB, 0, 0, start_pos, start_pos + gen_budget)
-                    while wstB.pos < start_pos + gen_budget - 1:
-                        step_window(ctx, bufsB, cfg_gen, wstB)
+                    var cfgB = make_cfg(pack_q4, q4_off, eB, pfB[0], pfB[1], total, total + gen_budget)
+                    while wstB.pos < total + gen_budget - 1:
+                        step_window(ctx, bufsB, cfgB, wstB)
                     ctx.synchronize()
                     var receiver_s = Float64(perf_counter_ns() - t0b) / 1e9
-                    var gen_ids = read_toks(ctx, bufsB, start_pos, start_pos + gen_budget, tmax)
+                    var gen_ids = read_toks(ctx, bufsB, total, total + gen_budget, tmax)
                     var ans_ids = trim_at_stop(gen_ids, stops)
                     var text = tok.decode(ans_ids)
                     var sv = -1
