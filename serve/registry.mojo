@@ -26,15 +26,8 @@ from attn import (
     amar_head_rmsnorm, amar_attn_decode, amar_gate_mul_cast, amar_qgate_split, amar_rope_yarn, amar_kv_append,
     amar_attn_prefill, amar_attn_prefill_wmma, HD, NQH, NKVH, KVT, TCAP, KVPAGE, KVHSTR, PA_ROWS, PW_ROWS, PW_THREADS,
 )
+from model import H, FFN, VOCAB, QF, KV, N_LAYERS, N_SSM, N_ATT, MEGA_ALLOWED
 
-comptime H = 4096
-comptime FFN = 12288
-comptime VOCAB = 248320
-comptime QF = 2 * H
-comptime KV = NKVH * HD
-comptime N_LAYERS = 32
-comptime N_SSM = 24
-comptime N_ATT = 8
 comptime TMAX = 1088
 comptime GEN_N = 64
 comptime CP = 1024

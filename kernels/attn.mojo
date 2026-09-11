@@ -5,11 +5,9 @@ from max.gpu.memory import AddressSpace
 from max.gpu.sync import barrier
 from layout import TileTensor, TensorLayout, row_major, stack_allocation
 from layout.tensor_core import mma
+from model import HD, NQH, NKVH, NROT, YARN_LOW, YARN_HIGH, FREQ_BASE, FREQ_SCALE, MSCALE
 
 comptime f32 = DType.float32
-comptime HD = 256
-comptime NQH = 16
-comptime NKVH = 4
 comptime KVT = DType.float32
 comptime KVPAGE = 128
 comptime KVPSH = 7
@@ -221,14 +219,6 @@ def amar_gate_mul_cast[
             DType.bfloat16
         ]()
     )
-
-
-comptime NROT = 64
-comptime YARN_LOW = Float32(14.0)
-comptime YARN_HIGH = Float32(22.0)
-comptime FREQ_BASE = Float32(1e7)
-comptime FREQ_SCALE = Float32(0.25)
-comptime MSCALE = Float32(1.1386294361119891)
 
 
 def amar_qgate_split[

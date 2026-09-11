@@ -61,4 +61,18 @@ No output is written to `/tmp`.
 
 ### Result
 
-Pending W0 build and gates.
+W0 passed on 2026-09-12. Preregistration commit: `f90e351`. The final code
+commit is recorded in the lane report. Default engine build and qwen35moe
+build both exited 0. The profile probe printed H 2048, QF 8192, KV 512,
+N_LAYERS 40, N_SSM 30, N_ATT 10, and MEGA_ALLOWED False. The final
+`./run-tests.sh` gate exited 0. Final `bench/force-ab.sh` used distinct
+binary hashes and passed 20/20 prompts, 64/64 each, min 100.0%, mean 100.0%,
+void none. The qwen35moe runtime refusal gate exited 1 as required and
+reported `BARO_MEGA=1 is not supported by the qwen35moe model profile`.
+`kernel-census --check` passed inside `run-tests.sh`.
+
+Operational deviation: the first test attempt lacked the lane-local q4 pack
+and failed before tests; a symlink to the existing main q4 pack was added in
+`.work`, then the unchanged test gate was rerun successfully. The first
+direct build also failed because it bypassed gpu-wait; all GPU builds and
+runtime gates after that were run through gpu-wait.

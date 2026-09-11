@@ -405,6 +405,9 @@ def load_state(
 def main() raises:
     comptime assert has_accelerator(), "Requires a GPU"
     var ctx = DeviceContext()
+    var mega = getenv("BARO_MEGA", "1") == "1"
+    if mega and not MEGA_ALLOWED:
+        raise Error("BARO_MEGA=1 is not supported by the qwen35moe model profile")
     var packdir = getenv("BARO_PACK", ".work/engine-pack-q4")
     var pack = load_pack(ctx, packdir)
     var wbuf = pack.wbuf
@@ -422,7 +425,6 @@ def main() raises:
     var dot3 = getenv("BARO_DOT", "0") == "1" and not pack_q4
     print("BARO_DOT:", dot3)
     print("pack q4 trunk:", pack_q4)
-    var mega = getenv("BARO_MEGA", "1") == "1"
     print("BARO_MEGA:", mega)
     var mega_win = getenv("BARO_MEGA_WIN", "0") == "1"
     print("BARO_MEGA_WIN:", mega_win)
