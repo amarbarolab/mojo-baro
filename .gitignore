@@ -10,3 +10,5 @@ bench/sweep.jsonl
 .claude/
 .codex/
 bench/ruler/prompts/
+bench/ggml-harness/op_bench
+bench/ggml-harness/op_bench.llama-commit
