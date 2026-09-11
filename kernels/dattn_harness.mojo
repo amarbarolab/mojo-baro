@@ -1,0 +1,72 @@
+from std.math import sqrt
+from max.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
+from layout import TileTensor, row_major
+
+from dattn import (
+    amar_dattn_exact, amar_dattn_split, amar_dattn_combine, dkv_off, dspan,
+    KVPAGE, DTHREADS, f32,
+)
+
+comptime FLAT = 1 << 26
+comptime flat_layout = row_major[FLAT]()
+
+
+@always_inline
+def hash_val(i: Int) -> Float32:
+    return Float32(Int((UInt64(i) * UInt64(2654435761)) % UInt64(2001))) / 1000 - 1
+
+
+def kv_pool_elems[HD: Int, NKVH: Int](T: Int) -> Int:
+    return ((T + KVPAGE - 1) // KVPAGE) * NKVH * KVPAGE * HD
+
+
+def fill_q(host: HostBuffer[f32], n: Int, qscale: Int):
+    var p = host.unsafe_ptr()
+    for i in range(n):
+        p[unsafe_offset=i] = hash_val(i) * Float32(qscale)
+
+
+def fill_kv[HD: Int, NKVH: Int, KVT: DType](host: HostBuffer[KVT], T: Int, seed: Int):
+    var p = host.unsafe_ptr()
+    for kvh in range(NKVH):
+        for t in range(T):
+            var base = dkv_off[HD, NKVH, 1](t, 0, kvh)
+            var src = (kvh * T + t) * HD + seed
+            for d in range(HD):
+                p[unsafe_offset=base + d] = hash_val(src + d).cast[KVT]()
+
+
+def eff_nsplit[HD: Int, NLD: Int](T: Int, ns: Int) -> Int:
+    var NS = (T + dspan[HD, NLD]() - 1) // dspan[HD, NLD]()
+    return min(max(ns, 1), max(NS, 1))
+
+
+def launch_dattn[
+    HD: Int, NQH: Int, NKVH: Int, KVT: DType, NLD: Int
+](
+    ctx: DeviceContext,
+    mut q_d: DeviceBuffer[f32],
+    mut k_d: DeviceBuffer[KVT],
+    mut v_d: DeviceBuffer[KVT],
+    mut o_d: DeviceBuffer[f32],
+    mut p_d: DeviceBuffer[f32],
+    T: Int,
+    ns: Int,
+    exact: Bool,
+) raises:
+    comptime q_layout = row_major[NQH, HD]()
+    var Q = TileTensor(q_d, q_layout)
+    var Kc = TileTensor(k_d, flat_layout)
+    var Vc = TileTensor(v_d, flat_layout)
+    var O = TileTensor(o_d, q_layout)
+    var Pg = TileTensor(p_d, flat_layout)
+    var scale = Float32(1) / sqrt(Float32(HD))
+    if exact:
+        comptime k_exact = amar_dattn_exact[HD, NQH, NKVH, KVT, 1, type_of(q_layout), type_of(flat_layout), type_of(q_layout)]
+        ctx.enqueue_function[k_exact](Q, Kc, Vc, O, Int32(T), scale, Int32(0), grid_dim=NQH, block_dim=HD)
+    else:
+        comptime k_split = amar_dattn_split[HD, NQH, NKVH, KVT, 1, NLD, type_of(q_layout), type_of(flat_layout), type_of(q_layout), type_of(flat_layout)]
+        ctx.enqueue_function[k_split](Q, Kc, Vc, O, Pg, Int32(T), Int32(ns), scale, Int32(0), grid_dim=(NKVH, ns), block_dim=DTHREADS)
+        if ns > 1:
+            comptime k_comb = amar_dattn_combine[HD, type_of(flat_layout), type_of(q_layout)]
+            ctx.enqueue_function[k_comb](Pg, O, Int32(ns), grid_dim=NQH, block_dim=HD)

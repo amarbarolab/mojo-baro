@@ -24,7 +24,7 @@ def scan():
             params = " ".join(pm.group(1).split()) if pm else ""
             kernels[name] = {"file": f.name, "params": params, "used": []}
     users = [REG, ROOT / "serve" / "engine.mojo", ROOT / "serve" / "spark.mojo", KDIR / "amarbaro.mojo"]
-    users += sorted((ROOT / "bench").glob("*.mojo")) + sorted(KDIR.glob("test_*.mojo"))
+    users += sorted((ROOT / "bench").glob("*.mojo")) + sorted(KDIR.glob("test_*.mojo")) + sorted(KDIR.glob("*_harness.mojo"))
     for u in users:
         src = u.read_text()
         for name in kernels:

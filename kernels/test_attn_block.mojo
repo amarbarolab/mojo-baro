@@ -2,6 +2,9 @@
 (docs/qwen35-ssm-notes.md §7b) vs tools/attn-ref.py. Position 7 with 7 cached
 tokens. Gates mirror test_ssm_block: exact-path intermediates at 1e-3, values
 crossing a bf16 cast at wider gates (boundary flips, documented there).
+Also bench/dattn-protocol.md gate 3: the generic decode attention's exact path,
+instantiated at the shipped HD/NQH/NKVH/f32, must be bit-identical to
+amar_attn_decode on this block's Q and KV cache.
 """
 from std.math import ceildiv
 from std.memory import alloc
@@ -17,6 +20,7 @@ from attn import (
     amar_head_rmsnorm, amar_attn_decode, amar_gate_mul, amar_qgate_split, amar_rope_yarn, amar_kv_append,
     HD, NQH, NKVH, KVT, TCAP, KVHSTR, kv_off,
 )
+from dattn import amar_dattn_exact
 
 comptime H = 4096
 comptime QF = 2 * H
@@ -126,6 +130,7 @@ def main() raises:
     var kc_d = ctx.enqueue_create_buffer[KVT](KVPOOL_T)
     var vc_d = ctx.enqueue_create_buffer[KVT](KVPOOL_T)
     var o_d = ctx.enqueue_create_buffer[f32](NQH * HD)
+    var o2_d = ctx.enqueue_create_buffer[f32](NQH * HD)
     var ob_d = ctx.enqueue_create_buffer[bf16](H)
     var out_d = ctx.enqueue_create_buffer[f32](H)
     var p_qf_d = ctx.enqueue_create_buffer[f32](SPLITK * SM * QF)
@@ -177,6 +182,7 @@ def main() raises:
     var Kc = TileTensor(kc_d, cache_layout)
     var Vc = TileTensor(vc_d, cache_layout)
     var O = TileTensor(o_d, q_layout)
+    var O2 = TileTensor(o2_d, q_layout)
     var O1 = TileTensor(o_d, h_layout)
     var ObB1 = TileTensor(ob_d, h_layout)
     var ObB2 = TileTensor(ob_d, row_major[1, H]())
@@ -198,6 +204,7 @@ def main() raises:
     comptime rope_k = amar_rope_yarn[type_of(kv_layout)]
     comptime append_k = amar_kv_append[type_of(cache_layout), type_of(kv_layout), 1]
     comptime att_k = amar_attn_decode[type_of(q_layout), type_of(cache_layout), type_of(q_layout), 1]
+    comptime datt_k = amar_dattn_exact[HD, NQH, NKVH, KVT, 1, type_of(q_layout), type_of(cache_layout), type_of(q_layout)]
     comptime gmul_k = amar_gate_mul[type_of(h_layout), type_of(h_layout)]
     comptime add_k = amar_residual_add[type_of(h_layout), type_of(h_layout)]
 
@@ -217,6 +224,11 @@ def main() raises:
     ctx.enqueue_function[append_k](Kc, Khd, Int32(T_PRE), Int32(0), grid_dim=NKVH, block_dim=HD)
     ctx.enqueue_function[append_k](Vc, Vhd, Int32(T_PRE), Int32(0), grid_dim=NKVH, block_dim=HD)
     ctx.enqueue_function[att_k](Q, Kc, Vc, O, Int32(T), Float32(0.0625), Int32(0), grid_dim=NQH, block_dim=HD)
+    ctx.enqueue_function[datt_k](Q, Kc, Vc, O2, Int32(T), Float32(0.0625), Int32(0), grid_dim=NQH, block_dim=HD)
+    var o_got = ctx.enqueue_create_host_buffer[f32](NQH * HD)
+    var o2_got = ctx.enqueue_create_host_buffer[f32](NQH * HD)
+    ctx.enqueue_copy(dst_buf=o_got, src_buf=o_d)
+    ctx.enqueue_copy(dst_buf=o2_got, src_buf=o2_d)
     ctx.enqueue_function[gmul_k](O1, Gate1, Int32(H), grid_dim=ceildiv(H, 256), block_dim=256)
     ctx.enqueue_function[cast_k](O1, ObB1, Int32(H), grid_dim=ceildiv(H, 256), block_dim=256)
     ctx.enqueue_function[g_h](ObB2, Wo, Ph, Int32(1), Int32(H), Int32(H), grid_dim=(ceildiv(H, SBN), SPLITK), block_dim=SK_THREADS)
@@ -235,4 +247,13 @@ def main() raises:
     check("k_new", k_got.unsafe_ptr(), knew_ref, KV)
     check("v_new", v_got.unsafe_ptr(), vnew_ref, KV)
     check("y", y_got.unsafe_ptr(), y_ref, H, 3e-2)
+    var ob = o_got.unsafe_ptr().unsafe_bitcast[UInt32]()
+    var o2b = o2_got.unsafe_ptr().unsafe_bitcast[UInt32]()
+    var bad = 0
+    for i in range(NQH * HD):
+        if ob[unsafe_offset=i] != o2b[unsafe_offset=i]:
+            bad += 1
+    print("dattn_exact vs amar_attn_decode: mismatched words", bad, "of", NQH * HD)
+    if bad != 0:
+        raise Error("gate 3: generic exact path is not bit-identical to amar_attn_decode")
     print("PASS: qwen35 gated full-attention block matches numpy reference")
