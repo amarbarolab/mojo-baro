@@ -9,6 +9,13 @@ after output.weight, so every trunk offset is unchanged by its presence.
 
 Usage: tools/engine-pack.py MODEL.gguf OUTDIR [--q8|--q4|--q2b3|--tq1|--tq2] [--q4-draft]
 
+A source GGUF may hold its 2D weights as K-quants (Q4_K, Q6_K, ...) instead of
+bf16: each such tensor is dequantised to f32 with gguf-py
+(`gguf.quants.dequantize`), rounded to bf16 (round-to-nearest-even), then fed
+through the same bf16 paths below (quantize/transpose) as a native-bf16
+source. `token_embd.weight` stays row-major, untransposed, unquantized either
+way.
+
 --q8: every 2D bf16 weight except token_embd is stored int8 in weight-native
 [out, in] layout followed by fp16 block scales [out, in/32], ggml q8_0
 rounding (d = amax/127 in fp32, q = roundf(x * (1/d)), d stored as fp16).
@@ -41,6 +48,8 @@ import sys
 from pathlib import Path
 
 import numpy as np
+from gguf.constants import GGML_QUANT_SIZES, GGMLQuantizationType
+from gguf.quants import dequantize as gguf_dequantize
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from importlib.util import spec_from_file_location, module_from_spec
@@ -83,6 +92,27 @@ def layer_names(i):
 
 def bf16_to_f32(u16):
     return (u16.astype(np.uint32) << 16).view(np.float32)
+
+
+def f32_to_bf16(x32):
+    """Round-to-nearest-even, matching ggml's ggml_fp32_to_bf16."""
+    u = x32.astype(np.float32).view(np.uint32)
+    bias = ((u >> 16) & 1) + np.uint32(0x7FFF)
+    return ((u + bias) >> 16).astype(np.uint16)
+
+
+def dequantize_kquant(f, data_start, toff, ttype, shape):
+    """A Q4_K/Q6_K (or any other gguf-py-known non-bf16/f32/f16) tensor,
+    dequantised to bf16 raw bytes via gguf-py so it can pass through the
+    same bf16 quantize/store paths below."""
+    qtype = GGMLQuantizationType(ttype)
+    block, tsize = GGML_QUANT_SIZES[qtype]
+    n_elem = int(np.prod(shape))
+    assert n_elem % block == 0, (shape, block)
+    f.seek(data_start + toff)
+    raw_q = np.frombuffer(f.read(n_elem // block * tsize), dtype=np.uint8)
+    w32 = gguf_dequantize(raw_q, qtype).reshape(shape).astype(np.float32)
+    return f32_to_bf16(w32).tobytes()
 
 
 def quantize_q8_0(w16):
@@ -227,11 +257,15 @@ def main():
     with open(outdir / "pack.bin", "wb") as out:
         for name in order:
             dims, ttype, toff = infos[name]
-            tname, esize = ge.GGML_BYTES[ttype]
             n_elem = int(np.prod(dims))
-            f.seek(data_start + toff)
-            raw = f.read(n_elem * esize)
             shape = list(reversed(dims))
+            if ttype in ge.GGML_BYTES:
+                tname, esize = ge.GGML_BYTES[ttype]
+                f.seek(data_start + toff)
+                raw = f.read(n_elem * esize)
+            else:
+                tname = "bf16"
+                raw = dequantize_kquant(f, data_start, toff, ttype, shape)
             if tname == "bf16" and len(shape) == 2 and name != "token_embd.weight":
                 w = np.frombuffer(raw, dtype=np.uint16).reshape(shape)
                 if q8:
