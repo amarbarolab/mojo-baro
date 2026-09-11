@@ -732,3 +732,95 @@ and no cost to decode. That is the honest claim. The 100x-class number needs
 M1b.
 
 Not run: nothing further; M1b preregistration is unwritten.
+
+---
+
+## C1 — control block: stop sequences, EOS-in-engine, cancel, FIFO+503 (frozen 2026-09-11, before its build)
+
+**Where the gap is (read from source, 2026-09-11).** `serve/PROTOCOL.md` says it
+in as many words: "there is no stop-token or cancel in the protocol." The
+engine (`serve/engine.mojo`) always decodes exactly the requested `n`; a stop
+token is only ever noticed by `serve/src/main.rs`'s `Acc::take`, client-side,
+after the token has already been generated. There is no way to end a running
+request early. The queue (`serve/src/engine.rs`, `mpsc::channel(QUEUE_CAP=64)`,
+one worker) is already FIFO and already returns 503 past the cap
+(`Engine::submit`'s `try_send` error mapped to `StatusCode::SERVICE_UNAVAILABLE`
+in `main.rs::check_and_submit`) -- nothing to change there, only to keep gated.
+
+**Change.**
+- Wire: the request line gains `"stop":[[id,...],...]` (a list of token-id
+  sequences, default `[]`); `serve/engine.mojo::parse_request` parses it.
+  `serve/src/main.rs` builds it from two sources: the tokenizer's own
+  `stop_ids` (each as a length-1 sequence, moving today's client-side EOS cut
+  into the engine) and an OpenAI-style `stop` request field (string or array
+  of strings, tokenized with `encode(s, false)`).
+- Engine: after each `step_window` call where `wst.pos >= len(prompt)`, if any
+  stop sequence is configured, sync + copy `toks_d` back and check whether the
+  generated tail ends with it; on a match, break the decode loop early
+  (`finish:"stop"` in the done line). Only requests that actually set `stop`
+  pay this sync; the no-stop path is untouched.
+- Cancel: a second line shape, `{"cancel":ID}`, written to the SAME stdin the
+  worker uses (now behind an `Arc<tokio::sync::Mutex<ChildStdin>>` so a cancel
+  can interleave with the in-flight request's line) whenever
+  `Engine::cancel(id)` is called and `id` is the request currently running.
+  The engine polls fd 0 with `poll(..., timeout=0)` once per `step_window`
+  call (prefill chunk or decode window alike); a hit is read and, if it is a
+  cancel for the running `req_id`, breaks the loop (`finish:"cancelled"`).
+  Polling costs one syscall per window (~us) against a ~7-10 ms window, and
+  never touches the GPU queue.
+- `done` gains `"finish":"length"|"stop"|"cancelled"`; `n`/`tok_s` are computed
+  from tokens actually generated, not the request's `n`, so an early stop or
+  cancel reports its real count. `serve/src/protocol.rs::DoneStats` gains
+  `finish: Option<String>` (absent = old engine = today's client-side
+  `Acc::finish_reason` fallback, so the wire change is backward compatible).
+- room for sampler settings (brief M3): the object is JSON, so a later field
+  needs no reshaping here -- nothing to add speculatively now (§7).
+
+**Not in this step.** Cancelling a request that is still queued, not yet
+running (the worker only understands cancel for what it is actively decoding;
+a queued job simply has not started). Any sampler field. Removing text from
+the *displayed* string when a multi-token stop string's tail tokens are not
+themselves flagged EOS by the tokenizer (`Acc` still only hides text at a
+known stop id) -- token-level stop is exact; text-level trimming for
+arbitrary stop strings is a finish-polish item, not gated here.
+
+**Predictions (frozen before the build).**
+- P-G1 Identity: the 20-prompt A/B (`bench/ab-prompts.sh`) at temperature 0,
+  no `stop`/`cancel` set, is bit-exact vs `main` -- the added `poll()` per
+  window is a host-side syscall with no GPU-visible effect, and the stop-check
+  sync never runs when `stop` is empty (the default). Falsifier: any
+  regression outside the standing +-2% band on the median, or any identity
+  mismatch, since neither should be possible from this change.
+- P-G2 Stop strings: a request with `stop` sequences ends generation at the
+  first token whose tail matches one of them; `finish:"stop"`; `n` is less
+  than the requested `max_tokens` when the stop occurs before the length
+  limit, and the emitted tokens end in the stop sequence.
+- P-G3 EOS moved server-side: a request with no explicit `stop` but whose
+  reference continuation reaches the tokenizer's EOS before `max_tokens`
+  now stops the engine loop at that token (todayâ€™s engine would keep
+  computing to `n`); `finish:"stop"`, and the emitted tokens are a prefix of
+  what the old (always-run-to-n) path would have emitted.
+- P-G4 Cancel: `Engine::cancel(id)` on a request mid-decode returns `Ok(true)`
+  and the engine's `done` line for that request arrives within one
+  `step_window` call of the cancel line reaching stdin, `finish:"cancelled"`,
+  `n` less than the requested length; a request submitted immediately after
+  completes normally and matches `ref-tokens-64.txt` (the worker, queue and
+  engine process are unharmed by a cancel).
+- P-G5 FIFO + 503: unchanged from today -- two requests submitted back to
+  back are served in submission order, and a request beyond `QUEUE_CAP` (64)
+  gets 503. Recorded, not expected to move (no code in this path changes).
+- Falsifier for the whole item: any identity break on the no-`stop`,
+  no-cancel path (P-G1), or a cancel/stop that corrupts the next request.
+
+**Verification before timing (P1).** `TMAX:`, `spec k:`, `prompt tokens:`
+read back as usual; the done line's `finish` field read back on every request
+that exercises stop or cancel; rebuild engine + `baro-serve` in the same
+stint; `arm.txt` first for the A/B.
+
+**Gate.** `tools/test_server.sh` ALL PASS, extended with a `stop`-string case
+(P-G2) and a cancel case (P-G4, via `/v1/chat/completions` streaming: the
+first SSE chunk's `id` is now `chatcmpl-<internal id>`, letting the test call
+`POST /v1/cancel {"id":...}` mid-stream); `run-tests.sh` unaffected (no kernel
+change); 20-prompt A/B (P-G1) within band.
+
+**Result.** pending -- filled in after the gated run.
