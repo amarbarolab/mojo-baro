@@ -1,8 +1,11 @@
 # Long-context prefill, 2026-09-11 (lane-prefill-long)
 
-Result: 32k prefill 43.3 s -> **17.4 s** (2.5x), **1.32x llama.cpp's 13.18 s**,
-inside the 1.5x target (19.77 s). The slowest of all six 32k runs of the final
-build, 17.55 s, is still inside it. 16k 15.77 -> 7.49 s (1.34x llama), 8k
+Result: 32k prefill 43.1 s -> **17.0 s** (2.54x), **1.29x llama.cpp's 13.18 s**,
+inside the 1.5x target (19.77 s): median of 5 alternating clock-probed pairs
+(review 2, below); the slowest of those five w3 runs is 17.14 s, and the
+slowest w3 32k run of the whole lane is 17.55 s. Every teacher-forced
+disagreement is a near-tie by the review's fixed rule (both builds' top-2 gap
+under 0.25; observed at most 0.015, review 1, below). 16k 15.77 -> 7.49 s (1.34x llama), 8k
 6.30 -> 3.30 s (1.29x llama). What moved it: f16 WMMA flash attention (32k
 attention 23.5 -> 4.0 s) and a one-wave SSM scan (6.9 -> 0.7 s); no GEMM work.
 Teacher-forced agreement with the champion: 64/64, 63/64, 64/64 at 8k / 16k /
@@ -304,3 +307,78 @@ is unexplained. It also does not show greedy identity past the first near-tie;
 it shows teacher-forced agreement. Anyone can rerun both:
 `bench/prefill-long-run.sh .work/engine-w3 w3 32768` for time and greedy
 parity; the `BARO_FORCE` runs in `.work/pipeline-c.sh` for agreement.
+
+## Review 1 (margin): every disagreement is a near-tie under the rule fixed before measuring
+
+Coordinator rule, fixed before the measurement: a teacher-forced disagreement is
+a near-tie iff BOTH builds' top1-minus-top2 logit gap at that position is below
+0.25; a larger gap is a real disagreement and blocks the merge.
+
+`BARO_MARGIN=1` (with `BARO_FORCE`) recomputes the head from each forced
+step's final residual (final rmsnorm, q4 head GEMM, reduce) and prints the
+top-2 logits. Builds: champion kernels `d329e77f`, w3 `e6a9e8b6`, both with the
+same harness; same reference history (the champion's greedy ids). Harness
+check: the recomputed top-1 equals the engine's own argmax at all 8 positions.
+Logs `.work/logs/margin/`.
+
+| disagreement | champion top-1 / top-2 (logits) | champion gap | w3 top-1 / top-2 (logits) | w3 gap | verdict |
+|---|---|---|---|---|---|
+| 16k prompt, position 1 | 47452 / 1719 (15.7308 / 15.7186) | 0.0123 | 1719 / 47452 (15.7096 / 15.7054) | 0.0042 | near-tie |
+| p07-json, position 1 | 79871 / 220 (18.6912 / 18.6767) | 0.0146 | 220 / 79871 (18.6887 / 18.6816) | 0.0071 | near-tie |
+| p09-explain-gpu, position 37 | 383 / 436 (19.6721 / 19.6615) | 0.0106 | 436 / 383 (19.6847 / 19.6765) | 0.0081 | near-tie |
+| p12-rust, position 3 | 1698 / 999 (21.7186 / 21.7153) | 0.0034 | 999 / 1698 (21.7198 / 21.7134) | 0.0064 | near-tie |
+
+At every position the two builds hold the same two candidates and swap them.
+The largest gap on either side is 0.0146, 17x under the rule's 0.25. No
+disagreement blocks the merge.
+
+## Review 2 (variance): every w3 32k run is under 19.77 s; the spread is the shared GEMM, not the new kernels
+
+Coordinator rule, fixed before the runs: the result stands iff every w3 run of
+5 alternating 32k pairs is below 19.77 s; if w3's spread persists while the
+champion stays within about 1 %, find the cause before claiming the result.
+Engines `f7990ce8` (champion) and `ee5868d5` (w3), one session, champion then
+w3 per pair, each run under `bench/clock-probe.sh`, `gpu-wait --priority 20`.
+Logs `.work/logs/var32/`, summary `.work/logs/pipeline-i.txt`. Every run: 32768
+prompt tokens, TMAX 32896, fail word 0, `GENERATED` md5 `cdb2f40e` (the
+champion's) on both arms.
+
+| pair | champion prefill_s | median sclk | w3 prefill_s | median sclk |
+|---|---|---|---|---|
+| 1 | 43.192 | 3079 | 16.965 | 3037 |
+| 2 | 42.989 | 3053 | 16.955 | 3048 |
+| 3 | 43.132 | 3054 | 17.135 | 3065 |
+| 4 | 43.211 | 3044 | 16.769 | 3023 |
+| 5 | 42.432 | 3062 | 15.966 | 2988 |
+| median (spread) | 43.132 (1.8 %) | | **16.955 (7.3 %)** | |
+
+**Rule met: the slowest w3 run is 17.135 s, 1.30x llama.cpp; the median
+16.955 s is 1.29x llama.cpp and 2.54x the champion.**
+
+The champion did not stay within 1 % (1.8 %), and both arms ran fastest in
+pair 5 (champion -0.70 s, w3 -0.99 s from their medians): a shift of similar
+absolute size in both, which a 2.5x shorter run shows as a 3x larger relative
+spread.
+
+**The profile split attributes the spread to the GEMM, which both builds
+share.** Three profiled w3 32k runs in the same session:
+
+| bucket | w3 run 1 | w3 run 2 | w3 run 3 | spread | champion (1 run) |
+|---|---|---|---|---|---|
+| attn | 3.954 | 3.952 | 3.954 | 0.05 % | 23.367 |
+| ssm_scan | 0.687 | 0.687 | 0.692 | 0.7 % | 6.892 |
+| gemm | 11.936 | 11.574 | 12.237 | 5.7 % | 12.626 |
+| other | 0.391 | 0.386 | 0.405 | | 0.417 |
+| total | 16.969 | 16.600 | 17.288 | 4.1 % | 43.302 |
+
+The two new kernels hold to a few milliseconds; the GEMM moves 0.66 s and
+carries the whole spread. Across every 32k profile of this lane (champion,
+w1, w2, w3, same GEMM code in all), the GEMM bucket spans 11.57-13.43 s. That
+0.4-1.9 s absolute swing is about 2 % of the champion's 43 s and 4-7 % of w3's
+17 s, which matches the two arms' spreads. So w3's larger relative spread is
+the shared prefill GEMM's run-to-run variance showing through a shorter total,
+not something the new kernels add. Not established: why the GEMM itself varies.
+Its phase draws the most power and package power sits above the 290 W cap in
+many samples, so throughput under the cap's moving average is the first
+suspect; it is untested. The earlier void triple's 15.30 s run and this set's
+15.97 s run are both fast outliers of the same kind.
