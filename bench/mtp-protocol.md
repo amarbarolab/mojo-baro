@@ -392,3 +392,26 @@ trunk: True`, `mtp: drafted/accepted`, `tok/s_gen`.
 **Falsifier.** k=2 gain under +1%, or acceptance down more than 5 points: the
 subset from this corpus does not pay on this model, and the change stays off by
 default. Claim rule: default-on only if P-FR1 holds and both P-FR2 and P-FR3 hold.
+
+### Result FR-Spec (2026-09-11, engine `.work/engine-fr` from this commit's tree)
+
+Pack `.work/engine-pack-q4-fr` (`tools/fr-draft.mojo`, checked by
+`tools/test_fr_draft.py`: trunk identical, 62080 rows byte-exact). Ids
+`.work/fr-ids.txt` sha256 `c99eb697bfa63080`..., corpus 720,004 tokens with only
+20,808 distinct ids, so 41,272 of the 62,080 rows were lowest-id filler.
+Arms in one gpu-wait job: arm A plus B2/B4 (`BARO_FR` unset) then arm A plus
+F2/F4 (`BARO_FR=1`); every B log reads `BARO_FR: False`, every F log
+`BARO_FR: True k 62080`, `pack q4 trunk: True`. Arm A median 137.24 / 137.12.
+
+| | full head | FR head | change | prediction | verdict |
+|---|---|---|---|---|---|
+| identity k=2 / k=4 | 20/20 / 20/20 | 20/20 / 20/20 | | 20/20 (P-FR1) | held |
+| tok/s_gen k=2 (median) | 150.80 | 161.78 | +7.29% (per prompt 1.014 to 1.125) | +3 to +9% (P-FR2) | held |
+| tok/s_gen k=4 (median) | 129.37 | 140.43 | +8.55% (per prompt 0.945 to 1.175) | +5 to +13% (P-FR3) | held |
+| acceptance k=2 | 65.9% | 65.0% | -0.9 pt | >= -3 pt (P-FR4) | held |
+| acceptance k=4 | 47.9% | 46.8% | -1.1 pt | >= -3 pt (P-FR4) | held |
+| corpus coverage by top 62080 | | 100% | | >= 95% (P-FR5) | held, but vacuous: every distinct corpus id fits |
+
+Claim rule met (P-FR1, P-FR2, P-FR3). Not yet default-on: the frequency table
+comes from a small corpus with lowest-id filler; the next round ranks the
+unseen ids by BPE merge order and widens the corpus, then re-runs this A/B.

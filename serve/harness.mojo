@@ -21,15 +21,21 @@ struct Pack(Movable):
     var have_q4_draft: Bool
     var pack_q4: Bool
     var e: Int
+    var fr_off: Int
+    var fr_ids_off: Int
+    var fr_k: Int
 
-    def __init__(out self, var wbuf: DeviceBuffer[DType.uint8], var off: List[Int], total: Int, q4_off: Int, have_q4_draft: Bool, pack_q4: Bool):
+    def __init__(out self, var wbuf: DeviceBuffer[DType.uint8], var off: List[Int], total: Int, q4_off: Int, have_q4_draft: Bool, pack_q4: Bool, fr_off: Int = 0, fr_ids_off: Int = 0, fr_k: Int = 0):
         self.wbuf = wbuf^
         self.off = off^
         self.total = total
         self.q4_off = q4_off
         self.have_q4_draft = have_q4_draft
         self.pack_q4 = pack_q4
-        self.e = len(self.off) - (1 if have_q4_draft else 0) - 15
+        self.fr_off = fr_off
+        self.fr_ids_off = fr_ids_off
+        self.fr_k = fr_k
+        self.e = len(self.off) - (1 if have_q4_draft else 0) - (2 if fr_k > 0 else 0) - 15
 
 
 def load_pack(ctx: DeviceContext, packdir: String) raises -> Pack:
@@ -40,6 +46,9 @@ def load_pack(ctx: DeviceContext, packdir: String) raises -> Pack:
     var q4_off = 0
     var have_q4_draft = False
     var pack_q4 = False
+    var fr_off = 0
+    var fr_ids_off = 0
+    var fr_k = 0
     with open(packdir + "/index.txt", "r") as f:
         for line in f.read().splitlines():
             var parts = line.split(" ")
@@ -55,7 +64,10 @@ def load_pack(ctx: DeviceContext, packdir: String) raises -> Pack:
             elif dt == "q8":
                 total += n + (n // 32) * 2
             elif dt == "q4":
-                if String(parts[0]) == "output.weight.q4draft":
+                if String(parts[0]) == "output.weight.frdraft":
+                    # trailing entry (tools/fr-draft.mojo): FR-Spec reduced draft head
+                    fr_off = Int(parts[2])
+                elif String(parts[0]) == "output.weight.q4draft":
                     # trailing entry (tools/engine-pack.py --q4-draft): the draft
                     # head's own q4 copy of output.weight, appended after the
                     # trunk order -- excluded from the blk.32 index math below.
@@ -65,6 +77,10 @@ def load_pack(ctx: DeviceContext, packdir: String) raises -> Pack:
                     # --q4 pack: every 2D trunk weight is ggml Q4_0
                     pack_q4 = True
                 total += n // 2 + (n // 32) * 2
+            elif dt == "i32" and String(parts[0]) == "frdraft.ids":
+                fr_ids_off = Int(parts[2])
+                fr_k = n
+                total += n * 4
             else:
                 raise Error("unknown pack dtype " + dt)
 
@@ -116,7 +132,7 @@ def load_pack(ctx: DeviceContext, packdir: String) raises -> Pack:
             flip = not flip
     ctx.synchronize()
     print("pack loaded in", Float64(perf_counter_ns() - t_load) / 1e9, "s")
-    return Pack(wbuf^, off^, total, q4_off, have_q4_draft, pack_q4)
+    return Pack(wbuf^, off^, total, q4_off, have_q4_draft, pack_q4, fr_off, fr_ids_off, fr_k)
 
 
 def alloc_bufs(ctx: DeviceContext, pack: Pack, tmax: Int) raises -> WindowBufs:

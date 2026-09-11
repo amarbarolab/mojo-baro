@@ -3,7 +3,7 @@ from max.gpu.host import DeviceContext, DeviceBuffer
 from layout import TileTensor, TensorLayout, row_major
 
 from elementwise import (
-    amar_rmsnorm, amar_rmsnorm_cast, amar_embed_lookup_pos, amar_argmax_pos, amar_tok_copy,
+    amar_rmsnorm, amar_rmsnorm_cast, amar_embed_lookup_pos, amar_argmax_pos, amar_tok_copy, amar_tok_remap,
     amar_quantize_q8_rows,
 )
 from matmul_skinny import (
@@ -188,6 +188,8 @@ comptime cast_m = amar_cast_bf16[type_of(xflat_layout), type_of(xflat_layout)]
 comptime cast_1 = amar_cast_bf16[type_of(h_layout), type_of(h_layout)]
 comptime tokcp_k = amar_tok_copy[type_of(dtok_layout), type_of(toks_layout)]
 comptime tokcp_b = amar_tok_copy[type_of(toks_layout), type_of(dtok_layout)]
+comptime frmap_layout = row_major[VOCAB]()
+comptime remap_d = amar_tok_remap[type_of(frmap_layout), type_of(dtok_layout)]
 comptime r_qf = amar_skinny_reduce[type_of(p_qf), type_of(qfm_layout), 1]
 comptime r_h = amar_skinny_reduce[type_of(p_h), type_of(xm_layout), 1]
 comptime r_kv = amar_skinny_reduce[type_of(p_kv), type_of(kvm_flat), 1]

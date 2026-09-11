@@ -27,6 +27,7 @@ must be reachable from `serve/registry.mojo`, a bench, or a test.
 | `amar_softmax_rows` | `elementwise.mojo` | `XLayout: TensorLayout` |  | kernels/test_elementwise.mojo |
 | `amar_swiglu` | `elementwise.mojo` | `GLayout: TensorLayout, ULayout: TensorLayout, OLayout: TensorLayout` |  | kernels/test_elementwise.mojo, kernels/test_q8_gemm.mojo |
 | `amar_tok_copy` | `elementwise.mojo` | `SLayout: TensorLayout, DLayout: TensorLayout` | tokcp_k, tokcp_b | serve/registry.mojo, bench/mspec_gaps.mojo |
+| `amar_tok_remap` | `elementwise.mojo` | `MLayout: TensorLayout, DLayout: TensorLayout` | remap_d | serve/registry.mojo |
 | `amar_matmul_naive` | `matmul.mojo` | `ALayout: TensorLayout, BLayout: TensorLayout, CLayout: TensorLayout` |  | bench/bench.mojo |
 | `amar_matmul_regtile` | `matmul.mojo` | `ALayout: TensorLayout, BLayout: TensorLayout, CLayout: TensorLayout` |  | bench/bench.mojo |
 | `amar_matmul_tiled` | `matmul.mojo` | `ALayout: TensorLayout, BLayout: TensorLayout, CLayout: TensorLayout` |  | bench/bench.mojo |

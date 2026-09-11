@@ -92,6 +92,18 @@ def tens_q4q[
     return rebind[TileTensor[DType.uint8, LT, MutAnyOrigin]](t)
 
 
+def tens_i32[
+    LT: TensorLayout
+](
+    ctx: DeviceContext, wbuf: DeviceBuffer[DType.uint8], o: Int, n: Int, lt: LT
+) -> TileTensor[DType.int32, LT, MutAnyOrigin]:
+    var b = DeviceBuffer[DType.int32](
+        ctx, (wbuf.unsafe_ptr() + o).unsafe_bitcast[Scalar[DType.int32]](), n, owning=False
+    )
+    var t = TileTensor(b, lt)
+    return rebind[TileTensor[DType.int32, LT, MutAnyOrigin]](t)
+
+
 def tens_q4s[
     LT: TensorLayout
 ](
@@ -147,7 +159,7 @@ def blk32_forward(
     mut hd_d: DeviceBuffer[f32], mut kc32_d: DeviceBuffer[KVT], mut vc32_d: DeviceBuffer[KVT],
     mut toks_d: DeviceBuffer[DType.int32], mut dtok_d: DeviceBuffer[DType.int32],
     prof3: Bool, mut p3: List[Int],
-    draft_q4: Bool, q4_off: Int, pack_q4: Bool,
+    draft_q4: Bool, q4_off: Int, pack_q4: Bool, fr_k: Int = 0, fr_off: Int = 0, fr_ids_off: Int = 0,
 ) raises:
     # blk.32 (NextN) draft head over m rows: row r is token Toks[tok_pos + r]
     # at sequence position pos + r, paired with hidden row r of hsrc
@@ -260,7 +272,13 @@ def blk32_forward(
     if do_head:
         ctx.enqueue_function[rmsc_k](Xm, SharedHeadNorm, CurBm, Int32(H), Float32(1e-6), grid_dim=m, block_dim=256)
         var Pv = TileTensor(p_v_d, p_v)
-        if draft_q4:
+        var nv = VOCAB
+        if fr_k > 0:
+            nv = fr_k
+            var Wfrq = tens_q4q(ctx, wbuf, fr_off, H * fr_k, q4_h_v)
+            var Wfrs = tens_q4s(ctx, wbuf, fr_off, H * fr_k, s_h_v)
+            gemm_q4(ctx, CurBm, Wfrq, Wfrs, Pv, m, fr_k, H)
+        elif draft_q4:
             var Wheadq4 = tens_q4q(ctx, wbuf, q4_off, H * VOCAB, q4_h_v)
             var Wheads4 = tens_q4s(ctx, wbuf, q4_off, H * VOCAB, s_h_v)
             gemm_q4(ctx, CurBm, Wheadq4, Wheads4, Pv, m, VOCAB, H)
@@ -268,13 +286,15 @@ def blk32_forward(
             var Wheadq = tens_q8q(ctx, wbuf, off[e - 1], H * VOCAB, q_h_v)
             var Wheads = tens_q8s(ctx, wbuf, off[e - 1], H * VOCAB, s_h_v)
             gemm_w[VOCAB, H](ctx, CurBm, wbuf, off[e - 1], pack_q4, Pv, m)
-        ctx.enqueue_function[r_head](Pv, Logitsm, Int32(m), Int32(VOCAB), grid_dim=ceildiv(m * VOCAB, 256), block_dim=256)
+        ctx.enqueue_function[r_head](Pv, Logitsm, Int32(m), Int32(nv), grid_dim=ceildiv(m * nv, 256), block_dim=256)
         if prof3:
             ctx.synchronize()
             var now4 = perf_counter_ns()
             p3[1] += Int(now4 - t3)
             t3 = now4
-        ctx.enqueue_function[argmax_d](Logitsm, Dtok, Int32(VOCAB), Int32(0), grid_dim=m, block_dim=256)
+        ctx.enqueue_function[argmax_d](Logitsm, Dtok, Int32(nv), Int32(0), grid_dim=m, block_dim=256)
+        if fr_k > 0:
+            ctx.enqueue_function[remap_d](tens_i32(ctx, wbuf, fr_ids_off, fr_k, frmap_layout), Dtok, Int32(m), grid_dim=1, block_dim=32)
         if prof3:
             ctx.synchronize()
             p3[2] += Int(perf_counter_ns() - t3)
@@ -518,6 +538,9 @@ struct WindowCfg(Copyable, Movable):
     var pack_q4: Bool
     var draft_q4: Bool
     var q4_off: Int
+    var fr_k: Int
+    var fr_off: Int
+    var fr_ids_off: Int
     var e: Int
     var kcfg: Int
     var spec: Bool
@@ -622,7 +645,7 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
             blk32_forward(ctx, b.wbuf, b.off, cfg.e, nproc, st.pos_prev + 1, st.pos_prev + 1, True, hn_rows,
                 b.x_d, b.curb_d, b.qf_d, b.q_d, b.k_d, b.v_d, b.gate_d, b.ao_d, b.resb_d, b.fgb_d, b.p_qf_d, b.p_kv_d, b.p_h_d,
                 b.p_ffn_d, b.p_ffn2_d, b.p_v_d, b.logits_d, b.cc_d, b.de_d, b.hd_d, b.kc32_d, b.vc32_d, b.toks_d, b.dtok_d,
-                cfg.pf3, st.p3, cfg.draft_q4, cfg.q4_off, cfg.pack_q4)
+                cfg.pf3, st.p3, cfg.draft_q4, cfg.q4_off, cfg.pack_q4, cfg.fr_k, cfg.fr_off, cfg.fr_ids_off)
             var Dtok = TileTensor(b.dtok_d, dtok_layout)
             ctx.enqueue_function[tokcp_k](Dtok, Toks, Int32(nproc - 1), Int32(st.pos + 1), Int32(1), grid_dim=1, block_dim=32)
             m = min(cfg.kcfg + 1, cfg.n_total - 1 - st.pos)
@@ -636,7 +659,7 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                 blk32_forward(ctx, b.wbuf, b.off, cfg.e, 1, st.pos + j, st.pos + j, True, hd_row,
                     b.x_d, b.curb_d, b.qf_d, b.q_d, b.k_d, b.v_d, b.gate_d, b.ao_d, b.resb_d, b.fgb_d, b.p_qf_d, b.p_kv_d, b.p_h_d,
                     b.p_ffn_d, b.p_ffn2_d, b.p_v_d, b.logits_d, b.cc_d, b.de_d, b.hd_d, b.kc32_d, b.vc32_d, b.toks_d, b.dtok_d,
-                    cfg.pf3, st.p3, cfg.draft_q4, cfg.q4_off, cfg.pack_q4)
+                    cfg.pf3, st.p3, cfg.draft_q4, cfg.q4_off, cfg.pack_q4, cfg.fr_k, cfg.fr_off, cfg.fr_ids_off)
                 ctx.enqueue_function[tokcp_k](Dtok, Toks, Int32(0), Int32(st.pos + j + 1), Int32(1), grid_dim=1, block_dim=32)
                 hrow = 0
             st.n_drafted += m - 1

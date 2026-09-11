@@ -315,7 +315,7 @@ def main() raises:
             pack_q4=pack_q4, draft_q4=False, q4_off=q4_off, e=e, kcfg=2,
             spec=False, spec_dbg=False, serve=False, req_id=0, prof=False, pf2=False, pf3=False, pf4=False,
             dump=False, mega=True, att_split=TMAX, mega_win=False, dot3=False, pf_chunk=1024,
-            pf_rows=0, pf_tail=0, n_total=plen, n_prompt=plen,
+            pf_rows=0, pf_tail=0, n_total=plen, fr_k=0, fr_off=0, fr_ids_off=0, n_prompt=plen,
         )
         wst.reset(perf_counter_ns())
         while wst.pos < plen:

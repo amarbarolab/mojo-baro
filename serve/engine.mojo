@@ -296,6 +296,10 @@ def main() raises:
     var e = pack.e
     var draft_q4 = getenv("BARO_DRAFT_Q4", "0") == "1" and have_q4_draft
     print("BARO_DRAFT_Q4:", draft_q4)
+    var fr_k = pack.fr_k if getenv("BARO_FR", "0") == "1" else 0
+    var fr_off = pack.fr_off
+    var fr_ids_off = pack.fr_ids_off
+    print("BARO_FR:", fr_k > 0, "k", fr_k)
     var dot3 = getenv("BARO_DOT", "0") == "1" and not pack_q4
     print("BARO_DOT:", dot3)
     print("pack q4 trunk:", pack_q4)
@@ -517,7 +521,7 @@ def main() raises:
         # stage sum exceeds the unsynchronized sub-block time; compare stages
         # within an arm and the same stage across m, never add these into a budget.
         var pf4 = getenv("BARO_PROFILE", "0") == "4"
-        var cfg = WindowCfg(pack_q4=pack_q4, draft_q4=draft_q4, q4_off=q4_off, e=e, kcfg=kcfg, spec=spec, spec_dbg=spec_dbg, serve=serve, req_id=req_id, prof=prof, pf2=pf2, pf3=pf3, pf4=pf4, dump=dump, mega=mega, att_split=att_split, mega_win=mega_win, dot3=dot3, pf_chunk=pf_chunk, pf_rows=pf_rows, pf_tail=pf_tail, n_total=n_total, n_prompt=len(prompt))
+        var cfg = WindowCfg(pack_q4=pack_q4, draft_q4=draft_q4, q4_off=q4_off, e=e, kcfg=kcfg, spec=spec, spec_dbg=spec_dbg, serve=serve, req_id=req_id, prof=prof, pf2=pf2, pf3=pf3, pf4=pf4, dump=dump, mega=mega, att_split=att_split, mega_win=mega_win, dot3=dot3, pf_chunk=pf_chunk, pf_rows=pf_rows, pf_tail=pf_tail, n_total=n_total, fr_k=fr_k, fr_off=fr_off, fr_ids_off=fr_ids_off, n_prompt=len(prompt))
         if len(force) > 0 and cfg.spec:
             raise Error("BARO_FORCE requires BARO_SPEC=0 (teacher forcing is a no-spec identity gate)")
         wst.reset(t0)

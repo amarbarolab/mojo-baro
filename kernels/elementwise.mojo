@@ -352,6 +352,21 @@ def amar_tok_copy[
     Dst[Int(di) + i] = rebind[Dst.ElementType](Src[Int(si) + i])
 
 
+def amar_tok_remap[
+    MLayout: TensorLayout, DLayout: TensorLayout
+](
+    Map: TileTensor[DType.int32, MLayout, MutAnyOrigin],
+    Dtok: TileTensor[DType.int32, DLayout, MutAnyOrigin],
+    n: Int32,
+):
+    comptime assert Map.flat_rank == 1 and Dtok.flat_rank == 1
+    var i = global_idx.x
+    if i >= Int(n):
+        return
+    var j = Int(rebind[Scalar[DType.int32]](Dtok[i]))
+    Dtok[i] = rebind[Dtok.ElementType](Map[j])
+
+
 def amar_quantize_q8_rows[
     ALayout: TensorLayout, QLayout: TensorLayout, SLayout: TensorLayout
 ](
