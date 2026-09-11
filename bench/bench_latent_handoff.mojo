@@ -32,6 +32,7 @@ from realign import realign_expected_embedding, final_norm_hidden
 from tokenizer import Tokenizer
 from prefix import Chain, prefix_hash
 from latent import mint_kv_latent, ingest_kv_latent, mint_chain_slot, ingest_into_chain
+from e13_projector import load_projector, apply_projector_k
 
 from grammar.automaton import Automaton
 from grammar.json_value import parse_json_file, parse_json_bytes, JSONDoc, JSONValue, JKindNull, JKindBool, JKindString, JKindNumber, JKindArray, JKindObject
@@ -810,6 +811,62 @@ def main() raises:
                     var t0b = perf_counter_ns()
                     var cfgB = run_to_prompt_end(ctx, bufsB, wstB, pack_q4, q4_off, eB, tokens, tmax)
                     apply_latent_to_receiver(ctx, bufsB, cfgB, wstB, latent_hA, k)
+                    append_known_tokens(ctx, bufsB, wstB, pack_q4, q4_off, eB, hand_ids, tmax)
+                    if nothink:
+                        append_known_tokens(ctx, bufsB, wstB, pack_q4, q4_off, eB, nothink_ids, tmax)
+                    var start_pos = wstB.pos
+                    var cfg_gen = make_cfg(pack_q4, q4_off, eB, 0, 0, start_pos, start_pos + gen_budget)
+                    while wstB.pos < start_pos + gen_budget - 1:
+                        step_window(ctx, bufsB, cfg_gen, wstB)
+                    ctx.synchronize()
+                    var receiver_s = Float64(perf_counter_ns() - t0b) / 1e9
+                    var gen_ids = read_toks(ctx, bufsB, start_pos, start_pos + gen_budget, tmax)
+                    var ans_ids = trim_at_stop(gen_ids, stops)
+                    var text = tok.decode(ans_ids)
+                    var sv = -1
+                    var scored = String("")
+                    if task_type == "json":
+                        scored = strip_for_json(text)
+                        sv = 1 if check_schema_valid(schema_file, scored, vp, tp) else 0
+                    else:
+                        scored = strip_for_math(text)
+                    out += arm_json(arm, producer_s, receiver_s, gen_ids, text, scored, sv, "")
+
+                elif arm == "L8-proj" or arm == "L32-proj":
+                    # E13 (docs/design/latent-os/06-experiments.md): producer
+                    # unchanged from L8-raw; a trained host-side projector
+                    # (e13_projector.mojo, piece 2) maps each raw vector
+                    # before apply_latent_to_receiver. BARO_E13_PROJ_K8 /
+                    # BARO_E13_PROJ_K32 name the trained weights file
+                    # (e13_projector.mojo's format); there is no built-in
+                    # fallback -- an untrained/missing path is a hard error,
+                    # never a silent downgrade to raw.
+                    var k = K32 if arm == "L32-proj" else K8
+                    var proj_path = getenv("BARO_E13_PROJ_K32", "") if arm == "L32-proj" else getenv("BARO_E13_PROJ_K8", "")
+                    if proj_path == "":
+                        raise Error(arm + ": set BARO_E13_PROJ_K8/BARO_E13_PROJ_K32 to a trained projector weights file")
+
+                    var latent_hA = ctx.enqueue_create_host_buffer[f32](k * H)
+                    ctx.synchronize()
+                    var t0a = perf_counter_ns()
+                    var cfgA = run_to_prompt_end(ctx, bufsA, wstA, pack_q4, q4_off, eA, tokens, tmax)
+                    collect_latent_raw(ctx, bufsA, cfgA, wstA, latent_hA, k)
+                    ctx.synchronize()
+
+                    var proj = load_projector(proj_path, H)
+                    var raw_flat = List[Float32](unsafe_uninit_length=k * H)
+                    for s in range(k * H):
+                        raw_flat[s] = latent_hA[s]
+                    var proj_flat = apply_projector_k(proj, raw_flat, k)
+                    var latent_hP = ctx.enqueue_create_host_buffer[f32](k * H)
+                    ctx.synchronize()
+                    for s in range(k * H):
+                        latent_hP[s] = proj_flat[s]
+                    var producer_s = Float64(perf_counter_ns() - t0a) / 1e9
+
+                    var t0b = perf_counter_ns()
+                    var cfgB = run_to_prompt_end(ctx, bufsB, wstB, pack_q4, q4_off, eB, tokens, tmax)
+                    apply_latent_to_receiver(ctx, bufsB, cfgB, wstB, latent_hP, k)
                     append_known_tokens(ctx, bufsB, wstB, pack_q4, q4_off, eB, hand_ids, tmax)
                     if nothink:
                         append_known_tokens(ctx, bufsB, wstB, pack_q4, q4_off, eB, nothink_ids, tmax)
