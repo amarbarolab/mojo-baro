@@ -17,7 +17,7 @@
 #include "ggml-cuda.h"
 
 #define IC_BYTES (96.0 * 1024 * 1024)
-#define MAX_ARMS 64
+#define MAX_ARMS 256
 
 static double now_us(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e6 + t.tv_nsec / 1e3; }
 
