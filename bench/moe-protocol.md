@@ -184,6 +184,7 @@ and the summed output all read from `Pack.wbuf`.
 All four layers pass the frozen `5e-3` bound, and each call includes routed
 and shared experts before summation. Gate 1: PASS. Receipt:
 `.work/moe-w3/gate1.txt`.
+Implementation commit: `142d2c9`.
 
 ## W2: Q4_K expert kernels
 
