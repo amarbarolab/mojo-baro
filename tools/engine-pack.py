@@ -225,7 +225,144 @@ def quantize_tq2_0(w16):
 TERNARY = {"q2b3": quantize_q2_b3, "tq1": quantize_tq1_0, "tq2": quantize_tq2_0}
 
 
+def _read_bf16(f, data_start, infos, name):
+    """Any 2D weight tensor as raw bf16 bytes + its (out, in) shape, regardless
+    of source dtype (bf16/f16/f32 direct, or a K-quant dequantised via gguf-py)."""
+    dims, ttype, toff = infos[name]
+    shape = list(reversed(dims))
+    if ttype not in ge.GGML_BYTES:
+        return dequantize_kquant(f, data_start, toff, ttype, shape), shape
+    tname, esize = ge.GGML_BYTES[ttype]
+    n_elem = int(np.prod(dims))
+    f.seek(data_start + toff)
+    raw = f.read(n_elem * esize)
+    if tname == "bf16":
+        return raw, shape
+    if tname == "f16":
+        w32 = np.frombuffer(raw, dtype=np.float16).astype(np.float32).reshape(shape)
+        return f32_to_bf16(w32).tobytes(), shape
+    if tname == "f32":
+        w32 = np.frombuffer(raw, dtype=np.float32).reshape(shape)
+        return f32_to_bf16(w32).tobytes(), shape
+    raise SystemExit(f"{name}: unsupported dtype {tname}")
+
+
+def _read_f32(f, data_start, infos, name):
+    """Any tensor as raw f32 bytes at full available precision (a K-quant
+    source goes through gguf-py's dequantizer directly, not a bf16 round trip,
+    so token_embd keeps native precision the way tools/spark-pack.py does)."""
+    dims, ttype, toff = infos[name]
+    shape = list(reversed(dims))
+    n_elem = int(np.prod(dims))
+    if ttype in ge.GGML_BYTES:
+        tname, esize = ge.GGML_BYTES[ttype]
+        f.seek(data_start + toff)
+        raw = f.read(n_elem * esize)
+        if tname == "f32":
+            return raw
+        if tname == "bf16":
+            return bf16_to_f32(np.frombuffer(raw, dtype=np.uint16)).astype(np.float32).tobytes()
+        if tname == "f16":
+            return np.frombuffer(raw, dtype=np.float16).astype(np.float32).tobytes()
+        raise SystemExit(f"{name}: unsupported dtype {tname}")
+    qtype = GGMLQuantizationType(ttype)
+    block, tsize = GGML_QUANT_SIZES[qtype]
+    assert n_elem % block == 0, (name, shape, block)
+    f.seek(data_start + toff)
+    raw_q = np.frombuffer(f.read(n_elem // block * tsize), dtype=np.uint8)
+    return gguf_dequantize(raw_q, qtype).reshape(shape).astype(np.float32).tobytes()
+
+
+def pack_dense(model, outdir):
+    """Pack a plain dense transformer (llama/qwen2/granite arch: separate Q/K/V
+    weights, no per-head output gate) into the pack format serve/spark.mojo
+    reads for a QKV_BIAS/HAS_GATE=False profile: attn_norm f32, attn_qkv q8
+    (Q/K/V weights concatenated along the output axis and quantised together,
+    ggml-style so the fused GEMM's row order is [Q rows][K rows][V rows]),
+    optional attn_qkv.bias f32 (concatenated the same way), attn_output q8,
+    ffn_norm f32, ffn_gate/ffn_up/ffn_down q8. token_embd is exact f32 (no
+    bf16 rounding, matching tools/spark-pack.py); output.weight is the tied
+    token_embd re-quantised to q8 when the GGUF has no separate output tensor
+    (tools/gen-profile.mojo's TIE_EMBED), else that tensor quantised directly.
+
+    Spark2_5's own per-head attention gate has no analogue here -- this mode
+    is for the recipes that don't have one; use tools/spark-pack.py for that.
+    """
+    f, infos, data_start, kv = ge.parse(model)
+    arch = kv["general.architecture"]
+    n_layers = kv[f"{arch}.block_count"]
+    has_bias = "blk.0.attn_q.bias" in infos
+    if "blk.0.attn_gate.weight" in infos:
+        raise SystemExit(f"{arch}: has a per-head attention gate, use tools/spark-pack.py instead")
+    tied = "output.weight" not in infos
+
+    outdir.mkdir(parents=True, exist_ok=True)
+    idx_lines = []
+    off = 0
+    with open(outdir / "pack.bin", "wb") as out:
+        def emit(name, raw, dt, n_elem):
+            nonlocal off
+            out.write(raw)
+            idx_lines.append(f"{name} {dt} {off} {n_elem}")
+            off += len(raw)
+
+        emit("token_embd.weight", _read_f32(f, data_start, infos, "token_embd.weight"), "f32",
+             int(np.prod(infos["token_embd.weight"][0])))
+
+        for i in range(n_layers):
+            b = f"blk.{i}."
+            emit(b + "attn_norm.weight", _read_f32(f, data_start, infos, b + "attn_norm.weight"),
+                 "f32", int(np.prod(infos[b + "attn_norm.weight"][0])))
+
+            qw, qsh = _read_bf16(f, data_start, infos, b + "attn_q.weight")
+            kw, ksh = _read_bf16(f, data_start, infos, b + "attn_k.weight")
+            vw, vsh = _read_bf16(f, data_start, infos, b + "attn_v.weight")
+            qkv = np.concatenate([
+                np.frombuffer(qw, dtype=np.uint16).reshape(qsh),
+                np.frombuffer(kw, dtype=np.uint16).reshape(ksh),
+                np.frombuffer(vw, dtype=np.uint16).reshape(vsh),
+            ], axis=0)
+            q, d = quantize_q8_0(qkv)
+            emit(b + "attn_qkv.weight", q.tobytes() + d.tobytes(), "q8", qkv.size)
+
+            if has_bias:
+                qb = np.frombuffer(_read_f32(f, data_start, infos, b + "attn_q.bias"), dtype=np.float32)
+                kb = np.frombuffer(_read_f32(f, data_start, infos, b + "attn_k.bias"), dtype=np.float32)
+                vb = np.frombuffer(_read_f32(f, data_start, infos, b + "attn_v.bias"), dtype=np.float32)
+                bias = np.concatenate([qb, kb, vb])
+                emit(b + "attn_qkv.bias", bias.astype(np.float32).tobytes(), "f32", bias.size)
+
+            ow, osh = _read_bf16(f, data_start, infos, b + "attn_output.weight")
+            q, d = quantize_q8_0(np.frombuffer(ow, dtype=np.uint16).reshape(osh))
+            emit(b + "attn_output.weight", q.tobytes() + d.tobytes(), "q8", osh[0] * osh[1])
+
+            emit(b + "ffn_norm.weight", _read_f32(f, data_start, infos, b + "ffn_norm.weight"),
+                 "f32", int(np.prod(infos[b + "ffn_norm.weight"][0])))
+
+            for part in ("ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"):
+                w, sh = _read_bf16(f, data_start, infos, b + part)
+                q, d = quantize_q8_0(np.frombuffer(w, dtype=np.uint16).reshape(sh))
+                emit(b + part, q.tobytes() + d.tobytes(), "q8", sh[0] * sh[1])
+
+        emit("output_norm.weight", _read_f32(f, data_start, infos, "output_norm.weight"),
+             "f32", int(np.prod(infos["output_norm.weight"][0])))
+
+        if tied:
+            ow, osh = _read_bf16(f, data_start, infos, "token_embd.weight")
+        else:
+            ow, osh = _read_bf16(f, data_start, infos, "output.weight")
+        q, d = quantize_q8_0(np.frombuffer(ow, dtype=np.uint16).reshape(osh))
+        emit("output.weight", q.tobytes() + d.tobytes(), "q8", osh[0] * osh[1])
+
+    (outdir / "index.txt").write_text("\n".join(idx_lines) + "\n")
+    print(f"packed {arch}, {n_layers} layers, bias={has_bias}, tied={tied}, {off/2**30:.2f} GiB")
+
+
 def main():
+    if "--dense" in sys.argv:
+        sys.argv.remove("--dense")
+        pack_dense(Path(sys.argv[1]), Path(sys.argv[2]))
+        return
     q8 = "--q8" in sys.argv
     if q8:
         sys.argv.remove("--q8")
