@@ -354,6 +354,32 @@ def main() raises:
     var spec_env = getenv("BARO_SPEC", "0") == "1"
     print("BARO_SPEC:", spec_env)
     var spec_dbg = getenv("BARO_SPEC_DBG", "0") == "1"
+    # Teacher-forced agreement (identity gate, CLAUDE.md: never greedy equality
+    # past ~256 ids). Off by default (empty path -> empty list, decode
+    # unchanged): the model's own no-spec argmax is recorded as "predicted"
+    # and the reference id is force-fed into the next step's context
+    # regardless of what the model chose, same file format and semantics as
+    # serve/spark.mojo:260-261.
+    var force = List[Int]()
+    var force_path = getenv("BARO_FORCE", "")
+    if force_path != "":
+        with open(force_path, "r") as ff:
+            var fdata = ff.read_bytes()
+            var fval = 0
+            var fhave = False
+            for i in range(len(fdata)):
+                var fb = Int(fdata[i])
+                if fb >= 48 and fb <= 57:
+                    fval = fval * 10 + (fb - 48)
+                    fhave = True
+                else:
+                    if fhave:
+                        force.append(fval)
+                    fval = 0
+                    fhave = False
+            if fhave:
+                force.append(fval)
+        print("BARO_FORCE:", force_path, " (", len(force), "ids )")
     var bufs = alloc_bufs(ctx, pack, tmax)
     var toks_d = bufs.toks_d
 
@@ -492,15 +518,20 @@ def main() raises:
         # within an arm and the same stage across m, never add these into a budget.
         var pf4 = getenv("BARO_PROFILE", "0") == "4"
         var cfg = WindowCfg(pack_q4=pack_q4, draft_q4=draft_q4, q4_off=q4_off, e=e, kcfg=kcfg, spec=spec, spec_dbg=spec_dbg, serve=serve, req_id=req_id, prof=prof, pf2=pf2, pf3=pf3, pf4=pf4, dump=dump, mega=mega, att_split=att_split, mega_win=mega_win, dot3=dot3, pf_chunk=pf_chunk, pf_rows=pf_rows, pf_tail=pf_tail, n_total=n_total, n_prompt=len(prompt))
+        if len(force) > 0 and cfg.spec:
+            raise Error("BARO_FORCE requires BARO_SPEC=0 (teacher forcing is a no-spec identity gate)")
         wst.reset(t0)
         wst.pos = cached
         wst.pos_prev = cached
         var prefill_done = False
         var cancelled = False
         var stopped = False
+        var predicted = List[Int]()
+        var force_tok_h = ctx.enqueue_create_host_buffer[DType.int32](1)
         # The stopwatch stays here, in the harness that is never embedded in a
         # gguf: step_window cannot reach t0, t_prefill_end or dt (P-A, 2026-09-08).
         while wst.pos < n_total - 1:
+            var pos_before = wst.pos
             if len(ckpt_hints) > 0 and wst.pos < pf_rows:
                 # A hint may fall inside what would otherwise be one big
                 # prefill chunk; cap this call's chunk so wst.pos actually
@@ -510,6 +541,17 @@ def main() raises:
                 step_window(ctx, bufs, step_cfg, wst)
             else:
                 step_window(ctx, bufs, cfg, wst)
+            if len(force) > 0 and pos_before >= len(prompt) - 1:
+                if wst.pos != pos_before + 1:
+                    raise Error("BARO_FORCE: step advanced by more than one position (spec/prefill batching) -- void arm")
+                var fi = pos_before - (len(prompt) - 1)
+                if fi < len(force):
+                    ctx.enqueue_copy(dst_buf=force_tok_h, src_buf=DeviceBuffer[DType.int32](ctx, toks_d.unsafe_ptr() + wst.pos, 1, owning=False))
+                    ctx.synchronize()
+                    predicted.append(Int(force_tok_h[0]))
+                    force_tok_h[0] = Int32(force[fi])
+                    ctx.enqueue_copy(dst_buf=DeviceBuffer[DType.int32](ctx, toks_d.unsafe_ptr() + wst.pos, 1, owning=False), src_buf=force_tok_h)
+                    ctx.synchronize()
             if ckpt_cap > 0 and wst.pos > cached and wst.pos < len(prompt):
                 if wst.pos == len(prompt) - 1 or wst.pos % CKPT_PERIOD == 0:
                     chain.save(ctx, bufs.convstate_d, bufs.sstate_d, wst.ring, wst.pos, prompt, False, False)
@@ -666,6 +708,16 @@ def main() raises:
         for i in range(len(generated)):
             line += String(generated[i]) + " "
         print("GENERATED:", line)
+        if len(force) > 0:
+            var ps = String("")
+            var agree = 0
+            var checked = min(len(predicted), len(force))
+            for i in range(len(predicted)):
+                ps += String(predicted[i]) + " "
+                if i < len(force) and predicted[i] == force[i]:
+                    agree += 1
+            print("predicted:", ps)
+            print("forced agreement:", agree, "/", checked)
         if spec:
             print("mtp: drafted", wst.n_drafted, " accepted", wst.n_accepted, " k", kcfg)
         if serve:
