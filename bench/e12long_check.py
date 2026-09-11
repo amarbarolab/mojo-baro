@@ -4,6 +4,7 @@
 usage: bench/e12long_check.py TASKS.json RAW1.raw.json [RAW2.raw.json ...]
 """
 import json
+import math
 import statistics
 import sys
 
@@ -17,6 +18,7 @@ def main():
     for raw in sys.argv[2:]:
         rows += json.load(open(raw))["items"]
     ok = {"T": 0, "KV": 0}
+    b = c = 0  # discordant: KV right and T wrong / T right and KV wrong
     bad = []
     rT, rK, mi = [], [], []
     for it in rows:
@@ -26,6 +28,8 @@ def main():
         sK = e8_score.score_arm(tasks[it["id"]], k)[0]
         ok["T"] += sT
         ok["KV"] += sK
+        b += sK and not sT
+        c += sT and not sK
         hash_eq = t["handoff_hash"] == k["handoff_hash"]
         ids_eq = t["generated_ids"] == k["generated_ids"]
         if not (hash_eq and ids_eq) or sT != sK:
@@ -40,6 +44,17 @@ def main():
     print(f"n={n}  T {ok['T']}/{n}  KV {ok['KV']}/{n}  "
           f"median recv T {statistics.median(rT):.2f} s KV {statistics.median(rK):.2f} s  "
           f"median mint+ingest {statistics.median(mi):.0f} ms  mismatched: {bad or 'none'}")
+    # E12 paired Wald CI on KV - T (06-experiments.md, E12 and E12-long thresholds).
+    d = (b - c) / n
+    se = math.sqrt((b + c) - (b - c) ** 2 / n) / n
+    lo, hi = 100 * (d - 1.645 * se), 100 * (d + 1.645 * se)
+
+    def pp(x):
+        return ("-" if x < 0 else "+") + f"{abs(x):.1f}"
+
+    inside = "yes" if lo > -5 and hi < 5 else "no"
+    print(f"gate: n={n} b={b} c={c} d={pp(100 * d)} pp  90% CI [{pp(lo)}, {pp(hi)}] pp  "
+          f"inside +/-5 pp: {inside}")
 
 
 if __name__ == "__main__":

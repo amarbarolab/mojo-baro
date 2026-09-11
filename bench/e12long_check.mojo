@@ -5,6 +5,7 @@
 # build: ./.venv/bin/mojo build bench/e12long_check.mojo -I . -o .work/e12long_check
 # usage: .work/e12long_check TASKS.json RAW1.raw.json [RAW2.raw.json ...]
 
+from std.math import sqrt
 from std.sys import argv
 
 from grammar.json_value import JSONDoc, parse_json_file
@@ -93,6 +94,8 @@ def main() raises:
 
     var ok_t = 0
     var ok_k = 0
+    var disc_b = 0  # KV right, T wrong
+    var disc_c = 0  # T right, KV wrong
     var n = 0
     var bad = List[String]()
     var r_t = List[Float64]()
@@ -130,6 +133,10 @@ def main() raises:
                 ok_t += 1
             if s_k:
                 ok_k += 1
+            if s_k and not s_t:
+                disc_b += 1
+            if s_t and not s_k:
+                disc_c += 1
             var hash_eq = field_str(raw, t, "handoff_hash") == field_str(raw, k, "handoff_hash")
             var ids_eq = same_int_array(
                 raw, raw.get_field(t, "generated_ids"), raw, raw.get_field(k, "generated_ids")
@@ -164,3 +171,18 @@ def main() raises:
         "  median mint+ingest ", fixed(median(mi^), 0), " ms  mismatched: ", bad_s,
         sep="",
     )
+    # E12 paired Wald CI on KV - T (06-experiments.md, E12 and E12-long thresholds).
+    var nf = Float64(n)
+    var d = Float64(disc_b - disc_c) / nf
+    var se = sqrt(Float64(disc_b + disc_c) - Float64((disc_b - disc_c) * (disc_b - disc_c)) / nf) / nf
+    var lo = 100.0 * (d - 1.645 * se)
+    var hi = 100.0 * (d + 1.645 * se)
+    print(
+        "gate: n=", n, " b=", disc_b, " c=", disc_c, " d=", pp(100.0 * d), " pp  90% CI [",
+        pp(lo), ", ", pp(hi), "] pp  inside +/-5 pp: ", "yes" if lo > -5.0 and hi < 5.0 else "no",
+        sep="",
+    )
+
+
+def pp(x: Float64) -> String:
+    return ("-" if x < 0.0 else "+") + fixed(abs(x), 1)
