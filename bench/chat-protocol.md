@@ -880,3 +880,32 @@ the general path.
   further change.
 
 **Gate.** As KSAMP, plus P-K7; P-K8 recorded against its bands.
+
+**Result, KSAMP-b build (2026-09-11, `.work/KSAMP-b-run.txt`, queue empty
+before the run).** P-K1 to P-K5 unchanged and PASS (identical chi-square
+numbers: the noise is keyed by element index, so the first build's draws
+reproduce). P-K7 PASS: fast path and forced general path (`CAP = 16`)
+agree on 10,000/10,000 tokens for all six P-K3 configurations and both
+P-K5 draw sets, probabilities bit-equal (the final pass is shared).
+
+P-K8, per call at V = 248320:
+
+| row | arm | measured | band |
+|---|---|---|---|
+| gaussian | greedy | 9.3 us | 6-12, **held** |
+| gaussian | T0.7/k20/p0.8 | 120.0 us | 25-60, missed |
+| gaussian | T0.8/k40/p0.95/min-p 0.05 | 121.3 us | 25-60, missed |
+| gaussian | plain T1 | 125.7 us | 60-120, missed |
+| gaussian | k off/p 0.95 (general path) | 422.4 us | none |
+| peaked | T0.7/k20/p0.8 | 552.2 us | 25-60, missed |
+| peaked | T0.8/k40/p0.95/min-p 0.05 | 664.9 us | 25-60, missed |
+| peaked | k off/p 0.95 | 137.7 us | 25-60, missed |
+| gaussian | `amar_argmax_row` (reference) | 129.5 us | - |
+
+The falsifier did not fire (greedy 9.3 us: a vectorised pass is cheap).
+Two misses are design facts, read off the arms: on the peaked row the
+20th token sits in the bulk, 12+ nats below `lmax`, beyond the widest
+8-nat window, so k20/k40 fall back to the general path (552/665 us); the
+Gaussian presets take the fast path yet cost 120 us, which the pass count
+(four vectorised passes at ~9 us) does not explain. Not yet diagnosed:
+phase timers next, before any KSAMP-c prediction.
