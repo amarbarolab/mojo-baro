@@ -41,11 +41,16 @@ def scalar_f64(mut r: Reader) raises -> Float64:
 
 
 def is_rope_neox_arch(arch: String) -> Bool:
-    return arch == "spark2_5" or arch == "qwen2" or arch == "granite"
+    return arch == "spark2_5" or arch == "qwen2"
 
 
 def is_rope_norm_arch(arch: String) -> Bool:
-    return arch == "llama"
+    # llama.cpp's llm_arch_rope_type (llama-model.cpp): LLM_ARCH_GRANITE is
+    # grouped with LLM_ARCH_LLAMA under "normal RoPE, pairs of consecutive
+    # head values" -- NOT with LLM_ARCH_QWEN2's NeoX-style half-offset group.
+    # Measured: granite-4.2-3b scored ~40/64 forced agreement vs llama.cpp
+    # with NEOX assumed, ~62/64+ after moving it here (bench/dense-protocol.md).
+    return arch == "llama" or arch == "granite"
 
 
 def is_gelu_arch(arch: String) -> Bool:

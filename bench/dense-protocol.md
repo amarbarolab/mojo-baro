@@ -107,6 +107,33 @@ Verdict: QKV_BIAS is correct (the bias-add kernel and the generalized per-layer 
 stride both work as designed), and qwen2-arch (neox rope, biased QKV, non-tied output) is
 correct end to end.
 
+### Result: granite-4.2-3b-BF16 (2026-09-11, `.work/dense/granite42-3b-run2/`) -- one repair round
+
+**First attempt FAILED**: 40/64 forced agreement average (range 26-51/64, all well under the
+90% floor). Root cause, found by reading `llama_model_rope_type` in llama.cpp's
+`llama-model.cpp`: `LLM_ARCH_GRANITE` is grouped with `LLM_ARCH_LLAMA` under "normal RoPE,
+pairs of consecutive head values" (`LLAMA_ROPE_TYPE_NORM`), not with `LLM_ARCH_QWEN2`'s
+half-offset NeoX group -- the opposite of what `tools/gen-profile.mojo` assumed. Granite's
+GGUF conversion permutes Q/K the same way Llama's does. This was a plan-derived guess never
+checked against the actual source before this run, exactly the failure mode
+`mojo-nightly-lane-builder`/this plan's own methodology warns about ("recipe differences read
+from llama.cpp source as SPEC, code written fresh") -- the table was assembled from general
+recollection instead of the source, for this one arch.
+
+Fix: `is_rope_norm_arch` in `tools/gen-profile.mojo` now includes `"granite"`. Re-ran clean.
+
+| # | prediction | result |
+|---|---|---|
+| 1 | >=90% agreement, >=18/20 prompts | **PASS, 20/20** (after the fix): range 63-64/64 (98.4-100%), one prompt 26/26 |
+| 2 | tok/s_gen positive/finite, no crash | **PASS**: 164.5-169.0 tok/s_gen (BF16 source, no quantization) |
+| 3 | chat smoke | **N/A as predicted**, not attempted |
+
+Verdict: granite-arch (NORM rope like llama, non-tied output, the distinct attention-scale
+multiplier from GRANITE_MULT) is correct end to end once the rope table is fixed.
+embedding_scale and residual_scale are both 1.0 in this checkpoint, so this run does not
+exercise the pack-time weight-folding gap noted in step 2's predictions above -- that remains
+unverified for a hypothetical Granite checkpoint with non-unity multipliers.
+
 ## KATT: head dimension as a comptime parameter
 
 Scope: the attention kernels the Spark path calls, `amar_attn_decode_swa_gated` and
