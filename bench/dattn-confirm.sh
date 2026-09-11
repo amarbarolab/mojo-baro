@@ -4,7 +4,8 @@
 #      (run-tests, mega == launch identity, model-ref 64/64); any failure aborts before timing
 #   2. REPS repeats (default 10); odd reps run arm R then O, even reps O then R (order bias)
 #      every target under rocprofv3 --kernel-trace; a background sampler logs sclk/mclk/power
-#   3. per rep: device us/iter per target (the arm's own kernels / (20 warmup + 200 iters))
+#   3. per rep: device us/iter per target = the arm's own kernels from the 21st main-kernel dispatch on
+#      (warmup excluded), divided by the main-kernel dispatch count; both read from the trace
 #      -> OUT/reps.tsv; OUT/confirm.md = mean, min, max, spread % per arm and target
 # usage: bench/dattn-confirm.sh [OUT_DIR] [TARGETS] [REPS]
 set -euo pipefail
@@ -31,12 +32,18 @@ if grep -q "^FAIL" "$OUT/mega-gate/SUMMARY.txt" || ! grep -q "^PASS" "$OUT/mega-
 SAMPLER=$!; trap 'kill $SAMPLER 2>/dev/null || true' EXIT
 one() {  # arm label args rep
   local d="$OUT/rep$4/$1/$2"; mkdir -p "$d"
-  local bin=.work/bench_dattn pat=amar_dattn
-  if [ "$1" = R ]; then bin=bench/ggml-harness/op_bench; pat=flash_attn; fi
+  local bin=.work/bench_dattn pat=amar_dattn main='amar_dattn_(split|exact)'
+  if [ "$1" = R ]; then bin=bench/ggml-harness/op_bench; pat=flash_attn; main='flash_attn_ext_vec'; fi
   # shellcheck disable=SC2086
   rocprofv3 --kernel-trace -f csv -d "$d" -o trace -- $bin $3 > "$d/stdout.txt" 2> "$d/stderr.log" || { echo "FAIL $1 $2 rep$4"; return; }
   grep -q "exceeds" "$d/stdout.txt" || echo "VOID-ROTATION $1 $2 rep$4"
-  local us; us=$(gawk -v pat="$pat" 'BEGIN{FPAT="([^,]*)|(\"[^\"]*\")"} NR>1 && $8 ~ pat {t += $11 - $10} END{printf "%.3f", t / 220 / 1e3}' "$d/trace_kernel_trace.csv")
+  local us; us=$(gawk -v pat="$pat" -v main="$main" 'BEGIN{FPAT="([^,]*)|(\"[^\"]*\")"}
+    NR>1 && $8 ~ pat { n++; st[n] = $10 + 0; du[n] = $11 - $10; mn[n] = ($8 ~ main) }
+    END { PROCINFO["sorted_in"] = "@val_num_asc"; for (i in st) ord[++k] = i
+          delete PROCINFO["sorted_in"]; for (i = 1; i <= k; i++) idx[i] = ord[i]
+          PROCINFO["sorted_in"] = "@ind_num_asc"
+          for (j = 1; j <= k; j++) { i = idx[j]; if (mn[i]) m++; if (m > 20) { t += du[i]; if (mn[i]) c++ } }
+          if (c == 0) { printf "NaN"; exit } printf "%.3f", t / c / 1e3 }' "$d/trace_kernel_trace.csv")
   printf "%s\t%s\t%s\t%s\n" "$4" "$1" "$2" "$us" >> "$OUT/reps.tsv"
 }
 : > "$OUT/reps.tsv"
@@ -66,7 +73,7 @@ echo
 echo "Per-kernel resources (rep 1, from the trace):"
 for d in "$OUT"/rep1/*/*/; do
   echo "- $(basename "$(dirname "$d")")/$(basename "$d"):"
-  ~/iTools/bin/rocprof-kernels "$d/trace_kernel_trace.csv" --iters 200 --warmup 20 2>/dev/null | grep -E '^\| [a-z_]' | grep -v copyBuffer | sed 's/^/    /'
+  ~/iTools/bin/rocprof-kernels "$d/trace_kernel_trace.csv" --iters 5000 --warmup 20 2>/dev/null | grep -E '^\| [a-z_]' | grep -v copyBuffer | sed 's/^/    /'
 done
 } > "$OUT/confirm.md"
 cat "$OUT/confirm.md"
