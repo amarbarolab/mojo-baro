@@ -287,13 +287,17 @@ def main():
             off += len(raw)
         if q4_draft:
             dims, ttype, toff = infos["output.weight"]
-            tname, esize = ge.GGML_BYTES[ttype]
-            assert tname == "bf16", tname
+            shape = list(reversed(dims))
             n_elem = int(np.prod(dims))
-            f.seek(data_start + toff)
-            w = np.frombuffer(f.read(n_elem * esize), dtype=np.uint16).reshape(
-                list(reversed(dims))
-            )
+            if ttype in ge.GGML_BYTES:
+                tname, esize = ge.GGML_BYTES[ttype]
+                assert tname == "bf16", tname
+                f.seek(data_start + toff)
+                w = np.frombuffer(f.read(n_elem * esize), dtype=np.uint16).reshape(shape)
+            else:
+                w = np.frombuffer(
+                    dequantize_kquant(f, data_start, toff, ttype, shape), dtype=np.uint16
+                ).reshape(shape)
             q, d = quantize_q4_0(w)
             raw = q.tobytes() + d.tobytes()
             out.write(raw)
