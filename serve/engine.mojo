@@ -101,11 +101,11 @@ def json_int(line: String, mut i: Int, mut v: Int) -> Bool:
 
 
 def parse_request(
-    line: String, mut id: Int, mut prompt: List[Int], mut n: Int, mut spec: Bool, mut has_spec: Bool, mut stop: List[List[Int]]
+    line: String, mut id: Int, mut prompt: List[Int], mut n: Int, mut spec: Bool, mut has_spec: Bool, mut stop: List[List[Int]], mut ckpt: List[Int]
 ) -> String:
-    # {"id":INT,"prompt":[INT,...],"n":INT,"spec":BOOL,"stop":[[INT,...],...]};
-    # spec and stop optional. Returns "" on success, else the error text (id
-    # is set when it parsed).
+    # {"id":INT,"prompt":[INT,...],"n":INT,"spec":BOOL,"stop":[[INT,...],...],
+    #  "ckpt":[INT,...]}; spec, stop and ckpt optional. Returns "" on
+    # success, else the error text (id is set when it parsed).
     id = 0
     var i = json_key(line, "id")
     if i < 0 or not json_int(line, i, id):
@@ -169,6 +169,22 @@ def parse_request(
                     return "stop sequence must hold non-negative integers"
                 seq.append(v2)
             stop.append(seq^)
+    var ci = json_key(line, "ckpt")
+    if ci >= 0:
+        if ci >= len(b) or b[ci] != 91:
+            return "ckpt must be an array of integers"
+        ci += 1
+        while True:
+            while ci < len(b) and (b[ci] == 32 or b[ci] == 44):
+                ci += 1
+            if ci >= len(b):
+                return "unterminated ckpt array"
+            if b[ci] == 93:
+                break
+            var v3 = 0
+            if not json_int(line, ci, v3) or v3 < 0:
+                return "ckpt must hold non-negative integers"
+            ckpt.append(v3)
     return ""
 
 
@@ -252,7 +268,7 @@ def main() raises:
     var ckpt_cap = atol(getenv("BARO_CKPT", "8")) if serve else 0
     if ckpt_cap < 0:
         ckpt_cap = 0
-    var chain = Chain(ctx, ckpt_cap)
+    var chain = Chain(ctx, ckpt_cap, packdir)
     print("checkpoints: cap", ckpt_cap, ", bytes", Float64(CKPT_BYTES) / 1e6, "MB each, period", CKPT_PERIOD)
     var req_id = 0
     if serve:
@@ -268,6 +284,7 @@ def main() raises:
         var cached = 0
         var restore_s = 0.0
         var stop_seqs = List[List[Int]]()
+        var ckpt_hints = List[Int]()
         if serve:
             var line_in = read_line(0)
             if not line_in:
@@ -275,7 +292,7 @@ def main() raises:
             var req_n = 0
             var req_spec = False
             var req_has_spec = False
-            var perr = parse_request(line_in.value(), req_id, prompt, req_n, req_spec, req_has_spec, stop_seqs)
+            var perr = parse_request(line_in.value(), req_id, prompt, req_n, req_spec, req_has_spec, stop_seqs, ckpt_hints)
             if perr == "" and len(prompt) < 1:
                 perr = "empty prompt"
             if perr == "" and req_n < 1:
@@ -390,9 +407,22 @@ def main() raises:
         # The stopwatch stays here, in the harness that is never embedded in a
         # gguf: step_window cannot reach t0, t_prefill_end or dt (P-A, 2026-09-08).
         while wst.pos < n_total - 1:
-            step_window(ctx, bufs, cfg, wst)
-            if ckpt_cap > 0 and wst.pos > cached and wst.pos < len(prompt) and (wst.pos == len(prompt) - 1 or wst.pos % CKPT_PERIOD == 0):
-                chain.save(ctx, bufs.convstate_d, bufs.sstate_d, wst.ring, wst.pos, prompt)
+            if len(ckpt_hints) > 0 and wst.pos < pf_rows:
+                # A hint may fall inside what would otherwise be one big
+                # prefill chunk; cap this call's chunk so wst.pos actually
+                # stops there (checkpoints are only taken between calls).
+                var step_cfg = cfg.copy()
+                step_cfg.pf_chunk = min(cfg.pf_chunk, next_ckpt_stop(ckpt_hints, wst.pos, pf_rows) - wst.pos)
+                step_window(ctx, bufs, step_cfg, wst)
+            else:
+                step_window(ctx, bufs, cfg, wst)
+            if ckpt_cap > 0 and wst.pos > cached and wst.pos < len(prompt):
+                if wst.pos == len(prompt) - 1 or wst.pos % CKPT_PERIOD == 0:
+                    chain.save(ctx, bufs.convstate_d, bufs.sstate_d, wst.ring, wst.pos, prompt, False, False)
+                else:
+                    var hi = hint_index(ckpt_hints, wst.pos)
+                    if hi >= 0:
+                        chain.save(ctx, bufs.convstate_d, bufs.sstate_d, wst.ring, wst.pos, prompt, hi == 0, True)
             if not prefill_done and wst.pos >= len(prompt):
                 ctx.synchronize()
                 t_prefill_end = perf_counter_ns()

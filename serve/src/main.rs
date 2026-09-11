@@ -252,6 +252,9 @@ struct Gen {
     /// tokenizer's own stop ids plus any caller-supplied `stop` strings,
     /// tokenized. Empty when there is no tokenizer.
     stop: Vec<Vec<u32>>,
+    /// M1b role-boundary checkpoint hints (`Text::role_boundaries`); empty
+    /// for `/v1/completions`, which has no message list.
+    ckpt: Vec<u32>,
 }
 
 /// OpenAI's `stop`: a single string or an array of strings.
@@ -299,7 +302,7 @@ fn check_and_submit(app: &App, g: &Gen) -> Result<(u64, mpsc::UnboundedReceiver<
         return Err(ApiError::exceed_context(g.prompt.len() as u64, tmax as u64));
     }
     app.engine
-        .submit(g.prompt.clone(), g.n, g.spec, g.stop.clone())
+        .submit(g.prompt.clone(), g.n, g.spec, g.stop.clone(), g.ckpt.clone())
         .map_err(|e| ApiError::Plain(StatusCode::SERVICE_UNAVAILABLE, e))
 }
 
@@ -481,6 +484,7 @@ async fn completions(State(app): State<Shared>, Json(r): Json<CompletionReq>) ->
         spec: spec_default(&app, r.spec),
         stream: r.stream,
         stop: compute_stop(&app, r.stop),
+        ckpt: vec![],
     };
     let model = r.model.unwrap_or_else(|| app.model.clone());
     let (req_id, rx) = check_and_submit(&app, &g)?;
@@ -560,12 +564,14 @@ async fn chat_completions(State(app): State<Shared>, Json(r): Json<ChatReq>) -> 
         .map(|m| Ok(ChatMessage { role: m.role.clone(), content: content_text(&m.content)? }))
         .collect::<Result<Vec<_>, ApiError>>()?;
     let rendered = t.apply_chat_template(&msgs).map_err(|e| ApiError::Plain(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let ckpt = t.role_boundaries(&msgs);
     let g = Gen {
         prompt: t.encode(&rendered, true).map_err(bad)?,
         n: r.max_completion_tokens.or(r.max_tokens).unwrap_or(DEFAULT_MAX_TOKENS),
         spec: spec_default(&app, r.spec),
         stream: r.stream,
         stop: compute_stop(&app, r.stop),
+        ckpt,
     };
     let model = r.model.unwrap_or_else(|| app.model.clone());
     let (req_id, rx) = check_and_submit(&app, &g)?;

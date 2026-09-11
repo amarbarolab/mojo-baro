@@ -49,7 +49,7 @@ for an unparseable line carries `"id":0`.
 ## Lines the server writes (stdin)
 
 ```
-{"id":ID,"prompt":[INT,...],"n":N,"spec":BOOL,"stop":[[INT,...],...]}\n
+{"id":ID,"prompt":[INT,...],"n":N,"spec":BOOL,"stop":[[INT,...],...],"ckpt":[INT,...]}\n
 {"cancel":ID}\n
 ```
 
@@ -67,6 +67,19 @@ for an unparseable line carries `"id":0`.
   a request with no `stop` pays nothing for this. `serve/src/main.rs` builds
   `stop` from the tokenizer's own EOS-like ids (each a length-1 sequence)
   plus any caller `stop` string, tokenized.
+- `ckpt`: optional, default `[]` (M1b role-boundary checkpoints). Token
+  positions where `serve/prefix.mojo` should also take a prefix checkpoint,
+  in addition to the periodic 1024-token grid and the prompt-end point.
+  `serve/src/main.rs` sends, for a chat request, the token length after
+  each message when the conversation so far is rendered with no generation
+  prompt (`Text::role_boundaries`) -- a later turn's full prompt starts
+  with exactly those same bytes, since history does not change, so these
+  positions are restore points for it. Index 0 (by convention the system
+  prompt) is saved pinned against eviction; every hint is saved as a
+  role-boundary checkpoint, evicted only after every periodic-grid one. A
+  hint that misses a real tokenization boundary wastes a checkpoint slot,
+  never corrupts a restore -- `lookup` still requires the stored SHA-256
+  hash (salted per pack, so two packs never share a checkpoint) to match.
 - `{"cancel":ID}`: a second line shape, written to the same stdin at any
   point while `ID` is decoding (the request line for the *next* id is never
   written before this one's `done` line, so a stray line mid-request can

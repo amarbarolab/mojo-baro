@@ -18,6 +18,9 @@ pub struct Request {
     /// generated tokens equals any of them (EOS ids included, as length-1
     /// sequences -- `serve/src/main.rs` builds this list).
     pub stop: Vec<Vec<u32>>,
+    /// M1b role-boundary checkpoint hint positions (`Text::role_boundaries`),
+    /// ascending; empty when the request has no message list.
+    pub ckpt: Vec<u32>,
 }
 
 /// The line that cancels the request currently decoding, if its id matches.
@@ -170,8 +173,9 @@ mod tests {
             n: 64,
             spec: false,
             stop: vec![],
+            ckpt: vec![],
         };
-        assert_eq!(r.line(), "{\"id\":7,\"prompt\":[760,6511,314],\"n\":64,\"spec\":false,\"stop\":[]}\n");
+        assert_eq!(r.line(), "{\"id\":7,\"prompt\":[760,6511,314],\"n\":64,\"spec\":false,\"stop\":[],\"ckpt\":[]}\n");
     }
 
     #[test]
@@ -182,10 +186,27 @@ mod tests {
             n: 8,
             spec: false,
             stop: vec![vec![151645], vec![9707, 11]],
+            ckpt: vec![],
         };
         assert_eq!(
             r.line(),
-            "{\"id\":1,\"prompt\":[1],\"n\":8,\"spec\":false,\"stop\":[[151645],[9707,11]]}\n"
+            "{\"id\":1,\"prompt\":[1],\"n\":8,\"spec\":false,\"stop\":[[151645],[9707,11]],\"ckpt\":[]}\n"
+        );
+    }
+
+    #[test]
+    fn request_line_carries_ckpt_hints() {
+        let r = Request {
+            id: 2,
+            prompt: vec![1, 2, 3],
+            n: 8,
+            spec: false,
+            stop: vec![],
+            ckpt: vec![7914, 8020],
+        };
+        assert_eq!(
+            r.line(),
+            "{\"id\":2,\"prompt\":[1,2,3],\"n\":8,\"spec\":false,\"stop\":[],\"ckpt\":[7914,8020]}\n"
         );
     }
 

@@ -873,3 +873,179 @@ changed in this item.
 
 Falsifier not triggered: no identity break on the no-`stop`, no-cancel path;
 no corruption of the request after a cancel or a stop.
+
+---
+
+## C2 — M1b role-boundary checkpoints (frozen 2026-09-11, before its build)
+
+**Where the fix targets, corrected from the design brief.** M1a's P-F3
+(above) measured the fixture as **5,755-5,858 tokens**, not the design's
+assumed 7,914 -- the number here uses the measured fixture, not the design
+figure. The miss itself stands: `cached` landed on the periodic-1024 grid
+(5120) because the prompt-end checkpoint (taken at `len(prompt)-1`, which
+includes the rendered generation-prompt marker) is never a prefix of the
+next turn's prompt -- the next turn's template re-render drops that marker
+and appends the real assistant turn instead. A checkpoint taken at the end
+of the **last message's own content**, before the marker, is exactly what
+the next turn's render starts with (history does not change), which is what
+role-boundary checkpoints are for.
+
+**Change.**
+- `serve/src/text.rs::role_boundaries`: for messages `[0..k]`, `k = 1..N`,
+  renders with no generation prompt and records the token length. Shares
+  `render()` with `apply_chat_template` (which now takes an explicit
+  `add_generation_prompt` bool internally). `chat_completions` sends these
+  as the request's `"ckpt"` array.
+- `serve/engine.mojo`: `parse_request` gains `"ckpt":[INT,...]`; the
+  prefill-checkpoint condition also fires on a hint position (not just the
+  periodic grid / prompt-end), via `hint_index`. Hint index 0 (the system
+  prompt, by convention message 0) is saved `pinned`; every hint is saved
+  `boundary`.
+- `serve/prefix.mojo`: `Checkpoint.hash` becomes a 32-byte SHA-256 digest
+  (own FIPS 180-4 implementation, verified against the empty-string/"abc"/
+  NIST-56-byte known-answer vectors before wiring in) of a per-pack salt
+  (`sha256(packdir)`) followed by the little-endian i32 tokens, replacing
+  the in-process FNV-1a 64. `Checkpoint` gains `pinned`/`boundary`;
+  `Chain.save`'s eviction order (full chain, no free slot) is: never a
+  pinned slot; among the rest, a periodic-grid checkpoint (`boundary =
+  False`) before a role-boundary one; within a class, the oldest.
+- A hint that does not land on a real tokenization boundary (a template
+  this trick does not fit) costs one wasted slot, never a wrong answer --
+  `lookup`'s hash compare is what decides correctness, not the hint.
+
+**Not in this step.** Branch points (a second sequence sharing a prefix,
+needs multi-sequence KV -- the concurrency work, C4). Cross-process /
+on-disk checkpoint sharing (the salt is there for it; nothing reads or
+writes a checkpoint across processes yet). Any change to `/v1/completions`
+(no message list, so no hints -- `Gen.ckpt` stays `[]` there).
+
+**Predictions (frozen before the build).**
+- P-H1 Identity: `run-tests.sh` and `tools/test_server.sh`'s existing
+  suites (unmodified, but every `/v1/chat/completions` case in
+  `test_server.sh` already sends `ckpt` hints as of this change) all PASS,
+  bit-exact/token-exact as today -- taking an *extra* checkpoint changes
+  nothing about what gets generated, only what gets restored from later.
+- P-H2 `kernels/test_prefix.mojo`'s new cases: a hint at a non-grid
+  position (300) is saved `pinned` (index 0) and `boundary`; a lookup
+  constrained to `n=301` finds it; restoring from it and replaying to the
+  end of `P` is byte-exact against the from-scratch reference (`cold_u`),
+  on both the megakernel and window paths. Retention: with cap 3, a 4th
+  save evicts the periodic-grid checkpoint before either the pinned or the
+  other role-boundary one; a 5th save evicts the *next* periodic-grid
+  checkpoint before the remaining role-boundary one.
+- P-H3 SHA-256 replaces FNV-1a with no behaviour change on any EXISTING
+  M1a check (`test_prefix.mojo`'s original cases, unmodified, still pass) --
+  the hash algorithm is an implementation detail behind `bytes_eq`, and nothing
+  in the lookup/save/restore control flow reads the hash's bits directly.
+- P-H4 DeerFlow tap replay (`tools/tap-replay.py`, `.work/chat/tap.jsonl`,
+  rows 0/1/2, copied into this worktree): turn 2 (row 1) restores from a
+  checkpoint at or near the end of row 0's own prompt (row 0's measured
+  prompt_tokens, 5,755-5,858 depending on row) rather than the 5120
+  periodic-grid point M1a hit -- `cached` within a handful of tokens of
+  row 0's `prompt_tokens` (the gap is the rendered generation-prompt
+  marker's own token count, expected single digits to low tens), and
+  `prefill_rows` correspondingly small. No wall-TTFT number is frozen (the
+  M1a design's "< 60 ms" was against the wrong fixture size); the receipt
+  is recorded against M1a's 616-766 ms for the same rows, and the honest
+  comparison is `cached`/`prefill_rows`, not a borrowed millisecond figure.
+- P-H5 20-prompt A/B (`bench/ab-prompts.sh`, one-shot mode): ratio within
+  ±2% of `main`, identity 20/20. One-shot mode never sets `BARO_SERVE=1`,
+  so `ckpt_cap` is forced to 0 and every changed code path (`chain.save`,
+  `hint_index`, the SHA-256 hash) is unreached -- this is a receipt that
+  the change is inert off the serve path, not a claim about decode speed
+  under checkpointing (that is P-H1/P-H4's territory).
+- Falsifier: any identity break in P-H1/P-H2/P-H3, a wrong retention
+  order, or `cached` at turn 2 *not* improving over M1a's 5120 for the
+  same rows (which would mean the boundary hint never lands, or lookup
+  never prefers it).
+
+**Verification before timing (P1).** `checkpoints:` line unchanged in
+shape; `finish`/`cached`/`prefill_rows` read from each tap-replay response's
+`usage.baro` and `timings`; rebuild engine + `baro-serve` in the same stint;
+`arm.txt` first for the A/B.
+
+**Gate.** `run-tests.sh` exit 0 (P-H2/P-H3); `tools/test_server.sh` ALL PASS
+(P-H1); tap-replay table filled against P-H4's reading rule; P-H5 within
+band.
+
+**Result.** PASS on every gate, recorded 2026-09-11. One repair round: the
+chunked-prefill bug below, and a template-compatibility bug found by the
+first real tap-replay run.
+
+**Bug found and fixed before the gate passed: hints inside one big prefill
+chunk were silently never taken.** `step_window`'s prefill branch only stops
+at chunk boundaries (`mc = min(pf_chunk, pf_rows - pos)`, `pf_chunk` default
+1024); a hint strictly between two chunk boundaries -- which is exactly
+where a real role boundary near the end of a long prompt lands -- was never
+visited as a discrete `wst.pos` and so never checked against `ckpt_hints`.
+`kernels/test_prefix.mojo`'s new M1b case (hint at 300 inside a single
+0->599 chunk) caught this immediately. Fix: `prefix.mojo::next_ckpt_stop`
+caps one prefill call's `pf_chunk` to the distance to the next hint or grid
+point, applied in both `serve/engine.mojo`'s main loop and
+`kernels/test_prefix.mojo::prefill_to`, gated on `len(ckpt_hints) > 0` so
+the no-hint path (`/v1/completions`, and every existing M1a case) takes the
+identical route it always did.
+
+**Bug found by the first live tap-replay run: a prefix render can fail
+where the full render succeeds.** DeerFlow's real chat template
+`raise_exception`s a system-only prefix ("No user query found in
+messages") -- `role_boundaries`'s k=1 call hit this and the error
+propagated through `?` into a 500 on every chat completion, not just the
+missing hint. Fixed by making `role_boundaries` skip a prefix that fails to
+render or tokenize instead of propagating (`text.rs`, new test
+`role_boundaries_skips_a_prefix_that_fails_to_render`); it returns `Vec<u32>`
+directly now, no longer `Result`. This is exactly the class of failure the
+design already tolerates (a bad hint wastes a slot) -- the gap was that the
+*error*, not just a missing hint, was reaching the caller.
+
+`kernels/test_prefix.mojo` / `run-tests.sh`: PASS, 82 kernels, 38 in
+registry, 0 orphans. The M1b cases: hint at 300 saved pinned + boundary via
+a real request, lookup constrained to `n=301` finds it, restore from it and
+replay to the end of `P` byte-exact against `cold_u` on both megakernel and
+window paths (P-H2). Retention: cap 3, a 4th save evicted the periodic-grid
+checkpoint (30) before the pinned (10) and role-boundary (20) ones; a 5th
+save evicted the *next* periodic-grid checkpoint (40) before the remaining
+role-boundary one (20) -- both PASS, exactly as predicted. Every original
+M1a case (SHA-256 now, not FNV-1a) still PASS (P-H3).
+
+`tools/test_server.sh`: ALL PASS (`.work/CHAT-c2-server-test/SUMMARY.txt`),
+including `chat`/`chat-stream`/`stop`/`cancel`, every one of which now sends
+`ckpt` hints on the wire with no observable difference (P-H1).
+
+P-H5 (`.work/ab-c2-results`, arm A = `.work/engine-base` (`38a85c7`), arm B =
+`.work/engine-c2-b`, `power_cap_uW=290000000`, `vddgfx=-100mV`): main median
+137.22 tok/s_gen spread 0.6%, C2 median 137.09 spread 0.5%, **ratio 0.999**,
+identity 20/20 PASS. Held, cleanly inside band (no outlier this round).
+
+P-H4, DeerFlow tap replay (`tools/tap-replay.py`, `.work/chat/tap.jsonl`
+copied into this worktree, rows 0/1/2 x2, `BARO_TMAX=16384`,
+`.work/tap-replay-server.std{out,err}`), against M1a's own numbers for the
+same rows (`cached` 5120 / `prefill_rows` 634-737 / `wall_s` 0.659-0.766):
+
+| row | prompt_tokens | cached | prefill_rows | prefill_s | wall_s | vs M1a wall_s |
+|---|---|---|---|---|---|---|
+| 0 (cold) | 5755 | 0 | 5754 | 3.999 | 4.055 | 5.279 |
+| 1 | 5770 | 5750 | 19 | 0.148 | 0.205 | 0.695 (3.4x) |
+| 2 | 5858 | 5765 | 92 | 0.221 | 0.286 | 0.766 (2.7x) |
+| 0 (2nd) | 5755 | 5750 | 4 | 0.031 | 0.079 | 0.659 (8.3x) |
+| 1 (2nd) | 5770 | 5750 | 19 | 0.147 | 0.200 | 0.696 (3.5x) |
+| 2 (2nd) | 5858 | 5765 | 92 | 0.219 | 0.281 | 0.762 (2.7x) |
+
+Held, and better than predicted on `cached`/`prefill_rows`: `cached` lands
+within 5-93 tokens of the row's own `prompt_tokens` (row 0's own repeat: 4
+tokens, "single digits" as predicted; rows 1/2 include real new turn
+content past the boundary, not just the marker, so their gap is larger but
+still `prefill_rows` in the tens, not the hundreds M1a measured -- both are
+genuinely smaller prefills than M1a's periodic-grid restore, not an
+artifact of measurement). M1a's 5120/634-737/0.659-0.766s becomes
+5750-5765/4-92/0.079-0.286s wall -- **2.7x to 8.3x** faster than M1a on the
+identical rows, and cold-vs-warm is 4.055s -> 0.079-0.286s (14x-51x). The
+M1a design's "< 60 ms" TTFT target is still missed on `prefill_s` for rows
+1/2 (147-221 ms: they replay real new content, not just a marker, so a
+sub-60ms number was never achievable for them); row 0's own repeat comes
+closest at 31 ms `prefill_s`. Recorded honestly against the measured
+numbers, not the design's borrowed millisecond figure.
+
+Verdict against the frozen predictions: P-H1 held. P-H2 held. P-H3 held.
+P-H4 held, and beat the directional prediction. P-H5 held. Falsifier not
+triggered.

@@ -82,6 +82,10 @@ impl Text {
     /// Render the chat template (the pack's, else ChatML which is what Qwen
     /// ships) with the generation prompt appended.
     pub fn apply_chat_template(&self, messages: &[ChatMessage]) -> Result<String, String> {
+        self.render(messages, true)
+    }
+
+    fn render(&self, messages: &[ChatMessage], add_generation_prompt: bool) -> Result<String, String> {
         let Some(tpl) = &self.meta.chat_template else {
             let mut s = String::new();
             for m in messages {
@@ -91,7 +95,9 @@ impl Text {
                 s.push_str(&m.content);
                 s.push_str("<|im_end|>\n");
             }
-            s.push_str("<|im_start|>assistant\n");
+            if add_generation_prompt {
+                s.push_str("<|im_start|>assistant\n");
+            }
             return Ok(s);
         };
         let mut env = Environment::new();
@@ -104,13 +110,40 @@ impl Text {
             .collect();
         let ctx = serde_json::json!({
             "messages": msgs,
-            "add_generation_prompt": true,
+            "add_generation_prompt": add_generation_prompt,
             "bos_token": self.meta.bos_token.clone().unwrap_or_default(),
             "eos_token": self.meta.eos_token.clone().unwrap_or_default(),
         });
         env.get_template("chat")
             .and_then(|t| t.render(minijinja::Value::from_serialize(&ctx)))
             .map_err(|e| format!("chat_template: {e}"))
+    }
+
+    /// M1b role-boundary checkpoint hints: the token length after each
+    /// message when the conversation up to that message is rendered with no
+    /// generation prompt. A later turn's full prompt starts with exactly
+    /// these same bytes (the history before it does not change), so these
+    /// positions double as restore points -- and the engine's prefix hash
+    /// (`serve/prefix.mojo`) catches a mismatch rather than trusting this
+    /// blindly, so a template this trick does not fit just wastes a hint,
+    /// never corrupts a response.
+    ///
+    /// A prefix that does not render or tokenize on its own is skipped, not
+    /// propagated: real templates validate the *whole* conversation (e.g.
+    /// Qwen agent templates `raise_exception` a system-only prefix with "no
+    /// user query found"), so an early k can legitimately fail here even
+    /// though the full render (this function's caller renders separately)
+    /// succeeds. Hints are an optimization; a request must never 500 over
+    /// one being unavailable.
+    pub fn role_boundaries(&self, messages: &[ChatMessage]) -> Vec<u32> {
+        let mut out = Vec::with_capacity(messages.len());
+        for k in 1..=messages.len() {
+            let Ok(rendered) = self.render(&messages[..k], false) else { continue };
+            let Ok(ids) = self.encode(&rendered, true) else { continue };
+            out.push(ids.len() as u32);
+        }
+        out.dedup();
+        out
     }
 
     pub fn is_stop(&self, id: u32) -> bool {
@@ -184,6 +217,58 @@ mod tests {
             s,
             "<|im_start|>system\nbe brief<|im_end|>\n<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n"
         );
+    }
+
+    #[test]
+    fn role_boundary_renders_are_prefixes_of_the_full_render() {
+        // The BPE-with-no-vocab tokenizer here can't produce meaningful
+        // token lengths (every encode is empty), so this exercises the
+        // string-level invariant role_boundaries relies on -- that each
+        // prefix render is a byte-exact prefix of the full render -- not
+        // the token-length numbers themselves (covered with a real
+        // tokenizer by tools/test_server.sh's M1b case).
+        let t = Text {
+            tok: Tokenizer::new(tokenizers::models::bpe::BPE::default()),
+            meta: Meta::default(),
+            stop_ids: vec![],
+        };
+        let msgs = [
+            ChatMessage { role: "system".into(), content: "be brief".into() },
+            ChatMessage { role: "user".into(), content: "hi".into() },
+        ];
+        let full = t.render(&msgs, false).unwrap();
+        for k in 1..=msgs.len() {
+            let prefix = t.render(&msgs[..k], false).unwrap();
+            assert!(full.starts_with(&prefix), "message {k} render is not a prefix: {prefix:?} vs {full:?}");
+        }
+        assert!(t.role_boundaries(&msgs).len() <= msgs.len());
+    }
+
+    #[test]
+    fn role_boundaries_skips_a_prefix_that_fails_to_render() {
+        // messages[1] is out of bounds for a 1-message prefix -- a stand-in
+        // for a real chat template's own validation rejecting a shorter
+        // prefix (Qwen agent templates `raise_exception` a system-only
+        // prefix with "no user query found"). k=1 must be skipped, not
+        // turn the whole call into an error.
+        let t = Text {
+            tok: Tokenizer::new(tokenizers::models::bpe::BPE::default()),
+            meta: Meta {
+                chat_template: Some("{% for m in messages %}<{{ m.role }}>{% endfor %}{{ messages[1].role }}".into()),
+                ..Meta::default()
+            },
+            stop_ids: vec![],
+        };
+        let msgs = [
+            ChatMessage { role: "system".into(), content: "be brief".into() },
+            ChatMessage { role: "user".into(), content: "hi".into() },
+        ];
+        // Doesn't panic or return an Err; k=1 (renders fine, but as an
+        // empty-BPE encode -> filtered by the same empty-encode behaviour
+        // as any other prefix) contributes nothing, k=2 does not error.
+        let _ = t.role_boundaries(&msgs);
+        assert!(t.render(&msgs, false).is_ok(), "the full render (k=2, what a real request sends) must succeed");
+        assert!(t.render(&msgs[..1], false).is_err(), "k=1 must actually fail to render, or this test proves nothing");
     }
 
     #[test]
