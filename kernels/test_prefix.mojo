@@ -202,7 +202,7 @@ def cold_reset(ctx: DeviceContext, mut bufs: WindowBufs) raises:
     ctx.synchronize()
 
 
-def prefill_to(ctx: DeviceContext, mut bufs: WindowBufs, pack: Pack, mega: Bool, mut wst: WindowState, end: Int, n_total: Int, n_prompt: Int, prompt: List[Int], mut chain: Chain, take: Bool) raises:
+def prefill_to(ctx: DeviceContext, mut bufs: WindowBufs, pack: Pack, mega: Bool, mut wst: WindowState, end: Int, n_total: Int, n_prompt: Int, prompt: List[Int], mut chain: Chain, take: Bool, hints: List[Int]) raises:
     # prompt rows [wst.pos, end) through prefill_forward in chunks of CP, exactly
     # as the engine loop cuts them from wst.pos; checkpoints at the engine's
     # boundaries when `take`.
@@ -213,9 +213,19 @@ def prefill_to(ctx: DeviceContext, mut bufs: WindowBufs, pack: Pack, mega: Bool,
         tail = MROWS
     var cfg = make_cfg(pack, mega, end, tail, n_total, n_prompt)
     while wst.pos < end:
-        step_window(ctx, bufs, cfg, wst)
-        if take and wst.pos < n_prompt and (wst.pos == n_prompt - 1 or wst.pos % CKPT_PERIOD == 0):
-            chain.save(ctx, bufs.convstate_d, bufs.sstate_d, wst.ring, wst.pos, prompt)
+        if take and len(hints) > 0:
+            var step_cfg = cfg.copy()
+            step_cfg.pf_chunk = min(cfg.pf_chunk, next_ckpt_stop(hints, wst.pos, end) - wst.pos)
+            step_window(ctx, bufs, step_cfg, wst)
+        else:
+            step_window(ctx, bufs, cfg, wst)
+        if take and wst.pos < n_prompt:
+            if wst.pos == n_prompt - 1 or wst.pos % CKPT_PERIOD == 0:
+                chain.save(ctx, bufs.convstate_d, bufs.sstate_d, wst.ring, wst.pos, prompt, False, False)
+            else:
+                var hi = hint_index(hints, wst.pos)
+                if hi >= 0:
+                    chain.save(ctx, bufs.convstate_d, bufs.sstate_d, wst.ring, wst.pos, prompt, hi == 0, True)
 
 
 def finish(ctx: DeviceContext, mut bufs: WindowBufs, pack: Pack, mega: Bool, mut wst: WindowState, n_total: Int, n_prompt: Int) raises:
@@ -237,13 +247,13 @@ def run_cold(ctx: DeviceContext, mut bufs: WindowBufs, pack: Pack, mega: Bool, p
     var wst = fresh_state()
     wst.reset(perf_counter_ns())
     if split_at > 0:
-        prefill_to(ctx, bufs, pack, mega, wst, split_at, n_total, n_prompt, prompt, chain, False)
-    prefill_to(ctx, bufs, pack, mega, wst, n_prompt - 1, n_total, n_prompt, prompt, chain, False)
+        prefill_to(ctx, bufs, pack, mega, wst, split_at, n_total, n_prompt, prompt, chain, False, List[Int]())
+    prefill_to(ctx, bufs, pack, mega, wst, n_prompt - 1, n_total, n_prompt, prompt, chain, False, List[Int]())
     finish(ctx, bufs, pack, mega, wst, n_total, n_prompt)
     return Snap(ctx, bufs, wst.ring, n_total)
 
 
-def run_request(ctx: DeviceContext, mut bufs: WindowBufs, pack: Pack, mega: Bool, prompt: List[Int], mut chain: Chain, mut cached_out: Int) raises -> Snap:
+def run_request(ctx: DeviceContext, mut bufs: WindowBufs, pack: Pack, mega: Bool, prompt: List[Int], mut chain: Chain, mut cached_out: Int, hints: List[Int]) raises -> Snap:
     # The engine serve path: lookup, restore into slot 0 or cold reset, replay,
     # checkpoints at the boundaries, commit after the final synchronize.
     var n_prompt = len(prompt)
@@ -266,12 +276,17 @@ def run_request(ctx: DeviceContext, mut bufs: WindowBufs, pack: Pack, mega: Bool
     wst.pos = cached
     wst.pos_prev = cached
     if n_prompt - 1 - cached >= PF_MIN:
-        prefill_to(ctx, bufs, pack, mega, wst, n_prompt - 1, n_total, n_prompt, prompt, chain, True)
+        prefill_to(ctx, bufs, pack, mega, wst, n_prompt - 1, n_total, n_prompt, prompt, chain, True, hints)
     var cfg = make_cfg(pack, mega, 0, 0, n_total, n_prompt)
     while wst.pos < n_total - 1:
         step_window(ctx, bufs, cfg, wst)
-        if wst.pos > cached and wst.pos < n_prompt and (wst.pos == n_prompt - 1 or wst.pos % CKPT_PERIOD == 0):
-            chain.save(ctx, bufs.convstate_d, bufs.sstate_d, wst.ring, wst.pos, prompt)
+        if wst.pos > cached and wst.pos < n_prompt:
+            if wst.pos == n_prompt - 1 or wst.pos % CKPT_PERIOD == 0:
+                chain.save(ctx, bufs.convstate_d, bufs.sstate_d, wst.ring, wst.pos, prompt, False, False)
+            else:
+                var hi = hint_index(hints, wst.pos)
+                if hi >= 0:
+                    chain.save(ctx, bufs.convstate_d, bufs.sstate_d, wst.ring, wst.pos, prompt, hi == 0, True)
     ctx.synchronize()
     chain.commit()
     cached_out = cached
@@ -293,6 +308,66 @@ def mutated(tokens: List[Int], at: Int) -> List[Int]:
     return out^
 
 
+def test_retention(ctx: DeviceContext, bufs: WindowBufs, packdir: String, mut fails: Int) raises:
+    # M1b retention (bench/chat-protocol.md M1b): pinned checkpoints are
+    # never evicted; among the rest, a periodic-grid checkpoint (boundary =
+    # False) is evicted before a role-boundary one, regardless of position.
+    # Pure Chain.save bookkeeping -- no decode, so mega vs window is moot;
+    # run once. The token lists are dummies (content doesn't matter, only
+    # that each position gets a distinct hash), and the device buffers are
+    # only a copy source (the bytes copied are never read back here).
+    print("== M1b retention: pinned never evicted, periodic evicted before role-boundary")
+    var c = Chain(ctx, 3, packdir)
+    # prefix_hash reads tokens[0:pos], so this dummy list must cover the
+    # largest pos used below (50); content doesn't matter otherwise.
+    var toks = List[Int]()
+    for i in range(64):
+        toks.append(i)
+    c.save(ctx, bufs.convstate_d, bufs.sstate_d, 0, 10, toks, True, True)
+    c.commit()
+    c.save(ctx, bufs.convstate_d, bufs.sstate_d, 0, 20, toks, False, True)
+    c.commit()
+    c.save(ctx, bufs.convstate_d, bufs.sstate_d, 0, 30, toks, False, False)
+    c.commit()
+    if c.count_valid() != 3:
+        print("  FAIL expected 3 valid checkpoints before eviction, got", c.count_valid())
+        fails += 1
+    c.save(ctx, bufs.convstate_d, bufs.sstate_d, 0, 40, toks, False, False)
+    c.commit()
+    var have10 = False
+    var have20 = False
+    var have30 = False
+    var have40 = False
+    for i in range(len(c.items)):
+        if c.items[i].valid:
+            have10 = have10 or c.items[i].pos == 10
+            have20 = have20 or c.items[i].pos == 20
+            have30 = have30 or c.items[i].pos == 30
+            have40 = have40 or c.items[i].pos == 40
+    if have10 and have20 and have40 and not have30:
+        print("  PASS periodic-grid checkpoint (30) evicted first; pinned (10) and role-boundary (20) kept")
+    else:
+        print("  FAIL retention order wrong: have10", have10, " have20", have20, " have30", have30, " have40", have40)
+        fails += 1
+    c.save(ctx, bufs.convstate_d, bufs.sstate_d, 0, 50, toks, False, False)
+    c.commit()
+    have10 = False
+    have20 = False
+    have40 = False
+    var have50 = False
+    for i in range(len(c.items)):
+        if c.items[i].valid:
+            have10 = have10 or c.items[i].pos == 10
+            have20 = have20 or c.items[i].pos == 20
+            have40 = have40 or c.items[i].pos == 40
+            have50 = have50 or c.items[i].pos == 50
+    if have10 and have20 and have50 and not have40:
+        print("  PASS second periodic-grid checkpoint (40) evicted before the role-boundary one (20)")
+    else:
+        print("  FAIL second eviction wrong: have10", have10, " have20", have20, " have40", have40, " have50", have50)
+        fails += 1
+
+
 def main() raises:
     comptime assert has_accelerator(), "Requires a GPU"
     var ctx = DeviceContext()
@@ -310,16 +385,16 @@ def main() raises:
 
     for arm in range(2):
         var mega = arm == 0
-        var chain = Chain(ctx, 8)
+        var chain = Chain(ctx, 8, packdir)
         var t0 = perf_counter_ns()
         var cold_u = run_cold(ctx, bufs, pack, mega, P, 0, chain)
         var cold_s = run_cold(ctx, bufs, pack, mega, P, A_LEN - 1, chain)
         compare("cold_s vs cold_u (chunk split at 1087, no checkpoint)", cold_s, cold_u, mega, fails)
         var c0 = 0
-        var snapA = run_request(ctx, bufs, pack, mega, A, chain, c0)
+        var snapA = run_request(ctx, bufs, pack, mega, A, chain, c0, List[Int]())
         print("  request A: cached", c0, " checkpoints", chain.count_valid(), " tok", snapA.tok)
         var c1 = 0
-        var rest = run_request(ctx, bufs, pack, mega, P, chain, c1)
+        var rest = run_request(ctx, bufs, pack, mega, P, chain, c1, List[Int]())
         print("  request P: cached", c1, " checkpoints", chain.count_valid())
         if c1 != A_LEN - 1:
             print("  FAIL restore point", c1, "want", A_LEN - 1)
@@ -339,13 +414,13 @@ def main() raises:
         for i in range(len(chain.items)):
             if chain.items[i].valid and chain.items[i].pos == A_LEN - 1:
                 ci = i
-        var saved_hash = chain.items[ci].hash
-        chain.items[ci].hash = saved_hash ^ UInt64(1)
+        var saved_hash = chain.items[ci].hash.copy()
+        chain.items[ci].hash[0] = chain.items[ci].hash[0] ^ UInt8(1)
         expect_lookup("corrupted hash on the 1087 checkpoint", chain, mutated(P, 1100), 1024, fails)
-        chain.items[ci].hash = saved_hash
+        chain.items[ci].hash = saved_hash^
 
         var c2 = 0
-        var rep = run_request(ctx, bufs, pack, mega, P, chain, c2)
+        var rep = run_request(ctx, bufs, pack, mega, P, chain, c2, List[Int]())
         print("  request P again: cached", c2, " checkpoints", chain.count_valid())
         if c2 != A_LEN + B_LEN - 1:
             print("  FAIL repeat restore point", c2, "want", A_LEN + B_LEN - 1)
@@ -355,13 +430,54 @@ def main() raises:
         var Pm = mutated(P, 1050)
         var cold_m = run_cold(ctx, bufs, pack, mega, Pm, 0, chain)
         var c3 = 0
-        var rest_m = run_request(ctx, bufs, pack, mega, Pm, chain, c3)
+        var rest_m = run_request(ctx, bufs, pack, mega, Pm, chain, c3, List[Int]())
         print("  request P' (token 1050 mutated): cached", c3, " checkpoints", chain.count_valid())
         if c3 != 1024:
             print("  FAIL P' restore point", c3, "want 1024")
             fails += 1
         compare("restore(P') at 1024 vs cold_u(P') (chunk-identical)", rest_m, cold_m, mega, fails)
+
+        # M1b role-boundary checkpoint (bench/chat-protocol.md M1b): a hint
+        # position off the periodic-1024 grid, index 0 -> pinned+boundary.
+        print("== M1b role-boundary checkpoint at 300 (fresh chain)")
+        var rb_chain = Chain(ctx, 8, packdir)
+        var A2 = List[Int]()
+        for i in range(600):
+            A2.append(P[i])
+        var rb_hints: List[Int] = [300]
+        var c4 = 0
+        var _rbsnap = run_request(ctx, bufs, pack, mega, A2, rb_chain, c4, rb_hints)
+        var rb_idx = -1
+        for i in range(len(rb_chain.items)):
+            if rb_chain.items[i].valid and rb_chain.items[i].pos == 300:
+                rb_idx = i
+        if rb_idx < 0 or not rb_chain.items[rb_idx].pinned or not rb_chain.items[rb_idx].boundary:
+            print("  FAIL role-boundary hint at 300 not saved as pinned+boundary")
+            fails += 1
+        else:
+            print("  PASS role-boundary hint at 300 saved via a real request (pinned, boundary)")
+        var lookup_301 = rb_chain.pos_of(rb_chain.lookup(P, 301))
+        if lookup_301 != 300:
+            print("  FAIL lookup constrained to n=301 chose", lookup_301, "want 300")
+            fails += 1
+        else:
+            print("  PASS lookup constrained to n=301 finds the role-boundary checkpoint at 300")
+        # Force restore specifically from the role-boundary checkpoint: drop
+        # the ordinary prompt-end checkpoint (599) that would otherwise win
+        # (lookup prefers the larger matching position).
+        for i in range(len(rb_chain.items)):
+            if rb_chain.items[i].valid and rb_chain.items[i].pos == 599:
+                rb_chain.items[i].valid = False
+        var c5 = 0
+        var rb_full = run_request(ctx, bufs, pack, mega, P, rb_chain, c5, List[Int]())
+        if c5 != 300:
+            print("  FAIL role-boundary restore point", c5, "want 300")
+            fails += 1
+        compare("restore(role-boundary@300)+replay vs cold_u", rb_full, cold_u, mega, fails)
+
         print("arm", "megakernel" if mega else "window", "done in", Float64(perf_counter_ns() - t0) / 1e9, "s")
+
+    test_retention(ctx, bufs, packdir, fails)
 
     if fails == 0:
         print("PASS: prefix checkpoints byte-exact")

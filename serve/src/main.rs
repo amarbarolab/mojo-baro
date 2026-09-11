@@ -28,11 +28,11 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 
-use engine::{Engine, Event};
+use engine::{EnginePool, Event};
 use text::{ChatMessage, Detok, Text};
 
 struct App {
-    engine: Engine,
+    engine: EnginePool,
     text: Option<Text>,
     model: String,
 }
@@ -102,14 +102,15 @@ async fn main() {
         eprintln!("tokenizer: none ({} missing); text endpoints disabled", tok_path.display());
         None
     };
-    let engine = match Engine::spawn(&opts.engine, &opts.pack).await {
+    let pool_size = std::env::var("BARO_POOL").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(1).max(1);
+    let engine = match EnginePool::spawn(&opts.engine, &opts.pack, pool_size).await {
         Ok(e) => e,
         Err(e) => {
             eprintln!("baro-serve: {e}");
             std::process::exit(1);
         }
     };
-    eprintln!("engine ready: {:?}", engine.limits);
+    eprintln!("engine pool ready: {} engine(s), limits {:?}", engine.pool_size(), engine.limits);
     let model = opts
         .pack
         .file_name()
@@ -122,6 +123,7 @@ async fn main() {
         .route("/v1/models", get(models))
         .route("/v1/completions", post(completions))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/cancel", post(cancel))
         .route("/tokenize", post(tokenize))
         .route("/detokenize", post(detokenize))
         .with_state(app.clone());
@@ -202,6 +204,7 @@ async fn health(State(app): State<Shared>) -> Json<Value> {
     Json(json!({
         "status": if app.engine.alive() { "ok" } else { "engine_dead" },
         "queue": app.engine.queue_depth(),
+        "pool": app.engine.queue_depths(),
         "tokenizer": app.text.is_some(),
         "limits": {"tmax": app.engine.limits.tmax, "mrows": app.engine.limits.mrows,
                    "kmax": app.engine.limits.kmax, "spec_k": app.engine.limits.spec_k},
@@ -247,9 +250,51 @@ struct Gen {
     n: u32,
     spec: bool,
     stream: bool,
+    /// Token-id sequences that end generation early (M2 control block): the
+    /// tokenizer's own stop ids plus any caller-supplied `stop` strings,
+    /// tokenized. Empty when there is no tokenizer.
+    stop: Vec<Vec<u32>>,
+    /// M1b role-boundary checkpoint hints (`Text::role_boundaries`); empty
+    /// for `/v1/completions`, which has no message list.
+    ckpt: Vec<u32>,
+    /// C3 control block (parsed here, not yet acted on by the engine).
+    sample: protocol::SampleParams,
 }
 
-fn check_and_submit(app: &App, g: &Gen) -> Result<mpsc::UnboundedReceiver<Event>, ApiError> {
+/// OpenAI's `stop`: a single string or an array of strings.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StopParam {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl StopParam {
+    fn into_vec(self) -> Vec<String> {
+        match self {
+            StopParam::One(s) => vec![s],
+            StopParam::Many(v) => v,
+        }
+    }
+}
+
+/// The tokenizer's own EOS-like ids (each a length-1 sequence, moving
+/// today's client-side-only cut into the engine) plus the caller's `stop`
+/// strings tokenized with no special tokens added. `[]` without a tokenizer.
+fn compute_stop(app: &App, user_stop: Option<StopParam>) -> Vec<Vec<u32>> {
+    let Some(t) = app.text.as_ref() else { return vec![] };
+    let mut stop: Vec<Vec<u32>> = t.stop_ids.iter().map(|&id| vec![id]).collect();
+    for s in user_stop.map(StopParam::into_vec).unwrap_or_default() {
+        if let Ok(ids) = t.encode(&s, false) {
+            if !ids.is_empty() {
+                stop.push(ids);
+            }
+        }
+    }
+    stop
+}
+
+fn check_and_submit(app: &App, g: &Gen) -> Result<(u64, mpsc::UnboundedReceiver<Event>), ApiError> {
     let tmax = app.engine.limits.tmax;
     if g.prompt.is_empty() {
         return Err(bad("prompt is empty"));
@@ -261,8 +306,21 @@ fn check_and_submit(app: &App, g: &Gen) -> Result<mpsc::UnboundedReceiver<Event>
         return Err(ApiError::exceed_context(g.prompt.len() as u64, tmax as u64));
     }
     app.engine
-        .submit(g.prompt.clone(), g.n, g.spec)
+        .submit(g.prompt.clone(), g.n, g.spec, g.stop.clone(), g.ckpt.clone(), g.sample.clone())
         .map_err(|e| ApiError::Plain(StatusCode::SERVICE_UNAVAILABLE, e))
+}
+
+/// `POST /v1/cancel {"id": "cmpl-7"|"chatcmpl-7"}`: cancels the named
+/// request if the engine is decoding it right now (M2 control block).
+#[derive(Deserialize)]
+struct CancelReq {
+    id: String,
+}
+
+async fn cancel(State(app): State<Shared>, Json(r): Json<CancelReq>) -> Result<Json<Value>, ApiError> {
+    let num = r.id.rsplit('-').next().unwrap_or("");
+    let id: u64 = num.parse().map_err(|_| bad(format!("id {:?} has no trailing request number", r.id)))?;
+    Ok(Json(json!({"cancelled": app.engine.cancel(id).await})))
 }
 
 /// Streaming state shared by both SSE shapes.
@@ -299,11 +357,14 @@ impl Acc {
         }
     }
 
-    fn finish_reason(&self) -> &'static str {
-        if self.stopped {
-            "stop"
-        } else {
-            "length"
+    /// The engine's own `finish` (M2 control block: "length"/"stop"/
+    /// "cancelled") wins when present; an older engine that never sent one
+    /// falls back to this client-side EOS check.
+    fn finish_reason(&self, engine_finish: Option<&str>) -> String {
+        match engine_finish {
+            Some(f) => f.to_string(),
+            None if self.stopped => "stop".to_string(),
+            None => "length".to_string(),
         }
     }
 }
@@ -311,7 +372,8 @@ impl Acc {
 fn stats_json(s: &protocol::DoneStats) -> Value {
     json!({"prefill_s": s.prefill_s, "decode_s": s.decode_s, "tok_s_gen": s.tok_s,
            "drafted": s.drafted, "accepted": s.accepted,
-           "cached": s.cached, "prefill_rows": s.prefill_rows, "restore_s": s.restore_s})
+           "cached": s.cached, "prefill_rows": s.prefill_rows, "restore_s": s.restore_s,
+           "finish": s.finish})
 }
 
 /// OpenAI `usage` plus the engine's prefix-checkpoint receipt (M1a):
@@ -364,7 +426,8 @@ fn sse_stream(
                 }
                 Event::Done(s) => {
                     ended = true;
-                    chunk(&app, ChunkKind::Finish { reason: acc.finish_reason(), stats: stats_json(&s), tokens: acc.tokens.clone() })
+                    let reason = acc.finish_reason(s.finish.as_deref());
+                    chunk(&app, ChunkKind::Finish { reason, stats: stats_json(&s), tokens: acc.tokens.clone() })
                 }
                 Event::Error(e) => {
                     ended = true;
@@ -379,11 +442,53 @@ fn sse_stream(
 
 enum ChunkKind {
     Delta { text: String, token: u32 },
-    Finish { reason: &'static str, stats: Value, tokens: Vec<u32> },
+    Finish { reason: String, stats: Value, tokens: Vec<u32> },
 }
 
 fn spec_default(app: &App, req_spec: Option<bool>) -> bool {
     req_spec.unwrap_or_else(|| std::env::var("BARO_SPEC").map(|v| v == "1").unwrap_or(false) && app.engine.limits.spec_k > 0)
+}
+
+// ---- C3 sampler fields (shared by both completion endpoints) ------------------
+
+/// `temperature`/`top_p`/`top_k`/`min_p`/`seed`/`presence_penalty`/
+/// `frequency_penalty`/`logprobs`: parsed and carried in the request's
+/// control block (C3), not yet acted on by the engine -- `logprobs` has no
+/// live sampling path to fall out of yet, so it is parsed and otherwise
+/// unused (bench/chat-protocol.md C3 scope note).
+#[derive(Deserialize, Default)]
+struct SamplerFields {
+    #[serde(default)]
+    temperature: Option<f32>,
+    #[serde(default)]
+    top_p: Option<f32>,
+    #[serde(default)]
+    top_k: Option<i32>,
+    #[serde(default)]
+    min_p: Option<f32>,
+    #[serde(default)]
+    seed: Option<u64>,
+    #[serde(default)]
+    presence_penalty: Option<f32>,
+    #[serde(default)]
+    frequency_penalty: Option<f32>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    logprobs: Option<bool>,
+}
+
+impl SamplerFields {
+    fn to_sample_params(&self) -> protocol::SampleParams {
+        protocol::SampleParams {
+            temperature: self.temperature,
+            top_p: self.top_p,
+            top_k: self.top_k,
+            min_p: self.min_p,
+            seed: self.seed,
+            presence_penalty: self.presence_penalty,
+            frequency_penalty: self.frequency_penalty,
+        }
+    }
 }
 
 // ---- /v1/completions -----------------------------------------------------------
@@ -400,6 +505,10 @@ struct CompletionReq {
     /// Extension: speculative (MTP) decode for this request; default BARO_SPEC.
     #[serde(default)]
     spec: Option<bool>,
+    #[serde(default)]
+    stop: Option<StopParam>,
+    #[serde(flatten)]
+    sampler: SamplerFields,
 }
 
 fn prompt_ids(app: &App, prompt: &Value) -> Result<Vec<u32>, ApiError> {
@@ -422,10 +531,13 @@ async fn completions(State(app): State<Shared>, Json(r): Json<CompletionReq>) ->
         n: r.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
         spec: spec_default(&app, r.spec),
         stream: r.stream,
+        stop: compute_stop(&app, r.stop),
+        ckpt: vec![],
+        sample: r.sampler.to_sample_params(),
     };
     let model = r.model.unwrap_or_else(|| app.model.clone());
-    let rx = check_and_submit(&app, &g)?;
-    let id = format!("cmpl-{}", now());
+    let (req_id, rx) = check_and_submit(&app, &g)?;
+    let id = format!("cmpl-{req_id}");
     let n_prompt = g.prompt.len();
     if g.stream {
         let created = now();
@@ -442,9 +554,10 @@ async fn completions(State(app): State<Shared>, Json(r): Json<CompletionReq>) ->
         return Ok(sse.into_response());
     }
     let (acc, text_out, stats) = collect(&app, rx).await?;
+    let reason = acc.finish_reason(stats.get("finish").and_then(Value::as_str));
     Ok(Json(json!({
         "id": id, "object": "text_completion", "created": now(), "model": model,
-        "choices": [{"index": 0, "text": text_out, "tokens": acc.tokens, "finish_reason": acc.finish_reason(), "logprobs": null}],
+        "choices": [{"index": 0, "text": text_out, "tokens": acc.tokens, "finish_reason": reason, "logprobs": null}],
         "usage": usage_json(n_prompt, acc.tokens.len(), &stats),
         "timings": stats,
     }))
@@ -466,6 +579,10 @@ struct ChatReq {
     stream: bool,
     #[serde(default)]
     spec: Option<bool>,
+    #[serde(default)]
+    stop: Option<StopParam>,
+    #[serde(flatten)]
+    sampler: SamplerFields,
 }
 
 #[derive(Deserialize)]
@@ -498,15 +615,19 @@ async fn chat_completions(State(app): State<Shared>, Json(r): Json<ChatReq>) -> 
         .map(|m| Ok(ChatMessage { role: m.role.clone(), content: content_text(&m.content)? }))
         .collect::<Result<Vec<_>, ApiError>>()?;
     let rendered = t.apply_chat_template(&msgs).map_err(|e| ApiError::Plain(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let ckpt = t.role_boundaries(&msgs);
     let g = Gen {
         prompt: t.encode(&rendered, true).map_err(bad)?,
         n: r.max_completion_tokens.or(r.max_tokens).unwrap_or(DEFAULT_MAX_TOKENS),
         spec: spec_default(&app, r.spec),
         stream: r.stream,
+        stop: compute_stop(&app, r.stop),
+        ckpt,
+        sample: r.sampler.to_sample_params(),
     };
     let model = r.model.unwrap_or_else(|| app.model.clone());
-    let rx = check_and_submit(&app, &g)?;
-    let id = format!("chatcmpl-{}", now());
+    let (req_id, rx) = check_and_submit(&app, &g)?;
+    let id = format!("chatcmpl-{req_id}");
     let n_prompt = g.prompt.len();
     if g.stream {
         let created = now();
@@ -530,9 +651,10 @@ async fn chat_completions(State(app): State<Shared>, Json(r): Json<ChatReq>) -> 
         return Ok(sse.into_response());
     }
     let (acc, text_out, stats) = collect(&app, rx).await?;
+    let reason = acc.finish_reason(stats.get("finish").and_then(Value::as_str));
     Ok(Json(json!({
         "id": id, "object": "chat.completion", "created": now(), "model": model,
-        "choices": [{"index": 0, "message": {"role": "assistant", "content": text_out}, "tokens": acc.tokens, "finish_reason": acc.finish_reason()}],
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": text_out}, "tokens": acc.tokens, "finish_reason": reason}],
         "usage": usage_json(n_prompt, acc.tokens.len(), &stats),
         "timings": stats,
     }))

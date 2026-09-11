@@ -42,6 +42,30 @@ def read_line(fd: Int) raises -> Optional[String]:
     return String(from_utf8=Span[UInt8](buf))
 
 
+def cancel_pending(fd: Int, req_id: Int) raises -> Bool:
+    # Non-blocking check for a "{"cancel":ID}" line on fd, once per
+    # step_window call. poll(fd, POLLIN, 0) never blocks; a hit means the
+    # writer's single write() of a short line is already in the pipe, so the
+    # blocking read_line below will not stall on a torn line.
+    var pfd = List[UInt8](unsafe_uninit_length=8)
+    var p = pfd.unsafe_ptr()
+    p.unsafe_bitcast[Int32]().unsafe_offset(0)[] = Int32(fd)
+    p.unsafe_bitcast[Int16]().unsafe_offset(2)[] = Int16(1)  # events = POLLIN
+    p.unsafe_bitcast[Int16]().unsafe_offset(3)[] = Int16(0)  # revents
+    var r = external_call["poll", Int32](p, UInt64(1), Int32(0))
+    if r <= 0 or (Int(p.unsafe_bitcast[Int16]().unsafe_offset(3)[]) & 1) == 0:
+        return False
+    var line_in = read_line(fd)
+    if not line_in:
+        return False
+    var line = line_in.value()
+    var i = json_key(line, "cancel")
+    var cid = 0
+    if i < 0 or not json_int(line, i, cid):
+        return False
+    return cid == req_id
+
+
 def json_key(line: String, key: String) -> Int:
     # Index of the first byte of the value for "key": ..., or -1.
     var i = line.find(String("\"") + key + "\"")
@@ -76,11 +100,63 @@ def json_int(line: String, mut i: Int, mut v: Int) -> Bool:
     return have
 
 
+def json_float(line: String, mut i: Int, mut v: Float64) -> Bool:
+    # Plain decimal (sign, digits, optional '.', digits); no exponent form --
+    # none of the sampler fields need one.
+    var b = line.as_bytes()
+    var neg = False
+    if i < len(b) and b[i] == 45:
+        neg = True
+        i += 1
+    var have = False
+    var ip: Float64 = 0
+    while i < len(b) and b[i] >= 48 and b[i] <= 57:
+        ip = ip * 10 + Float64(Int(b[i] - 48))
+        i += 1
+        have = True
+    var frac: Float64 = 0
+    if i < len(b) and b[i] == 46:
+        i += 1
+        var scale: Float64 = 1
+        while i < len(b) and b[i] >= 48 and b[i] <= 57:
+            scale /= 10
+            frac += Float64(Int(b[i] - 48)) * scale
+            i += 1
+            have = True
+    v = ip + frac
+    if neg:
+        v = -v
+    return have
+
+
+@fieldwise_init
+struct SampleParams(Copyable, Movable):
+    # C3 (bench/chat-protocol.md): parsed from the wire, not yet acted on --
+    # the live decode loop still always takes the greedy/MTP path. Ready for
+    # serve/sample_ref.mojo (host reference) or kernels/sample.mojo (device,
+    # lane-KSAMP) to read once either is wired in. temperature <= 0 means
+    # "off" throughout, matching both references' own convention.
+    var temperature: Float64
+    var top_p: Float64
+    var top_k: Int
+    var min_p: Float64
+    var seed: UInt64
+    var presence_penalty: Float64
+    var frequency_penalty: Float64
+
+
+def default_sample_params() -> SampleParams:
+    return SampleParams(temperature=0, top_p=1.0, top_k=0, min_p=0, seed=0, presence_penalty=0, frequency_penalty=0)
+
+
 def parse_request(
-    line: String, mut id: Int, mut prompt: List[Int], mut n: Int, mut spec: Bool, mut has_spec: Bool
+    line: String, mut id: Int, mut prompt: List[Int], mut n: Int, mut spec: Bool, mut has_spec: Bool, mut stop: List[List[Int]], mut ckpt: List[Int], mut sample: SampleParams
 ) -> String:
-    # {"id":INT,"prompt":[INT,...],"n":INT,"spec":BOOL}; spec optional.
-    # Returns "" on success, else the error text (id is set when it parsed).
+    # {"id":INT,"prompt":[INT,...],"n":INT,"spec":BOOL,"stop":[[INT,...],...],
+    #  "ckpt":[INT,...],"temperature":FLOAT,"top_p":FLOAT,"top_k":INT,
+    #  "min_p":FLOAT,"seed":INT,"presence_penalty":FLOAT,
+    #  "frequency_penalty":FLOAT}; everything past prompt/n optional. Returns
+    # "" on success, else the error text (id is set when it parsed).
     id = 0
     var i = json_key(line, "id")
     if i < 0 or not json_int(line, i, id):
@@ -115,6 +191,93 @@ def parse_request(
             has_spec = True
         else:
             return "spec must be true or false"
+    var si = json_key(line, "stop")
+    if si >= 0:
+        if si >= len(b) or b[si] != 91:
+            return "stop must be an array of arrays"
+        si += 1
+        while True:
+            while si < len(b) and (b[si] == 32 or b[si] == 44):
+                si += 1
+            if si >= len(b):
+                return "unterminated stop array"
+            if b[si] == 93:
+                break
+            if b[si] != 91:
+                return "stop entries must be arrays of token ids"
+            si += 1
+            var seq = List[Int]()
+            while True:
+                while si < len(b) and (b[si] == 32 or b[si] == 44):
+                    si += 1
+                if si >= len(b):
+                    return "unterminated stop sequence"
+                if b[si] == 93:
+                    si += 1
+                    break
+                var v2 = 0
+                if not json_int(line, si, v2) or v2 < 0:
+                    return "stop sequence must hold non-negative integers"
+                seq.append(v2)
+            stop.append(seq^)
+    var ci = json_key(line, "ckpt")
+    if ci >= 0:
+        if ci >= len(b) or b[ci] != 91:
+            return "ckpt must be an array of integers"
+        ci += 1
+        while True:
+            while ci < len(b) and (b[ci] == 32 or b[ci] == 44):
+                ci += 1
+            if ci >= len(b):
+                return "unterminated ckpt array"
+            if b[ci] == 93:
+                break
+            var v3 = 0
+            if not json_int(line, ci, v3) or v3 < 0:
+                return "ckpt must hold non-negative integers"
+            ckpt.append(v3)
+    var fi = json_key(line, "temperature")
+    if fi >= 0:
+        var fv: Float64 = 0
+        if not json_float(line, fi, fv):
+            return "temperature must be a number"
+        sample.temperature = fv
+    fi = json_key(line, "top_p")
+    if fi >= 0:
+        var fv2: Float64 = 0
+        if not json_float(line, fi, fv2):
+            return "top_p must be a number"
+        sample.top_p = fv2
+    fi = json_key(line, "top_k")
+    if fi >= 0:
+        var iv = 0
+        if not json_int(line, fi, iv):
+            return "top_k must be an integer"
+        sample.top_k = iv
+    fi = json_key(line, "min_p")
+    if fi >= 0:
+        var fv3: Float64 = 0
+        if not json_float(line, fi, fv3):
+            return "min_p must be a number"
+        sample.min_p = fv3
+    fi = json_key(line, "seed")
+    if fi >= 0:
+        var iv2 = 0
+        if not json_int(line, fi, iv2) or iv2 < 0:
+            return "seed must be a non-negative integer"
+        sample.seed = UInt64(iv2)
+    fi = json_key(line, "presence_penalty")
+    if fi >= 0:
+        var fv4: Float64 = 0
+        if not json_float(line, fi, fv4):
+            return "presence_penalty must be a number"
+        sample.presence_penalty = fv4
+    fi = json_key(line, "frequency_penalty")
+    if fi >= 0:
+        var fv5: Float64 = 0
+        if not json_float(line, fi, fv5):
+            return "frequency_penalty must be a number"
+        sample.frequency_penalty = fv5
     return ""
 
 
@@ -198,7 +361,7 @@ def main() raises:
     var ckpt_cap = atol(getenv("BARO_CKPT", "8")) if serve else 0
     if ckpt_cap < 0:
         ckpt_cap = 0
-    var chain = Chain(ctx, ckpt_cap)
+    var chain = Chain(ctx, ckpt_cap, packdir)
     print("checkpoints: cap", ckpt_cap, ", bytes", Float64(CKPT_BYTES) / 1e6, "MB each, period", CKPT_PERIOD)
     var req_id = 0
     if serve:
@@ -213,6 +376,9 @@ def main() raises:
         var ckpt_idx = -1
         var cached = 0
         var restore_s = 0.0
+        var stop_seqs = List[List[Int]]()
+        var ckpt_hints = List[Int]()
+        var sample = default_sample_params()
         if serve:
             var line_in = read_line(0)
             if not line_in:
@@ -220,7 +386,7 @@ def main() raises:
             var req_n = 0
             var req_spec = False
             var req_has_spec = False
-            var perr = parse_request(line_in.value(), req_id, prompt, req_n, req_spec, req_has_spec)
+            var perr = parse_request(line_in.value(), req_id, prompt, req_n, req_spec, req_has_spec, stop_seqs, ckpt_hints, sample)
             if perr == "" and len(prompt) < 1:
                 perr = "empty prompt"
             if perr == "" and req_n < 1:
@@ -330,16 +496,57 @@ def main() raises:
         wst.pos = cached
         wst.pos_prev = cached
         var prefill_done = False
+        var cancelled = False
+        var stopped = False
         # The stopwatch stays here, in the harness that is never embedded in a
         # gguf: step_window cannot reach t0, t_prefill_end or dt (P-A, 2026-09-08).
         while wst.pos < n_total - 1:
-            step_window(ctx, bufs, cfg, wst)
-            if ckpt_cap > 0 and wst.pos > cached and wst.pos < len(prompt) and (wst.pos == len(prompt) - 1 or wst.pos % CKPT_PERIOD == 0):
-                chain.save(ctx, bufs.convstate_d, bufs.sstate_d, wst.ring, wst.pos, prompt)
+            if len(ckpt_hints) > 0 and wst.pos < pf_rows:
+                # A hint may fall inside what would otherwise be one big
+                # prefill chunk; cap this call's chunk so wst.pos actually
+                # stops there (checkpoints are only taken between calls).
+                var step_cfg = cfg.copy()
+                step_cfg.pf_chunk = min(cfg.pf_chunk, next_ckpt_stop(ckpt_hints, wst.pos, pf_rows) - wst.pos)
+                step_window(ctx, bufs, step_cfg, wst)
+            else:
+                step_window(ctx, bufs, cfg, wst)
+            if ckpt_cap > 0 and wst.pos > cached and wst.pos < len(prompt):
+                if wst.pos == len(prompt) - 1 or wst.pos % CKPT_PERIOD == 0:
+                    chain.save(ctx, bufs.convstate_d, bufs.sstate_d, wst.ring, wst.pos, prompt, False, False)
+                else:
+                    var hi = hint_index(ckpt_hints, wst.pos)
+                    if hi >= 0:
+                        chain.save(ctx, bufs.convstate_d, bufs.sstate_d, wst.ring, wst.pos, prompt, hi == 0, True)
             if not prefill_done and wst.pos >= len(prompt):
                 ctx.synchronize()
                 t_prefill_end = perf_counter_ns()
                 prefill_done = True
+            if serve and cancel_pending(0, req_id):
+                cancelled = True
+                break
+            if len(stop_seqs) > 0 and wst.pos >= len(prompt):
+                ctx.synchronize()
+                ctx.enqueue_copy(dst_buf=toks_h, src_buf=toks_d)
+                ctx.synchronize()
+                var gen_len = wst.pos + 1 - len(prompt)
+                for si in range(len(stop_seqs)):
+                    var seq = stop_seqs[si].copy()
+                    var L = len(seq)
+                    if L == 0 or L > gen_len:
+                        continue
+                    var ok = True
+                    for k in range(L):
+                        if Int(toks_h[wst.pos - L + 1 + k]) != seq[k]:
+                            ok = False
+                            break
+                    if ok:
+                        stopped = True
+                        break
+                if stopped:
+                    break
+        if not prefill_done:
+            ctx.synchronize()
+            t_prefill_end = perf_counter_ns()
 
         var t_host = Float64(perf_counter_ns() - t0) / 1e9
         ctx.synchronize()
@@ -442,16 +649,19 @@ def main() raises:
         ctx.enqueue_copy(dst_buf=toks_h, src_buf=toks_d)
         ctx.synchronize()
         var generated = List[Int]()
-        for i in range(len(prompt), n_total):
+        for i in range(len(prompt), wst.pos + 1):
             generated.append(Int(toks_h[i]))
         var prefill_s = Float64(t_prefill_end - t0) / 1e9
         var decode_s = dt - prefill_s
+        var n_gen = len(generated)
         # tok/s_gen is the only number comparable to llama.cpp: it divides
-        # gen_n - 1 by decode time alone, matching timings.predicted_per_second.
-        # tok/s_total includes prefill and is reported for completeness only --
-        # it is not the engine's throughput against any external baseline.
-        print("tokens:", len(generated), " prefill_s:", prefill_s, " decode_s:", decode_s)
-        print("tok/s_total:", Float64(gen_n) / dt, " tok/s_gen:", Float64(gen_n - 1) / decode_s)
+        # n_gen - 1 by decode time alone, matching timings.predicted_per_second
+        # (n_gen, not the requested gen_n, so an early stop/cancel reports the
+        # rate over what actually ran). tok/s_total includes prefill and is
+        # reported for completeness only -- it is not the engine's throughput
+        # against any external baseline.
+        print("tokens:", n_gen, " prefill_s:", prefill_s, " decode_s:", decode_s)
+        print("tok/s_total:", Float64(n_gen) / dt, " tok/s_gen:", Float64(n_gen - 1) / decode_s if n_gen > 1 else 0.0)
         var line = String("")
         for i in range(len(generated)):
             line += String(generated[i]) + " "
@@ -459,10 +669,16 @@ def main() raises:
         if spec:
             print("mtp: drafted", wst.n_drafted, " accepted", wst.n_accepted, " k", kcfg)
         if serve:
-            var done_line = String("{\"id\":") + String(req_id) + ",\"done\":true,\"n\":" + String(len(generated))
+            var finish = String("length")
+            if cancelled:
+                finish = String("cancelled")
+            elif stopped:
+                finish = String("stop")
+            var done_line = String("{\"id\":") + String(req_id) + ",\"done\":true,\"n\":" + String(n_gen)
             done_line += ",\"prefill_s\":" + String(prefill_s) + ",\"decode_s\":" + String(decode_s)
-            done_line += ",\"tok_s\":" + String(Float64(gen_n - 1) / decode_s if gen_n > 1 else 0.0)
+            done_line += ",\"tok_s\":" + String(Float64(n_gen - 1) / decode_s if n_gen > 1 else 0.0)
             done_line += ",\"cached\":" + String(cached) + ",\"prefill_rows\":" + String(prefill_rows) + ",\"restore_s\":" + String(restore_s) + ",\"checkpoints\":" + String(chain.count_valid())
+            done_line += ",\"finish\":\"" + finish + "\""
             if spec:
                 done_line += ",\"drafted\":" + String(wst.n_drafted) + ",\"accepted\":" + String(wst.n_accepted) + ",\"k\":" + String(kcfg)
             print(done_line + "}")

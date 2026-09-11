@@ -13,7 +13,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::mpsc;
 
-use crate::protocol::{parse_line, DoneStats, EngineMsg, Request};
+use crate::protocol::{cancel_line, parse_line, DoneStats, EngineMsg, Request, SampleParams};
 
 /// What a request's consumer sees, in order: zero or more tokens, then
 /// exactly one `Done` or `Error`.
@@ -40,9 +40,15 @@ struct Job {
 
 pub struct Engine {
     tx: mpsc::Sender<Job>,
-    next_id: AtomicU64,
     queued: Arc<AtomicUsize>,
     alive: Arc<AtomicBool>,
+    /// The request id the engine is actively decoding, if any; set/cleared
+    /// by the worker around `run_one`. `cancel` reads it to decide whether a
+    /// cancel would land on anything, and the worker alone still owns
+    /// `stdin` -- no sharing needed to write a cancel line, since the worker
+    /// writes it itself once `cancel_tx` wakes its select loop.
+    current: Arc<tokio::sync::Mutex<Option<u64>>>,
+    cancel_tx: mpsc::UnboundedSender<u64>,
     pub limits: Limits,
     child: tokio::sync::Mutex<Option<Child>>,
 }
@@ -101,14 +107,17 @@ impl Engine {
         .map_err(|_| "engine did not become ready in time".to_string())??;
 
         let (tx, rx) = mpsc::channel::<Job>(QUEUE_CAP);
+        let (cancel_tx, cancel_rx) = mpsc::unbounded_channel::<u64>();
         let queued = Arc::new(AtomicUsize::new(0));
         let alive = Arc::new(AtomicBool::new(true));
-        tokio::spawn(worker(rx, stdin, lines, queued.clone(), alive.clone()));
+        let current = Arc::new(tokio::sync::Mutex::new(None));
+        tokio::spawn(worker(rx, stdin, lines, queued.clone(), alive.clone(), cancel_rx, current.clone()));
         Ok(Engine {
             tx,
-            next_id: AtomicU64::new(1),
             queued,
             alive,
+            current,
+            cancel_tx,
             limits,
             child: tokio::sync::Mutex::new(Some(child)),
         })
@@ -123,17 +132,21 @@ impl Engine {
         self.queued.load(Ordering::SeqCst)
     }
 
-    /// Queue one request. The receiver yields its events; dropping it
-    /// discards the rest of that request's output (the engine still runs
-    /// it to completion — there is no cancel in the protocol).
-    pub fn submit(&self, prompt: Vec<u32>, n: u32, spec: bool) -> Result<mpsc::UnboundedReceiver<Event>, String> {
+    /// Queue one request under the given id (assigned by the caller --
+    /// `EnginePool` owns a single id counter shared by every engine in the
+    /// pool, so ids stay unique across engines). Returns a receiver of its
+    /// events; dropping it without cancelling discards the rest of that
+    /// request's output, the engine still runs it to completion.
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit(
+        &self, id: u64, prompt: Vec<u32>, n: u32, spec: bool, stop: Vec<Vec<u32>>, ckpt: Vec<u32>, sample: SampleParams,
+    ) -> Result<mpsc::UnboundedReceiver<Event>, String> {
         if !self.alive() {
             return Err("engine process has exited".into());
         }
-        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (out, rx) = mpsc::unbounded_channel();
         let job = Job {
-            req: Request { id, prompt, n, spec },
+            req: Request { id, prompt, n, spec, stop, ckpt, sample },
             out,
         };
         self.queued.fetch_add(1, Ordering::SeqCst);
@@ -144,6 +157,17 @@ impl Engine {
                 Err(format!("queue full ({QUEUE_CAP} requests waiting)"))
             }
         }
+    }
+
+    /// Cancel `id` if the engine is actively decoding it right now. Returns
+    /// `false` for a request that has not started (still queued), already
+    /// finished, or does not exist -- cancelling a queued-but-not-yet-running
+    /// request is not supported (brief CHAT/C1: not in this step).
+    pub async fn cancel(&self, id: u64) -> bool {
+        if *self.current.lock().await != Some(id) {
+            return false;
+        }
+        self.cancel_tx.send(id).is_ok()
     }
 
     /// Close the engine's stdin (it exits at EOF) and reap it.
@@ -160,16 +184,105 @@ impl Engine {
     }
 }
 
+/// `BARO_POOL` engine processes (default 1 = today's single engine), each
+/// with its own pack load and its own request queue. `submit` routes to the
+/// engine with the fewest requests waiting or running (ties -> lowest
+/// index), so at `BARO_POOL=1` this is exactly today's single-queue
+/// behaviour; at `BARO_POOL=2` a second request starts on the other engine
+/// instead of waiting behind the first. One id counter, owned by the pool
+/// and never by an `Engine`, so ids stay unique across engines (`cancel`
+/// and the API's `cmpl-<id>`/`chatcmpl-<id>` depend on that).
+pub struct EnginePool {
+    engines: Vec<Engine>,
+    next_id: AtomicU64,
+    pub limits: Limits,
+}
+
+impl EnginePool {
+    pub async fn spawn(engine: &Path, pack: &Path, pool_size: usize) -> Result<EnginePool, String> {
+        let mut engines = Vec::with_capacity(pool_size.max(1));
+        for _ in 0..pool_size.max(1) {
+            engines.push(Engine::spawn(engine, pack).await?);
+        }
+        let limits = engines[0].limits.clone();
+        Ok(EnginePool {
+            engines,
+            next_id: AtomicU64::new(1),
+            limits,
+        })
+    }
+
+    pub fn pool_size(&self) -> usize {
+        self.engines.len()
+    }
+
+    pub fn alive(&self) -> bool {
+        self.engines.iter().any(Engine::alive)
+    }
+
+    /// Requests waiting or running, summed over every engine in the pool.
+    pub fn queue_depth(&self) -> usize {
+        self.engines.iter().map(Engine::queue_depth).sum()
+    }
+
+    /// Per-engine breakdown of `queue_depth`: lets the C4 gate tell "two
+    /// engines each running one request" apart from "one engine running
+    /// both while the other sits idle," which the summed `queue_depth`
+    /// alone cannot.
+    pub fn queue_depths(&self) -> Vec<usize> {
+        self.engines.iter().map(Engine::queue_depth).collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit(
+        &self, prompt: Vec<u32>, n: u32, spec: bool, stop: Vec<Vec<u32>>, ckpt: Vec<u32>, sample: SampleParams,
+    ) -> Result<(u64, mpsc::UnboundedReceiver<Event>), String> {
+        let mut best = 0;
+        let mut best_q = self.engines[0].queue_depth();
+        for (i, e) in self.engines.iter().enumerate().skip(1) {
+            let q = e.queue_depth();
+            if q < best_q {
+                best = i;
+                best_q = q;
+            }
+        }
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let rx = self.engines[best].submit(id, prompt, n, spec, stop, ckpt, sample)?;
+        Ok((id, rx))
+    }
+
+    /// Tries every engine (a request's id does not say which one it landed
+    /// on); at most one will have it as its `current` decode.
+    pub async fn cancel(&self, id: u64) -> bool {
+        for e in &self.engines {
+            if e.cancel(id).await {
+                return true;
+            }
+        }
+        false
+    }
+
+    pub async fn shutdown(&self) {
+        for e in &self.engines {
+            e.shutdown().await;
+        }
+    }
+}
+
 async fn worker(
     mut rx: mpsc::Receiver<Job>,
     mut stdin: ChildStdin,
     mut lines: tokio::io::Lines<BufReader<ChildStdout>>,
     queued: Arc<AtomicUsize>,
     alive: Arc<AtomicBool>,
+    mut cancel_rx: mpsc::UnboundedReceiver<u64>,
+    current: Arc<tokio::sync::Mutex<Option<u64>>>,
 ) {
     while let Some(job) = rx.recv().await {
         let id = job.req.id;
-        let result = run_one(&job, &mut stdin, &mut lines).await;
+        *current.lock().await = Some(id);
+        let result = run_one(&job, &mut stdin, &mut lines, &mut cancel_rx).await;
+        *current.lock().await = None;
         queued.fetch_sub(1, Ordering::SeqCst);
         if let Err(e) = result {
             eprintln!("engine: request {id}: {e}");
@@ -188,13 +301,18 @@ async fn worker(
     let _ = stdin.shutdown().await;
 }
 
-/// Write one request, forward its lines until its Done/Error.
-/// Only an I/O failure or engine EOF is an `Err` (the engine is gone);
-/// a protocol-level rejection is delivered as `Event::Error`.
+/// Write one request, forward its lines until its Done/Error. A cancel for
+/// this id (from `Engine::cancel`, via `cancel_rx`) is written to the same
+/// stdin the worker already owns; a cancel for any other id is stale (the
+/// request it named has already finished) and is dropped. Only an I/O
+/// failure or engine EOF is an `Err` (the engine is gone); a protocol-level
+/// rejection, or a cancelled request's own `done` line, is delivered as an
+/// `Event`.
 async fn run_one(
     job: &Job,
     stdin: &mut ChildStdin,
     lines: &mut tokio::io::Lines<BufReader<ChildStdout>>,
+    cancel_rx: &mut mpsc::UnboundedReceiver<u64>,
 ) -> Result<(), String> {
     let id = job.req.id;
     stdin
@@ -203,10 +321,22 @@ async fn run_one(
         .map_err(|e| format!("write to engine stdin: {e}"))?;
     stdin.flush().await.map_err(|e| format!("flush engine stdin: {e}"))?;
     loop {
-        let line = match lines.next_line().await {
-            Ok(Some(l)) => l,
-            Ok(None) => return Err("engine exited mid-request".into()),
-            Err(e) => return Err(format!("engine stdout: {e}")),
+        let line = tokio::select! {
+            l = lines.next_line() => match l {
+                Ok(Some(l)) => l,
+                Ok(None) => return Err("engine exited mid-request".into()),
+                Err(e) => return Err(format!("engine stdout: {e}")),
+            },
+            Some(cancel_id) = cancel_rx.recv() => {
+                if cancel_id == id {
+                    stdin
+                        .write_all(cancel_line(id).as_bytes())
+                        .await
+                        .map_err(|e| format!("write cancel to engine stdin: {e}"))?;
+                    stdin.flush().await.map_err(|e| format!("flush engine stdin: {e}"))?;
+                }
+                continue;
+            }
         };
         match parse_line(&line) {
             EngineMsg::Tok { id: rid, tok } if rid == id => {

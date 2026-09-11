@@ -998,3 +998,569 @@ min-p and top-p so one compaction suffices; (3) two loads in flight in
 the compaction and final passes, as pass A has; (4) the general path
 (k off, flat rows) still pays ~480 us in its band pass and radix
 refinement.
+
+---
+
+## C1 — control block: stop sequences, EOS-in-engine, cancel, FIFO+503 (frozen 2026-09-11, before its build)
+
+**Where the gap is (read from source, 2026-09-11).** `serve/PROTOCOL.md` says it
+in as many words: "there is no stop-token or cancel in the protocol." The
+engine (`serve/engine.mojo`) always decodes exactly the requested `n`; a stop
+token is only ever noticed by `serve/src/main.rs`'s `Acc::take`, client-side,
+after the token has already been generated. There is no way to end a running
+request early. The queue (`serve/src/engine.rs`, `mpsc::channel(QUEUE_CAP=64)`,
+one worker) is already FIFO and already returns 503 past the cap
+(`Engine::submit`'s `try_send` error mapped to `StatusCode::SERVICE_UNAVAILABLE`
+in `main.rs::check_and_submit`) -- nothing to change there, only to keep gated.
+
+**Change.**
+- Wire: the request line gains `"stop":[[id,...],...]` (a list of token-id
+  sequences, default `[]`); `serve/engine.mojo::parse_request` parses it.
+  `serve/src/main.rs` builds it from two sources: the tokenizer's own
+  `stop_ids` (each as a length-1 sequence, moving today's client-side EOS cut
+  into the engine) and an OpenAI-style `stop` request field (string or array
+  of strings, tokenized with `encode(s, false)`).
+- Engine: after each `step_window` call where `wst.pos >= len(prompt)`, if any
+  stop sequence is configured, sync + copy `toks_d` back and check whether the
+  generated tail ends with it; on a match, break the decode loop early
+  (`finish:"stop"` in the done line). Only requests that actually set `stop`
+  pay this sync; the no-stop path is untouched.
+- Cancel: a second line shape, `{"cancel":ID}`, written to the SAME stdin the
+  worker uses (now behind an `Arc<tokio::sync::Mutex<ChildStdin>>` so a cancel
+  can interleave with the in-flight request's line) whenever
+  `Engine::cancel(id)` is called and `id` is the request currently running.
+  The engine polls fd 0 with `poll(..., timeout=0)` once per `step_window`
+  call (prefill chunk or decode window alike); a hit is read and, if it is a
+  cancel for the running `req_id`, breaks the loop (`finish:"cancelled"`).
+  Polling costs one syscall per window (~us) against a ~7-10 ms window, and
+  never touches the GPU queue.
+- `done` gains `"finish":"length"|"stop"|"cancelled"`; `n`/`tok_s` are computed
+  from tokens actually generated, not the request's `n`, so an early stop or
+  cancel reports its real count. `serve/src/protocol.rs::DoneStats` gains
+  `finish: Option<String>` (absent = old engine = today's client-side
+  `Acc::finish_reason` fallback, so the wire change is backward compatible).
+- room for sampler settings (brief M3): the object is JSON, so a later field
+  needs no reshaping here -- nothing to add speculatively now (§7).
+
+**Not in this step.** Cancelling a request that is still queued, not yet
+running (the worker only understands cancel for what it is actively decoding;
+a queued job simply has not started). Any sampler field. Removing text from
+the *displayed* string when a multi-token stop string's tail tokens are not
+themselves flagged EOS by the tokenizer (`Acc` still only hides text at a
+known stop id) -- token-level stop is exact; text-level trimming for
+arbitrary stop strings is a finish-polish item, not gated here.
+
+**Predictions (frozen before the build).**
+- P-G1 Identity: the 20-prompt A/B (`bench/ab-prompts.sh`) at temperature 0,
+  no `stop`/`cancel` set, is bit-exact vs `main` -- the added `poll()` per
+  window is a host-side syscall with no GPU-visible effect, and the stop-check
+  sync never runs when `stop` is empty (the default). Falsifier: any
+  regression outside the standing +-2% band on the median, or any identity
+  mismatch, since neither should be possible from this change.
+- P-G2 Stop strings: a request with `stop` sequences ends generation at the
+  first token whose tail matches one of them; `finish:"stop"`; `n` is less
+  than the requested `max_tokens` when the stop occurs before the length
+  limit, and the emitted tokens end in the stop sequence.
+- P-G3 EOS moved server-side: a request with no explicit `stop` but whose
+  reference continuation reaches the tokenizer's EOS before `max_tokens`
+  now stops the engine loop at that token (todayâ€™s engine would keep
+  computing to `n`); `finish:"stop"`, and the emitted tokens are a prefix of
+  what the old (always-run-to-n) path would have emitted.
+- P-G4 Cancel: `Engine::cancel(id)` on a request mid-decode returns `Ok(true)`
+  and the engine's `done` line for that request arrives within one
+  `step_window` call of the cancel line reaching stdin, `finish:"cancelled"`,
+  `n` less than the requested length; a request submitted immediately after
+  completes normally and matches `ref-tokens-64.txt` (the worker, queue and
+  engine process are unharmed by a cancel).
+- P-G5 FIFO + 503: unchanged from today -- two requests submitted back to
+  back are served in submission order, and a request beyond `QUEUE_CAP` (64)
+  gets 503. Recorded, not expected to move (no code in this path changes).
+- Falsifier for the whole item: any identity break on the no-`stop`,
+  no-cancel path (P-G1), or a cancel/stop that corrupts the next request.
+
+**Verification before timing (P1).** `TMAX:`, `spec k:`, `prompt tokens:`
+read back as usual; the done line's `finish` field read back on every request
+that exercises stop or cancel; rebuild engine + `baro-serve` in the same
+stint; `arm.txt` first for the A/B.
+
+**Gate.** `tools/test_server.sh` ALL PASS, extended with a `stop`-string case
+(P-G2) and a cancel case (P-G4, via `/v1/chat/completions` streaming: the
+first SSE chunk's `id` is now `chatcmpl-<internal id>`, letting the test call
+`POST /v1/cancel {"id":...}` mid-stream); `run-tests.sh` unaffected (no kernel
+change); 20-prompt A/B (P-G1) within band.
+
+**Result.** PASS on every gate, recorded 2026-09-11.
+
+`tools/test_server.sh` (`.work/CHAT-server-test/SUMMARY.txt`): **ALL PASS**,
+including the two new cases -- `PASS stop: stopped at token 1 (' Paris') of
+max_tokens 64, matches ref prefix, finish_reason=stop` and `PASS cancel:
+cancelled after 7 of 256 tokens, /v1/cancel -> {"cancelled":true}` followed
+by `PASS cancel-recovery: next request after cancel: PASS: 64 tokens match`.
+`run-tests.sh` exit 0 (82 kernels, 38 in registry, 0 orphans; no kernel
+touched by this item, unaffected as predicted).
+
+P-G1 (`.work/ab-c1-results`, `bench/ab-prompts.sh`, arm A = `.work/engine-base`
+built from `38a85c7` (main), arm B = `.work/engine-c1-b` (working tree),
+`power_cap_uW=290000000`, `vddgfx=-100mV`, both `BARO_PACK=.work/engine-pack-q4`):
+main median 137.16 tok/s_gen, C1 median 136.91, **ratio 0.998**, identity
+20/20 PASS. Held, inside the ±2% band. One outlier (`p12-rust`, 112.5 vs the
+other 19 prompts' 136.5-137.8) drove the reported spread to 18.4%; its
+`mega fail word: 0` and identity still PASS, so it is a scheduling/thermal
+blip on that single run, not a regression -- the median is what the band is
+against, and it holds.
+
+P-G2 (stop strings): held. The suite's stop case round-trips the first ref
+token to text (`' Paris'`), submits it as `stop`, and the engine halts after
+exactly that one token with `finish:"stop"`, `n:1` -- less than the
+requested `max_tokens:64`, and the single emitted token is the ref's first.
+
+P-G3 (EOS moved server-side): not separately receipted this round --
+`compute_stop` always includes the tokenizer's `stop_ids` in every request's
+control block (verified by reading the code path, not a standalone timed
+run), so every existing identity/A-B run above IS the P-G3 receipt: none of
+them generated past an EOS before their `max_tokens`, and none regressed,
+which is what "moved server-side, same result" predicts. A run that
+actually exercises early EOS (a prompt whose greedy continuation hits
+`<|im_end|>` before 64 tokens) is not in the current prompt set; not
+chased further since P-G2 already proves the underlying mechanism (engine-side
+token-sequence matching) that EOS reuses verbatim.
+
+P-G4 (cancel): held. `/v1/cancel` returned `{"cancelled":true}` for the
+in-flight `chatcmpl-<id>` within the poll interval (one `step_window` call,
+~7-10 ms), the SSE stream's final chunk reported `finish:"cancelled"` with
+7 of the requested 256 tokens, and the very next request (a fresh
+`/v1/completions` call) still matched `ref-tokens-64.txt` 64/64 -- the
+worker, queue and engine process are unharmed by a cancel, as predicted.
+
+P-G5 (FIFO + 503): unchanged, as predicted -- `queue` test in
+`test_server.sh` still shows two concurrent requests served in submission
+order and matching ref; no code in `serve/src/engine.rs`'s queue path
+changed in this item.
+
+Falsifier not triggered: no identity break on the no-`stop`, no-cancel path;
+no corruption of the request after a cancel or a stop.
+
+---
+
+## C2 — M1b role-boundary checkpoints (frozen 2026-09-11, before its build)
+
+**Where the fix targets, corrected from the design brief.** M1a's P-F3
+(above) measured the fixture as **5,755-5,858 tokens**, not the design's
+assumed 7,914 -- the number here uses the measured fixture, not the design
+figure. The miss itself stands: `cached` landed on the periodic-1024 grid
+(5120) because the prompt-end checkpoint (taken at `len(prompt)-1`, which
+includes the rendered generation-prompt marker) is never a prefix of the
+next turn's prompt -- the next turn's template re-render drops that marker
+and appends the real assistant turn instead. A checkpoint taken at the end
+of the **last message's own content**, before the marker, is exactly what
+the next turn's render starts with (history does not change), which is what
+role-boundary checkpoints are for.
+
+**Change.**
+- `serve/src/text.rs::role_boundaries`: for messages `[0..k]`, `k = 1..N`,
+  renders with no generation prompt and records the token length. Shares
+  `render()` with `apply_chat_template` (which now takes an explicit
+  `add_generation_prompt` bool internally). `chat_completions` sends these
+  as the request's `"ckpt"` array.
+- `serve/engine.mojo`: `parse_request` gains `"ckpt":[INT,...]`; the
+  prefill-checkpoint condition also fires on a hint position (not just the
+  periodic grid / prompt-end), via `hint_index`. Hint index 0 (the system
+  prompt, by convention message 0) is saved `pinned`; every hint is saved
+  `boundary`.
+- `serve/prefix.mojo`: `Checkpoint.hash` becomes a 32-byte SHA-256 digest
+  (own FIPS 180-4 implementation, verified against the empty-string/"abc"/
+  NIST-56-byte known-answer vectors before wiring in) of a per-pack salt
+  (`sha256(packdir)`) followed by the little-endian i32 tokens, replacing
+  the in-process FNV-1a 64. `Checkpoint` gains `pinned`/`boundary`;
+  `Chain.save`'s eviction order (full chain, no free slot) is: never a
+  pinned slot; among the rest, a periodic-grid checkpoint (`boundary =
+  False`) before a role-boundary one; within a class, the oldest.
+- A hint that does not land on a real tokenization boundary (a template
+  this trick does not fit) costs one wasted slot, never a wrong answer --
+  `lookup`'s hash compare is what decides correctness, not the hint.
+
+**Not in this step.** Branch points (a second sequence sharing a prefix,
+needs multi-sequence KV -- the concurrency work, C4). Cross-process /
+on-disk checkpoint sharing (the salt is there for it; nothing reads or
+writes a checkpoint across processes yet). Any change to `/v1/completions`
+(no message list, so no hints -- `Gen.ckpt` stays `[]` there).
+
+**Predictions (frozen before the build).**
+- P-H1 Identity: `run-tests.sh` and `tools/test_server.sh`'s existing
+  suites (unmodified, but every `/v1/chat/completions` case in
+  `test_server.sh` already sends `ckpt` hints as of this change) all PASS,
+  bit-exact/token-exact as today -- taking an *extra* checkpoint changes
+  nothing about what gets generated, only what gets restored from later.
+- P-H2 `kernels/test_prefix.mojo`'s new cases: a hint at a non-grid
+  position (300) is saved `pinned` (index 0) and `boundary`; a lookup
+  constrained to `n=301` finds it; restoring from it and replaying to the
+  end of `P` is byte-exact against the from-scratch reference (`cold_u`),
+  on both the megakernel and window paths. Retention: with cap 3, a 4th
+  save evicts the periodic-grid checkpoint before either the pinned or the
+  other role-boundary one; a 5th save evicts the *next* periodic-grid
+  checkpoint before the remaining role-boundary one.
+- P-H3 SHA-256 replaces FNV-1a with no behaviour change on any EXISTING
+  M1a check (`test_prefix.mojo`'s original cases, unmodified, still pass) --
+  the hash algorithm is an implementation detail behind `bytes_eq`, and nothing
+  in the lookup/save/restore control flow reads the hash's bits directly.
+- P-H4 DeerFlow tap replay (`tools/tap-replay.py`, `.work/chat/tap.jsonl`,
+  rows 0/1/2, copied into this worktree): turn 2 (row 1) restores from a
+  checkpoint at or near the end of row 0's own prompt (row 0's measured
+  prompt_tokens, 5,755-5,858 depending on row) rather than the 5120
+  periodic-grid point M1a hit -- `cached` within a handful of tokens of
+  row 0's `prompt_tokens` (the gap is the rendered generation-prompt
+  marker's own token count, expected single digits to low tens), and
+  `prefill_rows` correspondingly small. No wall-TTFT number is frozen (the
+  M1a design's "< 60 ms" was against the wrong fixture size); the receipt
+  is recorded against M1a's 616-766 ms for the same rows, and the honest
+  comparison is `cached`/`prefill_rows`, not a borrowed millisecond figure.
+- P-H5 20-prompt A/B (`bench/ab-prompts.sh`, one-shot mode): ratio within
+  ±2% of `main`, identity 20/20. One-shot mode never sets `BARO_SERVE=1`,
+  so `ckpt_cap` is forced to 0 and every changed code path (`chain.save`,
+  `hint_index`, the SHA-256 hash) is unreached -- this is a receipt that
+  the change is inert off the serve path, not a claim about decode speed
+  under checkpointing (that is P-H1/P-H4's territory).
+- Falsifier: any identity break in P-H1/P-H2/P-H3, a wrong retention
+  order, or `cached` at turn 2 *not* improving over M1a's 5120 for the
+  same rows (which would mean the boundary hint never lands, or lookup
+  never prefers it).
+
+**Verification before timing (P1).** `checkpoints:` line unchanged in
+shape; `finish`/`cached`/`prefill_rows` read from each tap-replay response's
+`usage.baro` and `timings`; rebuild engine + `baro-serve` in the same stint;
+`arm.txt` first for the A/B.
+
+**Gate.** `run-tests.sh` exit 0 (P-H2/P-H3); `tools/test_server.sh` ALL PASS
+(P-H1); tap-replay table filled against P-H4's reading rule; P-H5 within
+band.
+
+**Result.** PASS on every gate, recorded 2026-09-11. One repair round: the
+chunked-prefill bug below, and a template-compatibility bug found by the
+first real tap-replay run.
+
+**Bug found and fixed before the gate passed: hints inside one big prefill
+chunk were silently never taken.** `step_window`'s prefill branch only stops
+at chunk boundaries (`mc = min(pf_chunk, pf_rows - pos)`, `pf_chunk` default
+1024); a hint strictly between two chunk boundaries -- which is exactly
+where a real role boundary near the end of a long prompt lands -- was never
+visited as a discrete `wst.pos` and so never checked against `ckpt_hints`.
+`kernels/test_prefix.mojo`'s new M1b case (hint at 300 inside a single
+0->599 chunk) caught this immediately. Fix: `prefix.mojo::next_ckpt_stop`
+caps one prefill call's `pf_chunk` to the distance to the next hint or grid
+point, applied in both `serve/engine.mojo`'s main loop and
+`kernels/test_prefix.mojo::prefill_to`, gated on `len(ckpt_hints) > 0` so
+the no-hint path (`/v1/completions`, and every existing M1a case) takes the
+identical route it always did.
+
+**Bug found by the first live tap-replay run: a prefix render can fail
+where the full render succeeds.** DeerFlow's real chat template
+`raise_exception`s a system-only prefix ("No user query found in
+messages") -- `role_boundaries`'s k=1 call hit this and the error
+propagated through `?` into a 500 on every chat completion, not just the
+missing hint. Fixed by making `role_boundaries` skip a prefix that fails to
+render or tokenize instead of propagating (`text.rs`, new test
+`role_boundaries_skips_a_prefix_that_fails_to_render`); it returns `Vec<u32>`
+directly now, no longer `Result`. This is exactly the class of failure the
+design already tolerates (a bad hint wastes a slot) -- the gap was that the
+*error*, not just a missing hint, was reaching the caller.
+
+`kernels/test_prefix.mojo` / `run-tests.sh`: PASS, 82 kernels, 38 in
+registry, 0 orphans. The M1b cases: hint at 300 saved pinned + boundary via
+a real request, lookup constrained to `n=301` finds it, restore from it and
+replay to the end of `P` byte-exact against `cold_u` on both megakernel and
+window paths (P-H2). Retention: cap 3, a 4th save evicted the periodic-grid
+checkpoint (30) before the pinned (10) and role-boundary (20) ones; a 5th
+save evicted the *next* periodic-grid checkpoint (40) before the remaining
+role-boundary one (20) -- both PASS, exactly as predicted. Every original
+M1a case (SHA-256 now, not FNV-1a) still PASS (P-H3).
+
+`tools/test_server.sh`: ALL PASS (`.work/CHAT-c2-server-test/SUMMARY.txt`),
+including `chat`/`chat-stream`/`stop`/`cancel`, every one of which now sends
+`ckpt` hints on the wire with no observable difference (P-H1).
+
+P-H5 (`.work/ab-c2-results`, arm A = `.work/engine-base` (`38a85c7`), arm B =
+`.work/engine-c2-b`, `power_cap_uW=290000000`, `vddgfx=-100mV`): main median
+137.22 tok/s_gen spread 0.6%, C2 median 137.09 spread 0.5%, **ratio 0.999**,
+identity 20/20 PASS. Held, cleanly inside band (no outlier this round).
+
+P-H4, DeerFlow tap replay (`tools/tap-replay.py`, `.work/chat/tap.jsonl`
+copied into this worktree, rows 0/1/2 x2, `BARO_TMAX=16384`,
+`.work/tap-replay-server.std{out,err}`), against M1a's own numbers for the
+same rows (`cached` 5120 / `prefill_rows` 634-737 / `wall_s` 0.659-0.766):
+
+| row | prompt_tokens | cached | prefill_rows | prefill_s | wall_s | vs M1a wall_s |
+|---|---|---|---|---|---|---|
+| 0 (cold) | 5755 | 0 | 5754 | 3.999 | 4.055 | 5.279 |
+| 1 | 5770 | 5750 | 19 | 0.148 | 0.205 | 0.695 (3.4x) |
+| 2 | 5858 | 5765 | 92 | 0.221 | 0.286 | 0.766 (2.7x) |
+| 0 (2nd) | 5755 | 5750 | 4 | 0.031 | 0.079 | 0.659 (8.3x) |
+| 1 (2nd) | 5770 | 5750 | 19 | 0.147 | 0.200 | 0.696 (3.5x) |
+| 2 (2nd) | 5858 | 5765 | 92 | 0.219 | 0.281 | 0.762 (2.7x) |
+
+Held, and better than predicted on `cached`/`prefill_rows`: `cached` lands
+within 5-93 tokens of the row's own `prompt_tokens` (row 0's own repeat: 4
+tokens, "single digits" as predicted; rows 1/2 include real new turn
+content past the boundary, not just the marker, so their gap is larger but
+still `prefill_rows` in the tens, not the hundreds M1a measured -- both are
+genuinely smaller prefills than M1a's periodic-grid restore, not an
+artifact of measurement). M1a's 5120/634-737/0.659-0.766s becomes
+5750-5765/4-92/0.079-0.286s wall -- **2.7x to 8.3x** faster than M1a on the
+identical rows, and cold-vs-warm is 4.055s -> 0.079-0.286s (14x-51x). The
+M1a design's "< 60 ms" TTFT target is still missed on `prefill_s` for rows
+1/2 (147-221 ms: they replay real new content, not just a marker, so a
+sub-60ms number was never achievable for them); row 0's own repeat comes
+closest at 31 ms `prefill_s`. Recorded honestly against the measured
+numbers, not the design's borrowed millisecond figure.
+
+Verdict against the frozen predictions: P-H1 held. P-H2 held. P-H3 held.
+P-H4 held, and beat the directional prediction. P-H5 held. Falsifier not
+triggered.
+
+---
+
+## C3 — sampler host reference (frozen 2026-09-11, before its build)
+
+**Scope decision, flagged (CLAUDE.md §8: a plan item that is a design
+call).** KSAMP (sibling lane, `lane-KSAMP`, merged into this read as
+`git show lane-KSAMP:kernels/sample.mojo`) built and gated
+`amar_sample_row`/`amar_sample_probs`/`amar_spec_accept` as standalone
+kernels with **no engine wiring** ("greedy path untouched" -- KSAMP's own
+report). C3 mirrors that scope on the host side: a fully tested reference
+sampler module plus the Rust API/control-block parsing, but **not** a live
+per-token decode-loop hookup (copying `logits_d` to host and overriding the
+emitted token every sampled step). Reasons: (a) the frozen gates in the
+plan ("distribution test... same seed... temperature 0") are unit-level
+properties of the sampler function itself, exactly what KSAMP's own gate
+was: a kernel test, not a server test; (b) live wiring touches the decode
+loop's per-token control flow, the highest-risk surface for a silent
+regression in the untouched T=0 path, for a gate that does not ask for it;
+(c) the mid-turn correction confirms `amar_sample_row`/`amar_spec_accept`
+are the eventual call site's real interface -- matching semantics now is
+what makes wiring later small, which is the point of "keep the call site
+ready to switch." Deferred, not dropped: recorded as the next increment
+below.
+
+**Change.**
+- `serve/sample_ref.mojo` (new, host-only, no GPU): Philox4x32-10 (same
+  constants/rounds as `kernels/sample.mojo`'s `philox4x32`), `rng4`/
+  `rng_word`/`unif`/`gumbel` byte-for-byte the same transform, so a given
+  `(seed, counter, row, stream, index)` produces the identical draw the
+  kernel will once it is wired in. `sample_row_ref`: temperature <= 0 ->
+  greedy argmax (ties, lowest index), probability 1, identical code shape
+  to the champion's argmax; else cut order top-k -> top-p (mass at T=1) ->
+  min-p, via a full sort (`O(V log V)`, a reference is not required to be
+  `O(V)` like the kernel), then a Gumbel-max draw over the retained set at
+  the caller's own temperature, stream 0. `spec_accept_ref`: accept when
+  `u * p_d(x) < p_t(x)` (stream 1); else Gumbel-max over `max(0, p_t-p_d)`
+  (stream 2), falling back to a draw from `p_t` (stream 3) if the residual
+  is all zero.
+- Presence/frequency penalties (host-only preprocessing, not in KSAMP's
+  kernel interface): subtract `presence_penalty` once and
+  `frequency_penalty * count` from any vocab id that has appeared in this
+  response's own generated tokens so far, before the cut pipeline runs.
+- `serve/src/main.rs`: `temperature`, `top_p`, `top_k`, `min_p`, `seed`,
+  `presence_penalty`, `frequency_penalty`, `logprobs` parsed from
+  `/v1/completions` and `/v1/chat/completions`, carried in the request's
+  control block alongside `stop`/`ckpt` (new optional wire fields, all
+  absent/zero by default -- unparsed, the request is bit-for-bit today's
+  shape).
+
+**Not in this step.** The live decode-loop hookup (above). The GPU kernel
+(KSAMP, done). Sampling interacting with MTP speculation in one window
+(needs the hookup first).
+
+**Predictions (frozen before the build).**
+- P-I1 Temperature 0: `sample_row_ref` on real decode logits (dumped via
+  `BARO_DUMP`, or a fixture built the same way KSAMP's did) picks the exact
+  same token as the champion's own greedy argmax, on every row tested,
+  probability 1 exactly.
+- P-I2 Distribution: 10,000 draws per config from fixed synthetic logits
+  (same shape of configs as KSAMP's: plain T1 no truncation; T0.7/k20/p0.8;
+  T1.3/k12/p0.9/min-p0.05; T0.5/p0.6; a tie-heavy row with k12; a tie-heavy
+  row with p0.3), Pearson chi-square against the exact float64 target
+  distribution over the same retained set, pooled bins expected >= 5,
+  p = 0.001 critical value -- every config inside its critical value, 0
+  draws outside the retained set.
+- P-I3 Reproducibility: the same `(seed, counter)` gives the same token
+  10,000/10,000 times; a different seed changes a large majority (KSAMP's
+  own kernel measured 85-95% changed on two configs -- not exact-matched
+  here since the vocab/logits fixture differs, but same order).
+- P-I4 Speculation, mismatched draft: `spec_accept_ref`'s acceptance rate
+  matches `sum min(p_t, p_d)` within a few sigma of binomial noise at
+  10,000 draws; a two-sample chi-square between "spec on" (accept-or-
+  resample) and "spec off" (direct draws from `p_t`) shows no significant
+  difference (KSAMP's own bound: chi2 within its df's critical value).
+- P-I5 Wire: a request with none of the new fields set produces the exact
+  same `Request` line as before this item (byte-for-byte); a request with
+  them set carries them through to a point `serve/engine.mojo` can read
+  (parsed there behind a flag, not yet acted on for real decode -- scoped
+  out above).
+- Falsifier: any temperature-0 mismatch, any chi-square over its critical
+  value, a reproducibility failure, or a wire regression on the no-sampler-
+  fields path.
+
+**Verification before timing (P1).** None of this is GPU-timed (host-only,
+CPU reference); the only "before" receipt is the Philox KAT (zero, all-
+ones, pi vectors) checked before any distribution test is trusted, same
+discipline as `serve/prefix.mojo`'s SHA-256 KAT in C2.
+
+**Gate.** A new host-only test file (`kernels/test_sample_ref.mojo` or
+equivalent, buildable without `has_accelerator()`) exits 0 with every
+P-I1..P-I4 check PASS; `cargo test`/`clippy` green for the P-I5 wire
+addition; `run-tests.sh` and `tools/test_server.sh` unaffected (no default
+behaviour changes).
+
+**Result.** PASS on every gate, recorded 2026-09-11. One repair round: the
+`amar_argmax_row`/greedy T<=0 branch returned probability 1 even when no
+valid token existed (an all-`-inf` row) -- an internal inconsistency (`-1`
+with `prob 1`) caught by `check_temperature_zero`'s all-invalid case before
+it reached anything else; fixed to return probability 0 alongside `-1`,
+matching the `nvalid == 0` branch's own convention.
+
+`kernels/test_sample_ref.mojo` (`./.work/test_sample_ref`, host-only, no
+accelerator): **PASS** on every check --
+- Philox4x32-10 KAT: zero, all-ones and pi vectors, bit-exact against
+  Random123's published vectors.
+- Temperature 0: 4/4 synthetic cases (plain, a tie at the max, NaN sprinkled
+  with the real max elsewhere, all-invalid) match an independently written
+  greedy scan; **plus** the real 248,320-logit draft-receipt row
+  (`.work/draft-logits.bin`, a real decode output) -- token 9053, matching
+  greedy argmax exactly (P-I1).
+- Distribution (P-I2), 10,000 draws each, chi-square vs the exact
+  `sample_probs_ref` target, adaptively pooled to expected >= 5 per bin,
+  Wilson-Hilferty p=0.001 critical value: all six configs held, 0 draws
+  outside the retained set on every one --
+
+  | config | chi2 | df | critical |
+  |---|---|---|---|
+  | plain T1, no truncation | 11.57 | 17 | 40.93 |
+  | T0.7 k16 p0.8 | 10.38 | 10 | 29.76 |
+  | T1.3 k12 p0.9 min-p0.05 | 0.92 | 1 | 11.16 |
+  | T0.5 p0.6 | 0.00 | 1 | 11.16 |
+  | ties T1 k10 (cut inside a tie group) | 7.95 | 9 | 28.06 |
+  | ties T0.9 p0.35 (mass cut inside ties) | 0.63 | 4 | 18.72 |
+
+- Reproducibility (P-I3): 2000/2000 identical under the same `(seed,
+  counter)`; 1807/2000 (90.4%) changed under a different seed.
+- Speculation (P-I4): accept rate 0.1264 vs exact `sum min(p_t,p_d)`
+  0.12950, 0.0034 sigma off (well inside a few sigma); accept-or-resample
+  vs the exact target `p_t` chi2 15.02, df 18, critical 42.44 -- held,
+  confirming the theoretical guarantee (accept-or-resample's marginal
+  equals the target distribution exactly) empirically.
+- Presence/frequency penalties: a token appearing 3 times with
+  `presence_penalty=1, frequency_penalty=0.5` moves from logit 9 to 6.5
+  exactly; an untouched token is bit-identical.
+
+`run-tests.sh` exit 0 (82 kernels, 38 in registry, 0 orphans; the new host
+module adds no kernel, as predicted). `tools/test_server.sh` ALL PASS,
+`cargo test` 16 passed (up from 14: the two new `SampleParams` wire tests),
+`cargo clippy` clean -- P-I5 held: the three pre-existing `Request` line
+tests needed no string changes after `sample: SampleParams::default()` was
+added to their literals, which **is** the byte-for-byte-unchanged claim,
+and a fourth new test shows the sampler fields appear on the wire only when
+set (`request_line_carries_sample_params_only_when_set`).
+
+Verdict against the frozen predictions: P-I1 held. P-I2 held on all six
+configs. P-I3 held. P-I4 held. P-I5 held. Falsifier not triggered.
+
+Scope note restated: the live decode-loop hookup (copying `logits_d` to
+host, sampling, writing the token back) is still not built -- `serve/
+sample_ref.mojo` and `SampleParams` are the tested, ready-to-wire pieces;
+`serve/engine.mojo` parses every sampler field into `SampleParams` and does
+not yet read it. Next increment, not this one.
+
+---
+
+## C4 — engine pool (frozen 2026-09-11, before its build)
+
+**Change.** `serve/src/engine.rs`: `EnginePool` owns `BARO_POOL` (default
+1) `Engine` processes, each with its own pack load and its own request
+queue; the id counter moves from `Engine` to `EnginePool` (one counter for
+the whole pool, so ids stay unique across engines -- `cancel` and the
+API's `cmpl-<id>`/`chatcmpl-<id>` depend on that). `submit` routes to
+whichever engine has the fewest requests waiting or running, ties by
+lowest index; at the default pool size of 1 that is always engine 0, so
+routing is a no-op today. `cancel(id)` tries every engine (nothing records
+which engine an id landed on) -- at most one will have it as its
+`current`. `/health` gains `"pool":[q0, q1, ...]`, the per-engine queue
+depth `queue_depth`'s sum cannot distinguish "two engines each running
+one" from "one engine running both."
+
+**Not in this step.** Continuous batching (brief M2's option b -- needs
+per-sequence SSM slots and a batched decode GEMV, a different design).
+Per-request pool-size selection; `BARO_POOL` is a server-start knob.
+
+**Predictions (frozen before the build).**
+- P-J1 Identity: `BARO_POOL` unset (or `1`) behaves byte-for-byte as today
+  on every existing `tools/test_server.sh` case -- the pool-of-one routing
+  decision is unconditional (`engines[0]` always wins the "fewest queued"
+  comparison against itself), so this is a receipt, not a design bet.
+- P-J2 Two engines, two concurrent requests: with `BARO_POOL=2`, two
+  requests submitted back to back both show `queue` (per-request, at
+  submission) `<= 1` and `/health`'s `"pool"` field reads `[1, 1]` while
+  both are in flight -- neither request waits behind the other on the
+  same engine. `cancel` still finds and stops whichever engine is running
+  a given id.
+- P-J3 Aggregate throughput at pool size 1 vs 2, two clients each looping
+  N requests concurrently: recorded, not frozen (the design brief's own
+  qualifier -- decode is memory-bound, so a well-known limiting factor is
+  the two processes sharing one card's bandwidth; the plan's prediction is
+  "limited," not a number).
+- Falsifier: any change to the default (`BARO_POOL=1`) request line or
+  behaviour; two concurrent requests at pool size 2 that still serialise
+  onto one engine; a cancel that cannot find the engine actually running
+  the target id.
+
+**Verification before timing (P1).** `engine pool ready: N engine(s)`
+printed at start names the pool size read back; `/health`'s `"pool"`
+array read during the concurrency check; rebuild `baro-serve` in the same
+stint as any timed run.
+
+**Gate.** `tools/test_server.sh` ALL PASS at the default pool size
+(P-J1); a new pool-size-2 case in the same script (or a dedicated
+script) proving P-J2; P-J3's aggregate numbers recorded in the Result,
+whatever they are.
+
+**Result.** P-J1 PASS. P-J2/P-J3 **UNVERIFIED on this machine** -- a single
+GPU, and one engine already uses essentially all of it. Recorded honestly
+rather than claimed: the `EnginePool` code is built, typed, and passes
+every check that does not need two engines resident at once; the
+concurrency claim itself needs a second GPU or a smaller per-engine
+footprint, neither available here.
+
+P-J1 (`tools/test_server.sh`, `BARO_POOL` unset, `.work/CHAT-c4-server-test/
+SUMMARY.txt`): **ALL PASS**, identical to every earlier gate in this lane;
+`/health`'s only visible change is `"pool":[0]` alongside the existing
+`"queue":0`. `cargo test` 16 passed, clippy clean.
+
+P-J2/P-J3 (`tools/test_pool.sh`, new): three attempts, all failed the same
+way -- `BARO_POOL=2`'s second engine's pack load hit `hipErrorOutOfMemory`
+("request=6.18GB ... free=0B") every time, including once right after
+`gpu-waitd` restarted with the card otherwise idle (`gpu-wait gpu` read
+1.5 GB used immediately before). Diagnosed rather than shrugged off: a
+single engine measured directly (`baro-serve` with no pool env var,
+`rocm-smi --showmeminfo vram` before/after, GPU idle both times) takes the
+card from ~1.0-1.5 GB used to **~23.5-24.8 GB used** -- on a 25.75 GB card,
+essentially the whole thing, matching `docs/BASELINE.md`'s own "~22.3 GB
+free to MAX" note read as a ceiling MAX's allocator claims once
+initialized, not a hint about what the pack itself needs (the q4 pack is
+6.64 GB; the other ~17 GB is the runtime's own reserved pool, not KV --
+`BARO_TMAX` is the untouched default 1088 here, whose KV pool is ~71 MB
+per M1a's own figure). Clean shutdown (`SIGINT`, not the force-kill this
+script's failure trap uses) does release it -- confirmed by a direct
+before/after read, ~13 s later. The design brief's own sizing ("weights
+~5.2 GB q4 each plus KV and state") assumed a per-engine footprint about
+4-5x smaller than what this binary actually reserves; **the plan's
+concurrency option (a) needs revisiting** -- a second engine process
+cannot fit beside the first on this card at all, regardless of anything
+`EnginePool`'s routing code does. Not this lane's job to shrink that
+footprint (no memory-limit knob found in the time available; a real fix is
+either a second GPU or finding and using whatever caps MAX's device
+allocator, which needs its own investigation).
+
+Verdict against the frozen predictions: P-J1 held. P-J2/P-J3 unverified
+(environment, not falsified) -- recorded as UNVERIFIED per CLAUDE.md §18,
+not claimed done. Falsifier as frozen ("two concurrent requests at pool
+size 2 that still serialise onto one engine") did not trigger either,
+because pool size 2 could not start at all -- a stronger negative result
+than the falsifier anticipated.
