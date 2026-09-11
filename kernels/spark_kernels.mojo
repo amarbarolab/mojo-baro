@@ -110,7 +110,7 @@ def amar_gemv_q8[
 
 
 def amar_rope_kv_append[
-    NROT_: Int, NAT: Int, CLayout: TensorLayout, NLayout: TensorLayout
+    NROT_: Int, NAT: Int, CLayout: TensorLayout, NLayout: TensorLayout, HD_: Int = HD, NKVH_: Int = NKVH
 ](
     Kc: TileTensor[KVT, CLayout, MutAnyOrigin],
     Vc: TileTensor[KVT, CLayout, MutAnyOrigin],
@@ -124,7 +124,7 @@ def amar_rope_kv_append[
     var h = block_idx.x
     var which = Int(block_idx.y)
     var d = Int(thread_idx.x)
-    var cb = kv_off[NAT](Int(pos), Int(att_i), Int(h)) + d
+    var cb = kv_off[NAT, HD_, NKVH_](Int(pos), Int(att_i), Int(h)) + d
     if which == 1:
         Vc.ptr[unsafe_offset=cb] = rebind[Scalar[KVT]](rebind[Scalar[f32]](V[h, d]).cast[KVT]())
         return
@@ -144,7 +144,7 @@ def amar_rope_kv_append[
 
 
 def amar_attn_decode_swa_gated[
-    QLayout: TensorLayout, KLayout: TensorLayout, GLayout: TensorLayout, OLayout: TensorLayout, NAT: Int
+    QLayout: TensorLayout, KLayout: TensorLayout, GLayout: TensorLayout, OLayout: TensorLayout, NAT: Int, HD_: Int = HD, NQH_: Int = NQH, NKVH_: Int = NKVH
 ](
     Q: TileTensor[f32, QLayout, MutAnyOrigin],
     Kc: TileTensor[KVT, KLayout, MutAnyOrigin],
@@ -160,17 +160,17 @@ def amar_attn_decode_swa_gated[
     var h = Int(block_idx.x)
     var r = Int(block_idx.y)
     var tid = Int(thread_idx.x)
-    var kvh = h // (NQH // NKVH)
+    var kvh = h // (NQH_ // NKVH_)
     var T = Int(t_len) + r
     var t_lo = 0
     if Int(win) > 0 and T > Int(win):
         t_lo = T - Int(win)
-    var qrow = r * NQH + h
-    var qs = stack_allocation[f32, address_space = AddressSpace.SHARED](row_major[HD]())
-    var scores = stack_allocation[f32, address_space = AddressSpace.SHARED](row_major[HD]())
-    var red = stack_allocation[f32, address_space = AddressSpace.SHARED](row_major[HD // WARP_SIZE]())
-    var res = attn_head_span[NAT=NAT](Q, Kc, Vc, qs, scores, red, qrow, kvh, t_lo, T, tid, Int(lane_id()), scale, Int(att_i))
-    if tid < HD:
+    var qrow = r * NQH_ + h
+    var qs = stack_allocation[f32, address_space = AddressSpace.SHARED](row_major[HD_]())
+    var scores = stack_allocation[f32, address_space = AddressSpace.SHARED](row_major[HD_]())
+    var red = stack_allocation[f32, address_space = AddressSpace.SHARED](row_major[HD_ // WARP_SIZE]())
+    var res = attn_head_span[NAT=NAT, HD_=HD_, NKVH_=NKVH_](Q, Kc, Vc, qs, scores, red, qrow, kvh, t_lo, T, tid, Int(lane_id()), scale, Int(att_i))
+    if tid < HD_:
         var inv = 1 / res[1]
         var g = rebind[Scalar[f32]](Gate[h])
         var o = res[2] * inv
