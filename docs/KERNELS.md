@@ -72,11 +72,12 @@ must be reachable from `serve/registry.mojo`, a bench, or a test.
 | `amar_spec_accept` | `sample.mojo` | `PLayout: TensorLayout, TLayout: TensorLayout` |  | kernels/test_sample.mojo |
 | `amar_argmax_final` | `spark_kernels.mojo` | `NB: Int, VLayout: TensorLayout, ILayout: TensorLayout, OLayout: TensorLayout` |  | serve/spark.mojo |
 | `amar_argmax_part` | `spark_kernels.mojo` | `NB: Int, XLayout: TensorLayout, VLayout: TensorLayout, ILayout: TensorLayout` |  | serve/spark.mojo |
-| `amar_attn_decode_swa_gated` | `spark_kernels.mojo` | `QLayout: TensorLayout, KLayout: TensorLayout, GLayout: TensorLayout, OLayout: TensorLayout, NAT: Int, HD_: Int = HD, NQH_: Int = NQH, NKVH_: Int = NKVH` |  | serve/spark.mojo, kernels/test_spark_attn.mojo |
+| `amar_attn_decode_swa_gated` | `spark_kernels.mojo` | `QLayout: TensorLayout, KLayout: TensorLayout, GLayout: TensorLayout, OLayout: TensorLayout, NAT: Int, HD_: Int = HD, NQH_: Int = NQH, NKVH_: Int = NKVH, HAS_GATE: Bool = True` |  | serve/spark.mojo, kernels/test_spark_attn.mojo |
+| `amar_bias_add` | `spark_kernels.mojo` | `XLayout: TensorLayout, BLayout: TensorLayout` |  | serve/spark.mojo |
 | `amar_embed_lookup_f32` | `spark_kernels.mojo` | `TLayout: TensorLayout, OLayout: TensorLayout, KLayout: TensorLayout` |  | serve/spark.mojo |
 | `amar_gemv_q8` | `spark_kernels.mojo` | `EPI: Int, ALayout: TensorLayout, QLayout: TensorLayout, SLayout: TensorLayout, CLayout: TensorLayout, BLayout: TensorLayout` |  | serve/spark.mojo |
-| `amar_rope_kv_append` | `spark_kernels.mojo` | `NROT_: Int, NAT: Int, CLayout: TensorLayout, NLayout: TensorLayout, HD_: Int = HD, NKVH_: Int = NKVH` |  | serve/spark.mojo, kernels/test_spark_attn.mojo |
-| `amar_rope_plain` | `spark_kernels.mojo` | `NROT_: Int, XLayout: TensorLayout` |  | serve/spark.mojo |
+| `amar_rope_kv_append` | `spark_kernels.mojo` | `NROT_: Int, NAT: Int, CLayout: TensorLayout, NLayout: TensorLayout, HD_: Int = HD, NKVH_: Int = NKVH, NEOX: Bool = True` |  | serve/spark.mojo, kernels/test_spark_attn.mojo |
+| `amar_rope_plain` | `spark_kernels.mojo` | `NROT_: Int, XLayout: TensorLayout, NEOX: Bool = True` |  | serve/spark.mojo |
 | `amar_cast_bf16` | `ssm.mojo` | `XLayout: TensorLayout, OLayout: TensorLayout` | cast_m, cast_1 | serve/registry.mojo, kernels/test_attn_block.mojo, kernels/test_moe_block.mojo, kernels/test_ssm_block.mojo |
 | `amar_residual_add` | `ssm.mojo` | `XLayout: TensorLayout, YLayout: TensorLayout` |  | kernels/test_attn_block.mojo, kernels/test_ssm_block.mojo |
 | `amar_ssm_conv` | `ssm.mojo` | `QLayout: TensorLayout, SLayout: TensorLayout, WLayout: TensorLayout, OLayout: TensorLayout` | conv_k | serve/registry.mojo, bench/bench_launch_floor.mojo, kernels/test_mega_block.mojo, kernels/test_prefill.mojo, kernels/test_ssm_block.mojo |
