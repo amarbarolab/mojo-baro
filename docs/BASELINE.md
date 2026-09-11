@@ -5,7 +5,10 @@ is reproducible with the command given. If you are an agent picking up a kernel
 task, this is your starting point: **do not re-derive it, and do not trust a
 number that is not in this file or produced by `bench/run.py`.**
 
-Last verified: 2026-09-02 (fp16 WMMA rows; see `bench/wmma-fp16-protocol.md` Round 3).
+Last verified: 2026-09-12 for the long-context prefill rows only
+(`docs/prefill-long-ctx-2026-09-11.md`), and 2026-09-02 for the fp16 WMMA rows
+(`bench/wmma-fp16-protocol.md` Round 3). Rows not named here were not re-measured
+on those dates: check the protocol each one cites before trusting it.
 
 ## Hardware and toolchain
 
@@ -17,7 +20,7 @@ Last verified: 2026-09-02 (fp16 WMMA rows; see `bench/wmma-fp16-protocol.md` Rou
 | ROCm | 7.2, hipBLASLt present at `/opt/rocm/lib/libhipblaslt.so` |
 | Mojo | **1.0.0** — repo-local venv, `./.venv/bin/mojo` |
 | MAX | 26.5.0 |
-| Rust | 1.97.1 (service layer not started) |
+| Rust | 1.97.1, service layer SHIPPED: `serve/` crate `baro-serve` (axum + tokio), the OpenAI-compatible HTTP front for `serve/engine.mojo`. One engine per card: `BARO_POOL` > 1 does not fit on a single 24 GB GPU, because one engine's MAX runtime reserves about 23.5 to 24.8 GB |
 
 Nothing is installed machine-wide. `uv sync` creates `.venv` from the tracked
 `pyproject.toml`, which pins `max[all]==26.5.0` (Mojo 1.0.0) from PyPI. **Not the
@@ -29,7 +32,7 @@ stable release and is not carried there, so a nightly pin does not resolve.
 ```
 Python/app  →  Mojo (GPU kernels)  →  C++ shim (vendor SDK)  →  hipBLASLt
                       ↑
-                    Rust (network/API shell) — NOT STARTED
+                    Rust (network/API shell): serve/ crate baro-serve, shipped
 ```
 
 Rust talks only to Mojo's C-ABI surface. It must **not** bind the C++ shim

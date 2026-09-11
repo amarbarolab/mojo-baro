@@ -41,8 +41,13 @@ Same box, same GGUF, 20-prompt medians unless noted
 Speculative decode with the model's own MTP head is opt-in (`BARO_SPEC=1`) and
 output-identical to plain greedy decode on every prompt tested. On the q4 pack
 it gives 1.10x at k=2 ([`bench/mtp-protocol.md`](bench/mtp-protocol.md)).
-Prefill is the known weak spot: 2.5 to 3.3x slower than llama.cpp at 8k to 32k
-context.
+Prefill was the known weak spot and is now within about 1.3x of llama.cpp at 8k
+to 32k context, down from 2.5 to 3.3x: 3.29 s at 8k against its 2.56 s (1.29x),
+7.17 s at 16k against 5.60 s (1.28x), 17.42 s at 32k against 13.18 s (1.32x).
+Against our own previous champion that is 1.9x to 2.5x faster (6.35 / 15.87 /
+43.71 s). It is still slower than llama.cpp, just no longer by a wide margin
+([`docs/prefill-long-ctx-2026-09-11.md`](docs/prefill-long-ctx-2026-09-11.md):
+f16 WMMA flash attention plus a one-wave SSM scan).
 
 ### A cold-cache vendor beat at the decode shape
 
