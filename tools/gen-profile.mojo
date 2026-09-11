@@ -41,23 +41,31 @@ def scalar_f64(mut r: Reader) raises -> Float64:
 
 
 def is_rope_neox_arch(arch: String) -> Bool:
+    # llama_model_rope_type (llama-model.cpp): LLM_ARCH_QWEN2's group, "pairs
+    # offset by n_rot/2". spark2_5 is NEOX by construction (kernels/spark_kernels.mojo
+    # predates this table), not a llama.cpp fact.
     return arch == "spark2_5" or arch == "qwen2"
 
 
 def is_rope_norm_arch(arch: String) -> Bool:
-    # llama.cpp's llm_arch_rope_type (llama-model.cpp): LLM_ARCH_GRANITE is
-    # grouped with LLM_ARCH_LLAMA under "normal RoPE, pairs of consecutive
-    # head values" -- NOT with LLM_ARCH_QWEN2's NeoX-style half-offset group.
-    # Measured: granite-4.2-3b scored ~40/64 forced agreement vs llama.cpp
-    # with NEOX assumed, ~62/64+ after moving it here (bench/dense-protocol.md).
+    # llama_model_rope_type (llama-model.cpp): LLM_ARCH_GRANITE is grouped with
+    # LLM_ARCH_LLAMA under "normal RoPE, pairs of consecutive head values" --
+    # NOT with LLM_ARCH_QWEN2's NeoX-style half-offset group. Measured:
+    # granite-4.2-3b scored ~40/64 forced agreement vs llama.cpp with NEOX
+    # assumed, 98.4-100% after moving it here (bench/dense-protocol.md).
+    # Full table + citations: ~/Brain/mojo/mojo-baro/2026-09-11-llama-arch-recipe-facts.md
     return arch == "llama" or arch == "granite"
 
 
 def is_gelu_arch(arch: String) -> Bool:
+    # spark2_5 predates this table (kernels/spark_kernels.mojo's GELU tanh-approx epilogue
+    # was hand-written, not read from llama.cpp -- it isn't in llama.cpp at all).
     return arch == "spark2_5"
 
 
 def is_silu_arch(arch: String) -> Bool:
+    # build_layer_ffn in llama.cpp's src/models/{llama,qwen2,granite}.cpp: build_ffn(...,
+    # LLM_FFN_SILU, LLM_FFN_PAR, ...). ~/Brain/mojo/mojo-baro/2026-09-11-llama-arch-recipe-facts.md
     return arch == "llama" or arch == "qwen2" or arch == "granite"
 
 
