@@ -230,3 +230,70 @@ Where the remaining gap is (profile on p09, BARO_PROFILE=1): draft path
 (bandwidth model says ~1.05x). SSM sub-block is per-row serial (5
 launches x 24 layers per extra row); multi-row GEMM at QV=16 not yet
 at the m=1 stream rate. Both are the next MTP levers, before q4.
+
+## Amendment MSPEC step 1 (frozen 2026-09-11 before any trace run, tree `dc9e06b`)
+
+Plan: `~/Brain/mojo/mojo-baro/briefs/2026-09-11-mega-spec-window.md`. Question:
+is the launch-gap share of the speculative verify window large enough that a
+multi-row megakernel for m = k+1 could pay? This amendment measures; it builds
+nothing.
+
+**Prior on the record.** `megakernel-mrow-protocol.md` (2026-09-06, q8 pack,
+`BARO_PROFILE=3`, one prompt): 646 launches x 2.43 us = 1.57 ms = 6.0% of a
+26 ms k=2 window, estimated from the launch floor, not measured on a timeline.
+Its W3 round built `amar_mega_window[MR=3]` and closed it: the megakernel's m=3
+GEMM phases scale 1.6x from m=1 vs 1.5x native, so it lost to the launch path.
+Zero gaps is therefore an upper bound on what a window megakernel can buy, not
+an expected gain. The default pack is now q4 (`.work/engine-pack-q4`), whose
+trunk window is shorter than q8's, so the same launch count is a larger share.
+
+**Instrument.** `.work/engine` built from this tree. For each of the 20
+`bench/mtp-prompts/` prompts, one process per arm, GPU through `gpu-wait`:
+- `A`: no spec, bare (identity reference, no-spec tok/s context).
+- `B2`, `B4`: `BARO_SPEC=1 BARO_SPEC_K=2|4`, bare (the tok/s the bound scales).
+- `T2`, `T4`: the same two arms under `rocprofv3 --kernel-trace --output-format csv`.
+
+P1 receipts read from each run's own log, per arm: `BARO_SPEC:`, `spec k:`,
+`BARO_MEGA:`, `BARO_MEGA_WIN:` (must be False: the window runs the launch
+path), `pack q4 trunk:` (True), `mtp: drafted/accepted`, `tok/s_gen`; pack
+identity = resolved `BARO_PACK` path plus sha256 of its manifest files, recorded
+once per session. Identity gate: `GENERATED` of every B and T run equals A's.
+A run failing its receipt or identity is void.
+
+**Definitions (from the kernel trace, per spec iteration).**
+- *Verify window* = the trunk pass of `step_window` under `win_spec`: from the
+  start of its `embed_k` dispatch to the end of its `argmax_d` dispatch.
+  Kernel count n, kernel sum S (sum of dispatch durations), wall W (span), gap
+  share g = 1 - S/W.
+- *Iteration* = from the start of the draft process pass (`blk32_forward`) to
+  the start of the next iteration; adds the draft path and the host accept
+  sync. Its idle share is reported beside g, not used for the decision.
+- Per prompt, g is aggregated as sum(W - S) / sum(W) over its spec windows.
+
+**Decision metric and kill line.** Median over the 20 prompts of the per-prompt
+g at k=2 (the shipping default). **g < 10%: stop at step 1**, no build.
+g >= 10%: report and wait for the maintainer's go; step 2 is not started by this lane
+either way.
+
+**Upper bound on the gain.** Per prompt, tok/s_ub = B tok/s_gen /
+(1 - sum(W - S) / decode_s of the traced run). Reported as the median over 20
+prompts for k=2 and k=4, beside the B median.
+
+**Trace overhead check.** If the median T/B tok/s ratio is below 0.95, the
+tracer is inflating gaps: the measured g is then an upper bound and says so
+in the Result; the decision still uses it (an inflated g below 10% kills
+harder).
+
+| prediction (frozen) | k=2 | k=4 |
+|---|---|---|
+| dispatches per verify window | 600-700 | 600-700 (same code path, m=5) |
+| verify window wall W, ms | 10-15 | 12-19 |
+| gap share g, median | **7-17%, point 11%** | **5-13%, point 9%** |
+| tok/s_ub / B | 1.05-1.15x | 1.04-1.12x |
+| T/B tok/s ratio (tracer cost) | 0.93-1.00 | 0.93-1.00 |
+
+Reasoning: ~650 dispatches at 1.5-3 us of dispatch gap each is 1.0-1.9 ms;
+q4 is ~57% of q8's bytes, so the m=3 launch-path window is ~11-14 ms against
+q8's 21.3 ms. Falsifier for the reasoning (not the decision): g outside
+4-20% at k=2 means the per-dispatch gap model is wrong and the Result says
+what the trace shows instead.
