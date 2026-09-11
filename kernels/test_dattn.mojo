@@ -1,9 +1,9 @@
 """Numerics probe for the generic decode attention (bench/dattn-protocol.md gate 2).
 deterministic inputs (op_bench's fill formula, V with a seed offset), one instantiation
 per shape, output dumped for tools/dattn-ref.py's fp64 reference.
-usage: test_dattn SHAPE T PATH NS NLD QSCALE OUT
+usage: test_dattn SHAPE T PATH NS NLD ROT QSCALE OUT
   SHAPE S0 (shipped 256/16/4 f32) | S1 (256/16/4 f16) | S2 (64/40/8 f16) | S3 (128/28/4 f16)
-  PATH exact | split; NS requested split count (clamped to the span count); NLD 4 | 8
+  PATH exact | split; NS requested split count (clamped to the span count); NLD 2 | 4 | 8; ROT 0 | 1 (per-block start rotation)
 """
 from std.sys import argv, has_accelerator
 
@@ -16,7 +16,7 @@ comptime f16 = DType.float16
 
 
 def run[
-    HD: Int, NQH: Int, NKVH: Int, KVT: DType, NLD: Int
+    HD: Int, NQH: Int, NKVH: Int, KVT: DType, NLD: Int, ROT: Bool
 ](T: Int, exact: Bool, ns_req: Int, qscale: Int, out_path: String) raises:
     var ctx = DeviceContext()
     var ns = 1 if exact else eff_nsplit[HD, NLD](T, ns_req)
@@ -38,13 +38,13 @@ def run[
     ctx.enqueue_copy(dst_buf=k_d, src_buf=k_h)
     ctx.enqueue_copy(dst_buf=v_d, src_buf=v_h)
     o_d.enqueue_fill(0)
-    launch_dattn[HD, NQH, NKVH, KVT, NLD](ctx, q_d, k_d, v_d, o_d, p_d, T, ns, exact)
+    launch_dattn[HD, NQH, NKVH, KVT, NLD, 8, ROT](ctx, q_d, k_d, v_d, o_d, p_d, T, ns, exact)
     ctx.enqueue_copy(dst_buf=o_h, src_buf=o_d)
     ctx.synchronize()
     print(
         "echo HD", HD, "NQH", NQH, "NKVH", NKVH, "KVT", "f16" if KVT == f16 else "f32",
         "T", T, "path", "exact" if exact else "split", "nsplit", ns, "nld", NLD,
-        "span", dspan[HD, NLD](), "qscale", qscale,
+        "rot", 1 if ROT else 0, "span", dspan[HD, NLD](), "qscale", qscale,
     )
     with open(out_path, "w") as f:
         var p = o_h.unsafe_ptr().unsafe_bitcast[UInt8]()
@@ -54,34 +54,75 @@ def run[
 def main() raises:
     comptime assert has_accelerator(), "Requires a GPU"
     var a = argv()
-    if len(a) != 8:
-        raise Error("usage: test_dattn SHAPE T PATH NS NLD QSCALE OUT")
+    if len(a) != 9:
+        raise Error("usage: test_dattn SHAPE T PATH NS NLD ROT QSCALE OUT")
     var shape = String(a[1])
     var T = Int(String(a[2]))
     var exact = String(a[3]) == "exact"
     var ns = Int(String(a[4]))
     var nld = Int(String(a[5]))
-    var qscale = Int(String(a[6]))
-    var out_path = String(a[7])
+    var rot = String(a[6]) == "1"
+    var qscale = Int(String(a[7]))
+    var out_path = String(a[8])
     if shape == "S0":
-        if nld == 4:
-            run[256, 16, 4, f32, 4](T, exact, ns, qscale, out_path)
+        if nld == 2 and rot:
+            run[256, 16, 4, f32, 2, True](T, exact, ns, qscale, out_path)
+        elif nld == 2 and not rot:
+            run[256, 16, 4, f32, 2, False](T, exact, ns, qscale, out_path)
+        elif nld == 4 and rot:
+            run[256, 16, 4, f32, 4, True](T, exact, ns, qscale, out_path)
+        elif nld == 4 and not rot:
+            run[256, 16, 4, f32, 4, False](T, exact, ns, qscale, out_path)
+        elif nld == 8 and rot:
+            run[256, 16, 4, f32, 8, True](T, exact, ns, qscale, out_path)
+        elif nld == 8 and not rot:
+            run[256, 16, 4, f32, 8, False](T, exact, ns, qscale, out_path)
         else:
-            run[256, 16, 4, f32, 8](T, exact, ns, qscale, out_path)
+            raise Error("NLD must be 2, 4 or 8")
     elif shape == "S1":
-        if nld == 4:
-            run[256, 16, 4, f16, 4](T, exact, ns, qscale, out_path)
+        if nld == 2 and rot:
+            run[256, 16, 4, f16, 2, True](T, exact, ns, qscale, out_path)
+        elif nld == 2 and not rot:
+            run[256, 16, 4, f16, 2, False](T, exact, ns, qscale, out_path)
+        elif nld == 4 and rot:
+            run[256, 16, 4, f16, 4, True](T, exact, ns, qscale, out_path)
+        elif nld == 4 and not rot:
+            run[256, 16, 4, f16, 4, False](T, exact, ns, qscale, out_path)
+        elif nld == 8 and rot:
+            run[256, 16, 4, f16, 8, True](T, exact, ns, qscale, out_path)
+        elif nld == 8 and not rot:
+            run[256, 16, 4, f16, 8, False](T, exact, ns, qscale, out_path)
         else:
-            run[256, 16, 4, f16, 8](T, exact, ns, qscale, out_path)
+            raise Error("NLD must be 2, 4 or 8")
     elif shape == "S2":
-        if nld == 4:
-            run[64, 40, 8, f16, 4](T, exact, ns, qscale, out_path)
+        if nld == 2 and rot:
+            run[64, 40, 8, f16, 2, True](T, exact, ns, qscale, out_path)
+        elif nld == 2 and not rot:
+            run[64, 40, 8, f16, 2, False](T, exact, ns, qscale, out_path)
+        elif nld == 4 and rot:
+            run[64, 40, 8, f16, 4, True](T, exact, ns, qscale, out_path)
+        elif nld == 4 and not rot:
+            run[64, 40, 8, f16, 4, False](T, exact, ns, qscale, out_path)
+        elif nld == 8 and rot:
+            run[64, 40, 8, f16, 8, True](T, exact, ns, qscale, out_path)
+        elif nld == 8 and not rot:
+            run[64, 40, 8, f16, 8, False](T, exact, ns, qscale, out_path)
         else:
-            run[64, 40, 8, f16, 8](T, exact, ns, qscale, out_path)
+            raise Error("NLD must be 2, 4 or 8")
     elif shape == "S3":
-        if nld == 4:
-            run[128, 28, 4, f16, 4](T, exact, ns, qscale, out_path)
+        if nld == 2 and rot:
+            run[128, 28, 4, f16, 2, True](T, exact, ns, qscale, out_path)
+        elif nld == 2 and not rot:
+            run[128, 28, 4, f16, 2, False](T, exact, ns, qscale, out_path)
+        elif nld == 4 and rot:
+            run[128, 28, 4, f16, 4, True](T, exact, ns, qscale, out_path)
+        elif nld == 4 and not rot:
+            run[128, 28, 4, f16, 4, False](T, exact, ns, qscale, out_path)
+        elif nld == 8 and rot:
+            run[128, 28, 4, f16, 8, True](T, exact, ns, qscale, out_path)
+        elif nld == 8 and not rot:
+            run[128, 28, 4, f16, 8, False](T, exact, ns, qscale, out_path)
         else:
-            run[128, 28, 4, f16, 8](T, exact, ns, qscale, out_path)
+            raise Error("NLD must be 2, 4 or 8")
     else:
         raise Error("unknown shape " + shape)

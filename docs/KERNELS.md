@@ -15,7 +15,7 @@ must be reachable from `serve/registry.mojo`, a bench, or a test.
 | `amar_rope_yarn` | `attn.mojo` | `XLayout: TensorLayout` | rope_q, rope_k, rope_qp, rope_kp | serve/registry.mojo, kernels/test_attn_block.mojo, kernels/test_mega_block.mojo |
 | `amar_dattn_combine` | `dattn.mojo` | `HD: Int, PLayout: TensorLayout, OLayout: TensorLayout,` |  | kernels/dattn_harness.mojo |
 | `amar_dattn_exact` | `dattn.mojo` | `HD: Int, NQH: Int, NKVH: Int, KVT: DType, NAT: Int, QLayout: TensorLayout, KLayout: TensorLayout, OLayout: TensorLayout,` |  | kernels/test_attn_block.mojo, kernels/dattn_harness.mojo |
-| `amar_dattn_split` | `dattn.mojo` | `HD: Int, NQH: Int, NKVH: Int, KVT: DType, NAT: Int, NLD: Int, QLayout: TensorLayout, KLayout: TensorLayout, OLayout: TensorLayout, PLayout: TensorLayout,` |  | kernels/dattn_harness.mojo |
+| `amar_dattn_split` | `dattn.mojo` | `HD: Int, NQH: Int, NKVH: Int, KVT: DType, NAT: Int, NLD: Int, NW: Int, ROT: Bool, QLayout: TensorLayout, KLayout: TensorLayout, OLayout: TensorLayout, PLayout: TensorLayout,` |  | kernels/dattn_harness.mojo |
 | `amar_argmax_pos` | `elementwise.mojo` | `XLayout: TensorLayout, OLayout: TensorLayout` | argmax_k, argmax_d | serve/registry.mojo, kernels/test_mega_block.mojo |
 | `amar_argmax_row` | `elementwise.mojo` | `XLayout: TensorLayout, OLayout: TensorLayout` |  | kernels/test_elementwise.mojo |
 | `amar_embed_lookup` | `elementwise.mojo` | `TLayout: TensorLayout, OLayout: TensorLayout` |  | kernels/test_elementwise.mojo |
@@ -95,7 +95,7 @@ Every `kernels/test_*.mojo`, the gate script that runs it, and its first docstri
 | test | run by | covers |
 |---|---|---|
 | `test_attn_block.mojo` | manual | Parity: one decode token through the qwen35 gated full-attention block (docs/qwen35-ssm-notes.md §7b) vs tools/attn-ref.py. Position 7 with 7 cached tokens. Gates mirror test_ssm_block: exact-path intermediates at 1e-3, values crossing a bf16 cast at wider gates (boundary flips, documented there). Also bench/dattn-protocol.md gate 3: the generic decode attention's exact path, instantiated at the shipped HD/NQH/NKVH/f32, must be bit-identical to amar_attn_decode on this block's Q and KV cache. |
-| `test_dattn.mojo` | manual | Numerics probe for the generic decode attention (bench/dattn-protocol.md gate 2). deterministic inputs (op_bench's fill formula, V with a seed offset), one instantiation per shape, output dumped for tools/dattn-ref.py's fp64 reference. usage: test_dattn SHAPE T PATH NS NLD QSCALE OUT SHAPE S0 (shipped 256/16/4 f32) | S1 (256/16/4 f16) | S2 (64/40/8 f16) | S3 (128/28/4 f16) PATH exact | split; NS requested split count (clamped to the span count); NLD 4 | 8 |
+| `test_dattn.mojo` | manual | Numerics probe for the generic decode attention (bench/dattn-protocol.md gate 2). deterministic inputs (op_bench's fill formula, V with a seed offset), one instantiation per shape, output dumped for tools/dattn-ref.py's fp64 reference. usage: test_dattn SHAPE T PATH NS NLD ROT QSCALE OUT SHAPE S0 (shipped 256/16/4 f32) | S1 (256/16/4 f16) | S2 (64/40/8 f16) | S3 (128/28/4 f16) PATH exact | split; NS requested split count (clamped to the span count); NLD 2 | 4 | 8; ROT 0 | 1 (per-block start rotation) |
 | `test_elementwise.mojo` | manual | Host-reference checks for the elementwise/decode kernel pack. |
 | `test_gemm.mojo` | run-tests.sh | Numeric check: shim GEMM on gfx1100 vs a host reference. |
 | `test_gguf_gemm.mojo` | manual | Parity check: real Qwythos bf16 weight through skinny_wt vs numpy reference. |

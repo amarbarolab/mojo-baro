@@ -4,7 +4,7 @@ from layout import TileTensor, row_major
 
 from dattn import (
     amar_dattn_exact, amar_dattn_split, amar_dattn_combine, dkv_off, dspan,
-    KVPAGE, DTHREADS, f32,
+    KVPAGE, DTHREADS, DMAXS, f32,
 )
 
 comptime FLAT = 1 << 26
@@ -38,11 +38,11 @@ def fill_kv[HD: Int, NKVH: Int, KVT: DType](host: HostBuffer[KVT], T: Int, seed:
 
 def eff_nsplit[HD: Int, NLD: Int](T: Int, ns: Int) -> Int:
     var NS = (T + dspan[HD, NLD]() - 1) // dspan[HD, NLD]()
-    return min(max(ns, 1), max(NS, 1))
+    return min(min(max(ns, 1), max(NS, 1)), DMAXS)
 
 
 def launch_dattn[
-    HD: Int, NQH: Int, NKVH: Int, KVT: DType, NLD: Int
+    HD: Int, NQH: Int, NKVH: Int, KVT: DType, NLD: Int, NW: Int, ROT: Bool
 ](
     ctx: DeviceContext,
     mut q_d: DeviceBuffer[f32],
@@ -65,8 +65,8 @@ def launch_dattn[
         comptime k_exact = amar_dattn_exact[HD, NQH, NKVH, KVT, 1, type_of(q_layout), type_of(flat_layout), type_of(q_layout)]
         ctx.enqueue_function[k_exact](Q, Kc, Vc, O, Int32(T), scale, Int32(0), grid_dim=NQH, block_dim=HD)
     else:
-        comptime k_split = amar_dattn_split[HD, NQH, NKVH, KVT, 1, NLD, type_of(q_layout), type_of(flat_layout), type_of(q_layout), type_of(flat_layout)]
-        ctx.enqueue_function[k_split](Q, Kc, Vc, O, Pg, Int32(T), Int32(ns), scale, Int32(0), grid_dim=(NKVH, ns), block_dim=DTHREADS)
+        comptime k_split = amar_dattn_split[HD, NQH, NKVH, KVT, 1, NLD, NW, ROT, type_of(q_layout), type_of(flat_layout), type_of(q_layout), type_of(flat_layout)]
+        ctx.enqueue_function[k_split](Q, Kc, Vc, O, Pg, Int32(T), Int32(ns), scale, Int32(0), grid_dim=(NKVH, ns), block_dim=NW * 32)
         if ns > 1:
             comptime k_comb = amar_dattn_combine[HD, type_of(flat_layout), type_of(q_layout)]
-            ctx.enqueue_function[k_comb](Pg, O, Int32(ns), grid_dim=NQH, block_dim=HD)
+            ctx.enqueue_function[k_comb](Pg, O, Int32(ns), grid_dim=NQH, block_dim=DTHREADS)

@@ -21,7 +21,8 @@ SHAPES = {
 }
 LENGTHS = [1, 127, 128, 129, 4096]
 PATHS = [("exact", 1), ("split", 1), ("split", 8), ("split", 64)]
-NLDS = [4, 8]
+NLDS = [2, 4, 8]
+ROTS = [0, 1]
 QSCALES = [1, 8]
 TOL = 2e-3
 
@@ -67,26 +68,26 @@ def main():
     shapes = ["S1"] if a.quick else list(SHAPES)
     lengths = [129, 4096] if a.quick else LENGTHS
     worst, failed, n = 0.0, [], 0
-    for shape, T, (path, ns), nld, qscale in itertools.product(shapes, lengths, PATHS, NLDS, QSCALES):
-        if path == "exact" and nld == 8:
+    for shape, T, (path, ns), nld, rot, qscale in itertools.product(shapes, lengths, PATHS, NLDS, ROTS, QSCALES):
+        if path == "exact" and (nld != 4 or rot == 1):
             continue
         q, k, v = inputs(shape, T, qscale)
         ref = reference(shape, q, k, v)
-        f = f"{a.out}/{shape}_{T}_{path}{ns}_n{nld}_q{qscale}.bin"
-        r = subprocess.run([a.bin, shape, str(T), path, str(ns), str(nld), str(qscale), f],
+        f = f"{a.out}/{shape}_{T}_{path}{ns}_n{nld}_r{rot}_q{qscale}.bin"
+        r = subprocess.run([a.bin, shape, str(T), path, str(ns), str(nld), str(rot), str(qscale), f],
                            capture_output=True, text=True)
         echo = r.stdout.strip().splitlines()[-1] if r.stdout.strip() else ""
         if r.returncode != 0 or not echo.startswith("echo "):
-            failed.append((shape, T, path, ns, nld, qscale, "RUN FAILED: " + r.stderr.strip()[-200:]))
+            failed.append((shape, T, path, ns, nld, rot, qscale, "RUN FAILED: " + r.stderr.strip()[-200:]))
             continue
         got = np.fromfile(f, dtype=np.float32).reshape(ref.shape).astype(np.float64)
         err = np.abs(got - ref).max() / max(np.abs(ref).max(), 1e-30)
         worst = max(worst, err)
         n += 1
         ok = err <= TOL and np.isfinite(got).all()
-        print(f"{'ok  ' if ok else 'FAIL'} {shape} T={T:<5} {path} ns={ns:<3} nld={nld} q={qscale} relmax={err:.2e}  [{echo[5:]}]")
+        print(f"{'ok  ' if ok else 'FAIL'} {shape} T={T:<5} {path} ns={ns:<3} nld={nld} rot={rot} q={qscale} relmax={err:.2e}  [{echo[5:]}]")
         if not ok:
-            failed.append((shape, T, path, ns, nld, qscale, f"relmax {err:.3e}"))
+            failed.append((shape, T, path, ns, nld, rot, qscale, f"relmax {err:.3e}"))
     print(f"\n{n} cases, worst relmax {worst:.3e}, tolerance {TOL:.0e}, failures {len(failed)}")
     for x in failed:
         print("  FAIL", *x)
