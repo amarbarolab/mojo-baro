@@ -360,13 +360,15 @@ Question: does restricting the MTP draft head to a frequency-ranked vocabulary
 subset (FR-Spec, MiniCPM4 paper arXiv 2506.07900 section 4.1.1) raise
 speculative tok/s_gen on the q4 pack without changing the output?
 
+*Path note (2026-09-11, before any run): the two tools named below were ported from the planned Python to Mojo (CLAUDE.md s9 default); names corrected, nothing else changed.*
+
 **Change.** The draft head (`blk32_forward`, `do_head`) computes logits over
 `FR_K = 62080` rows (25% of 248320) of `output.weight`, taken from the q4
 pack's own rows in frequency order, then maps the argmax back to the full id
 with one int gather. The verify step still uses the full vocabulary, so a draft
 outside the subset is simply rejected; output must not change. Switch:
-`BARO_FR=1` on a pack built by `tools/fr-draft.py`. Frequency table:
-`tools/fr-vocab.py` over `bench/ruler/data/essays.txt` plus the repo's
+`BARO_FR=1` on a pack built by `tools/fr-draft.mojo`. Frequency table:
+`tools/fr-vocab.mojo` over `bench/ruler/data/essays.txt` plus the repo's
 tracked `serve/`, `kernels/`, `tools/*.py`, `docs/*.md`, `bench/*.md`
 text (about 2.3 MB). The 20 `bench/mtp-prompts/` prompts are not in it.
 
@@ -415,3 +417,25 @@ F2/F4 (`BARO_FR=1`); every B log reads `BARO_FR: False`, every F log
 Claim rule met (P-FR1, P-FR2, P-FR3). Not yet default-on: the frequency table
 comes from a small corpus with lowest-id filler; the next round ranks the
 unseen ids by BPE merge order and widens the corpus, then re-runs this A/B.
+
+## Amendment FR-Spec round 2 (frozen 2026-09-11 before its run)
+
+Round 1's table came from a 720k-token corpus with 20,808 distinct ids; the other
+41,272 rows were lowest-id filler. Round 2 changes only the id table:
+`tools/fr-vocab.mojo` now ranks ids the corpus never produced by the BPE merge
+that builds them (measured nearly a no-op on this tokenizer: 61,613 of 62,080
+rows unchanged, because its ids already follow merge order), and the corpus
+grows to 48.2M tokens (essays, repo text, the maintainer's markdown notes, the
+llama.cpp sources; 77,807 distinct ids; the top 62,080 cover 99.95%). Ids
+`.work/fr-ids-ac.txt` sha256 `e56773aeedbf29a0`...; 45,562 rows shared with round 1.
+Pack `.work/engine-pack-q4-fr-ac`, same builder and checker. Instrument, arms and
+receipts as round 1; B arms re-run in the same job.
+
+Predictions (F vs B at the same k, 20-prompt medians):
+- P-FR6 identity 20/20 at k=2 and k=4 (hard gate).
+- P-FR7 acceptance change vs full head no worse than round 1 (-0.9 pt at k=2,
+  -1.1 pt at k=4), and within +-1 pt of it.
+- P-FR8 tok/s_gen gain within 2 points of round 1 (+7.29% k=2, +8.55% k=4): the
+  head size is unchanged, so only acceptance can move the result.
+Falsifier: acceptance worse than round 1 at both k, which would mean a bigger
+general corpus ranks the model's actual tokens worse than the small one.
