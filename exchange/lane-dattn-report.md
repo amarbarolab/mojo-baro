@@ -132,3 +132,29 @@ every target (arm lines); O split kernels 176 / 192 / 192 VGPR with 0 / 0 / 316 
   trace's resource read-back.
 - Skill `kernel-arm-round`: sweep, freeze by commit, fail-closed confirmation; void-row
   checks; the traps above.
+
+## Round 2: wired into the engine (2026-09-11, `bench/dattn-wire-protocol.md`)
+
+**Verdict: LAND on the branch** (merge is the maintainer's call). The split branch of `attn_phases`
+and the launch path's attention now share `dattn_split_body` / `dattn_combine_body`; the
+default path (T <= 1088) keeps its old arithmetic and stays bit-identical (mega-gate ALL
+PASS on every pack). Stint `.work/dattn-wire/w1`, commit `b7c5041`, engines base
+`18bd27c3efebcf1f` vs new `606e156d60333e5d`.
+
+| test | base | new | ratio |
+|---|---|---|---|
+| 20-prompt median tok/s_gen (P4), identity 20/20 | 127.96 | 136.41 | 1.066 |
+| decode after p8192, median of 3 | 112.70 | 124.48 | 1.104 |
+| decode after p32768, median of 3 | 85.22 | 101.36 | 1.189 |
+| split identity mega vs launch (p0512, p8192) | | 64/64, 64/64 | |
+| 64-token agreement vs exact attention (8k, 32k) | 64/64 | 64/64 | |
+
+The short-context +6.6 % is not the attention kernel (not entered below 1088): recompiling
+the megakernel re-rolled its dot-loop schedule into a faster ticket (dual 114 to 124). With
+that factor taken out, the attention kernel alone is 1.04x at 8k and 1.13x at 32k, matching
+the frozen model (0.70 / 2.54 ms of attention measured against 0.65 / 2.41 predicted). The
+schedule gain is fragile: any later megakernel edit can undo it.
+
+Next levers: lower `BARO_ATT_SPLIT_T` below 1088 (split beat exact at every length from 512
+standalone; needs its own frozen A/B); re-embed the pack sources at merge time (the embed
+closure now includes `kernels/dattn.mojo`; the worktree's packs are main's, not touched here).

@@ -69,6 +69,39 @@ gpu-wait job, fail-closed.
 - Spread > 10 % on a long-context arm: that row is void.
 - Engine sha in the summary differs from the arms table: the stint is void.
 
-## Result
+## Result (2026-09-11, stint `.work/dattn-wire/w1`, commit `b7c5041`)
 
-(empty until the stint reports)
+**Verdict: LAND (on `lane-dattn`; merging is the maintainer's call).** G1-G4 pass, W3 32k ratio 1.189
+>= 1.08, W2 held. W1's band **missed high** (1.066 against 0.98-1.02); its falsifier (< 0.98)
+did not fire, and the land rule is read as "W1 not falsified". That reading is stated here so
+it can be overruled.
+
+| gate | result | read from |
+|---|---|---|
+| G1 numerics | PASS 920/920, worst 1.57e-5 | `.work/dattn/ref-rows.log` |
+| G2 fingerprint | PASS: q4 token dual 124/79/79/59, 0 spills, LDS 36.8 KB | `tools/isa-receipt.py`, `isa-loops` |
+| G3 mega-gate on new (sha `606e156d60333e5d`) | ALL PASS: q8 / q8d / q4 mega == launch at spec 0 and 1, q8 and q4 vs ref-tokens-64 | `mega-gate/SUMMARY.txt` |
+| G4 split identity (`BARO_ATT_SPLIT=1`) | mega == launch 64/64 at p0512 and p8192, fail word 0 | `SUMMARY.txt` |
+
+| prediction | frozen | observed | |
+|---|---|---|---|
+| W1 20-prompt ratio | 0.98-1.02, identity 20/20 | **1.066** (base 127.96, new 136.41 tok/s_gen, spread 0.5 / 1.4 %), identity 20/20 | MISSED high |
+| W2 agreement vs exact | new prefix >= base prefix | 64/64 for base, new and exact at p8192 and p32768 | HELD |
+| W3 8k ratio | 1.04 (1.02-1.07) | **1.104** (112.70 to 124.48, spread 0.3 / 0.2 %) | MISSED high |
+| W3 32k ratio | 1.19 (1.10-1.25) | **1.189** (85.22 to 101.36, spread 0.3 / 0.3 %) | HELD |
+
+Where the gain comes from. The new code is not entered below T = 1088, so W1's +6.6 % is the
+megakernel's re-rolled schedule (hot dot loop dual 114 to 124, s_delay_alu 704 to 644), not
+attention. Taking the 20-prompt token time (7.815 base, 7.331 ms new) as the non-attention
+part: attention at 8k is 1.058 ms base and 0.702 ms new (predicted 0.65), at 32k 3.919 ms
+and 2.535 ms (predicted 2.41). The attention kernel alone is worth **1.04x at 8k and 1.13x at
+32k**; the schedule re-roll multiplies every token by about 1.066 on top. The 32k land bar
+(1.08) is met by the attention share alone.
+
+Receipts: arm file `ab20/arm.txt` engA = base `18bd27c3efebcf1f`, engB = new `606e156d60333e5d`,
+same pack and env; every run prints `att split: 1088` (exact arm 1000000), `TMAX: 33792`,
+`mega fail word: 0`; exact attention at 32k 45.43 tok/s (the chat lane's pre-split 45.7).
+
+Caveat on W1: the +6.6 % is a property of this build's register allocation (memory
+`megakernel-lottery-fingerprint`). Any later megakernel edit can re-roll it either way; check
+the fingerprint before crediting or blaming a short-context change.
