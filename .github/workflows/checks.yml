@@ -7,7 +7,8 @@ on:
 
 jobs:
   non-gpu:
-    # Everything here runs without a GPU or the Mojo toolchain. The kernels
+    # Everything here runs without a GPU; the Mojo compiler is needed only to
+    # build the kernel census. The kernels
     # themselves are verified by ./run-tests.sh on an RDNA3 card, which no
     # hosted runner has; see CONTRIBUTING.md.
     runs-on: ubuntu-latest
@@ -16,5 +17,5 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install pyyaml
+      - run: pip install pyyaml mojo==1.0.0
       - run: tools/ci-checks.sh

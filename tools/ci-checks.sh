@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # usage: tools/ci-checks.sh
-# Every invariant that can be checked without a GPU or the Mojo toolchain.
+# Every invariant that can be checked without a GPU. Needs the Mojo compiler
+# (repo .venv, or `mojo` on PATH in CI) for the kernel census only.
 # Runs in CI and locally. Kernel work still needs ./run-tests.sh on the card.
 set -u
 cd "$(dirname "$0")/.."
@@ -9,15 +10,20 @@ step() { printf '\n== %s\n' "$1"; }
 ok()   { echo "  OK  $1"; }
 bad()  { echo "  FAIL $1"; fails=$((fails + 1)); }
 
+MOJO=./.venv/bin/mojo; [ -x "$MOJO" ] || MOJO=mojo
+mkdir -p .work
+CENSUS=.work/kernel-census
+"$MOJO" build tools/kernel-census.mojo -o "$CENSUS" || { echo "kernel census failed to build"; exit 1; }
+
 step "kernel census (no orphaned kernels)"
-if python3 tools/kernel-census.py --check; then ok "every amar_* kernel is reachable"
+if "$CENSUS" --check; then ok "every amar_* kernel is reachable"
 else bad "orphaned kernel: it is in kernels/ but no engine, bench or test calls it"; fi
 
 step "docs/KERNELS.md is current"
 cp docs/KERNELS.md .ci-kernels-before.md
-python3 tools/kernel-census.py >/dev/null
+"$CENSUS" >/dev/null
 if diff -q .ci-kernels-before.md docs/KERNELS.md >/dev/null; then ok "generated census matches the committed file"
-else bad "docs/KERNELS.md is stale; regenerate with tools/kernel-census.py"; diff -u .ci-kernels-before.md docs/KERNELS.md | head -20; fi
+else bad "docs/KERNELS.md is stale; regenerate with tools/kernel-census.mojo"; diff -u .ci-kernels-before.md docs/KERNELS.md | head -20; fi
 mv .ci-kernels-before.md docs/KERNELS.md
 
 step "python sources parse"

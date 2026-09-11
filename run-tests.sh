@@ -14,4 +14,5 @@ cmake --build "$S" -j"$(nproc)" >/dev/null
 ./.venv/bin/mojo build kernels/test_prefix.mojo -o .work/test_prefix -I kernels -I serve
 ./.work/test_prefix
 
-python3 tools/kernel-census.py --check
+./.venv/bin/mojo build tools/kernel-census.mojo -o .work/kernel-census
+./.work/kernel-census --check
