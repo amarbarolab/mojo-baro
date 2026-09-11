@@ -13,7 +13,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::mpsc;
 
-use crate::protocol::{cancel_line, parse_line, DoneStats, EngineMsg, Request};
+use crate::protocol::{cancel_line, parse_line, DoneStats, EngineMsg, Request, SampleParams};
 
 /// What a request's consumer sees, in order: zero or more tokens, then
 /// exactly one `Done` or `Error`.
@@ -138,14 +138,16 @@ impl Engine {
     /// receiver of its events. Dropping the receiver without cancelling
     /// discards the rest of that request's output; the engine still runs it
     /// to completion.
-    pub fn submit(&self, prompt: Vec<u32>, n: u32, spec: bool, stop: Vec<Vec<u32>>, ckpt: Vec<u32>) -> Result<(u64, mpsc::UnboundedReceiver<Event>), String> {
+    pub fn submit(
+        &self, prompt: Vec<u32>, n: u32, spec: bool, stop: Vec<Vec<u32>>, ckpt: Vec<u32>, sample: SampleParams,
+    ) -> Result<(u64, mpsc::UnboundedReceiver<Event>), String> {
         if !self.alive() {
             return Err("engine process has exited".into());
         }
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (out, rx) = mpsc::unbounded_channel();
         let job = Job {
-            req: Request { id, prompt, n, spec, stop, ckpt },
+            req: Request { id, prompt, n, spec, stop, ckpt, sample },
             out,
         };
         self.queued.fetch_add(1, Ordering::SeqCst);

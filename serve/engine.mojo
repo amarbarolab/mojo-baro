@@ -100,12 +100,63 @@ def json_int(line: String, mut i: Int, mut v: Int) -> Bool:
     return have
 
 
+def json_float(line: String, mut i: Int, mut v: Float64) -> Bool:
+    # Plain decimal (sign, digits, optional '.', digits); no exponent form --
+    # none of the sampler fields need one.
+    var b = line.as_bytes()
+    var neg = False
+    if i < len(b) and b[i] == 45:
+        neg = True
+        i += 1
+    var have = False
+    var ip: Float64 = 0
+    while i < len(b) and b[i] >= 48 and b[i] <= 57:
+        ip = ip * 10 + Float64(Int(b[i] - 48))
+        i += 1
+        have = True
+    var frac: Float64 = 0
+    if i < len(b) and b[i] == 46:
+        i += 1
+        var scale: Float64 = 1
+        while i < len(b) and b[i] >= 48 and b[i] <= 57:
+            scale /= 10
+            frac += Float64(Int(b[i] - 48)) * scale
+            i += 1
+            have = True
+    v = ip + frac
+    if neg:
+        v = -v
+    return have
+
+
+@fieldwise_init
+struct SampleParams(Copyable, Movable):
+    # C3 (bench/chat-protocol.md): parsed from the wire, not yet acted on --
+    # the live decode loop still always takes the greedy/MTP path. Ready for
+    # serve/sample_ref.mojo (host reference) or kernels/sample.mojo (device,
+    # lane-KSAMP) to read once either is wired in. temperature <= 0 means
+    # "off" throughout, matching both references' own convention.
+    var temperature: Float64
+    var top_p: Float64
+    var top_k: Int
+    var min_p: Float64
+    var seed: UInt64
+    var presence_penalty: Float64
+    var frequency_penalty: Float64
+
+
+def default_sample_params() -> SampleParams:
+    return SampleParams(temperature=0, top_p=1.0, top_k=0, min_p=0, seed=0, presence_penalty=0, frequency_penalty=0)
+
+
 def parse_request(
-    line: String, mut id: Int, mut prompt: List[Int], mut n: Int, mut spec: Bool, mut has_spec: Bool, mut stop: List[List[Int]], mut ckpt: List[Int]
+    line: String, mut id: Int, mut prompt: List[Int], mut n: Int, mut spec: Bool, mut has_spec: Bool, mut stop: List[List[Int]], mut ckpt: List[Int], mut sample: SampleParams
 ) -> String:
     # {"id":INT,"prompt":[INT,...],"n":INT,"spec":BOOL,"stop":[[INT,...],...],
-    #  "ckpt":[INT,...]}; spec, stop and ckpt optional. Returns "" on
-    # success, else the error text (id is set when it parsed).
+    #  "ckpt":[INT,...],"temperature":FLOAT,"top_p":FLOAT,"top_k":INT,
+    #  "min_p":FLOAT,"seed":INT,"presence_penalty":FLOAT,
+    #  "frequency_penalty":FLOAT}; everything past prompt/n optional. Returns
+    # "" on success, else the error text (id is set when it parsed).
     id = 0
     var i = json_key(line, "id")
     if i < 0 or not json_int(line, i, id):
@@ -185,6 +236,48 @@ def parse_request(
             if not json_int(line, ci, v3) or v3 < 0:
                 return "ckpt must hold non-negative integers"
             ckpt.append(v3)
+    var fi = json_key(line, "temperature")
+    if fi >= 0:
+        var fv: Float64 = 0
+        if not json_float(line, fi, fv):
+            return "temperature must be a number"
+        sample.temperature = fv
+    fi = json_key(line, "top_p")
+    if fi >= 0:
+        var fv2: Float64 = 0
+        if not json_float(line, fi, fv2):
+            return "top_p must be a number"
+        sample.top_p = fv2
+    fi = json_key(line, "top_k")
+    if fi >= 0:
+        var iv = 0
+        if not json_int(line, fi, iv):
+            return "top_k must be an integer"
+        sample.top_k = iv
+    fi = json_key(line, "min_p")
+    if fi >= 0:
+        var fv3: Float64 = 0
+        if not json_float(line, fi, fv3):
+            return "min_p must be a number"
+        sample.min_p = fv3
+    fi = json_key(line, "seed")
+    if fi >= 0:
+        var iv2 = 0
+        if not json_int(line, fi, iv2) or iv2 < 0:
+            return "seed must be a non-negative integer"
+        sample.seed = UInt64(iv2)
+    fi = json_key(line, "presence_penalty")
+    if fi >= 0:
+        var fv4: Float64 = 0
+        if not json_float(line, fi, fv4):
+            return "presence_penalty must be a number"
+        sample.presence_penalty = fv4
+    fi = json_key(line, "frequency_penalty")
+    if fi >= 0:
+        var fv5: Float64 = 0
+        if not json_float(line, fi, fv5):
+            return "frequency_penalty must be a number"
+        sample.frequency_penalty = fv5
     return ""
 
 
@@ -285,6 +378,7 @@ def main() raises:
         var restore_s = 0.0
         var stop_seqs = List[List[Int]]()
         var ckpt_hints = List[Int]()
+        var sample = default_sample_params()
         if serve:
             var line_in = read_line(0)
             if not line_in:
@@ -292,7 +386,7 @@ def main() raises:
             var req_n = 0
             var req_spec = False
             var req_has_spec = False
-            var perr = parse_request(line_in.value(), req_id, prompt, req_n, req_spec, req_has_spec, stop_seqs, ckpt_hints)
+            var perr = parse_request(line_in.value(), req_id, prompt, req_n, req_spec, req_has_spec, stop_seqs, ckpt_hints, sample)
             if perr == "" and len(prompt) < 1:
                 perr = "empty prompt"
             if perr == "" and req_n < 1:

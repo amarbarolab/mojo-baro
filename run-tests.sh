@@ -14,5 +14,10 @@ cmake --build "$S" -j"$(nproc)" >/dev/null
 ./.venv/bin/mojo build kernels/test_prefix.mojo -o .work/test_prefix -I kernels -I serve
 ./.work/test_prefix
 
+# C3 host reference sampler: pure CPU, no accelerator needed, matched
+# against kernels/sample.mojo's semantics (lane-KSAMP).
+./.venv/bin/mojo build kernels/test_sample_ref.mojo -o .work/test_sample_ref -I kernels -I serve
+./.work/test_sample_ref
+
 ./.venv/bin/mojo build tools/kernel-census.mojo -o .work/kernel-census
 ./.work/kernel-census --check

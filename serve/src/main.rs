@@ -255,6 +255,8 @@ struct Gen {
     /// M1b role-boundary checkpoint hints (`Text::role_boundaries`); empty
     /// for `/v1/completions`, which has no message list.
     ckpt: Vec<u32>,
+    /// C3 control block (parsed here, not yet acted on by the engine).
+    sample: protocol::SampleParams,
 }
 
 /// OpenAI's `stop`: a single string or an array of strings.
@@ -302,7 +304,7 @@ fn check_and_submit(app: &App, g: &Gen) -> Result<(u64, mpsc::UnboundedReceiver<
         return Err(ApiError::exceed_context(g.prompt.len() as u64, tmax as u64));
     }
     app.engine
-        .submit(g.prompt.clone(), g.n, g.spec, g.stop.clone(), g.ckpt.clone())
+        .submit(g.prompt.clone(), g.n, g.spec, g.stop.clone(), g.ckpt.clone(), g.sample.clone())
         .map_err(|e| ApiError::Plain(StatusCode::SERVICE_UNAVAILABLE, e))
 }
 
@@ -445,6 +447,48 @@ fn spec_default(app: &App, req_spec: Option<bool>) -> bool {
     req_spec.unwrap_or_else(|| std::env::var("BARO_SPEC").map(|v| v == "1").unwrap_or(false) && app.engine.limits.spec_k > 0)
 }
 
+// ---- C3 sampler fields (shared by both completion endpoints) ------------------
+
+/// `temperature`/`top_p`/`top_k`/`min_p`/`seed`/`presence_penalty`/
+/// `frequency_penalty`/`logprobs`: parsed and carried in the request's
+/// control block (C3), not yet acted on by the engine -- `logprobs` has no
+/// live sampling path to fall out of yet, so it is parsed and otherwise
+/// unused (bench/chat-protocol.md C3 scope note).
+#[derive(Deserialize, Default)]
+struct SamplerFields {
+    #[serde(default)]
+    temperature: Option<f32>,
+    #[serde(default)]
+    top_p: Option<f32>,
+    #[serde(default)]
+    top_k: Option<i32>,
+    #[serde(default)]
+    min_p: Option<f32>,
+    #[serde(default)]
+    seed: Option<u64>,
+    #[serde(default)]
+    presence_penalty: Option<f32>,
+    #[serde(default)]
+    frequency_penalty: Option<f32>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    logprobs: Option<bool>,
+}
+
+impl SamplerFields {
+    fn to_sample_params(&self) -> protocol::SampleParams {
+        protocol::SampleParams {
+            temperature: self.temperature,
+            top_p: self.top_p,
+            top_k: self.top_k,
+            min_p: self.min_p,
+            seed: self.seed,
+            presence_penalty: self.presence_penalty,
+            frequency_penalty: self.frequency_penalty,
+        }
+    }
+}
+
 // ---- /v1/completions -----------------------------------------------------------
 
 #[derive(Deserialize)]
@@ -461,6 +505,8 @@ struct CompletionReq {
     spec: Option<bool>,
     #[serde(default)]
     stop: Option<StopParam>,
+    #[serde(flatten)]
+    sampler: SamplerFields,
 }
 
 fn prompt_ids(app: &App, prompt: &Value) -> Result<Vec<u32>, ApiError> {
@@ -485,6 +531,7 @@ async fn completions(State(app): State<Shared>, Json(r): Json<CompletionReq>) ->
         stream: r.stream,
         stop: compute_stop(&app, r.stop),
         ckpt: vec![],
+        sample: r.sampler.to_sample_params(),
     };
     let model = r.model.unwrap_or_else(|| app.model.clone());
     let (req_id, rx) = check_and_submit(&app, &g)?;
@@ -532,6 +579,8 @@ struct ChatReq {
     spec: Option<bool>,
     #[serde(default)]
     stop: Option<StopParam>,
+    #[serde(flatten)]
+    sampler: SamplerFields,
 }
 
 #[derive(Deserialize)]
@@ -572,6 +621,7 @@ async fn chat_completions(State(app): State<Shared>, Json(r): Json<ChatReq>) -> 
         stream: r.stream,
         stop: compute_stop(&app, r.stop),
         ckpt,
+        sample: r.sampler.to_sample_params(),
     };
     let model = r.model.unwrap_or_else(|| app.model.clone());
     let (req_id, rx) = check_and_submit(&app, &g)?;

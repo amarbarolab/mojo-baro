@@ -80,6 +80,14 @@ for an unparseable line carries `"id":0`.
   hint that misses a real tokenization boundary wastes a checkpoint slot,
   never corrupts a restore -- `lookup` still requires the stored SHA-256
   hash (salted per pack, so two packs never share a checkpoint) to match.
+- `temperature`/`top_p`/`top_k`/`min_p`/`seed`/`presence_penalty`/
+  `frequency_penalty`: optional (C3 control block). Parsed into
+  `SampleParams` and **not yet acted on** -- the decode loop still always
+  takes the greedy/MTP path regardless of these. `serve/sample_ref.mojo`
+  is the host reference these will drive once wired (matched byte-for-byte
+  against `kernels/sample.mojo`'s `amar_sample_row`/`amar_spec_accept`,
+  lane-KSAMP); absent, the request line is identical to before this field
+  existed.
 - `{"cancel":ID}`: a second line shape, written to the same stdin at any
   point while `ID` is decoding (the request line for the *next* id is never
   written before this one's `done` line, so a stray line mid-request can
@@ -115,8 +123,8 @@ makes): about 0.5% of tok/s_gen on the 5-token receipt prompt.
 |---|---|---|
 | `GET /health` | | `status`, `queue` (waiting+running), `tokenizer` (bool), `limits` (the ready line), `pack` |
 | `GET /v1/models` | | one model, id = pack directory name |
-| `POST /v1/completions` | `prompt` (string, or array of token ids), `max_tokens` (default 64), `stream`, `spec` (extension), `stop` (string or array of strings) | response adds `choices[0].tokens` (the generated ids) and `timings` (the done line, including `finish`). Token-id prompts need no tokenizer; `stop` needs one (silently `[]` without). |
-| `POST /v1/chat/completions` | `messages`, `max_tokens`/`max_completion_tokens`, `stream`, `spec`, `stop` | needs the tokenizer; template from `tokenizer-meta.json` (`chat_template`, Jinja via minijinja + pycompat) else ChatML |
+| `POST /v1/completions` | `prompt` (string, or array of token ids), `max_tokens` (default 64), `stream`, `spec` (extension), `stop` (string or array of strings), `temperature`/`top_p`/`top_k`/`min_p`/`seed`/`presence_penalty`/`frequency_penalty`/`logprobs` (C3, parsed and carried, not yet acted on) | response adds `choices[0].tokens` (the generated ids) and `timings` (the done line, including `finish`). Token-id prompts need no tokenizer; `stop` needs one (silently `[]` without). |
+| `POST /v1/chat/completions` | `messages`, `max_tokens`/`max_completion_tokens`, `stream`, `spec`, `stop`, the same C3 sampler fields | needs the tokenizer; template from `tokenizer-meta.json` (`chat_template`, Jinja via minijinja + pycompat) else ChatML |
 | `POST /v1/cancel` | `{"id": "cmpl-7"}` / `{"id": "chatcmpl-7"}` (the response `id`, or the SSE `id` field of its first chunk -- read while the request is still streaming) | `{"cancelled": bool}`; `true` only if that request was the one actively decoding. A queued-but-not-started or already-finished id returns `false`. |
 | `POST /tokenize` | `{"content": "...", "add_special": false}` | `{"tokens": [...]}` |
 | `POST /detokenize` | `{"tokens": [...]}` | `{"content": "..."}` |

@@ -7,8 +7,31 @@
 use serde::Serialize;
 use serde_json::Value;
 
+/// C3 sampler control block (bench/chat-protocol.md): parsed by the engine
+/// (`serve/engine.mojo::SampleParams`) but not yet acted on there -- the
+/// live decode loop still always takes the greedy/MTP path. `#[serde(skip_serializing_if)]`
+/// on every field means a request that sets none of them serialises
+/// byte-for-byte as it did before this struct existed.
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+pub struct SampleParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frequency_penalty: Option<f32>,
+}
+
 /// One request line, serialised exactly as the engine's parser expects.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct Request {
     pub id: u64,
     pub prompt: Vec<u32>,
@@ -21,6 +44,8 @@ pub struct Request {
     /// M1b role-boundary checkpoint hint positions (`Text::role_boundaries`),
     /// ascending; empty when the request has no message list.
     pub ckpt: Vec<u32>,
+    #[serde(flatten)]
+    pub sample: SampleParams,
 }
 
 /// The line that cancels the request currently decoding, if its id matches.
@@ -174,6 +199,7 @@ mod tests {
             spec: false,
             stop: vec![],
             ckpt: vec![],
+            sample: SampleParams::default(),
         };
         assert_eq!(r.line(), "{\"id\":7,\"prompt\":[760,6511,314],\"n\":64,\"spec\":false,\"stop\":[],\"ckpt\":[]}\n");
     }
@@ -187,6 +213,7 @@ mod tests {
             spec: false,
             stop: vec![vec![151645], vec![9707, 11]],
             ckpt: vec![],
+            sample: SampleParams::default(),
         };
         assert_eq!(
             r.line(),
@@ -203,10 +230,36 @@ mod tests {
             spec: false,
             stop: vec![],
             ckpt: vec![7914, 8020],
+            sample: SampleParams::default(),
         };
         assert_eq!(
             r.line(),
             "{\"id\":2,\"prompt\":[1,2,3],\"n\":8,\"spec\":false,\"stop\":[],\"ckpt\":[7914,8020]}\n"
+        );
+    }
+
+    #[test]
+    fn request_line_carries_sample_params_only_when_set() {
+        let r = Request {
+            id: 3,
+            prompt: vec![1],
+            n: 8,
+            spec: false,
+            stop: vec![],
+            ckpt: vec![],
+            sample: SampleParams {
+                temperature: Some(0.8),
+                top_p: Some(0.9),
+                top_k: Some(40),
+                min_p: Some(0.05),
+                seed: Some(42),
+                presence_penalty: None,
+                frequency_penalty: None,
+            },
+        };
+        assert_eq!(
+            r.line(),
+            "{\"id\":3,\"prompt\":[1],\"n\":8,\"spec\":false,\"stop\":[],\"ckpt\":[],\"temperature\":0.8,\"top_p\":0.9,\"top_k\":40,\"min_p\":0.05,\"seed\":42}\n"
         );
     }
 

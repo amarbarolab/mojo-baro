@@ -1144,4 +1144,61 @@ P-I1..P-I4 check PASS; `cargo test`/`clippy` green for the P-I5 wire
 addition; `run-tests.sh` and `tools/test_server.sh` unaffected (no default
 behaviour changes).
 
-**Result.** pending -- filled in after the gated run.
+**Result.** PASS on every gate, recorded 2026-09-11. One repair round: the
+`amar_argmax_row`/greedy T<=0 branch returned probability 1 even when no
+valid token existed (an all-`-inf` row) -- an internal inconsistency (`-1`
+with `prob 1`) caught by `check_temperature_zero`'s all-invalid case before
+it reached anything else; fixed to return probability 0 alongside `-1`,
+matching the `nvalid == 0` branch's own convention.
+
+`kernels/test_sample_ref.mojo` (`./.work/test_sample_ref`, host-only, no
+accelerator): **PASS** on every check --
+- Philox4x32-10 KAT: zero, all-ones and pi vectors, bit-exact against
+  Random123's published vectors.
+- Temperature 0: 4/4 synthetic cases (plain, a tie at the max, NaN sprinkled
+  with the real max elsewhere, all-invalid) match an independently written
+  greedy scan; **plus** the real 248,320-logit draft-receipt row
+  (`.work/draft-logits.bin`, a real decode output) -- token 9053, matching
+  greedy argmax exactly (P-I1).
+- Distribution (P-I2), 10,000 draws each, chi-square vs the exact
+  `sample_probs_ref` target, adaptively pooled to expected >= 5 per bin,
+  Wilson-Hilferty p=0.001 critical value: all six configs held, 0 draws
+  outside the retained set on every one --
+
+  | config | chi2 | df | critical |
+  |---|---|---|---|
+  | plain T1, no truncation | 11.57 | 17 | 40.93 |
+  | T0.7 k16 p0.8 | 10.38 | 10 | 29.76 |
+  | T1.3 k12 p0.9 min-p0.05 | 0.92 | 1 | 11.16 |
+  | T0.5 p0.6 | 0.00 | 1 | 11.16 |
+  | ties T1 k10 (cut inside a tie group) | 7.95 | 9 | 28.06 |
+  | ties T0.9 p0.35 (mass cut inside ties) | 0.63 | 4 | 18.72 |
+
+- Reproducibility (P-I3): 2000/2000 identical under the same `(seed,
+  counter)`; 1807/2000 (90.4%) changed under a different seed.
+- Speculation (P-I4): accept rate 0.1264 vs exact `sum min(p_t,p_d)`
+  0.12950, 0.0034 sigma off (well inside a few sigma); accept-or-resample
+  vs the exact target `p_t` chi2 15.02, df 18, critical 42.44 -- held,
+  confirming the theoretical guarantee (accept-or-resample's marginal
+  equals the target distribution exactly) empirically.
+- Presence/frequency penalties: a token appearing 3 times with
+  `presence_penalty=1, frequency_penalty=0.5` moves from logit 9 to 6.5
+  exactly; an untouched token is bit-identical.
+
+`run-tests.sh` exit 0 (82 kernels, 38 in registry, 0 orphans; the new host
+module adds no kernel, as predicted). `tools/test_server.sh` ALL PASS,
+`cargo test` 16 passed (up from 14: the two new `SampleParams` wire tests),
+`cargo clippy` clean -- P-I5 held: the three pre-existing `Request` line
+tests needed no string changes after `sample: SampleParams::default()` was
+added to their literals, which **is** the byte-for-byte-unchanged claim,
+and a fourth new test shows the sampler fields appear on the wire only when
+set (`request_line_carries_sample_params_only_when_set`).
+
+Verdict against the frozen predictions: P-I1 held. P-I2 held on all six
+configs. P-I3 held. P-I4 held. P-I5 held. Falsifier not triggered.
+
+Scope note restated: the live decode-loop hookup (copying `logits_d` to
+host, sampling, writing the token back) is still not built -- `serve/
+sample_ref.mojo` and `SampleParams` are the tested, ready-to-wire pieces;
+`serve/engine.mojo` parses every sampler field into `SampleParams` and does
+not yet read it. Next increment, not this one.
