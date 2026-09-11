@@ -11,14 +11,14 @@ from std.sys import argv, exit
 
 from moe_pack import (
     parse_moe_index, tensor_byte_size, resolve_expert, resolve_plain,
-    size_host_state,
+    size_host_state, N_EXP,
 )
 import model_qwen35moe as P
 
 
 def file_size(path: String) raises -> Int:
     with open(path, "r") as f:
-        return f.seek(0, 2)
+        return Int(f.seek(0, 2))
 
 
 def main() raises:
@@ -50,18 +50,17 @@ def main() raises:
 
     for proj in ["gate", "up", "down"]:
         var p = String(proj)
-        var out_dim = P.H if p == "down" else P.E_FFN
-        var in_dim = P.E_FFN if p == "down" else P.H
-        var sh_out = P.H if p == "down" else P.SH_FFN
-        var sh_in = P.SH_FFN if p == "down" else P.H
+        # routed and shared experts share the same FFN width (P.FFN = 512)
+        var out_dim = P.H if p == "down" else P.FFN
+        var in_dim = P.FFN if p == "down" else P.H
 
-        var shared = resolve_expert(tensors, 0, p, True, 0, 0, sh_out, sh_out, sh_in)
+        var shared = resolve_expert(tensors, 0, p, True, 0, 0, out_dim, out_dim, in_dim)
         print("blk.0 shared", p, "offset:", shared.byte_offset)
 
         var e0 = resolve_expert(tensors, 0, p, False, 0, 0, out_dim, out_dim, in_dim)
         print("blk.0 expert0", p, "offset:", e0.byte_offset)
 
-        var e_last = resolve_expert(tensors, 0, p, False, P.N_EXP - 1, 0, out_dim, out_dim, in_dim)
+        var e_last = resolve_expert(tensors, 0, p, False, N_EXP - 1, 0, out_dim, out_dim, in_dim)
         var tname = "blk.0.ffn_" + p + "_exps.weight"
         var tinfo = resolve_plain(tensors, tname)
         var per_expert_bytes = out_dim * e_last.row_bytes
@@ -70,7 +69,7 @@ def main() raises:
             print("FAIL: expert0", p, "offset does not match tensor base")
             fail = True
         if e_last.byte_offset + per_expert_bytes != tinfo.offset + tensor_total:
-            print("FAIL: expert", P.N_EXP - 1, p, "does not reach the tensor's end")
+            print("FAIL: expert", N_EXP - 1, p, "does not reach the tensor's end")
             fail = True
 
     # --- Q6_K down_exps layers (34, 38, 39 in this GGUF's UD quant mix) ----
@@ -80,7 +79,7 @@ def main() raises:
         if info.dtype != "q6_k":
             print("FAIL:", name, "expected q6_k, got", info.dtype)
             fail = True
-        var e0 = resolve_expert(tensors, layer, "down", False, 0, 0, P.H, P.H, P.E_FFN)
+        var e0 = resolve_expert(tensors, layer, "down", False, 0, 0, P.H, P.H, P.FFN)
         if e0.byte_offset != info.offset:
             print("FAIL:", name, "expert0 offset mismatch")
             fail = True
