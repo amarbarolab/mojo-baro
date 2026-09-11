@@ -62,11 +62,8 @@ def main():
     for k in kfiles:
         new_kv.append((f"baro.kernel.src.{src_key(k)}", k.read_text()))
 
-    out = open(dst, "wb")
-    out.write(struct.pack("<4sI", b"GGUF", 3))
-    out.write(struct.pack("<QQ", n_tensors, n_kv + len(new_kv)))
-
-    # copy existing KV region + tensor infos verbatim by re-parsing bounds
+    # copy the existing KV entries except any earlier baro.kernel.* set (re-embedding from a
+    # BARO file must replace its sources, not append a second set), then the tensor infos
     kv_start = f.tell()
     from importlib.util import spec_from_file_location, module_from_spec
     spec = spec_from_file_location("ge", Path(__file__).parent / "gguf-extract.py")
@@ -74,10 +71,15 @@ def main():
     spec.loader.exec_module(ge)
     _, infos, data_start, kv = ge.parse(src)
     f.seek(kv_start)
+    keep = []
     for _ in range(n_kv):
-        ge.read_str(f)
+        a = f.tell()
+        key = ge.read_str(f)
+        key = key.decode("utf-8") if isinstance(key, bytes) else key
         (vtype,) = struct.unpack("<I", f.read(4))
         ge.read_value(f, vtype, want=False)
+        if not key.startswith("baro.kernel."):
+            keep.append((a, f.tell()))
     kv_end = f.tell()
     for _ in range(n_tensors):
         ge.read_str(f)
@@ -85,8 +87,12 @@ def main():
         f.seek(8 * nd + 4 + 8, 1)
     info_end = f.tell()
 
-    f.seek(kv_start)
-    out.write(f.read(kv_end - kv_start))
+    out = open(dst, "wb")
+    out.write(struct.pack("<4sI", b"GGUF", 3))
+    out.write(struct.pack("<QQ", n_tensors, len(keep) + len(new_kv)))
+    for a, b in keep:
+        f.seek(a)
+        out.write(f.read(b - a))
     for key, val in new_kv:
         w_str(out, key)
         out.write(struct.pack("<I", 8))
@@ -103,7 +109,7 @@ def main():
             break
         out.write(chunk)
     out.close()
-    print(f"wrote {dst} (+{len(new_kv)} kv)")
+    print(f"wrote {dst} (+{len(new_kv)} kv, dropped {n_kv - len(keep)} earlier baro.kernel.* kv)")
 
 
 if __name__ == "__main__":
