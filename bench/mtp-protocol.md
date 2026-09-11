@@ -456,5 +456,5 @@ median 136.92 / 136.99.
 Falsifier triggered: acceptance is worse than round 1 at both k, so a larger
 general corpus ranks this model's own tokens worse than the small one did. The
 larger tok/s gain is partly run-to-run noise (round 1's full-head arms read 150.80
-and 129.37). Next: rank by the model's own output (`bench/fr-gen-corpus.sh`,
+and 129.37). Next: rank by the model's own output (a generated corpus,
 option B) rather than by general text. FR-Spec stays off by default.
