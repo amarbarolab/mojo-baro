@@ -40,7 +40,6 @@ struct Job {
 
 pub struct Engine {
     tx: mpsc::Sender<Job>,
-    next_id: AtomicU64,
     queued: Arc<AtomicUsize>,
     alive: Arc<AtomicBool>,
     /// The request id the engine is actively decoding, if any; set/cleared
@@ -115,7 +114,6 @@ impl Engine {
         tokio::spawn(worker(rx, stdin, lines, queued.clone(), alive.clone(), cancel_rx, current.clone()));
         Ok(Engine {
             tx,
-            next_id: AtomicU64::new(1),
             queued,
             alive,
             current,
@@ -134,17 +132,18 @@ impl Engine {
         self.queued.load(Ordering::SeqCst)
     }
 
-    /// Queue one request, returning its id (for a later `cancel`) and a
-    /// receiver of its events. Dropping the receiver without cancelling
-    /// discards the rest of that request's output; the engine still runs it
-    /// to completion.
+    /// Queue one request under the given id (assigned by the caller --
+    /// `EnginePool` owns a single id counter shared by every engine in the
+    /// pool, so ids stay unique across engines). Returns a receiver of its
+    /// events; dropping it without cancelling discards the rest of that
+    /// request's output, the engine still runs it to completion.
+    #[allow(clippy::too_many_arguments)]
     pub fn submit(
-        &self, prompt: Vec<u32>, n: u32, spec: bool, stop: Vec<Vec<u32>>, ckpt: Vec<u32>, sample: SampleParams,
-    ) -> Result<(u64, mpsc::UnboundedReceiver<Event>), String> {
+        &self, id: u64, prompt: Vec<u32>, n: u32, spec: bool, stop: Vec<Vec<u32>>, ckpt: Vec<u32>, sample: SampleParams,
+    ) -> Result<mpsc::UnboundedReceiver<Event>, String> {
         if !self.alive() {
             return Err("engine process has exited".into());
         }
-        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (out, rx) = mpsc::unbounded_channel();
         let job = Job {
             req: Request { id, prompt, n, spec, stop, ckpt, sample },
@@ -152,7 +151,7 @@ impl Engine {
         };
         self.queued.fetch_add(1, Ordering::SeqCst);
         match self.tx.try_send(job) {
-            Ok(()) => Ok((id, rx)),
+            Ok(()) => Ok(rx),
             Err(_) => {
                 self.queued.fetch_sub(1, Ordering::SeqCst);
                 Err(format!("queue full ({QUEUE_CAP} requests waiting)"))
@@ -181,6 +180,91 @@ impl Engine {
         if tokio::time::timeout(Duration::from_secs(30), child.wait()).await.is_err() {
             eprintln!("engine did not exit after stdin EOF; killing");
             let _ = child.kill().await;
+        }
+    }
+}
+
+/// `BARO_POOL` engine processes (default 1 = today's single engine), each
+/// with its own pack load and its own request queue. `submit` routes to the
+/// engine with the fewest requests waiting or running (ties -> lowest
+/// index), so at `BARO_POOL=1` this is exactly today's single-queue
+/// behaviour; at `BARO_POOL=2` a second request starts on the other engine
+/// instead of waiting behind the first. One id counter, owned by the pool
+/// and never by an `Engine`, so ids stay unique across engines (`cancel`
+/// and the API's `cmpl-<id>`/`chatcmpl-<id>` depend on that).
+pub struct EnginePool {
+    engines: Vec<Engine>,
+    next_id: AtomicU64,
+    pub limits: Limits,
+}
+
+impl EnginePool {
+    pub async fn spawn(engine: &Path, pack: &Path, pool_size: usize) -> Result<EnginePool, String> {
+        let mut engines = Vec::with_capacity(pool_size.max(1));
+        for _ in 0..pool_size.max(1) {
+            engines.push(Engine::spawn(engine, pack).await?);
+        }
+        let limits = engines[0].limits.clone();
+        Ok(EnginePool {
+            engines,
+            next_id: AtomicU64::new(1),
+            limits,
+        })
+    }
+
+    pub fn pool_size(&self) -> usize {
+        self.engines.len()
+    }
+
+    pub fn alive(&self) -> bool {
+        self.engines.iter().any(Engine::alive)
+    }
+
+    /// Requests waiting or running, summed over every engine in the pool.
+    pub fn queue_depth(&self) -> usize {
+        self.engines.iter().map(Engine::queue_depth).sum()
+    }
+
+    /// Per-engine breakdown of `queue_depth`: lets the C4 gate tell "two
+    /// engines each running one request" apart from "one engine running
+    /// both while the other sits idle," which the summed `queue_depth`
+    /// alone cannot.
+    pub fn queue_depths(&self) -> Vec<usize> {
+        self.engines.iter().map(Engine::queue_depth).collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit(
+        &self, prompt: Vec<u32>, n: u32, spec: bool, stop: Vec<Vec<u32>>, ckpt: Vec<u32>, sample: SampleParams,
+    ) -> Result<(u64, mpsc::UnboundedReceiver<Event>), String> {
+        let mut best = 0;
+        let mut best_q = self.engines[0].queue_depth();
+        for (i, e) in self.engines.iter().enumerate().skip(1) {
+            let q = e.queue_depth();
+            if q < best_q {
+                best = i;
+                best_q = q;
+            }
+        }
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let rx = self.engines[best].submit(id, prompt, n, spec, stop, ckpt, sample)?;
+        Ok((id, rx))
+    }
+
+    /// Tries every engine (a request's id does not say which one it landed
+    /// on); at most one will have it as its `current` decode.
+    pub async fn cancel(&self, id: u64) -> bool {
+        for e in &self.engines {
+            if e.cancel(id).await {
+                return true;
+            }
+        }
+        false
+    }
+
+    pub async fn shutdown(&self) {
+        for e in &self.engines {
+            e.shutdown().await;
         }
     }
 }

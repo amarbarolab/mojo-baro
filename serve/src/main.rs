@@ -28,11 +28,11 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 
-use engine::{Engine, Event};
+use engine::{EnginePool, Event};
 use text::{ChatMessage, Detok, Text};
 
 struct App {
-    engine: Engine,
+    engine: EnginePool,
     text: Option<Text>,
     model: String,
 }
@@ -102,14 +102,15 @@ async fn main() {
         eprintln!("tokenizer: none ({} missing); text endpoints disabled", tok_path.display());
         None
     };
-    let engine = match Engine::spawn(&opts.engine, &opts.pack).await {
+    let pool_size = std::env::var("BARO_POOL").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(1).max(1);
+    let engine = match EnginePool::spawn(&opts.engine, &opts.pack, pool_size).await {
         Ok(e) => e,
         Err(e) => {
             eprintln!("baro-serve: {e}");
             std::process::exit(1);
         }
     };
-    eprintln!("engine ready: {:?}", engine.limits);
+    eprintln!("engine pool ready: {} engine(s), limits {:?}", engine.pool_size(), engine.limits);
     let model = opts
         .pack
         .file_name()
@@ -203,6 +204,7 @@ async fn health(State(app): State<Shared>) -> Json<Value> {
     Json(json!({
         "status": if app.engine.alive() { "ok" } else { "engine_dead" },
         "queue": app.engine.queue_depth(),
+        "pool": app.engine.queue_depths(),
         "tokenizer": app.text.is_some(),
         "limits": {"tmax": app.engine.limits.tmax, "mrows": app.engine.limits.mrows,
                    "kmax": app.engine.limits.kmax, "spec_k": app.engine.limits.spec_k},

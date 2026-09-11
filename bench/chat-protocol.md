@@ -1255,4 +1255,46 @@ stint as any timed run.
 script) proving P-J2; P-J3's aggregate numbers recorded in the Result,
 whatever they are.
 
-**Result.** pending -- filled in after the gated run.
+**Result.** P-J1 PASS. P-J2/P-J3 **UNVERIFIED on this machine** -- a single
+GPU, and one engine already uses essentially all of it. Recorded honestly
+rather than claimed: the `EnginePool` code is built, typed, and passes
+every check that does not need two engines resident at once; the
+concurrency claim itself needs a second GPU or a smaller per-engine
+footprint, neither available here.
+
+P-J1 (`tools/test_server.sh`, `BARO_POOL` unset, `.work/CHAT-c4-server-test/
+SUMMARY.txt`): **ALL PASS**, identical to every earlier gate in this lane;
+`/health`'s only visible change is `"pool":[0]` alongside the existing
+`"queue":0`. `cargo test` 16 passed, clippy clean.
+
+P-J2/P-J3 (`tools/test_pool.sh`, new): three attempts, all failed the same
+way -- `BARO_POOL=2`'s second engine's pack load hit `hipErrorOutOfMemory`
+("request=6.18GB ... free=0B") every time, including once right after
+`gpu-waitd` restarted with the card otherwise idle (`gpu-wait gpu` read
+1.5 GB used immediately before). Diagnosed rather than shrugged off: a
+single engine measured directly (`baro-serve` with no pool env var,
+`rocm-smi --showmeminfo vram` before/after, GPU idle both times) takes the
+card from ~1.0-1.5 GB used to **~23.5-24.8 GB used** -- on a 25.75 GB card,
+essentially the whole thing, matching `docs/BASELINE.md`'s own "~22.3 GB
+free to MAX" note read as a ceiling MAX's allocator claims once
+initialized, not a hint about what the pack itself needs (the q4 pack is
+6.64 GB; the other ~17 GB is the runtime's own reserved pool, not KV --
+`BARO_TMAX` is the untouched default 1088 here, whose KV pool is ~71 MB
+per M1a's own figure). Clean shutdown (`SIGINT`, not the force-kill this
+script's failure trap uses) does release it -- confirmed by a direct
+before/after read, ~13 s later. The design brief's own sizing ("weights
+~5.2 GB q4 each plus KV and state") assumed a per-engine footprint about
+4-5x smaller than what this binary actually reserves; **the plan's
+concurrency option (a) needs revisiting** -- a second engine process
+cannot fit beside the first on this card at all, regardless of anything
+`EnginePool`'s routing code does. Not this lane's job to shrink that
+footprint (no memory-limit knob found in the time available; a real fix is
+either a second GPU or finding and using whatever caps MAX's device
+allocator, which needs its own investigation).
+
+Verdict against the frozen predictions: P-J1 held. P-J2/P-J3 unverified
+(environment, not falsified) -- recorded as UNVERIFIED per CLAUDE.md §18,
+not claimed done. Falsifier as frozen ("two concurrent requests at pool
+size 2 that still serialise onto one engine") did not trigger either,
+because pool size 2 could not start at all -- a stronger negative result
+than the falsifier anticipated.
