@@ -167,7 +167,23 @@ performance threshold is part of W3.
 
 ### Result
 
-Pending the loader-lane report and W3 build.
+Gate 1 passed on 2026-09-12 using the loader commits integrated unchanged
+from `lane-MOE-LOADER` and the real `.work/moe-w1/pack`. The gate binary was
+built with `-D BARO_MODEL=qwen35moe`; `load_pack` loaded the 21,005,191,680
+byte blob, and `parse_moe_index` plus `resolve_expert` selected every weight
+by tensor name. Router, routed Q4_K gate/up/down, shared Q8_0 gate/up/down,
+and the summed output all read from `Pack.wbuf`.
+
+| layer | ids | router max_rel | routed max_rel | shared max_rel | summed y max_rel |
+|---:|---:|---:|---:|---:|---:|
+| 0 | 8/8 exact | 1.935e-7 | 8.789e-8 | 1.303e-4 | 1.333e-4 |
+| 1 | 8/8 exact | 2.345e-7 | 1.345e-7 | 1.836e-7 | 1.663e-7 |
+| 2 | 8/8 exact | 3.065e-7 | 1.234e-7 | 1.104e-7 | 1.465e-7 |
+| 3 | 8/8 exact | 3.234e-7 | 1.483e-6 | 2.000e-7 | 1.598e-6 |
+
+All four layers pass the frozen `5e-3` bound, and each call includes routed
+and shared experts before summation. Gate 1: PASS. Receipt:
+`.work/moe-w3/gate1.txt`.
 
 ## W2: Q4_K expert kernels
 
