@@ -137,3 +137,56 @@ were `38478b34aa4aaf4d` and `a81f2c583ae876e5`.
 
 Operational deviation: W1 reused the W0 engine binary because W1 changes
 only the packer and pack output. The engine regression was rerun unchanged.
+
+## W2: Q4_K expert kernels
+
+### Question
+
+Can the routed and shared expert GEMVs consume raw ggml Q4_K blocks on gfx1100
+and match the MoE oracle on real blk.0 and one attention-layer weights while
+keeping q4 dequantisation within the preregistered performance band?
+
+### Treatment
+
+Add `amar_moe_gate_up_q4k` and `amar_moe_down_q4k` with the existing bf16 MoE
+interfaces and fused Q4_K dequantisation. Expert tensors remain raw Q4_K on
+the GPU. Extend `test_moe_block` to exercise the q4 path.
+
+### Method
+
+Use `tools/moe-ref.py --gguf` on real blk.0 and one full-attention block as the
+numeric reference. Gate expert ids exactly and outputs within 5e-3 of the
+oracle after the established bf16 intermediate. Run all GPU tests and timing
+through gpu-wait. Timing uses rotating disjoint expert sets whose aggregate
+working set exceeds the 96 MB Infinity Cache. Record the full timing spread,
+clock and declared VRAM in `.work/moe-w2/`.
+
+### Registered prediction
+
+Both real-weight cases produce exact 8/8 routed expert ids and output error at
+or below 5e-3. The q4 routed and shared calls compile and pass the extended
+block test. Rotating-cache timing is 55 to 100 us per token per layer, with
+the q4 path below the existing 92 to 102 us bf16 feasibility range.
+
+### Scoring
+
+W2 passes only with exact ids, max output error at most 5e-3 for both real
+weight cases, an extended block test exit 0, and a reported rotating-cache
+timing. A failed parity case or a second failed gate attempt closes W2.
+
+### Failure meanings
+
+- ID mismatch means router or expert-index ordering is wrong.
+- Output error over 5e-3 means Q4_K dequantisation or accumulation is wrong.
+- Test failure means the host launch interface is incomplete.
+- Timing above the registered range means dequant ALU cost erased the byte
+  reduction and the kernel does not carry the expected speed.
+
+### Outputs
+
+Durable outputs are the kernel test receipt, parity receipt, timing receipt,
+this protocol, and the lane report. No output is written to `/tmp`.
+
+### Result
+
+Pending W2 build and gates.
