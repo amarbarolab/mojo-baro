@@ -909,3 +909,45 @@ Two misses are design facts, read off the arms: on the peaked row the
 Gaussian presets take the fast path yet cost 120 us, which the pass count
 (four vectorised passes at ~9 us) does not explain. Not yet diagnosed:
 phase timers next, before any KSAMP-c prediction.
+
+**Diagnosis (measured, `.work/ksamp-diag/phases.txt`).** An uncommitted
+copy of the kernel with a block barrier and a `llvm.readsteadycounter`
+stamp at each phase boundary, 100 runs per arm after 20 warm-up, Gaussian
+row, T0.7/k20/p0.8, microseconds from kernel start: pass A + reductions
+15.0, threshold pass 73.1 (58 us), compaction 86.0 (13), sort 90.0 (4),
+prefix scan 91.2, final pass 113.6 (22), end 115.0. Peaked row, same
+preset: general path 13.7 -> 510.3. ISA receipt (`tools/isa-receipt.py`):
+every sampler kernel 47-50 VGPR, 0 scratch, 0 spills, so the threshold
+pass is ALU and divergence (each element inside the 8-nat window runs
+the 8-lane accumulate), not spilling. Widening the window to reach the
+peaked row's 20th token (12+ nats) would put the whole bulk inside it.
+
+## KSAMP-c: sampled window, exact compaction (frozen 2026-09-11, before its build)
+
+**Change.** The threshold pass is replaced by a 16-chunk contiguous
+subsample of 16,384 elements (all of the row when V is smaller). Per
+thread it counts elements, and for top-k off their masses, within
+D of `lmax` for 16 values of D from 0.25 to 32 nats. The window is the
+smallest D whose estimate holds 2k + 16 tokens (top-k on) or the top-p
+mass with half the remaining margin (top-k off). The compaction pass
+then counts exactly, accumulating the exact fixed-point `Z` when top-k
+is off. On overflow of CAP it steps D down, on too few tokens or too
+little mass it steps D up, at most four compactions, then the general
+path. Sort, prefix scan and the cut rule are unchanged, so P-K7's
+identity must still hold. The final pass tests membership against the
+cut's float value instead of re-deriving the key. Block reductions go
+through `warp` shuffles plus one 32-entry LDS step (two barriers instead
+of ten).
+
+**Predictions.**
+- P-K9 P-K1 to P-K5 and P-K7 unchanged and PASS.
+- P-K10 Per call at V = 248320: greedy 5-10 us; Gaussian and peaked rows,
+  T0.7/k20/p0.8 and T0.8/k40/p0.95/min-p 0.05: 35-65 us; peaked row k
+  off/p 0.95: 35-65 us; plain T1 80-110 us (Philox and two logs per
+  element, untouched); Gaussian k off/p 0.95 takes the general path,
+  recorded, no band.
+- Falsifier: a preset at 35-65 missing by more than 2x means the phase
+  model (pass 12 us, compaction 13, sort 4, final 12) is wrong; re-run
+  the phase timers before any other change.
+
+**Gate.** As KSAMP-b; P-K10 recorded against its bands.
