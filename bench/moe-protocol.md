@@ -76,3 +76,56 @@ and failed before tests; a symlink to the existing main q4 pack was added in
 `.work`, then the unchanged test gate was rerun successfully. The first
 direct build also failed because it bypassed gpu-wait; all GPU builds and
 runtime gates after that were run through gpu-wait.
+
+## W1: qwen35moe pack
+
+### Question
+
+Can the qwen35moe GGUF be packed into the engine layout without changing
+tensor values beyond the registered quantization bounds and while remaining
+at or below 21.5 GB?
+
+### Treatment
+
+Add `--arch qwen35moe` to `tools/engine-pack.py`. Copy Q8_0 tensors into the
+engine q8 layout, copy Q4_K expert blocks raw, requantise only
+`output.weight` from Q6_K to q8, and copy F32 tensors unchanged. Fix and
+document tensor index order. Source is
+`~/Models/RegesCore-1.0-35/RegesCore-1.0-35B-UD-Q4_K_S-BARO.gguf`.
+
+### Method
+
+Run the packer once into `.work/moe-w1/pack`, then compare every packed tensor
+after dequantisation with gguf-py's source dequantisation. Q8_0 and Q4_K
+copies must be exact at the source block level. The Q6_K head must satisfy
+the q8 rounding bound. Record source and pack byte counts, tensor counts, and
+any excluded tensors. Outputs remain under `.work/moe-w1/`.
+
+### Registered prediction
+
+The pack completes with every source tensor represented, no excluded expert
+tensors, exact Q8_0 and Q4_K block copies, Q6_K head error within q8 rounding,
+and total pack size no greater than 21.5 GB. Confidence ordering: tensor
+coverage, exact raw-copy checks, Q6_K bound, then size.
+
+### Scoring
+
+W1 passes only if all tensors are covered, all exact-copy checks pass, the
+Q6_K bound passes, and pack size is at most 21.5 GB. Any missing tensor,
+wrong index order, failed comparison, or size overage fails W1.
+
+### Failure meanings
+
+- Missing tensors mean the architecture inventory or pack order is incomplete.
+- Raw-copy mismatch means the source offsets or block representation changed.
+- Q6_K bound failure means the head requantisation is wrong or too lossy.
+- Size overage means the q4 expert representation is not being retained.
+
+### Outputs
+
+Durable outputs are the pack, comparison receipt, this protocol, and the lane
+report. No output is written to `/tmp`.
+
+### Result
+
+Pending W1 build and gate.
