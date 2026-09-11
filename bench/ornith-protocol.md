@@ -161,3 +161,33 @@ down while `ours` held the GPU and vice versa throughout.
 **Verdict: Ornith-1.5-9B runs correctly and at a usable speed through the K-quant engine pack.**
 No kernel or engine bug found; the one genuine miss was this protocol's own tok/s prediction band
 for llama.cpp, not the systems under test.
+
+## Rebase onto main (2026-09-11, coordinator-requested pre-merge)
+
+Main had moved to `fc28bf1` (lane-CHAT merged: C1 control block/cancel/stop, M1b checkpoints,
+C3 host sampler, C4 engine pool). `git rebase main` conflicted in `serve/engine.mojo`'s decode
+loop: CHAT added `cancelled`/`stopped`, hint-aware prefill chunking, and extended
+`Chain.save`'s signature with two required `Bool`s (`pinned`, `boundary`); this lane's
+`BARO_FORCE` block sits in the same loop body. Resolved keeping both: `pos_before` is captured
+before whichever `step_window` variant runs (plain or hint-chunked), the forced-token
+read-back/overwrite runs immediately after using the resulting `wst.pos`, and the checkpoint save
+calls keep CHAT's new signature verbatim (this lane's old 5-arg call would not have compiled
+against it). CHAT's post-loop `cancel_pending`/`stop_seqs` handling is untouched and sits after
+the merged block, as before. Compiles clean (0 errors).
+
+Also fixed, coordinator-flagged: `--q4-draft` KeyError'd on a K-quant `output.weight` (read raw
+bytes through `ge.GGML_BYTES` directly, bypassing the K-quant path) — same `dequantize_kquant`
+fallback as the main pack loop, spot-checked against the source Q6_K bytes (S-sized, not gated,
+MTP draft-head speed stays out of this round).
+
+Re-verified against current main, both required by the coordinator before merge:
+
+| gate | result |
+|---|---|
+| G2 (`BARO_FORCE` no-op), vs a fresh build of `fc28bf1`, Qwythos q4 pack, greedy | **PASS, 20/20** (`.work/g2-ab-rebase/results.txt`) |
+| `run-tests.sh` | **exit 0**, 85 kernels, 38 in registry, 0 orphans (unchanged) |
+
+Step 3's numbers above (G3, 3a-3d) were not rerun — nothing in the rebase touches the K-quant
+pack path, the forcing semantics, or any kernel; the merge conflict was ordering/wiring around
+CHAT's unrelated additions (cancel/stop/checkpoint-signature), not a change to what this lane's
+code computes. `bench/ornith-run.sh` remains valid to rerun if that assumption is ever doubted.
