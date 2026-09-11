@@ -6,6 +6,7 @@ tables), control/user_defined tokens matched in the text before BPE. Regexes run
 on mojo-uregex (~/Projects/mojo/mojo-uregex/src, build with -I).
 """
 from std.collections import Dict
+from std.memory import bitcast
 from uregex import Pattern
 from uregex.pattern import to_codepoints, from_codepoints
 
@@ -46,6 +47,16 @@ struct Reader:
             v |= Int(self.buf[self.pos + i]) << (8 * i)
         self.pos += 8
         return v
+
+    def f32(mut self) raises -> Float32:
+        self.need(4)
+        var b0 = UInt32(self.buf[self.pos])
+        var b1 = UInt32(self.buf[self.pos + 1])
+        var b2 = UInt32(self.buf[self.pos + 2])
+        var b3 = UInt32(self.buf[self.pos + 3])
+        var bits = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+        self.pos += 4
+        return bitcast[DType.float32, 1](bits)[0]
 
     def string(mut self) raises -> String:
         var n = self.u64()
@@ -95,6 +106,7 @@ struct Tokenizer(Movable):
     var types: List[Int]
     var tok2id: Dict[String, Int]
     var ranks: Dict[String, Int]
+    var scores: List[Float32]
     var pre: String
     var patterns: List[Pattern]
     var specials: List[List[Int]]
@@ -106,12 +118,16 @@ struct Tokenizer(Movable):
     var chat_template: String
     var b2u: List[Int]
     var u2b: Dict[Int, Int]
+    var is_spm: Bool
+    var add_space_prefix: Bool
+    var ignore_merges: Bool
 
     def __init__(out self, gguf_path: String) raises:
         self.tokens = List[String]()
         self.types = List[Int]()
         self.tok2id = Dict[String, Int]()
         self.ranks = Dict[String, Int]()
+        self.scores = List[Float32]()
         self.pre = String("default")
         self.patterns = List[Pattern]()
         self.specials = List[List[Int]]()
@@ -123,9 +139,13 @@ struct Tokenizer(Movable):
         self.chat_template = String("")
         self.b2u = List[Int]()
         self.u2b = Dict[Int, Int]()
+        self.is_spm = False
+        self.add_space_prefix = False
+        self.ignore_merges = False
         self._byte_maps()
         self._read_gguf(gguf_path)
-        self._compile_pre()
+        if not self.is_spm:
+            self._compile_pre()
         for i in range(len(self.tokens)):
             self.tok2id[self.tokens[i]] = i
             if self.types[i] == T_CONTROL or self.types[i] == T_USER:
@@ -157,6 +177,8 @@ struct Tokenizer(Movable):
         _ = r.u64()
         var n_kv = r.u64()
         var model = String("")
+        var saw_add_bos_key = False
+        var saw_add_space_prefix_key = False
         for _ in range(n_kv):
             var key = r.string()
             var vtype = r.u32()
@@ -182,6 +204,10 @@ struct Tokenizer(Movable):
                     self.types.reserve(n)
                     for _ in range(n):
                         self.types.append(r.scalar_int(etype))
+                elif key == "tokenizer.ggml.scores" and etype == 6:
+                    self.scores.reserve(n)
+                    for _ in range(n):
+                        self.scores.append(r.f32())
                 elif etype == 8:
                     for _ in range(n):
                         _ = r.string()
@@ -200,10 +226,25 @@ struct Tokenizer(Movable):
                     self.pad_id = v
                 elif key == "tokenizer.ggml.add_bos_token":
                     self.add_bos = v == 1
-        if model != "gpt2":
-            raise Error("tokenizer.ggml.model=" + model + ": only byte-level BPE (gpt2) is supported")
+                    saw_add_bos_key = True
+                elif key == "tokenizer.ggml.add_space_prefix":
+                    self.add_space_prefix = v == 1
+                    saw_add_space_prefix_key = True
+        if model == "gpt2":
+            self.is_spm = False
+        elif model == "llama":
+            self.is_spm = True
+        else:
+            raise Error("tokenizer.ggml.model=" + model + ": only gpt2 (BPE) or llama (SPM) is supported")
         if len(self.tokens) == 0 or len(self.tokens) != len(self.types):
             raise Error("gguf: tokens/token_type missing or mismatched")
+        if self.is_spm and len(self.scores) != len(self.tokens):
+            raise Error("gguf: tokenizer.ggml.scores missing or mismatched for SPM model")
+        if not saw_add_space_prefix_key:
+            self.add_space_prefix = self.is_spm
+        self.ignore_merges = self.pre == "llama3" or self.pre == "llama-bpe"
+        if not saw_add_bos_key and self.ignore_merges:
+            self.add_bos = True
 
     def _compile_pre(mut self) raises:
         comptime CONTR = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)"
@@ -218,7 +259,7 @@ struct Tokenizer(Movable):
             self.patterns.append(Pattern(r"[一-龥぀-ゟ゠-ヿ]+"))
             self.patterns.append(Pattern(r"[!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+| ?[\p{P}\p{S}]+|[\r\n]|\s+(?!\S)|\s+"))
             self.patterns.append(Pattern(r"\p{N}"))
-        elif self.pre == "gpt-2" or self.pre == "default":
+        elif self.pre == "gpt-2" or self.pre == "default" or self.pre == "granite-docling":
             self.patterns.append(Pattern(r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"))
         else:
             raise Error("tokenizer.ggml.pre=" + self.pre + ": no pre-tokenizer regex on file")
@@ -238,6 +279,14 @@ struct Tokenizer(Movable):
         var syms = List[String]()
         for b in piece.as_bytes():
             syms.append(String(Codepoint.from_u32(UInt32(self.b2u[Int(b)])).value()))
+        if self.ignore_merges and len(syms) > 0:
+            var whole = String("")
+            for s in syms:
+                whole += s
+            var wid = self.tok2id.get(whole, -1)
+            if wid >= 0:
+                out.append(wid)
+                return
         while len(syms) > 1:
             var best = -1
             var best_rank = 1 << 60
@@ -260,6 +309,75 @@ struct Tokenizer(Movable):
             if id < 0:
                 raise Error("tokenizer: symbol not in vocab: " + s)
             out.append(id)
+
+    def _hex_digit(self, n: Int) -> String:
+        var code = UInt32(48 + n) if n < 10 else UInt32(55 + n)
+        return String(Codepoint.from_u32(code).value())
+
+    def _byte_tok(self, b: UInt8) raises -> Int:
+        var key = String("<0x")
+        key += self._hex_digit(Int(b) >> 4)
+        key += self._hex_digit(Int(b) & 15)
+        key += ">"
+        var id = self.tok2id.get(key, -1)
+        if id < 0:
+            raise Error("tokenizer: no byte token for " + key)
+        return id
+
+    def _hex_val(self, c: UInt8) -> Int:
+        return Int(c) - 48 if c <= 57 else Int(c) - 65 + 10
+
+    def _byte_from_tok(self, id: Int) -> UInt8:
+        var raw = List[UInt8]()
+        for b in self.tokens[id].as_bytes():
+            raw.append(b)
+        return UInt8(self._hex_val(raw[3]) * 16 + self._hex_val(raw[4]))
+
+    def _spm(self, text: String, mut out: List[Int]) raises:
+        var cps = to_codepoints(text)
+        var syms = List[String]()
+        for j in range(len(cps)):
+            syms.append(from_codepoints(cps, j, j + 1))
+        while len(syms) > 1:
+            var best = -1
+            var best_score: Float32 = 0.0
+            for i in range(len(syms) - 1):
+                var cand = String(syms[i])
+                cand += syms[i + 1]
+                var id = self.tok2id.get(cand, -1)
+                if id < 0:
+                    continue
+                var sc = self.scores[id]
+                if best < 0 or sc > best_score:
+                    best = i
+                    best_score = sc
+            if best < 0:
+                break
+            var merged = String(syms[best])
+            merged += syms[best + 1]
+            syms[best] = merged^
+            _ = syms.pop(best + 1)
+        for s in syms:
+            var id = self.tok2id.get(s, -1)
+            if id >= 0:
+                out.append(id)
+            else:
+                for b in s.as_bytes():
+                    out.append(self._byte_tok(b))
+
+    def _spm_encode(self, chunk: String, is_prev_special: Bool, mut out: List[Int]) raises:
+        var text = String(" ") if (self.add_space_prefix and is_prev_special) else String("")
+        text += chunk
+        var raw = List[UInt8]()
+        for b in text.as_bytes():
+            if b == 32:
+                raw.append(0xE2)
+                raw.append(0x96)
+                raw.append(0x81)
+            else:
+                raw.append(b)
+        var escaped = String(StringSlice(unsafe_from_utf8=Span(raw)))
+        self._spm(escaped, out)
 
     def _match_special(self, cps: List[Int], at: Int) -> Int:
         var best = -1
@@ -288,16 +406,22 @@ struct Tokenizer(Movable):
         var cps = to_codepoints(text)
         var start = 0
         var i = 0
+        var is_prev_special = True
         while i <= len(cps):
             var k = -1 if i == len(cps) else self._match_special(cps, i)
             if k >= 0 or i == len(cps):
                 if i > start:
-                    for piece in self._pieces(from_codepoints(cps, start, i)):
-                        self._bpe(piece, out)
+                    if self.is_spm:
+                        self._spm_encode(from_codepoints(cps, start, i), is_prev_special, out)
+                    else:
+                        for piece in self._pieces(from_codepoints(cps, start, i)):
+                            self._bpe(piece, out)
+                    is_prev_special = False
                 if k >= 0:
                     out.append(self.special_ids[k])
                     i += len(self.specials[k])
                     start = i
+                    is_prev_special = True
                 else:
                     i += 1
             else:
@@ -306,18 +430,45 @@ struct Tokenizer(Movable):
 
     def decode(self, ids: List[Int], keep_special: Bool = False) -> String:
         var bytes = List[UInt8]()
+        var is_prev_special = True
         for id in ids:
             if id < 0 or id >= len(self.tokens):
                 continue
             var ty = self.types[id]
             if ty == T_CONTROL and not keep_special:
+                is_prev_special = True
                 continue
             if ty == T_CONTROL or ty == T_USER:
                 for b in self.tokens[id].as_bytes():
                     bytes.append(b)
+                is_prev_special = True
                 continue
-            for c in self.tokens[id].codepoints():
-                var b = self.u2b.get(Int(c.to_u32()), -1)
-                if b >= 0:
-                    bytes.append(UInt8(b))
+            if self.is_spm:
+                if ty == T_BYTE:
+                    bytes.append(self._byte_from_tok(id))
+                else:
+                    var raw = List[UInt8]()
+                    for b in self.tokens[id].as_bytes():
+                        raw.append(b)
+                    var piece = List[UInt8]()
+                    var j = 0
+                    var n = len(raw)
+                    while j < n:
+                        if j + 2 < n and raw[j] == 0xE2 and raw[j + 1] == 0x96 and raw[j + 2] == 0x81:
+                            piece.append(32)
+                            j += 3
+                        else:
+                            piece.append(raw[j])
+                            j += 1
+                    var off = 0
+                    if self.add_space_prefix and is_prev_special and len(piece) > 0 and piece[0] == 32:
+                        off = 1
+                    for k in range(off, len(piece)):
+                        bytes.append(piece[k])
+            else:
+                for c in self.tokens[id].codepoints():
+                    var b = self.u2b.get(Int(c.to_u32()), -1)
+                    if b >= 0:
+                        bytes.append(UInt8(b))
+            is_prev_special = False
         return String(StringSlice(unsafe_from_utf8=Span(bytes)))

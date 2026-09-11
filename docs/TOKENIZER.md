@@ -171,6 +171,48 @@ Gate (ref = `llama-tokenize` on the source GGUF + Spark ids from llama-server
 in-process; `BARO_PROMPT=<ids>` still works. The Python tool above stays as the
 oracle-side builder for HF `tokenizer.json` consumers.
 
+### Dense family targets (preregistered 2026-09-11, lane TOK)
+
+Adds SPM (`tokenizer.ggml.model == "llama"`, scores-based merge, byte-fallback via
+`<0xXX>` tokens) and the `granite-docling` BPE pre-tokenizer (same regex as
+`gpt-2`/`default`) to `serve/tokenizer.mojo`. Two real bugs found while wiring the
+`llama-bpe` target and fixed in the same commit: `llama3`/`llama-bpe` GGUFs carry no
+`tokenizer.ggml.add_bos_token` key, so `add_bos` must default true for that pre-type
+(llama.cpp's `llm_tokenizer_bpe` constructor hardcodes it); the same pre-type sets
+`ignore_merges` (a whole regex-split piece that is already a vocab token is emitted
+directly, skipping BPE merges), needed because Llama-3.2's vocab has number tokens
+with no reachable merge chain.
+
+Targets and GGUFs (2026-09-11):
+
+| target | pre / model | GGUF |
+|---|---|---|
+| Llama-3.2-1B-Instruct | `llama-bpe` (BPE) | `~/Models/llama-3.2-1b-instruct-q4_K_M/Llama-3.2-1B-Instruct-Q4_K_M.gguf` |
+| Qwen2.5-7B-Instruct | `qwen2` (BPE, already supported) | `~/Models/qwen2.5-7b-instruct-gguf/Qwen2.5-7B-Instruct-Q4_K_M.gguf` |
+| granite-4.2-3b | `granite-docling` (BPE) | `~/Models/granite-4.2-3b-bf16/granite-4.2-3b-BF16.gguf` |
+| lily-cybersecurity-7b | `llama` (SPM) | `~/Models/lily-cybersecurity-7b-v0.2-q6_k/lily-cybersecurity-7b-v0.2-q6_k.gguf` |
+
+Gate: `tools/test_tokenizer_mojo.py --gguf <target>` (`HARD_SET` + the 20
+`bench/mtp-prompts` prompts, both re-encoded live against `llama-tokenize` on that
+GGUF rather than read from a stale `.tokens` file, so the same script is correct
+for any target) must PASS 0 failures per target, plus `decode(encode(x)) == x`.
+`HARD_SET` was 40 cases, not the plan's "41" (counted precisely, not by the grep
+that inflated it); its own `"empty"` entry is now folded into the gate's single
+dedicated empty-string case below (39 + empty + 20 prompts + chat = 61 cases per
+target). Regression floor: the existing default target (Qwythos, `qwen35`) plus
+the Spark `--extra` case, previously 63/63, now 62/62 after that fold (same
+coverage, the duplicate empty-string expectation removed).
+
+The empty-string case needed its own fix: `add_bos_token` defaults to `true` for
+`llama3`/`llama-bpe` GGUFs that omit the key (llama.cpp hardcodes it in
+`llm_tokenizer_bpe`'s constructor), so `encode("", add_special=True)` correctly
+returns `[bos_id]`, not `[]`, on such models -- the test now reads
+`add_bos_token` (or that pre-type default) straight from GGUF metadata instead of
+inferring it from whether some case's reference ids happen to start with
+`bos_id`, which produced a false positive on Qwen2.5 (`bos_token_id` there is the
+same id as `<|endoftext|>`, and the `special-eot` case's text legitimately starts
+with that token).
+
 ### Chat templates (2026-09-08)
 
 `serve/spark.mojo` renders `tokenizer.chat_template` in-process with

@@ -18,10 +18,13 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, os.path.expanduser("~/llama.cpp/gguf-py"))
 
 HARD_SET = {
-    "empty": "",
     "ascii": "The quick brown fox jumps over the lazy dog.",
     "contractions": "I'm sure they've seen it, but we'll see; IT'S NOT what you'd think. Don't.",
     "leading-space": " hello world",
+    # "empty" is covered by the dedicated ("empty", ...) case below, which
+    # derives the right reference from add_bos; kept out of HARD_SET so it
+    # isn't double-counted with two different (and, for add_bos=true models,
+    # differently-correct) expectations.
     "trailing-space": "hello world ",
     "many-spaces": "   three   spaces   everywhere   ",
     "tabs-code": "def f(x):\n\tif x:\n\t\treturn [1, 2, 3]\n\treturn {}\n",
@@ -99,6 +102,26 @@ def render_chat(gguf, messages, add_generation_prompt=True):
                                        pad_token=tok(kv_int("tokenizer.ggml.padding_token_id")))
 
 
+def bos_add_bos_of(gguf):
+    """(bos_id, add_bos), read from GGUF metadata -- never inferred from
+    whether some case's ref happens to start with bos_id, since a model can
+    have a hard-set case whose literal text IS its own bos/eot string (qwen2.5:
+    bos_token_id == the <|endoftext|> id, and "special-eot" starts with that
+    text -- a false "add_bos" positive if inferred from ref[0])."""
+    from gguf import GGUFReader
+    rd = GGUFReader(gguf)
+    f = rd.fields.get("tokenizer.ggml.bos_token_id")
+    bos = int(f.parts[f.data[0]][0]) if f else None
+    f = rd.fields.get("tokenizer.ggml.add_bos_token")
+    if f is not None:
+        return bos, bool(f.parts[f.data[0]][0])
+    f = rd.fields.get("tokenizer.ggml.pre")
+    pre = bytes(f.parts[f.data[0]]).decode("utf-8") if f else None
+    # llama.cpp llm_tokenizer_bpe ctor hardcodes add_bos=true for this pre
+    # group when the GGUF carries no explicit add_bos_token key.
+    return bos, pre in ("llama3", "llama-v3", "llama-bpe")
+
+
 def ours_batch(cli, gguf, texts):
     with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as f:
         f.write("\0".join(texts))
@@ -132,14 +155,17 @@ def main():
     prompts = json.loads((ROOT / "bench/mtp-prompts/prompts.json").read_text())
     for stem in prompts:
         txt = (ROOT / "bench/mtp-prompts" / f"{stem}.txt").read_text()
-        ref = [int(x) for x in (ROOT / "bench/mtp-prompts" / f"{stem}.tokens").read_text().split()]
-        cases.append((f"prompt:{stem}", txt, ref))
+        cases.append((f"prompt:{stem}", txt, encode_ref(a.llama_tokenize, gguf, txt)))
     for name, text in HARD_SET.items():
         cases.append((f"hard:{name}", text, encode_ref(a.llama_tokenize, gguf, text)))
     chat = render_chat(gguf, [{"role": "user", "content": "What is 2+2?"}])
     if chat:
         cases.append(("chat", chat, encode_ref(a.llama_tokenize, gguf, chat)))
-    cases.append(("empty", "", []))
+    # llama-tokenize refuses an empty prompt; "OG tokenizer behavior:
+    # tokenizer.encode('', add_special_tokens=True) returns [bos] when the
+    # model adds one" (llama.cpp llama-vocab.cpp), [] otherwise.
+    bos, add_bos = bos_add_bos_of(gguf)
+    cases.append(("empty", "", [bos] if add_bos else []))
 
     got = ours_batch(a.cli, gguf, [c[1] for c in cases])
     fails = 0
@@ -149,7 +175,13 @@ def main():
             i = next((k for k in range(min(len(g), len(ref))) if g[k] != ref[k]), min(len(g), len(ref)))
             print(f"FAIL {name}: first diff at {i}: ref {ref[i:i+5]} got {g[i:i+5]} (len {len(ref)} vs {len(g)})")
         else:
-            rt = ours_decode(a.cli, gguf, g)
+            # decode(encode(x)) == x is a content round trip; BOS is a
+            # generation-context addition, not part of x, so strip it before
+            # comparing (matches "add_special_tokens=False" semantics for the
+            # purpose of this check only -- the id comparison above already
+            # proved encode(add_special=True) agrees with llama-tokenize).
+            g_rt = g[1:] if add_bos and g[:1] == [bos] else g
+            rt = ours_decode(a.cli, gguf, g_rt)
             if rt != text:
                 fails += 1
                 print(f"FAIL decode {name}: {rt[:60]!r} != {text[:60]!r}")
