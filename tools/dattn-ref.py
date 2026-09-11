@@ -23,6 +23,7 @@ LENGTHS = [1, 127, 128, 129, 4096]
 PATHS = [("exact", 1), ("split", 1), ("split", 8), ("split", 64)]
 NLDS = [2, 4, 8]
 ROTS = [0, 1]
+MS = [1, 3]
 QSCALES = [1, 8]
 TOL = 2e-3
 
@@ -32,26 +33,29 @@ def hash_val(i):
     return ((i * np.uint64(2654435761)) % np.uint64(2001)).astype(np.float64) / 1000.0 - 1.0
 
 
-def inputs(shape, T, qscale):
+def inputs(shape, T, qscale, M):
     HD, NQH, NKVH, kvt = SHAPES[shape]
-    q = (hash_val(np.arange(NQH * HD)).astype(np.float32) * np.float32(qscale)).reshape(NQH, HD)
-    idx = np.arange(NKVH * T * HD)
-    k = hash_val(idx).astype(np.float32).astype(kvt).reshape(NKVH, T, HD)
-    v = hash_val(idx + 1000003).astype(np.float32).astype(kvt).reshape(NKVH, T, HD)
+    TT = T + M - 1
+    q = (hash_val(np.arange(M * NQH * HD)).astype(np.float32) * np.float32(qscale)).reshape(M * NQH, HD)
+    idx = np.arange(NKVH * TT * HD)
+    k = hash_val(idx).astype(np.float32).astype(kvt).reshape(NKVH, TT, HD)
+    v = hash_val(idx + 1000003).astype(np.float32).astype(kvt).reshape(NKVH, TT, HD)
     return q, k, v
 
 
-def reference(shape, q, k, v):
+def reference(shape, q, k, v, T, M):
     HD, NQH, NKVH, _ = SHAPES[shape]
     G = NQH // NKVH
     q64, k64, v64 = q.astype(np.float64), k.astype(np.float64), v.astype(np.float64)
-    out = np.zeros((NQH, HD))
+    out = np.zeros((M * NQH, HD))
     scale = 1.0 / np.sqrt(HD)
-    for h in range(NQH):
-        kvh = h // G
-        s = k64[kvh] @ q64[h] * scale
-        p = np.exp(s - s.max())
-        out[h] = (p @ v64[kvh]) / p.sum()
+    for r in range(M):
+        n = T + r
+        for h in range(NQH):
+            kvh = h // G
+            s = k64[kvh, :n] @ q64[r * NQH + h] * scale
+            p = np.exp(s - s.max())
+            out[r * NQH + h] = (p @ v64[kvh, :n]) / p.sum()
     return out
 
 
@@ -68,26 +72,28 @@ def main():
     shapes = ["S1"] if a.quick else list(SHAPES)
     lengths = [129, 4096] if a.quick else LENGTHS
     worst, failed, n = 0.0, [], 0
-    for shape, T, (path, ns), nld, rot, qscale in itertools.product(shapes, lengths, PATHS, NLDS, ROTS, QSCALES):
+    for shape, T, (path, ns), nld, rot, M, qscale in itertools.product(shapes, lengths, PATHS, NLDS, ROTS, MS, QSCALES):
         if path == "exact" and (nld != 4 or rot == 1):
             continue
-        q, k, v = inputs(shape, T, qscale)
-        ref = reference(shape, q, k, v)
-        f = f"{a.out}/{shape}_{T}_{path}{ns}_n{nld}_r{rot}_q{qscale}.bin"
-        r = subprocess.run([a.bin, shape, str(T), path, str(ns), str(nld), str(rot), str(qscale), f],
+        if M > 1 and (nld != 4 or rot == 1):
+            continue
+        q, k, v = inputs(shape, T, qscale, M)
+        ref = reference(shape, q, k, v, T, M)
+        f = f"{a.out}/{shape}_{T}_{path}{ns}_n{nld}_r{rot}_m{M}_q{qscale}.bin"
+        r = subprocess.run([a.bin, shape, str(T), path, str(ns), str(nld), str(rot), str(M), str(qscale), f],
                            capture_output=True, text=True)
         echo = r.stdout.strip().splitlines()[-1] if r.stdout.strip() else ""
         if r.returncode != 0 or not echo.startswith("echo "):
-            failed.append((shape, T, path, ns, nld, rot, qscale, "RUN FAILED: " + r.stderr.strip()[-200:]))
+            failed.append((shape, T, path, ns, nld, rot, M, qscale, "RUN FAILED: " + r.stderr.strip()[-200:]))
             continue
         got = np.fromfile(f, dtype=np.float32).reshape(ref.shape).astype(np.float64)
         err = np.abs(got - ref).max() / max(np.abs(ref).max(), 1e-30)
         worst = max(worst, err)
         n += 1
         ok = err <= TOL and np.isfinite(got).all()
-        print(f"{'ok  ' if ok else 'FAIL'} {shape} T={T:<5} {path} ns={ns:<3} nld={nld} rot={rot} q={qscale} relmax={err:.2e}  [{echo[5:]}]")
+        print(f"{'ok  ' if ok else 'FAIL'} {shape} T={T:<5} {path} ns={ns:<3} nld={nld} rot={rot} m={M} q={qscale} relmax={err:.2e}  [{echo[5:]}]")
         if not ok:
-            failed.append((shape, T, path, ns, nld, rot, qscale, f"relmax {err:.3e}"))
+            failed.append((shape, T, path, ns, nld, rot, M, qscale, f"relmax {err:.3e}"))
     print(f"\n{n} cases, worst relmax {worst:.3e}, tolerance {TOL:.0e}, failures {len(failed)}")
     for x in failed:
         print("  FAIL", *x)

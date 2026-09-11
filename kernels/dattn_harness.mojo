@@ -8,6 +8,7 @@ from dattn import (
 )
 
 comptime FLAT = 1 << 26
+comptime DROWS = 4
 comptime flat_layout = row_major[FLAT]()
 
 
@@ -42,7 +43,7 @@ def eff_nsplit[HD: Int, NLD: Int](T: Int, ns: Int) -> Int:
 
 
 def launch_dattn[
-    HD: Int, NQH: Int, NKVH: Int, KVT: DType, NLD: Int, NW: Int, ROT: Bool
+    HD: Int, NQH: Int, NKVH: Int, KVT: DType, NLD: Int, ROT: Bool
 ](
     ctx: DeviceContext,
     mut q_d: DeviceBuffer[f32],
@@ -53,8 +54,9 @@ def launch_dattn[
     T: Int,
     ns: Int,
     exact: Bool,
+    m: Int = 1,
 ) raises:
-    comptime q_layout = row_major[NQH, HD]()
+    comptime q_layout = row_major[DROWS * NQH, HD]()
     var Q = TileTensor(q_d, q_layout)
     var Kc = TileTensor(k_d, flat_layout)
     var Vc = TileTensor(v_d, flat_layout)
@@ -63,10 +65,10 @@ def launch_dattn[
     var scale = Float32(1) / sqrt(Float32(HD))
     if exact:
         comptime k_exact = amar_dattn_exact[HD, NQH, NKVH, KVT, 1, type_of(q_layout), type_of(flat_layout), type_of(q_layout)]
-        ctx.enqueue_function[k_exact](Q, Kc, Vc, O, Int32(T), scale, Int32(0), grid_dim=NQH, block_dim=HD)
+        ctx.enqueue_function[k_exact](Q, Kc, Vc, O, Int32(T), scale, Int32(0), grid_dim=(NQH, m), block_dim=HD)
     else:
-        comptime k_split = amar_dattn_split[HD, NQH, NKVH, KVT, 1, NLD, NW, ROT, type_of(q_layout), type_of(flat_layout), type_of(q_layout), type_of(flat_layout)]
-        ctx.enqueue_function[k_split](Q, Kc, Vc, O, Pg, Int32(T), Int32(ns), scale, Int32(0), grid_dim=(NKVH, ns), block_dim=NW * 32)
+        comptime k_split = amar_dattn_split[HD, NQH, NKVH, KVT, 1, NLD, ROT, type_of(q_layout), type_of(flat_layout), type_of(q_layout), type_of(flat_layout)]
+        ctx.enqueue_function[k_split](Q, Kc, Vc, O, Pg, Int32(T), Int32(ns), scale, Int32(0), grid_dim=(NKVH, ns, m), block_dim=DTHREADS)
         if ns > 1:
-            comptime k_comb = amar_dattn_combine[HD, type_of(flat_layout), type_of(q_layout)]
-            ctx.enqueue_function[k_comb](Pg, O, Int32(ns), grid_dim=NQH, block_dim=DTHREADS)
+            comptime k_comb = amar_dattn_combine[HD, DMAXS, type_of(flat_layout), type_of(q_layout)]
+            ctx.enqueue_function[k_comb](Pg, O, Int32(ns), grid_dim=m * NQH, block_dim=DTHREADS)

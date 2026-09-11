@@ -5,7 +5,7 @@ content from op_bench's fill formula) rotate over >= 4 x 96 MB so every iteratio
 from HBM. Every arm-defining parameter is echoed before timing (P1). The wall number is a
 sanity receipt only; device time per iteration comes from rocprofv3 (bench/dattn-run.sh),
 summed over the split and combine kernels the way the R arm's catalog sums ext_vec + combine.
-usage: bench_dattn SHAPE T ITERS NS NLD ROT PATH   (SHAPE S1|S2|S3; NLD 2|4|8 loads per span; ROT 1 = per-block start rotation; PATH exact|split)
+usage: bench_dattn SHAPE T ITERS NS NLD ROT PATH   (SHAPE S0 (256/16/4 f32, the engine) | S1|S2|S3; NLD 2|4|8 loads per span; ROT 1 = per-block start rotation; PATH exact|split)
 """
 from std.sys import argv, has_accelerator
 from std.time import perf_counter_ns
@@ -66,11 +66,11 @@ def run[
         + " the 96 MB Infinity Cache x4)"
     )
     for i in range(WARMUP):
-        launch_dattn[HD, NQH, NKVH, KVT, NLD, 8, ROT](ctx, q_d, ks[i % arms], vs[i % arms], o_d, p_d, T, ns, exact)
+        launch_dattn[HD, NQH, NKVH, KVT, NLD, ROT](ctx, q_d, ks[i % arms], vs[i % arms], o_d, p_d, T, ns, exact)
     ctx.synchronize()
     var t0 = perf_counter_ns()
     for i in range(iters):
-        launch_dattn[HD, NQH, NKVH, KVT, NLD, 8, ROT](ctx, q_d, ks[i % arms], vs[i % arms], o_d, p_d, T, ns, exact)
+        launch_dattn[HD, NQH, NKVH, KVT, NLD, ROT](ctx, q_d, ks[i % arms], vs[i % arms], o_d, p_d, T, ns, exact)
     ctx.synchronize()
     var us = Float64(perf_counter_ns() - t0) / 1e3 / Float64(iters)
     var moved = Float64(arm_bytes + 2 * 4 * NQH * HD) / 1e6
@@ -135,6 +135,21 @@ def main() raises:
             run[128, 28, 4, f16, 8, True](T, iters, ns, exact)
         elif nld == 8 and not rot:
             run[128, 28, 4, f16, 8, False](T, iters, ns, exact)
+        else:
+            raise Error("NLD must be 2, 4 or 8")
+    elif shape == "S0":
+        if nld == 2 and rot:
+            run[256, 16, 4, f32, 2, True](T, iters, ns, exact)
+        elif nld == 2 and not rot:
+            run[256, 16, 4, f32, 2, False](T, iters, ns, exact)
+        elif nld == 4 and rot:
+            run[256, 16, 4, f32, 4, True](T, iters, ns, exact)
+        elif nld == 4 and not rot:
+            run[256, 16, 4, f32, 4, False](T, iters, ns, exact)
+        elif nld == 8 and rot:
+            run[256, 16, 4, f32, 8, True](T, iters, ns, exact)
+        elif nld == 8 and not rot:
+            run[256, 16, 4, f32, 8, False](T, iters, ns, exact)
         else:
             raise Error("NLD must be 2, 4 or 8")
     else:

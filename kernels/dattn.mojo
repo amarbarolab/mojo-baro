@@ -241,21 +241,25 @@ def dattn_step[
             o[g] = fma(v8, SIMD[f32, 8](pb), o[g])
 
 
-def amar_dattn_split[
-    HD: Int, NQH: Int, NKVH: Int, KVT: DType, NAT: Int, NLD: Int, NW: Int, ROT: Bool,
+@always_inline
+def dattn_nsplit[HD: Int, NLD: Int, NKVH: Int](T: Int, m: Int, blocks: Int) -> Int:
+    var NS = (T + dspan[HD, NLD]() - 1) // dspan[HD, NLD]()
+    return max(min(max(blocks // (m * NKVH), 1), NS), 1)
+
+
+@always_inline
+def dattn_split_body[
+    HD: Int, NQH: Int, NKVH: Int, KVT: DType, NAT: Int, NLD: Int, ROT: Bool,
     QLayout: TensorLayout, KLayout: TensorLayout, OLayout: TensorLayout, PLayout: TensorLayout,
 ](
     Q: TileTensor[f32, QLayout, MutAnyOrigin],
     Kc: TileTensor[KVT, KLayout, MutAnyOrigin],
     Vc: TileTensor[KVT, KLayout, MutAnyOrigin],
-    O: TileTensor[f32, OLayout, MutAnyOrigin],
+    mut O: TileTensor[f32, OLayout, MutAnyOrigin],
     Pg: TileTensor[f32, PLayout, MutAnyOrigin],
-    t_len: Int32,
-    nsplit: Int32,
-    scale: Float32,
-    att_i: Int32,
+    kvh: Int, sp: Int, r: Int, ns: Int, T: Int, scale: Float32, ai: Int, tid: Int,
 ):
-    comptime assert Q.flat_rank == 2 and Kc.flat_rank == 1 and Vc.flat_rank == 1 and O.flat_rank == 2 and Pg.flat_rank == 1
+    comptime assert Kc.flat_rank == 1 and Vc.flat_rank == 1 and O.flat_rank == 2
     comptime G = NQH // NKVH
     comptime LPR = HD // 8
     comptime RPL = WARP_SIZE // LPR
@@ -263,14 +267,8 @@ def amar_dattn_split[
     comptime DUP = LPR // NLD
     comptime PSTR = HD + 2
     comptime N8 = G * HD // 8
-    comptime NT = NW * WARP_SIZE
-    comptime assert NQH == G * NKVH and LPR * RPL == WARP_SIZE and DUP * NLD == LPR and N8 <= NT
-    var kvh = Int(block_idx.x)
-    var sp = Int(block_idx.y)
-    var ns = Int(nsplit)
-    var T = Int(t_len)
-    var ai = Int(att_i)
-    var tid = Int(thread_idx.x)
+    comptime NW = DWAVES
+    comptime assert NQH == G * NKVH and LPR * RPL == WARP_SIZE and DUP * NLD == LPR and N8 <= DTHREADS
     var wave = tid // WARP_SIZE
     var lane = tid % WARP_SIZE
     var lr = lane // LPR
@@ -279,10 +277,11 @@ def amar_dattn_split[
     var NS = (T + SPAN - 1) // SPAN
     var s_lo = sp * NS // ns
     var s_hi = (sp + 1) * NS // ns
+    var hb = r * NQH + kvh * G
     var qs = stack_allocation[f32, address_space = AddressSpace.SHARED](row_major[G * HD]())
     var qsv = qs.vectorize[8]()
     if tid < N8:
-        qsv[tid] = rebind[qsv.ElementType](Q.ptr.unsafe_load[width=8](kvh * G * HD + tid * 8) * scale)
+        qsv[tid] = rebind[qsv.ElementType](Q.ptr.unsafe_load[width=8](hb * HD + tid * 8) * scale)
     barrier()
     var o = InlineArray[SIMD[f32, 8], G](fill=SIMD[f32, 8](0))
     var m = InlineArray[Float32, G](fill=NEG)
@@ -304,8 +303,8 @@ def amar_dattn_split[
         dattn_step[HD, G, KVT, NLD](qs, kr, vr, o, m, l, t0, T, lane, lr, jtok)
         k += NW
     comptime for g in range(G):
-        comptime for r in range(log2_floor(RPL)):
-            comptime off = LPR << r
+        comptime for rr in range(log2_floor(RPL)):
+            comptime off = LPR << rr
             comptime for e in range(8):
                 o[g][e] += warp.shuffle_xor(o[g][e], UInt32(off))
     var wm = stack_allocation[f32, address_space = AddressSpace.SHARED](row_major[NW * G]())
@@ -342,12 +341,11 @@ def amar_dattn_split[
         var g = tid // (HD // 8)
         var c = (tid % (HD // 8)) * 8
         var v = rebind[SIMD[f32, 8]](accv[tid])
-        var h = kvh * G + g
+        var h = hb + g
         if ns == 1:
             var inv = 1 / lb[g]
-            var O_ = O
             comptime for e in range(8):
-                O_[h, c + e] = rebind[O_.ElementType](v[e] * inv)
+                O[h, c + e] = rebind[O.ElementType](v[e] * inv)
         else:
             var pp = Pg.ptr.unsafe_offset((h * ns + sp) * PSTR)
             if c == 0:
@@ -357,25 +355,20 @@ def amar_dattn_split[
                 pp[unsafe_offset=2 + c + e] = v[e]
 
 
-comptime DMAXS = 1024
-
-
-def amar_dattn_combine[
-    HD: Int, PLayout: TensorLayout, OLayout: TensorLayout,
+@always_inline
+def dattn_combine_body[
+    HD: Int, MAXS: Int, PLayout: TensorLayout, OLayout: TensorLayout,
 ](
     Pg: TileTensor[f32, PLayout, MutAnyOrigin],
-    O: TileTensor[f32, OLayout, MutAnyOrigin],
-    nsplit: Int32,
+    mut O: TileTensor[f32, OLayout, MutAnyOrigin],
+    hg: Int, ns: Int, tid: Int,
 ):
-    comptime assert Pg.flat_rank == 1 and O.flat_rank == 2
+    comptime assert O.flat_rank == 2
     comptime PSTR = HD + 2
-    var h = Int(block_idx.x)
-    var tid = Int(thread_idx.x)
     var wave = tid // WARP_SIZE
     var lane = tid % WARP_SIZE
-    var ns = Int(nsplit)
-    var pp = Pg.ptr.unsafe_offset(h * ns * PSTR)
-    var wsh = stack_allocation[f32, address_space = AddressSpace.SHARED](row_major[DMAXS]())
+    var pp = Pg.ptr.unsafe_offset(hg * ns * PSTR)
+    var wsh = stack_allocation[f32, address_space = AddressSpace.SHARED](row_major[MAXS]())
     var red = stack_allocation[f32, address_space = AddressSpace.SHARED](row_major[DWAVES]())
     var mloc = NEG
     var sp = tid
@@ -420,5 +413,40 @@ def amar_dattn_combine[
         while sp < ns:
             o0 = fma(rebind[Scalar[f32]](wsh[sp]), pd[unsafe_offset=sp * PSTR], o0)
             sp += 1
-        var O_ = O
-        O_[h, tid] = rebind[O_.ElementType](((o0 + o1) + (o2 + o3)) * (1 / lsum))
+        O[hg, tid] = rebind[O.ElementType](((o0 + o1) + (o2 + o3)) * (1 / lsum))
+    barrier()
+
+
+def amar_dattn_split[
+    HD: Int, NQH: Int, NKVH: Int, KVT: DType, NAT: Int, NLD: Int, ROT: Bool,
+    QLayout: TensorLayout, KLayout: TensorLayout, OLayout: TensorLayout, PLayout: TensorLayout,
+](
+    Q: TileTensor[f32, QLayout, MutAnyOrigin],
+    Kc: TileTensor[KVT, KLayout, MutAnyOrigin],
+    Vc: TileTensor[KVT, KLayout, MutAnyOrigin],
+    O: TileTensor[f32, OLayout, MutAnyOrigin],
+    Pg: TileTensor[f32, PLayout, MutAnyOrigin],
+    t_len: Int32,
+    nsplit: Int32,
+    scale: Float32,
+    att_i: Int32,
+):
+    var O_ = O
+    var r = Int(block_idx.z)
+    dattn_split_body[HD, NQH, NKVH, KVT, NAT, NLD, ROT](
+        Q, Kc, Vc, O_, Pg, Int(block_idx.x), Int(block_idx.y), r, Int(nsplit), Int(t_len) + r, scale, Int(att_i), Int(thread_idx.x)
+    )
+
+
+comptime DMAXS = 1024
+
+
+def amar_dattn_combine[
+    HD: Int, MAXS: Int, PLayout: TensorLayout, OLayout: TensorLayout,
+](
+    Pg: TileTensor[f32, PLayout, MutAnyOrigin],
+    O: TileTensor[f32, OLayout, MutAnyOrigin],
+    nsplit: Int32,
+):
+    var O_ = O
+    dattn_combine_body[HD, MAXS](Pg, O_, Int(block_idx.x), Int(nsplit), Int(thread_idx.x))
