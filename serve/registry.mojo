@@ -232,8 +232,8 @@ comptime rope_qp = amar_rope_yarn[type_of(qp_layout)]
 comptime rope_kp = amar_rope_yarn[type_of(kvp_layout)]
 comptime append_p = amar_kv_append[type_of(cache_layout), type_of(kvp_layout), N_ATT]
 comptime attp_k = amar_attn_prefill[type_of(qp_layout), type_of(cache_layout), type_of(qp_layout), N_ATT]
-comptime gmul_p = amar_gate_mul_cast[type_of(xpflat_layout), type_of(xpflat_layout), type_of(xpflat_layout)]
 comptime attpw_k = amar_attn_prefill_wmma[type_of(qp_layout), type_of(cache_layout), type_of(qp_layout), N_ATT]
+comptime gmul_p = amar_gate_mul_cast[type_of(xpflat_layout), type_of(xpflat_layout), type_of(xpflat_layout)]
 comptime swiglu_p = amar_prefill_swiglu_bf16[type_of(ffnp_layout), type_of(ffnp_layout)]
 
 

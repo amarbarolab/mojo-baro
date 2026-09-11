@@ -873,14 +873,14 @@ def main() raises:
     comptime assert has_accelerator(), "Requires a GPU"
     var ctx = DeviceContext()
     test_attn(ctx)
-    test_ssm(ctx)
-    test_gemm(ctx)
-    print("PASS: prefill kernels")
     var wmma_ok = True
     try:
         test_attn_wmma(ctx)
     except:
         wmma_ok = False
         print("FAIL: attn prefill wmma (continuing so the remaining sections report)")
+    test_ssm(ctx)
+    test_gemm(ctx)
     if not wmma_ok:
         raise Error("parity failure: attn prefill wmma")
+    print("PASS: prefill kernels")
