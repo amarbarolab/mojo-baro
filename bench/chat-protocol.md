@@ -732,3 +732,94 @@ and no cost to decode. That is the honest claim. The 100x-class number needs
 M1b.
 
 Not run: nothing further; M1b preregistration is unwritten.
+
+---
+
+## KSAMP: device sampler and speculative acceptance kernels (frozen 2026-09-11, before its build)
+
+Plan: `~/Brain/mojo/mojo-baro/briefs/2026-09-11-chat-engine-next.md`, item KSAMP.
+Lane `lane-KSAMP`, files `kernels/sample.mojo` and `kernels/test_sample.mojo`.
+No engine wiring, no greedy-path change, no penalties (the KSAMP interface has none;
+they belong to the CHAT host path and a later kernel step).
+
+**Interface (fixed by the plan, spelled in this repo's kernel form).** Rows are
+`X: [R, V] f32`, one block per row, the same shape as `amar_argmax_row`, so the
+caller swaps one launch for the other.
+- `amar_sample_row(X, Out[R] i32, Prob[R] f32, n, temperature, top_k, top_p,
+  min_p, seed: u64, counter: u64)`: token id and its probability under the
+  distribution it was drawn from.
+- `amar_spec_accept(Pt, Pd, Dtok, Out, Acc, n, seed, counter)`: per row, accept
+  the drafted token `x` when `u * p_d(x) < p_t(x)` (probability
+  `min(1, p_t/p_d)`), otherwise emit a draw from the normalised
+  `max(0, p_t - p_d)`. The uniform `u` and the resample noise come from the
+  same counter RNG as the sampler, in separate streams.
+- Addition flagged for CHAT: `amar_sample_probs(X, P, n, ...same params)`
+  writes the full truncated, tempered distribution row. `amar_spec_accept`
+  needs `p_t` and `p_d` as rows and nothing in the fixed interface produces
+  them; this kernel shares the sampler's selection code, so the probabilities
+  the acceptance rule sees are the ones the sampler draws from.
+
+**Semantics (llama.cpp order, design §5).** Valid logits are finite and not
+NaN. top-k (0 or >= valid count = off) keeps the k largest; top-p (>= 1 = off)
+keeps the shortest prefix, in descending order, whose softmax mass over the
+top-k set at temperature 1 reaches `top_p`, the crossing token included;
+min-p (<= 0 = off) keeps tokens with `p >= min_p * p_max` at temperature 1;
+then temperature scales the survivors and one token is drawn. Ties in value
+are ordered by lower index first, so every cut is a prefix of one total order
+(value descending, index ascending) and the three filters commute.
+`temperature <= 0` returns `amar_argmax_row`'s token (same rule: lowest index
+among the maximum, NaN ignored, all-invalid row gives 0) with probability 1.
+A sampled row with no valid logit gives token -1, probability 0.
+
+**Mechanism.** Counter RNG = Philox4x32-10 (Random123 constants), key = seed,
+counter = (counter lo, counter hi, row, stream << 28 | element / 4). The draw
+is Gumbel-max over the survivors, `argmax((l - lmax) / T + G_i)` with `G_i`
+keyed by the element index, so the token does not depend on thread count or
+summation order: a (seed, counter) pair reproduces bit-exactly. Cuts are found
+without a sort: pass 1 finds `lmax`; pass 2 builds a 257-bucket histogram of
+`(lmax - l) * 8` (1/8-nat bands, one tail bucket) with counts and fixed-point
+masses (`exp(l - lmax) * 2^40` as u64, so sums are exact and order-free); the
+band holding the k-th token (or the top-p crossing) is refined by a four-digit
+8-bit radix select on the order-preserving u32 key of the logit, restricted to
+that band, then by index for ties. One block of 1024 threads per row.
+
+**Predictions.**
+- P-K1 Philox4x32-10 matches the Random123 known-answer vectors (zero and
+  all-ones counter/key).
+- P-K2 Temperature 0: token equal to `amar_argmax_row` on 8 random rows at the
+  real vocabulary V = 248320 plus edge rows (value ties, +0/-0, -inf, NaN, all
+  -inf), 100 % of rows.
+- P-K3 Distribution: fixed logits over V = 64, 10,000 draws per configuration
+  (T 1.0 / k off / p off; T 0.7 / k 20 / p 0.8; T 1.3 / k 12 / p 0.9 / min-p
+  0.05; T 0.5 / k off / p 0.6; a tie-heavy row with k cutting inside a tie),
+  Pearson chi-square against the exact float64 distribution (bins pooled to
+  expected >= 5) below the p = 0.001 critical value, **zero** draws outside
+  the truncated set, returned probability within 1e-5 of the exact value,
+  `amar_sample_probs` row within 1e-5 of exact and summing to 1 within 1e-5.
+- P-K4 Reproducibility: two launches with the same (seed, counter) give the
+  same 10,000 tokens; a different seed changes at least half of them on the
+  flat configuration.
+- P-K5 Speculation: a deliberately mismatched draft (different logits, same
+  sampling parameters), drafts drawn by `amar_sample_row` from `p_d`, then
+  `amar_spec_accept`; 10,000 rows, accepted-or-resampled tokens pass the
+  chi-square against `p_t`; acceptance rate within 4 sigma of
+  `sum_i min(p_t, p_d)`; a two-sample chi-square between these tokens and
+  direct `amar_sample_row` draws from `p_t` passes at p = 0.001
+  (speculation on and off indistinguishable).
+- P-K6 Time per call at V = 248320, R = 1, logits Gaussian sigma 2.5 with a
+  few boosted tokens, row hot in L2 (as in the engine, where the lm-head
+  writes it just before): greedy 5-15 us (one pass); Qwen preset
+  (T 0.7 / k 20 / p 0.8) 50-110 us (12 passes over 1 MB at ~6.5 us per pass
+  for one block); llama.cpp default (T 0.8 / k 40 / p 0.95 / min-p 0.05)
+  same band; k off / p 0.95: 30-70 us (7 passes). Falsifier: either
+  sampling preset above 150 us means the per-pass cost model is wrong;
+  look at LDS atomic contention in the band pass before anything else.
+
+**Verification before timing (P1).** The test prints grid, block, V, R and
+every sampling parameter of each timed arm from the values it launched with,
+in the same binary that is timed, and runs the P-K2 and P-K3 checks in the
+same process before timing.
+
+**Gate.** `./run-tests.sh` exit 0 with the census at +3 kernels and 0
+orphans, `kernels/test_sample.mojo` PASS on P-K1 to P-K5, P-K6 recorded
+against its bands; both captured to `.work/KSAMP-gate.txt`.
