@@ -46,7 +46,7 @@ from attn import (
 from ssm import (
     amar_ssm_conv, amar_ssm_delta_step, amar_ssm_qk_l2norm, amar_ssm_gated_out_bf16,
     amar_ssm_gates_rows, amar_ssm_conv_chunk, amar_ssm_qk_l2norm_rows, amar_ssm_delta_chunk,
-    amar_ssm_gated_out_rows_bf16, CONV, KDIM, NH_K, NH_V, SSTATE, SSM_EPS,
+    amar_ssm_gated_out_rows_bf16, amar_ssm_delta_chunk_w, DC_BLOCKS, CONV, KDIM, NH_K, NH_V, SSTATE, SSM_EPS,
 )
 
 comptime bf16 = DType.bfloat16
@@ -789,6 +789,24 @@ def test_ssm(ctx: DeviceContext) raises:
                     o += s * Float64(cA_h[r * CONV + kh * SSTATE + i])
                 ow[unsafe_offset=(r * NH_V + h) * SSTATE + j] = Float32(o)
     check("ssm delta chunk vs fp64 host recurrence", oA_h.unsafe_ptr(), ow, SS_M * NH_V * SSTATE, 1e-3)
+
+    var ssC = ctx.enqueue_create_buffer[f32](SS_SLOTS * NH_V * SSTATE * SSTATE)
+    var oC = ctx.enqueue_create_buffer[f32](SS_M * NH_V * SSTATE)
+    ctx.enqueue_copy(dst_buf=ssC, src_buf=ss_h)
+    ctx.enqueue_memset(oC, 0)
+    var SsC = TileTensor(ssC, ss_s)
+    var OC = TileTensor(oC, o_s)
+    ctx.enqueue_function[amar_ssm_delta_chunk_w[type_of(ss_s), type_of(qkv_s), type_of(g_s), type_of(o_s)]](
+        SsC, ConvA, Eg, Be, OC, Int32(0), Int32(0), Int32(SS_SLOTS), Int32(SS_M), grid_dim=DC_BLOCKS, block_dim=32,
+    )
+    var oC_h = ctx.enqueue_create_host_buffer[f32](SS_M * NH_V * SSTATE)
+    var ssC_h = ctx.enqueue_create_host_buffer[f32](SS_SLOTS * NH_V * SSTATE * SSTATE)
+    ctx.enqueue_copy(dst_buf=oC_h, src_buf=oC)
+    ctx.enqueue_copy(dst_buf=ssC_h, src_buf=ssC)
+    ctx.synchronize()
+    check("ssm delta chunk_w vs serial delta chunk, O all rows", oC_h.unsafe_ptr(), oA_h.unsafe_ptr(), SS_M * NH_V * SSTATE, 1e-4)
+    check("ssm delta chunk_w final state slot vs serial", ssC_h.unsafe_ptr().unsafe_offset(fs * NH_V * SSTATE * SSTATE), ssA_h.unsafe_ptr().unsafe_offset(fs * NH_V * SSTATE * SSTATE), NH_V * SSTATE * SSTATE, 1e-4)
+    check("ssm delta chunk_w vs fp64 host recurrence", oC_h.unsafe_ptr(), ow, SS_M * NH_V * SSTATE, 1e-3)
     print("PASS: ssm chunk kernels")
 
 

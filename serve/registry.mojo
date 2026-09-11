@@ -14,7 +14,7 @@ from ssm import (
     amar_ssm_reduce_gates, amar_ssm_conv, amar_ssm_qk_l2norm,
     amar_ssm_delta_step, amar_ssm_gated_out_bf16, amar_cast_bf16, CONV, NH_V, SSTATE,
     amar_ssm_gates_rows, amar_ssm_conv_chunk, amar_ssm_qk_l2norm_rows, amar_ssm_delta_chunk,
-    amar_ssm_gated_out_rows_bf16,
+    amar_ssm_gated_out_rows_bf16, amar_ssm_delta_chunk_w, DC_BLOCKS,
 )
 from matmul_prefill import (
     amar_matmul_prefill_q4, amar_matmul_prefill_q8, amar_prefill_swiglu_bf16, PF_THREADS,
@@ -223,6 +223,7 @@ comptime gates_p = amar_ssm_gates_rows[type_of(g32p_layout), type_of(g32p_layout
 comptime conv_p = amar_ssm_conv_chunk[type_of(qfp_layout), type_of(csall_layout), type_of(cw_layout), type_of(convp_layout)]
 comptime l2_p = amar_ssm_qk_l2norm_rows[type_of(convp_layout)]
 comptime delta_p = amar_ssm_delta_chunk[type_of(ssall_layout), type_of(convp_layout), type_of(g32p_layout), type_of(op_layout)]
+comptime deltaw_p = amar_ssm_delta_chunk_w[type_of(ssall_layout), type_of(convp_layout), type_of(g32p_layout), type_of(op_layout)]
 comptime gated_p = amar_ssm_gated_out_rows_bf16[type_of(op_layout), type_of(xp_layout), type_of(n128_layout), type_of(xp_layout)]
 comptime split_p = amar_qgate_split[type_of(qfp_layout), type_of(qp_layout), type_of(xpflat_layout)]
 comptime hrms_qp = amar_head_rmsnorm[type_of(qp_layout), type_of(hd_layout)]
