@@ -128,4 +128,12 @@ report. No output is written to `/tmp`.
 
 ### Result
 
-Pending W1 build and gate.
+W1 passed on 2026-09-12. Packer output contains 733/733 tensors at
+21,005,191,680 bytes (19.56 GiB). Raw-copy verification passed 732/732
+non-head tensors and the Q6_K output head had 0 values over the registered
+bound. The final `./run-tests.sh` gate exited 0. The final teacher-forced A/B
+passed 20/20 prompts at 64/64, min 100.0%, mean 100.0%, void none. Arm hashes
+were `38478b34aa4aaf4d` and `a81f2c583ae876e5`.
+
+Operational deviation: W1 reused the W0 engine binary because W1 changes
+only the packer and pack output. The engine regression was rerun unchanged.

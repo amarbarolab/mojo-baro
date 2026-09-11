@@ -358,7 +358,57 @@ def pack_dense(model, outdir):
     print(f"packed {arch}, {n_layers} layers, bias={has_bias}, tied={tied}, {off/2**30:.2f} GiB")
 
 
+def pack_moe(model, outdir):
+    """Pack qwen35moe in fixed lexical tensor order without expanding experts."""
+    f, infos, data_start, kv = ge.parse(model)
+    arch = kv["general.architecture"]
+    if arch != "qwen35moe":
+        raise SystemExit(f"--arch qwen35moe requires qwen35moe GGUF, got {arch}")
+    outdir.mkdir(parents=True, exist_ok=True)
+    names = sorted(infos)
+    idx_lines = []
+    off = 0
+    with open(outdir / "pack.bin", "wb") as out:
+        for name in names:
+            dims, ttype, toff = infos[name]
+            n_elem = int(np.prod(dims))
+            if ttype in ge.GGML_BYTES:
+                tname, esize = ge.GGML_BYTES[ttype]
+                f.seek(data_start + toff)
+                raw = f.read(n_elem * esize)
+                dt = tname
+            else:
+                qtype = GGMLQuantizationType(ttype)
+                block, tsize = GGML_QUANT_SIZES[qtype]
+                f.seek(data_start + toff)
+                raw = f.read((n_elem // block) * tsize)
+                dt = qtype.name.lower()
+            if name == "output.weight":
+                shape = list(reversed(dims))
+                raw_bf16 = dequantize_kquant(f, data_start, toff, ttype, shape)
+                q, d = quantize_q8_0(np.frombuffer(raw_bf16, dtype=np.uint16).reshape(shape))
+                raw = q.tobytes() + d.tobytes()
+                dt = "q8"
+            out.write(raw)
+            idx_lines.append(f"{name} {dt} {off} {n_elem}")
+            off += len(raw)
+    (outdir / "index.txt").write_text("\n".join(idx_lines) + "\n")
+    counts = {}
+    for line in idx_lines:
+        dt = line.split()[1]
+        counts[dt] = counts.get(dt, 0) + 1
+    print(f"packed {len(names)} tensors, {off/2**30:.2f} GiB, dtypes={counts}")
+
+
 def main():
+    if "--arch" in sys.argv:
+        i = sys.argv.index("--arch")
+        arch = sys.argv[i + 1]
+        del sys.argv[i:i + 2]
+        if arch == "qwen35moe":
+            pack_moe(Path(sys.argv[1]), Path(sys.argv[2]))
+            return
+        raise SystemExit(f"unsupported architecture: {arch}")
     if "--dense" in sys.argv:
         sys.argv.remove("--dense")
         pack_dense(Path(sys.argv[1]), Path(sys.argv[2]))
