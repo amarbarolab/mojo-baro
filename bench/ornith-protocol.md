@@ -126,3 +126,38 @@ Requantising Ornith through anything other than `--q8`; `--q4-draft` (MTP draft-
 by the K-quant path — would `KeyError` if invoked on a K-quant `output.weight`, since it still reads
 `ge.GGML_BYTES` directly; out of scope, not fixed); serving concurrent requests; any kernel change
 (the item's Rules forbid it outright; `BARO_FORCE` needed none, per the amendment above).
+
+## Result (2026-09-11, engine sha `e469d1c`, `bench/ornith-run.sh` — `.work/ornith-run/`)
+
+Read-back (P1): engine build 0 errors, `BARO_PACK` pack 442 tensors (printed at load); llama.cpp
+`/props` `n_ctx: 8192`; llama-server ran 4 parallel slots (round-robin slot ids 0-3 in
+`llama-server.log`, single request at a time from this script so that does not affect per-request
+timing) — not read back before this run, noted here as a receipt gap for the next one; llama-server
+down while `ours` held the GPU and vice versa throughout.
+
+- **G3 (kernel self-consistency): 64/64, first divergence at position 64 — i.e. none.** Matches the
+  prediction exactly. `ours`' kernels compute exactly what the q8 pack's numbers say to, on Ornith's
+  actual tensor shapes and values, not just on Qwythos's.
+- **Step 3a (teacher-forced agreement vs llama.cpp): median 63/64 (98.4%), range 57-64/64.** Well
+  above the 60-90% predicted band and nowhere near the 30% falsifier — the two independent
+  quantisation paths (K-quant->q8 vs llama.cpp's native mixed-K-quant) agree far more often than
+  the conservative prediction assumed. One outlier, `p16-chat` at 57/64 (89%), still comfortably
+  above the falsifier; not investigated further (3a is reported, not gated, per the protocol above).
+- **Step 3b (tok/s_gen, 20-prompt median):** `ours` **80.78** (range 76.8-81.0) — inside the
+  predicted 70-95 band. `llama.cpp` **88.8** (range 83.1-90.6, from `llama-server.log`'s own
+  `eval time ... tokens per second`, not the `/completion` response's `timings` block, which this
+  script did not capture — a gap for next time) — **below the predicted 110-150 band**, though still
+  inside the 80-200 falsifier. The Q4_K_M-vs-Q8_0 byte-scaling argument overestimated llama.cpp's
+  edge; `ours`/`llama.cpp` = **0.91x**, close rather than the implied ~0.6x. No kernel or config
+  change follows from this alone (P6: the prediction's own scaling assumption is the more likely
+  miss, not either engine); flagged for the next round that touches decode speed on this shape.
+- **Step 3c (MTP identical to no-spec): 20/20.** Matches the prediction exactly —
+  `.work/ornith-run/mtp/results.txt`.
+- **Step 3d (chat smoke): PASS**, response read: *"The user is asking a simple factual question: the
+  capital of France. I should answer in one sentence as requested. \</think\> The capital of France
+  is Paris."* — coherent, correctly answers the question, reasoning-then-answer shape expected of
+  the Ornith family (per the `ornith` skill).
+
+**Verdict: Ornith-1.5-9B runs correctly and at a usable speed through the K-quant engine pack.**
+No kernel or engine bug found; the one genuine miss was this protocol's own tok/s prediction band
+for llama.cpp, not the systems under test.
