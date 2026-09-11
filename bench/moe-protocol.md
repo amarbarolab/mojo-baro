@@ -138,6 +138,37 @@ were `38478b34aa4aaf4d` and `a81f2c583ae876e5`.
 Operational deviation: W1 reused the W0 engine binary because W1 changes
 only the packer and pack output. The engine regression was rerun unchanged.
 
+## W3: host wiring, non-mega decode
+
+### Question
+
+Can the qwen35moe engine load the raw expert pack by named tensor semantics,
+execute one m=1 MoE block with both routed and shared experts, and serve a
+teacher-forced decode through the existing Rust front?
+
+### Preregistration
+
+This W3 gate is frozen before any W3 source build. The loader lane owns
+`serve/harness.mojo` and its loader module. This lane owns
+`serve/window.mojo`, `serve/engine.mojo`, and the protocol and report.
+
+Gate 1 requires the loader probe to resolve all 733 packed tensors by name,
+with expert, layer, projection, row range, dtype, and byte offset matching
+the W2 semantic map. One real layer-0-to-3 block must then reproduce the
+reference hidden output with max relative error at most `5e-3`; the call must
+include at least one routed expert and the shared expert before summation.
+
+Gate 2 requires the qwen35moe non-mega m=1 engine to pass the existing GPU
+test suite, teacher-forced agreement on all 20 `bench/mtp-prompts` prompts at
+64/64 tokens against llama.cpp, and one Rust-front
+`/v1/chat/completions` request with `BARO_PACK` set to the qwen35moe pack
+returning a non-empty assistant answer. No prefill, batching, MTP window, or
+performance threshold is part of W3.
+
+### Result
+
+Pending the loader-lane report and W3 build.
+
 ## W2: Q4_K expert kernels
 
 ### Question
