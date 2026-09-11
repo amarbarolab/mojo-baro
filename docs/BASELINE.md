@@ -350,6 +350,18 @@ run-tests, identity on every runnable pack with spec on/off, ref tokens,
 per-sub-block device profile, `BARO_DUMP=path` dumps X per layer for both
 arms. Round receipts: `bench/megakernel-protocol.md`.
 
+**q4 m=1 champion since 2026-09-11 (`3824e20`, merge of lane-dattn): 136.37
+tok/s_gen no-spec, 20-prompt median** (was 133.9). Post-merge A/B against
+pre-merge main (`.work/engine-premerge`, same pack and env): 127.98 -> 136.37
+(1.066x), identity 20/20; receipt `.work/postmerge-dattn/ab20.log`, merged
+spread 4.4 % from one prompt (p15 130.8), every other prompt 135.9-136.7. Not
+an attention gain (the new decode attention runs only above T = 1088): the
+megakernel recompile re-rolled the q4 dot loop into a faster schedule,
+`isa-loops` dual 114/78/78/53 -> 124/79/79/59, 0 scratch. Any later
+`kernels/mega.mojo` edit can re-roll it back; read the fingerprint first.
+Long context from the same merge: decode after p8192 112.70 -> 124.48, after
+p32768 85.22 -> 101.36 (`bench/dattn-wire-protocol.md`).
+
 **q4 m=1 champion since 2026-09-08 (`9e6feaa`): 133.9 tok/s_gen no-spec,
 20-prompt median** (was 130.6). The per-phase rmsnorm+quantise and its grid
 barrier are folded into the consuming GEMV's LDS prologue (`stage_rms`, 65
