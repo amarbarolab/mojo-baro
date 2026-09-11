@@ -71,10 +71,10 @@ must be reachable from `serve/registry.mojo`, a bench, or a test.
 | `amar_spec_accept` | `sample.mojo` | `PLayout: TensorLayout, TLayout: TensorLayout` |  | kernels/test_sample.mojo |
 | `amar_argmax_final` | `spark_kernels.mojo` | `NB: Int, VLayout: TensorLayout, ILayout: TensorLayout, OLayout: TensorLayout` |  | serve/spark.mojo |
 | `amar_argmax_part` | `spark_kernels.mojo` | `NB: Int, XLayout: TensorLayout, VLayout: TensorLayout, ILayout: TensorLayout` |  | serve/spark.mojo |
-| `amar_attn_decode_swa_gated` | `spark_kernels.mojo` | `QLayout: TensorLayout, KLayout: TensorLayout, GLayout: TensorLayout, OLayout: TensorLayout, NAT: Int` |  | serve/spark.mojo |
+| `amar_attn_decode_swa_gated` | `spark_kernels.mojo` | `QLayout: TensorLayout, KLayout: TensorLayout, GLayout: TensorLayout, OLayout: TensorLayout, NAT: Int, HD_: Int = HD, NQH_: Int = NQH, NKVH_: Int = NKVH` |  | serve/spark.mojo, kernels/test_spark_attn.mojo |
 | `amar_embed_lookup_f32` | `spark_kernels.mojo` | `TLayout: TensorLayout, OLayout: TensorLayout, KLayout: TensorLayout` |  | serve/spark.mojo |
 | `amar_gemv_q8` | `spark_kernels.mojo` | `EPI: Int, ALayout: TensorLayout, QLayout: TensorLayout, SLayout: TensorLayout, CLayout: TensorLayout, BLayout: TensorLayout` |  | serve/spark.mojo |
-| `amar_rope_kv_append` | `spark_kernels.mojo` | `NROT_: Int, NAT: Int, CLayout: TensorLayout, NLayout: TensorLayout` |  | serve/spark.mojo |
+| `amar_rope_kv_append` | `spark_kernels.mojo` | `NROT_: Int, NAT: Int, CLayout: TensorLayout, NLayout: TensorLayout, HD_: Int = HD, NKVH_: Int = NKVH` |  | serve/spark.mojo, kernels/test_spark_attn.mojo |
 | `amar_rope_plain` | `spark_kernels.mojo` | `NROT_: Int, XLayout: TensorLayout` |  | serve/spark.mojo |
 | `amar_cast_bf16` | `ssm.mojo` | `XLayout: TensorLayout, OLayout: TensorLayout` | cast_m, cast_1 | serve/registry.mojo, kernels/test_attn_block.mojo, kernels/test_moe_block.mojo, kernels/test_ssm_block.mojo |
 | `amar_residual_add` | `ssm.mojo` | `XLayout: TensorLayout, YLayout: TensorLayout` |  | kernels/test_attn_block.mojo, kernels/test_ssm_block.mojo |
@@ -109,7 +109,8 @@ Every `kernels/test_*.mojo`, the gate script that runs it, and its first docstri
 | `test_prefix.mojo` | run-tests.sh | Byte-exact prefix checkpoint restore (bench/chat-protocol.md M1a, P-F1). |
 | `test_q8_gemm.mojo` | manual | Milestone-6 checks: int8 dequant-in-kernel GEMM + fused SwiGLU epilogue. |
 | `test_realign.mojo` | manual | REALIGN live test (round 3): for 5 real prompts on .work/engine-pack-q4, prefill through the prompt under mega=True (the E9/HARNESS configuration -- bench_latent_handoff.mojo runs every latent step through the megakernel), call realign_expected_embedding and final_norm_hidden on the final row, and dump the row's pre-final-norm hidden (b.x_d), e, and the f32 post-final-norm hidden (h, round 3) to .work/realign-dump/ for tools/realign_oracle.py (numpy) to recompute independently off the dumped hidden state and the pack's own weights -- never against a Mojo-side logits/hn_d dump (see serve/realign.mojo's docstring for why b.logits_d/b.hn_d are not usable here). |
-| `test_sample.mojo` | run-tests.sh | Device sampler checks for kernels/sample.mojo (KSAMP, bench/chat-protocol.md P-K1..P-K10). |
+| `test_sample.mojo` | manual | Device sampler checks for kernels/sample.mojo (KSAMP, bench/chat-protocol.md P-K1..P-K10). |
 | `test_sample_ref.mojo` | run-tests.sh | Host reference sampler gate (bench/chat-protocol.md C3, P-I1..P-I4). |
+| `test_spark_attn.mojo` | run-tests.sh | KATT head-dimension parity (bench/dense-protocol.md, KATT section). The Spark attention path, amar_rope_kv_append then amar_attn_decode_swa_gated, runs at (HD, NQH, NKVH) = (64, 32, 8), (128, 28, 4), (256, 16, 4) on synthetic data. Inputs, the appended cache row and the bf16 outputs are dumped to KATT_OUT (default .work/katt) for tools/spark-attn-ref.py, the numpy float64 oracle that decides pass or fail. |
 | `test_ssm_block.mojo` | manual | Parity: one decode token through the qwen35 gated-delta-net block on GPU vs the numpy reference (tools/ssm-ref.py implementing docs/qwen35-ssm-notes.md). |
 | `test_ternary_gemm.mojo` | manual | Parity check for the three ternary wave-per-row GEMV kernels (matmul_ternary.mojo: q2b3row = Q2_B3/B3S, tq1row = TQ1_0, tq2row = TQ2_0) against the C reference codec. |
