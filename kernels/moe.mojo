@@ -312,6 +312,44 @@ def q8_0_row_dot[
     return warp.sum(acc)
 
 
+def moe_embed_q8_0_pos[
+    OLayout: TensorLayout, KLayout: TensorLayout,
+](
+    W: MutPointer[Scalar[u8], MutAnyOrigin],
+    O: TileTensor[f32, OLayout, MutAnyOrigin],
+    Toks: TileTensor[i32, KLayout, MutAnyOrigin],
+    pos: Int32,
+    n: Int32,
+    row_bytes: Int32,
+):
+    comptime assert O.flat_rank == 2 and Toks.flat_rank == 1
+    var idx = global_idx.x
+    if idx >= Int(n):
+        return
+    var token = Int(rebind[Scalar[i32]](Toks[Int(pos) + Int(block_idx.y)]))
+    var row_base = token * Int(row_bytes)
+    O[block_idx.y, idx] = rebind[O.ElementType](q8_0_value(W, row_base, idx))
+
+
+def moe_matmul_q8_0_m1[
+    OLayout: TensorLayout, ALayout: TensorLayout,
+](
+    A: TileTensor[bf16, ALayout, MutAnyOrigin],
+    W: MutPointer[Scalar[u8], MutAnyOrigin],
+    O: TileTensor[f32, OLayout, MutAnyOrigin],
+    n: Int32,
+    k_dim: Int32,
+    row_bytes: Int32,
+):
+    comptime assert A.flat_rank == 2 and O.flat_rank == 1
+    var row = Int(block_idx.x) * MOE_WAVES + Int(thread_idx.x) // WARP_SIZE
+    if row >= Int(n):
+        return
+    var dot = q8_0_row_dot(A, W, 0, row * Int(row_bytes), Int(k_dim))
+    if lane_id() == 0:
+        O[row] = rebind[O.ElementType](dot)
+
+
 def moe_sig_gate_q8_0[
     XLayout: TensorLayout, OLayout: TensorLayout,
 ](
