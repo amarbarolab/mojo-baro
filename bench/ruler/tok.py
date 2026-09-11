@@ -17,7 +17,13 @@ CLI = ROOT / ".work/baro-tokenize"
 def load(pack):
     meta_path = Path(pack) / "tokenizer-meta.json"
     meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
-    gguf = os.environ.get("BARO_GGUF") or meta.get("source_gguf")
+    gguf = os.environ.get("BARO_GGUF")
+    if not gguf:
+        gguf = meta.get("source_gguf")
+        if gguf and not Path(gguf).exists():
+            pure = Path(gguf).with_name(Path(gguf).stem + "-pure" + Path(gguf).suffix)
+            if pure.exists():
+                gguf = str(pure)
     if not gguf or not Path(gguf).exists():
         raise SystemExit(f"tok.load: set BARO_GGUF to the tokenizer's GGUF (got {gguf!r})")
     if not CLI.exists():
