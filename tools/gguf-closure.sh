@@ -45,8 +45,11 @@ fi
 ref=${ref:-.work/engine-pack/ref-tokens-64.txt}
 if [ -f "$out/window.mojo" ] && ! grep -q '^def main' "$out/engine.mojo" 2>/dev/null; then
   kcommit=$(jq -r '.["baro.kernel.commit"]' "$out/meta.json")
-  git show "$kcommit:serve/engine.mojo" > "$out/harness.mojo" || { echo "no serve/engine.mojo at gguf commit $kcommit"; exit 1; }
-  entry="$out/harness.mojo"; echo "split layout: harness serve/engine.mojo@$kcommit"
+  git show "$kcommit:serve/engine.mojo" > "$out/closure_main.mojo" || { echo "no serve/engine.mojo at gguf commit $kcommit"; exit 1; }
+  for m in $(sed -n 's/^from \([a-z_]*\) import.*/\1/p' "$out/closure_main.mojo"); do
+    [ -f "$out/$m.mojo" ] || ! git cat-file -e "$kcommit:serve/$m.mojo" 2>/dev/null || git show "$kcommit:serve/$m.mojo" > "$out/$m.mojo"
+  done
+  entry="$out/closure_main.mojo"; echo "split layout: harness serve/engine.mojo@$kcommit"
 fi
 ./.venv/bin/mojo build "$entry" -I "$out" -o .work/engine-closure 2>&1 | grep -E "error" -A3 && exit 1 || true
 ./.work/engine-closure > "$out/run.log"
