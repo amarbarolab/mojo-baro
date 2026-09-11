@@ -32,7 +32,7 @@ SAMPLER=$!; trap 'kill $SAMPLER 2>/dev/null || true' EXIT
 one() {  # arm label args rep
   local d="$OUT/rep$4/$1/$2"; mkdir -p "$d"
   local bin=.work/bench_dattn pat=amar_dattn
-  [ "$1" = R ] && { bin=bench/ggml-harness/op_bench; pat=flash_attn; }
+  if [ "$1" = R ]; then bin=bench/ggml-harness/op_bench; pat=flash_attn; fi
   # shellcheck disable=SC2086
   rocprofv3 --kernel-trace -f csv -d "$d" -o trace -- $bin $3 > "$d/stdout.txt" 2> "$d/stderr.log" || { echo "FAIL $1 $2 rep$4"; return; }
   grep -q "exceeds" "$d/stdout.txt" || echo "VOID-ROTATION $1 $2 rep$4"
@@ -45,7 +45,7 @@ for rep in $(seq 1 "$REPS"); do
   for arm in $order; do
     grep -vE '^\s*(#|$)' "$TG" | while IFS='|' read -r a label args; do
       a=$(echo "$a" | xargs); label=$(echo "$label" | xargs)
-      [ "$a" = "$arm" ] && one "$arm" "$label" "$args" "$rep"
+      if [ "$a" = "$arm" ]; then one "$arm" "$label" "$args" "$rep"; fi
     done
   done
   echo "rep $rep done ($order)"
