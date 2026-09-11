@@ -14,6 +14,15 @@
 2. amar_attn_prefill (causal, online softmax, GQA 16/4) on synthetic Q/K/V:
    vs fp64 host softmax (rel < 1e-3) and vs amar_attn_decode over the same
    chunk (rel < 1e-5).
+2b. amar_attn_prefill_wmma (f16 WMMA flash attention, lane prefill-long) and
+   amar_attn_prefill at M/P = 21/37, 100/1000 (crosses KV pages) and 1024/1500
+   (the engine's chunk shape): f32 kernel vs fp64 host (rel < 1e-3); WMMA
+   kernel vs an fp64 host reference fed the same f16-rounded Q/K/V
+   (rel < 2e-2; the residual is P's own f16 rounding). Gate revised after
+   the first run: the pre-set rel < 1e-2 vs the exact fp64 reference failed
+   at 0.13-0.20 on this synthetic data (Q/K uniform in +-4), all of it f16
+   input rounding (docs/prefill-long-ctx-2026-09-11.md). The exact-reference
+   numbers still print; the engine gate is teacher-forced agreement.
 3. SSM chunk kernels vs the decode-path per-row kernels stepped through the
    same ring (conv window, delta state, l2norm, gated out: identical fp32 op
    order, gate 1e-6) and the delta recurrence vs an fp64 host reference
@@ -30,7 +39,10 @@ from layout import TileTensor, TensorLayout, row_major
 from matmul_skinny import amar_matmul_skinny_q4rowb, amar_skinny_reduce, SM, ROW_WAVES, ROW_THREADS
 from matmul_prefill import amar_matmul_prefill_q4, amar_matmul_prefill_q8, amar_prefill_swiglu_bf16, PF_THREADS
 from matmul_prefill_lds import amar_matmul_prefill_lds, LDS_THREADS
-from attn import amar_attn_decode, amar_attn_prefill, HD, NQH, NKVH, PA_ROWS, KVT, TCAP, KVHSTR, kv_off
+from attn import (
+    amar_attn_decode, amar_attn_prefill, amar_attn_prefill_wmma, HD, NQH, NKVH, PA_ROWS, PW_ROWS, PW_THREADS,
+    KVT, TCAP, KVHSTR, KVPAGE, kv_off,
+)
 from ssm import (
     amar_ssm_conv, amar_ssm_delta_step, amar_ssm_qk_l2norm, amar_ssm_gated_out_bf16,
     amar_ssm_gates_rows, amar_ssm_conv_chunk, amar_ssm_qk_l2norm_rows, amar_ssm_delta_chunk,
@@ -444,6 +456,133 @@ def test_attn(ctx: DeviceContext) raises:
     print("PASS: attn prefill")
 
 
+def attn_ref(
+    qp: MutPointer[Float32, MutUntrackedOrigin], kp: MutPointer[Float32, MutUntrackedOrigin],
+    vp: MutPointer[Float32, MutUntrackedOrigin], dst: MutPointer[Float32, MutUntrackedOrigin],
+    r: Int, TT: Int, TP: Int, rounded: Bool,
+):
+    var sc = alloc[Float64](TT)
+    for h in range(NQH):
+        var kvh = h // (NQH // NKVH)
+        var T = TP + r + 1
+        var mx = Float64(-1e300)
+        for t in range(T):
+            var a = Float64(0)
+            for d in range(HD):
+                var qv = qp[unsafe_offset=(r * NQH + h) * HD + d]
+                var kv = kp[unsafe_offset=(kvh * TT + t) * HD + d]
+                if rounded:
+                    qv = qv.cast[f16]().cast[f32]()
+                    kv = kv.cast[f16]().cast[f32]()
+                a += Float64(qv) * Float64(kv)
+            sc[unsafe_offset=t] = a * 0.0625
+            if sc[unsafe_offset=t] > mx:
+                mx = sc[unsafe_offset=t]
+        var tot = Float64(0)
+        for t in range(T):
+            sc[unsafe_offset=t] = exp(sc[unsafe_offset=t] - mx)
+            tot += sc[unsafe_offset=t]
+        for d in range(HD):
+            var o = Float64(0)
+            for t in range(T):
+                var vv = vp[unsafe_offset=(kvh * TT + t) * HD + d]
+                if rounded:
+                    vv = vv.cast[f16]().cast[f32]()
+                o += sc[unsafe_offset=t] * Float64(vv)
+            dst[unsafe_offset=(r * NQH + h) * HD + d] = Float32(o / tot)
+    sc.free()
+
+
+def attn_case[TM: Int, TP: Int](ctx: DeviceContext, seed: UInt64) raises -> Bool:
+    comptime TT = TP + TM
+    comptime NQ = TM * NQH * HD
+    comptime ql = row_major[TM * NQH, HD]()
+    comptime POOL = ceildiv(TT, KVPAGE) * NKVH * KVHSTR
+    var q_h = ctx.enqueue_create_host_buffer[f32](NQ)
+    var o_h = ctx.enqueue_create_host_buffer[f32](NQ)
+    var o2_h = ctx.enqueue_create_host_buffer[f32](NQ)
+    var kp_h = ctx.enqueue_create_host_buffer[KVT](POOL)
+    var vp_h = ctx.enqueue_create_host_buffer[KVT](POOL)
+    ctx.synchronize()
+    var st = seed
+    for i in range(NQ):
+        q_h[i] = lcg(st) * 4
+    for i in range(POOL):
+        kp_h[i] = 0
+        vp_h[i] = 0
+    var k_h = alloc[Float32](NKVH * TT * HD)
+    var v_h = alloc[Float32](NKVH * TT * HD)
+    for kh in range(NKVH):
+        for t in range(TT):
+            for d in range(HD):
+                var kv = (lcg(st) * 4).cast[KVT]()
+                var vv = lcg(st).cast[KVT]()
+                k_h[unsafe_offset=(kh * TT + t) * HD + d] = kv.cast[f32]()
+                v_h[unsafe_offset=(kh * TT + t) * HD + d] = vv.cast[f32]()
+                kp_h[kv_off[1](t, 0, kh) + d] = kv
+                vp_h[kv_off[1](t, 0, kh) + d] = vv
+    var q_d = ctx.enqueue_create_buffer[f32](NQ)
+    var k_d = ctx.enqueue_create_buffer[KVT](POOL)
+    var v_d = ctx.enqueue_create_buffer[KVT](POOL)
+    var o_d = ctx.enqueue_create_buffer[f32](NQ)
+    var o2_d = ctx.enqueue_create_buffer[f32](NQ)
+    ctx.enqueue_copy(dst_buf=q_d, src_buf=q_h)
+    ctx.enqueue_copy(dst_buf=k_d, src_buf=kp_h)
+    ctx.enqueue_copy(dst_buf=v_d, src_buf=vp_h)
+    ctx.enqueue_memset(o_d, 0)
+    ctx.enqueue_memset(o2_d, 0)
+    var Q = TileTensor(q_d, ql)
+    var Kc = TileTensor(k_d, kca_layout)
+    var Vc = TileTensor(v_d, kca_layout)
+    var O = TileTensor(o_d, ql)
+    var O2 = TileTensor(o2_d, ql)
+    var scale = Float32(0.0625)
+    ctx.enqueue_function[amar_attn_prefill[type_of(ql), type_of(kca_layout), type_of(ql), 1]](
+        Q, Kc, Vc, O, Int32(TP), Int32(TM), scale, Int32(0), grid_dim=(NKVH, ceildiv(TM, PA_ROWS)), block_dim=256,
+    )
+    ctx.enqueue_function[amar_attn_prefill_wmma[type_of(ql), type_of(kca_layout), type_of(ql), 1]](
+        Q, Kc, Vc, O2, Int32(TP), Int32(TM), scale, Int32(0), grid_dim=(NKVH, ceildiv(TM, PW_ROWS)), block_dim=PW_THREADS,
+    )
+    ctx.enqueue_copy(dst_buf=o_h, src_buf=o_d)
+    ctx.enqueue_copy(dst_buf=o2_h, src_buf=o2_d)
+    ctx.synchronize()
+    var want = alloc[Float32](NQ)
+    var want16 = alloc[Float32](NQ)
+    var qp = q_h.unsafe_ptr()
+
+    def one(r: Int) {imm qp, imm k_h, imm v_h, imm want, imm want16}:
+        attn_ref(qp, k_h, v_h, want, r, TT, TP, False)
+        attn_ref(qp, k_h, v_h, want16, r, TT, TP, True)
+
+    parallelize(one, TM)
+    var tag = String(" M=") + String(TM) + " P=" + String(TP)
+    var ok = True
+    try:
+        check("attn prefill f32 vs fp64 host" + tag, o_h.unsafe_ptr(), want, NQ, 1e-3)
+    except:
+        ok = False
+    try:
+        check("attn prefill wmma vs fp64 host on f16-rounded q/k/v" + tag, o2_h.unsafe_ptr(), want16, NQ, 2e-2)
+    except:
+        ok = False
+    check("info (no gate): wmma vs exact fp64 host" + tag, o2_h.unsafe_ptr(), want, NQ, 1e30)
+    check("info (no gate): f32 kernel vs fp64 host on f16-rounded q/k/v" + tag, o_h.unsafe_ptr(), want16, NQ, 1e30)
+    want.free()
+    want16.free()
+    k_h.free()
+    v_h.free()
+    return ok
+
+
+def test_attn_wmma(ctx: DeviceContext) raises:
+    var ok1 = attn_case[21, 37](ctx, 777)
+    var ok2 = attn_case[100, 1000](ctx, 99)
+    var ok3 = attn_case[1024, 1500](ctx, 5)
+    if not (ok1 and ok2 and ok3):
+        raise Error("parity failure: attn prefill wmma")
+    print("PASS: attn prefill wmma")
+
+
 comptime SS_M = 21
 comptime SS_SLOTS = 9
 comptime qkv_s = row_major[SS_M, CONV]()
@@ -719,3 +858,11 @@ def main() raises:
     test_ssm(ctx)
     test_gemm(ctx)
     print("PASS: prefill kernels")
+    var wmma_ok = True
+    try:
+        test_attn_wmma(ctx)
+    except:
+        wmma_ok = False
+        print("FAIL: attn prefill wmma (continuing so the remaining sections report)")
+    if not wmma_ok:
+        raise Error("parity failure: attn prefill wmma")

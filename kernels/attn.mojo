@@ -4,6 +4,7 @@ from std.math import cos, exp, fma, log, rsqrt, sin
 from max.gpu.memory import AddressSpace
 from max.gpu.sync import barrier
 from layout import TileTensor, TensorLayout, row_major, stack_allocation
+from layout.tensor_core import mma
 
 comptime f32 = DType.float32
 comptime HD = 256
@@ -388,3 +389,142 @@ def amar_attn_prefill[
         var inv = 1 / l_run
         comptime for i in range(8):
             O_[qrow, lane * 8 + i] = rebind[O_.ElementType](o[i] * inv)
+
+
+comptime f16 = DType.float16
+comptime PW_WAVES = 4
+comptime PW_THREADS = PW_WAVES * WARP_SIZE
+comptime PW_GQ = NQH // NKVH
+comptime PW_ROWS = PW_WAVES * 16 // PW_GQ
+comptime PW_TK = 16
+comptime PW_QS = HD + 8
+comptime PW_VS = PW_TK + 8
+comptime PW_PS = Float32(32768.0)
+
+
+def amar_attn_prefill_wmma[
+    QLayout: TensorLayout, KLayout: TensorLayout, OLayout: TensorLayout, NAT: Int
+](
+    Q: TileTensor[f32, QLayout, MutAnyOrigin],
+    Kc: TileTensor[KVT, KLayout, MutAnyOrigin],
+    Vc: TileTensor[KVT, KLayout, MutAnyOrigin],
+    O: TileTensor[f32, OLayout, MutAnyOrigin],
+    pos: Int32,
+    m: Int32,
+    scale: Float32,
+    att_i: Int32,
+):
+    comptime assert Q.flat_rank == 2 and Kc.flat_rank == 1 and Vc.flat_rank == 1 and O.flat_rank == 2
+    var kvh = Int(block_idx.x)
+    var tile = Int(block_idx.y)
+    var tid = Int(thread_idx.x)
+    var wave = tid // WARP_SIZE
+    var lane = tid % WARP_SIZE
+    var h = lane % 16
+    var half = lane // 16
+    var M = Int(m)
+    var P = Int(pos)
+    var ai = Int(att_i)
+    var row0 = tile * PW_ROWS
+    var t_blk = P + min(row0 + PW_ROWS, M)
+    var wrow = row0 + wave * (16 // PW_GQ)
+    var r = wrow + h // PW_GQ
+    var valid = r < M
+    var qrow = r * NQH + kvh * PW_GQ + h % PW_GQ
+    var wave_on = wrow < M
+    var wlim = P + min(wrow + 16 // PW_GQ - 1, M - 1)
+    var lim = P + r
+
+    var qs = stack_allocation[f16, address_space = AddressSpace.SHARED](row_major[PW_WAVES * 16, PW_QS]())
+    var ks = stack_allocation[f16, address_space = AddressSpace.SHARED](row_major[PW_TK, PW_QS]())
+    var vt = stack_allocation[f16, address_space = AddressSpace.SHARED](row_major[HD, PW_VS]())
+    var qsv = qs.vectorize[1, 8]()
+    var ksv = ks.vectorize[1, 8]()
+    var vtv = vt.vectorize[1, 8]()
+    var Qv = Q.vectorize[1, 8]()
+    var O_ = O
+
+    comptime for s in range(PW_WAVES * 16 * HD // 8 // PW_THREADS):
+        var v = tid + s * PW_THREADS
+        var qi = v // (HD // 8)
+        var c = v % (HD // 8)
+        var rr = row0 + qi // PW_GQ
+        var x = SIMD[f16, 8](0)
+        if rr < M:
+            x = rebind[SIMD[f32, 8]](Qv[rr * NQH + kvh * PW_GQ + qi % PW_GQ, c]).cast[f16]()
+        qsv[qi, c] = rebind[qsv.ElementType](x)
+
+    var m_run = Float32(-3.4e38)
+    var l_run = Float32(0)
+    var acc = InlineArray[SIMD[f32, 8], HD // 16](fill=SIMD[f32, 8](0))
+    var t0 = 0
+    while t0 < t_blk:
+        barrier()
+        comptime for s in range(PW_TK * HD // 8 // PW_THREADS):
+            var v = tid + s * PW_THREADS
+            var key = v // (HD // 8)
+            var c = v % (HD // 8)
+            var p = t0 + key
+            var x = SIMD[f16, 8](0)
+            if p < t_blk:
+                var Kr = TileTensor(Kc.ptr.unsafe_offset(kv_off[NAT](p, ai, kvh)), row_major[HD]()).vectorize[8]()
+                x = rebind[SIMD[KVT, 8]](Kr[c]).cast[f16]()
+            ksv[key, c] = rebind[ksv.ElementType](x)
+        comptime for s in range(PW_TK * HD // 8 // PW_THREADS):
+            var v = tid + s * PW_THREADS
+            var key = v % PW_TK
+            var c = v // PW_TK
+            var p = t0 + key
+            var x = SIMD[f16, 8](0)
+            if p < t_blk:
+                var Vr = TileTensor(Vc.ptr.unsafe_offset(kv_off[NAT](p, ai, kvh)), row_major[HD]()).vectorize[8]()
+                x = rebind[SIMD[KVT, 8]](Vr[c]).cast[f16]()
+            comptime for i in range(8):
+                vt[c * 8 + i, key] = rebind[vt.ElementType](x[i])
+        barrier()
+        if wave_on and t0 <= wlim:
+            var s0 = SIMD[f32, 8](0)
+            var s1 = SIMD[f32, 8](0)
+            comptime for c in range(HD // 16):
+                var a = rebind[SIMD[f16, 8]](ksv[h, 2 * c]).join(rebind[SIMD[f16, 8]](ksv[h, 2 * c + 1]))
+                var b = rebind[SIMD[f16, 8]](qsv[wave * 16 + h, 2 * c]).join(rebind[SIMD[f16, 8]](qsv[wave * 16 + h, 2 * c + 1]))
+                var t = SIMD[f32, 8](0)
+                comptime if c % 2 == 0:
+                    mma(t, a, b, s0)
+                    s0 = t
+                else:
+                    mma(t, a, b, s1)
+                    s1 = t
+            var sc = (s0 + s1) * scale
+            var mx = Float32(-3.4e38)
+            comptime for i in range(8):
+                if valid and t0 + 2 * i + half <= lim:
+                    mx = max(mx, sc[i])
+            mx = max(mx, warp.shuffle_xor(mx, UInt32(16)))
+            var m_new = max(m_run, mx)
+            var alpha = exp(m_run - m_new)
+            var pv = SIMD[f32, 8](0)
+            comptime for i in range(8):
+                if valid and t0 + 2 * i + half <= lim:
+                    pv[i] = exp(sc[i] - m_new)
+            var ps = pv.reduce_add()
+            ps += warp.shuffle_xor(ps, UInt32(16))
+            l_run = l_run * alpha + ps
+            m_run = m_new
+            var bf = SIMD[f16, 16](0)
+            comptime for i in range(8):
+                var own = (pv[i] * PW_PS).cast[f16]()
+                var oth = (warp.shuffle_xor(pv[i], UInt32(16)) * PW_PS).cast[f16]()
+                bf[2 * i] = own if half == 0 else oth
+                bf[2 * i + 1] = oth if half == 0 else own
+            comptime for dt in range(HD // 16):
+                var a = rebind[SIMD[f16, 8]](vtv[dt * 16 + h, 0]).join(rebind[SIMD[f16, 8]](vtv[dt * 16 + h, 1]))
+                var t = SIMD[f32, 8](0)
+                mma(t, a, bf, acc[dt] * alpha)
+                acc[dt] = t
+        t0 += PW_TK
+    if valid:
+        var inv = 1 / (l_run * PW_PS)
+        comptime for dt in range(HD // 16):
+            comptime for i in range(8):
+                O_[qrow, dt * 16 + 2 * i + half] = rebind[O_.ElementType](acc[dt][i] * inv)

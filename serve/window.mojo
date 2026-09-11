@@ -393,7 +393,7 @@ def prefill_forward(
             if prof:
                 ctx.synchronize()
                 ta = perf_counter_ns()
-            ctx.enqueue_function[attp_k](Qp, Kc, Vc, Aop, Int32(pos), Int32(m), Float32(0.0625), Int32(att_i), grid_dim=(NKVH, ceildiv(m, PA_ROWS)), block_dim=256)
+            ctx.enqueue_function[attpw_k](Qp, Kc, Vc, Aop, Int32(pos), Int32(m), Float32(0.0625), Int32(att_i), grid_dim=(NKVH, ceildiv(m, PW_ROWS)), block_dim=PW_THREADS)
             if prof:
                 ctx.synchronize()
                 pfx[0] += Int(perf_counter_ns() - ta)
