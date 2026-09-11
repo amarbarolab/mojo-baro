@@ -4,7 +4,10 @@
 #   cargo clippy clean, cargo test (protocol parser), engine + server build,
 #   /health, one completion by token ids == ref-tokens-64 (tools/check-tokens.sh),
 #   one streamed (SSE) request == ref, two concurrent requests queued == ref,
-#   a rejected over-length request, clean shutdown (SIGINT: server exit 0, engine gone).
+#   a stop-string ends generation early (M2 control block), a mid-stream
+#   cancel stops generation within one window and the next request still
+#   matches ref, a rejected over-length request, clean shutdown (SIGINT:
+#   server exit 0, engine gone).
 # Pack: BARO_PACK (default .work/engine-pack-q4); ref = $pack/ref-tokens-64.txt.
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -137,6 +140,78 @@ assert text == full, (text, full)
 print(len(chunks) - 1, "delta chunks; streamed text == non-streamed text")
 PY
   ok chat-stream "$(cat "$out/chat-stream.check")"
+
+  # --- stop strings end generation early (M2 control block) ------------------------
+  python3 - "$out" "$url" "$ref" "$prompt_json" <<'PY' > "$out/stop.check" || die stop "$(cat "$out/stop.check")"
+import json, sys, urllib.request
+out, url, ref, prompt = sys.argv[1], sys.argv[2], sys.argv[3], json.loads(sys.argv[4])
+ref_ids = [int(x) for x in open(ref).read().split()]
+
+def post(path, body):
+    req = urllib.request.Request(f"{url}{path}", data=json.dumps(body).encode(), headers={"content-type": "application/json"})
+    return json.load(urllib.request.urlopen(req))
+
+# A stop string built from the reference continuation's own first k tokens,
+# kept only if detokenize->tokenize round-trips exactly (so the engine's
+# token-level match is guaranteed to land, not a tokenizer-boundary guess).
+stop_k, stop_text = None, None
+for k in range(1, 9):
+    text = post("/detokenize", {"tokens": ref_ids[:k]})["content"]
+    if post("/tokenize", {"content": text})["tokens"] == ref_ids[:k]:
+        stop_k, stop_text = k, text
+        break
+assert stop_k is not None, f"no exact round-trip in the first 8 ref tokens: {ref_ids[:8]}"
+
+d = post("/v1/completions", {"prompt": prompt, "max_tokens": 64, "spec": False, "stop": stop_text})
+toks = d["choices"][0]["tokens"]
+assert d["choices"][0]["finish_reason"] == "stop", d
+assert toks == ref_ids[:stop_k], (toks, ref_ids[:stop_k])
+print(f"stopped at token {stop_k} ({stop_text!r}) of max_tokens 64, matches ref prefix, finish_reason=stop")
+PY
+  ok stop "$(cat "$out/stop.check")"
+
+  # --- cancel mid-generation (M2 control block) -------------------------------------
+  : > "$out/cancel.sse"
+  curl -sfN "$url/v1/chat/completions" -H 'content-type: application/json' \
+    -d '{"messages": [{"role": "user", "content": "Say hello."}], "max_tokens": 256, "spec": false, "stream": true}' > "$out/cancel.sse" &
+  cpid=$!
+  req_id=""
+  for _ in $(seq 1 200); do
+    req_id=$(python3 -c "
+import json
+for l in open('$out/cancel.sse'):
+    if l.startswith('data: ') and l.strip() != 'data: [DONE]':
+        try:
+            print(json.loads(l[6:])['id']); break
+        except Exception:
+            pass
+" 2>/dev/null) || true
+    [ -n "$req_id" ] && break
+    kill -0 "$cpid" 2>/dev/null || break
+    sleep 0.02
+  done
+  [ -n "$req_id" ] || die cancel "no request id observed in the SSE stream before it ended"
+  cancel_resp=$(curl -sf "$url/v1/cancel" -H 'content-type: application/json' -d "{\"id\": \"$req_id\"}") || die cancel "curl to /v1/cancel failed"
+  wait "$cpid" || true
+  python3 - "$out" "$cancel_resp" <<'PY' > "$out/cancel.check" || die cancel "$(cat "$out/cancel.check")"
+import json, sys
+out, cancel_resp = sys.argv[1], sys.argv[2]
+datas = [l[6:] for l in open(f"{out}/cancel.sse").read().split("\n") if l.startswith("data: ")]
+assert datas and datas[-1] == "[DONE]", "no [DONE]"
+chunks = [json.loads(d) for d in datas[:-1]]
+fin = chunks[-1]["choices"][0]["finish_reason"]
+n_tok = len(chunks) - 1
+assert json.loads(cancel_resp)["cancelled"] is True, cancel_resp
+assert fin == "cancelled", chunks[-1]
+assert n_tok < 256, n_tok
+print(f"cancelled after {n_tok} of 256 tokens, /v1/cancel -> {cancel_resp.strip()}")
+PY
+  ok cancel "$(cat "$out/cancel.check")"
+  curl -sf "$url/v1/completions" -H 'content-type: application/json' \
+    -d "{\"prompt\": $prompt_json, \"max_tokens\": 64, \"spec\": false}" > "$out/postcancel.json" || die cancel-recovery "post-cancel request: curl failed"
+  python3 -c "import json; d=json.load(open('$out/postcancel.json')); print('GENERATED:', ' '.join(map(str, d['choices'][0]['tokens'])), '')" > "$out/postcancel.gen" || die cancel-recovery "$(cat "$out/postcancel.json")"
+  tools/check-tokens.sh "$ref" "$out/postcancel.gen" > "$out/postcancel.check" 2>&1 || die cancel-recovery "$(cat "$out/postcancel.check")"
+  ok cancel-recovery "next request after cancel: $(cat "$out/postcancel.check")"
 else
   echo "SKIP text endpoints: no tokenizer.json in $pack" | tee -a "$out/SUMMARY.txt"
 fi

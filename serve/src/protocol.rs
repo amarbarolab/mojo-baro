@@ -14,6 +14,17 @@ pub struct Request {
     pub prompt: Vec<u32>,
     pub n: u32,
     pub spec: bool,
+    /// Token-id sequences; generation stops as soon as the tail of the
+    /// generated tokens equals any of them (EOS ids included, as length-1
+    /// sequences -- `serve/src/main.rs` builds this list).
+    pub stop: Vec<Vec<u32>>,
+}
+
+/// The line that cancels the request currently decoding, if its id matches.
+/// Written to the same stdin the request line uses; the engine polls for it
+/// once per decode window.
+pub fn cancel_line(id: u64) -> String {
+    format!("{{\"cancel\":{id}}}\n")
 }
 
 impl Request {
@@ -37,6 +48,10 @@ pub struct DoneStats {
     pub cached: Option<u64>,
     pub prefill_rows: Option<u64>,
     pub restore_s: Option<f64>,
+    /// "length" | "stop" | "cancelled"; absent on an older engine that has
+    /// no concept of an early stop, in which case the caller falls back to
+    /// its own client-side EOS check.
+    pub finish: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -131,6 +146,7 @@ pub fn parse_line(line: &str) -> EngineMsg {
                     cached: get_u64(&v, "cached"),
                     prefill_rows: get_u64(&v, "prefill_rows"),
                     restore_s: get_f64(&v, "restore_s"),
+                    finish: v.get("finish").and_then(Value::as_str).map(str::to_string),
                 },
             };
         }
@@ -153,8 +169,29 @@ mod tests {
             prompt: vec![760, 6511, 314],
             n: 64,
             spec: false,
+            stop: vec![],
         };
-        assert_eq!(r.line(), "{\"id\":7,\"prompt\":[760,6511,314],\"n\":64,\"spec\":false}\n");
+        assert_eq!(r.line(), "{\"id\":7,\"prompt\":[760,6511,314],\"n\":64,\"spec\":false,\"stop\":[]}\n");
+    }
+
+    #[test]
+    fn request_line_carries_stop_sequences() {
+        let r = Request {
+            id: 1,
+            prompt: vec![1],
+            n: 8,
+            spec: false,
+            stop: vec![vec![151645], vec![9707, 11]],
+        };
+        assert_eq!(
+            r.line(),
+            "{\"id\":1,\"prompt\":[1],\"n\":8,\"spec\":false,\"stop\":[[151645],[9707,11]]}\n"
+        );
+    }
+
+    #[test]
+    fn cancel_line_is_a_bare_id() {
+        assert_eq!(cancel_line(42), "{\"cancel\":42}\n");
     }
 
     #[test]
@@ -190,11 +227,28 @@ mod tests {
                 assert_eq!(stats.cached, Some(7913));
                 assert_eq!(stats.prefill_rows, Some(41));
                 assert_eq!(stats.restore_s, Some(0.002));
+                assert_eq!(stats.finish, None);
             }
             other => panic!("expected Done, got {other:?}"),
         }
         let m = parse_line("{\"id\":4,\"done\":true,\"n\":1,\"prefill_s\":0.01,\"decode_s\":0.0,\"tok_s\":0.0}");
         assert!(matches!(m, EngineMsg::Done { id: 4, .. }));
+    }
+
+    #[test]
+    fn done_line_carries_finish_reason() {
+        for (finish, n) in [("stop", 9u32), ("cancelled", 3u32)] {
+            let m = parse_line(&format!(
+                "{{\"id\":5,\"done\":true,\"n\":{n},\"prefill_s\":0.01,\"decode_s\":0.1,\"tok_s\":1.0,\"finish\":\"{finish}\"}}"
+            ));
+            match m {
+                EngineMsg::Done { stats, .. } => {
+                    assert_eq!(stats.n, n);
+                    assert_eq!(stats.finish, Some(finish.to_string()));
+                }
+                other => panic!("expected Done, got {other:?}"),
+            }
+        }
     }
 
     #[test]

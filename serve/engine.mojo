@@ -42,6 +42,30 @@ def read_line(fd: Int) raises -> Optional[String]:
     return String(from_utf8=Span[UInt8](buf))
 
 
+def cancel_pending(fd: Int, req_id: Int) raises -> Bool:
+    # Non-blocking check for a "{"cancel":ID}" line on fd, once per
+    # step_window call. poll(fd, POLLIN, 0) never blocks; a hit means the
+    # writer's single write() of a short line is already in the pipe, so the
+    # blocking read_line below will not stall on a torn line.
+    var pfd = List[UInt8](unsafe_uninit_length=8)
+    var p = pfd.unsafe_ptr()
+    p.unsafe_bitcast[Int32]().unsafe_offset(0)[] = Int32(fd)
+    p.unsafe_bitcast[Int16]().unsafe_offset(2)[] = Int16(1)  # events = POLLIN
+    p.unsafe_bitcast[Int16]().unsafe_offset(3)[] = Int16(0)  # revents
+    var r = external_call["poll", Int32](p, UInt64(1), Int32(0))
+    if r <= 0 or (Int(p.unsafe_bitcast[Int16]().unsafe_offset(3)[]) & 1) == 0:
+        return False
+    var line_in = read_line(fd)
+    if not line_in:
+        return False
+    var line = line_in.value()
+    var i = json_key(line, "cancel")
+    var cid = 0
+    if i < 0 or not json_int(line, i, cid):
+        return False
+    return cid == req_id
+
+
 def json_key(line: String, key: String) -> Int:
     # Index of the first byte of the value for "key": ..., or -1.
     var i = line.find(String("\"") + key + "\"")
@@ -77,10 +101,11 @@ def json_int(line: String, mut i: Int, mut v: Int) -> Bool:
 
 
 def parse_request(
-    line: String, mut id: Int, mut prompt: List[Int], mut n: Int, mut spec: Bool, mut has_spec: Bool
+    line: String, mut id: Int, mut prompt: List[Int], mut n: Int, mut spec: Bool, mut has_spec: Bool, mut stop: List[List[Int]]
 ) -> String:
-    # {"id":INT,"prompt":[INT,...],"n":INT,"spec":BOOL}; spec optional.
-    # Returns "" on success, else the error text (id is set when it parsed).
+    # {"id":INT,"prompt":[INT,...],"n":INT,"spec":BOOL,"stop":[[INT,...],...]};
+    # spec and stop optional. Returns "" on success, else the error text (id
+    # is set when it parsed).
     id = 0
     var i = json_key(line, "id")
     if i < 0 or not json_int(line, i, id):
@@ -115,6 +140,35 @@ def parse_request(
             has_spec = True
         else:
             return "spec must be true or false"
+    var si = json_key(line, "stop")
+    if si >= 0:
+        if si >= len(b) or b[si] != 91:
+            return "stop must be an array of arrays"
+        si += 1
+        while True:
+            while si < len(b) and (b[si] == 32 or b[si] == 44):
+                si += 1
+            if si >= len(b):
+                return "unterminated stop array"
+            if b[si] == 93:
+                break
+            if b[si] != 91:
+                return "stop entries must be arrays of token ids"
+            si += 1
+            var seq = List[Int]()
+            while True:
+                while si < len(b) and (b[si] == 32 or b[si] == 44):
+                    si += 1
+                if si >= len(b):
+                    return "unterminated stop sequence"
+                if b[si] == 93:
+                    si += 1
+                    break
+                var v2 = 0
+                if not json_int(line, si, v2) or v2 < 0:
+                    return "stop sequence must hold non-negative integers"
+                seq.append(v2)
+            stop.append(seq^)
     return ""
 
 
@@ -213,6 +267,7 @@ def main() raises:
         var ckpt_idx = -1
         var cached = 0
         var restore_s = 0.0
+        var stop_seqs = List[List[Int]]()
         if serve:
             var line_in = read_line(0)
             if not line_in:
@@ -220,7 +275,7 @@ def main() raises:
             var req_n = 0
             var req_spec = False
             var req_has_spec = False
-            var perr = parse_request(line_in.value(), req_id, prompt, req_n, req_spec, req_has_spec)
+            var perr = parse_request(line_in.value(), req_id, prompt, req_n, req_spec, req_has_spec, stop_seqs)
             if perr == "" and len(prompt) < 1:
                 perr = "empty prompt"
             if perr == "" and req_n < 1:
@@ -330,6 +385,8 @@ def main() raises:
         wst.pos = cached
         wst.pos_prev = cached
         var prefill_done = False
+        var cancelled = False
+        var stopped = False
         # The stopwatch stays here, in the harness that is never embedded in a
         # gguf: step_window cannot reach t0, t_prefill_end or dt (P-A, 2026-09-08).
         while wst.pos < n_total - 1:
@@ -340,6 +397,32 @@ def main() raises:
                 ctx.synchronize()
                 t_prefill_end = perf_counter_ns()
                 prefill_done = True
+            if serve and cancel_pending(0, req_id):
+                cancelled = True
+                break
+            if len(stop_seqs) > 0 and wst.pos >= len(prompt):
+                ctx.synchronize()
+                ctx.enqueue_copy(dst_buf=toks_h, src_buf=toks_d)
+                ctx.synchronize()
+                var gen_len = wst.pos + 1 - len(prompt)
+                for si in range(len(stop_seqs)):
+                    var seq = stop_seqs[si].copy()
+                    var L = len(seq)
+                    if L == 0 or L > gen_len:
+                        continue
+                    var ok = True
+                    for k in range(L):
+                        if Int(toks_h[wst.pos - L + 1 + k]) != seq[k]:
+                            ok = False
+                            break
+                    if ok:
+                        stopped = True
+                        break
+                if stopped:
+                    break
+        if not prefill_done:
+            ctx.synchronize()
+            t_prefill_end = perf_counter_ns()
 
         var t_host = Float64(perf_counter_ns() - t0) / 1e9
         ctx.synchronize()
@@ -442,16 +525,19 @@ def main() raises:
         ctx.enqueue_copy(dst_buf=toks_h, src_buf=toks_d)
         ctx.synchronize()
         var generated = List[Int]()
-        for i in range(len(prompt), n_total):
+        for i in range(len(prompt), wst.pos + 1):
             generated.append(Int(toks_h[i]))
         var prefill_s = Float64(t_prefill_end - t0) / 1e9
         var decode_s = dt - prefill_s
+        var n_gen = len(generated)
         # tok/s_gen is the only number comparable to llama.cpp: it divides
-        # gen_n - 1 by decode time alone, matching timings.predicted_per_second.
-        # tok/s_total includes prefill and is reported for completeness only --
-        # it is not the engine's throughput against any external baseline.
-        print("tokens:", len(generated), " prefill_s:", prefill_s, " decode_s:", decode_s)
-        print("tok/s_total:", Float64(gen_n) / dt, " tok/s_gen:", Float64(gen_n - 1) / decode_s)
+        # n_gen - 1 by decode time alone, matching timings.predicted_per_second
+        # (n_gen, not the requested gen_n, so an early stop/cancel reports the
+        # rate over what actually ran). tok/s_total includes prefill and is
+        # reported for completeness only -- it is not the engine's throughput
+        # against any external baseline.
+        print("tokens:", n_gen, " prefill_s:", prefill_s, " decode_s:", decode_s)
+        print("tok/s_total:", Float64(n_gen) / dt, " tok/s_gen:", Float64(n_gen - 1) / decode_s if n_gen > 1 else 0.0)
         var line = String("")
         for i in range(len(generated)):
             line += String(generated[i]) + " "
@@ -459,10 +545,16 @@ def main() raises:
         if spec:
             print("mtp: drafted", wst.n_drafted, " accepted", wst.n_accepted, " k", kcfg)
         if serve:
-            var done_line = String("{\"id\":") + String(req_id) + ",\"done\":true,\"n\":" + String(len(generated))
+            var finish = String("length")
+            if cancelled:
+                finish = String("cancelled")
+            elif stopped:
+                finish = String("stop")
+            var done_line = String("{\"id\":") + String(req_id) + ",\"done\":true,\"n\":" + String(n_gen)
             done_line += ",\"prefill_s\":" + String(prefill_s) + ",\"decode_s\":" + String(decode_s)
-            done_line += ",\"tok_s\":" + String(Float64(gen_n - 1) / decode_s if gen_n > 1 else 0.0)
+            done_line += ",\"tok_s\":" + String(Float64(n_gen - 1) / decode_s if n_gen > 1 else 0.0)
             done_line += ",\"cached\":" + String(cached) + ",\"prefill_rows\":" + String(prefill_rows) + ",\"restore_s\":" + String(restore_s) + ",\"checkpoints\":" + String(chain.count_valid())
+            done_line += ",\"finish\":\"" + finish + "\""
             if spec:
                 done_line += ",\"drafted\":" + String(wst.n_drafted) + ",\"accepted\":" + String(wst.n_accepted) + ",\"k\":" + String(kcfg)
             print(done_line + "}")

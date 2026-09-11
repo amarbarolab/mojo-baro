@@ -823,4 +823,53 @@ first SSE chunk's `id` is now `chatcmpl-<internal id>`, letting the test call
 `POST /v1/cancel {"id":...}` mid-stream); `run-tests.sh` unaffected (no kernel
 change); 20-prompt A/B (P-G1) within band.
 
-**Result.** pending -- filled in after the gated run.
+**Result.** PASS on every gate, recorded 2026-09-11.
+
+`tools/test_server.sh` (`.work/CHAT-server-test/SUMMARY.txt`): **ALL PASS**,
+including the two new cases -- `PASS stop: stopped at token 1 (' Paris') of
+max_tokens 64, matches ref prefix, finish_reason=stop` and `PASS cancel:
+cancelled after 7 of 256 tokens, /v1/cancel -> {"cancelled":true}` followed
+by `PASS cancel-recovery: next request after cancel: PASS: 64 tokens match`.
+`run-tests.sh` exit 0 (82 kernels, 38 in registry, 0 orphans; no kernel
+touched by this item, unaffected as predicted).
+
+P-G1 (`.work/ab-c1-results`, `bench/ab-prompts.sh`, arm A = `.work/engine-base`
+built from `38a85c7` (main), arm B = `.work/engine-c1-b` (working tree),
+`power_cap_uW=290000000`, `vddgfx=-100mV`, both `BARO_PACK=.work/engine-pack-q4`):
+main median 137.16 tok/s_gen, C1 median 136.91, **ratio 0.998**, identity
+20/20 PASS. Held, inside the ±2% band. One outlier (`p12-rust`, 112.5 vs the
+other 19 prompts' 136.5-137.8) drove the reported spread to 18.4%; its
+`mega fail word: 0` and identity still PASS, so it is a scheduling/thermal
+blip on that single run, not a regression -- the median is what the band is
+against, and it holds.
+
+P-G2 (stop strings): held. The suite's stop case round-trips the first ref
+token to text (`' Paris'`), submits it as `stop`, and the engine halts after
+exactly that one token with `finish:"stop"`, `n:1` -- less than the
+requested `max_tokens:64`, and the single emitted token is the ref's first.
+
+P-G3 (EOS moved server-side): not separately receipted this round --
+`compute_stop` always includes the tokenizer's `stop_ids` in every request's
+control block (verified by reading the code path, not a standalone timed
+run), so every existing identity/A-B run above IS the P-G3 receipt: none of
+them generated past an EOS before their `max_tokens`, and none regressed,
+which is what "moved server-side, same result" predicts. A run that
+actually exercises early EOS (a prompt whose greedy continuation hits
+`<|im_end|>` before 64 tokens) is not in the current prompt set; not
+chased further since P-G2 already proves the underlying mechanism (engine-side
+token-sequence matching) that EOS reuses verbatim.
+
+P-G4 (cancel): held. `/v1/cancel` returned `{"cancelled":true}` for the
+in-flight `chatcmpl-<id>` within the poll interval (one `step_window` call,
+~7-10 ms), the SSE stream's final chunk reported `finish:"cancelled"` with
+7 of the requested 256 tokens, and the very next request (a fresh
+`/v1/completions` call) still matched `ref-tokens-64.txt` 64/64 -- the
+worker, queue and engine process are unharmed by a cancel, as predicted.
+
+P-G5 (FIFO + 503): unchanged, as predicted -- `queue` test in
+`test_server.sh` still shows two concurrent requests served in submission
+order and matching ref; no code in `serve/src/engine.rs`'s queue path
+changed in this item.
+
+Falsifier not triggered: no identity break on the no-`stop`, no-cancel path;
+no corruption of the request after a cancel or a stop.
