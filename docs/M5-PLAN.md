@@ -23,10 +23,10 @@ before touching anything. Board: `~/Brain/mojo-baro/whiteboard.md`.
   (`prompt-tokens.txt` beside it). Engine pack = `.work/engine-pack/`
   (built FROM the BARO gguf; `-orig` sibling from the original file).
 - Self-describing model: `~/Models/qwythos-9b-claude-mythos-5-1m-mtp-bf16/
-  Qwythos-9B-Claude-Mythos-5-1M-MTP-BF16-BARO-9b8a399.gguf` embeds all kernel +
-  engine sources (11 `baro.kernel.src.*` KVs). Closure verified 2026-09-05:
+  Qwythos-9B-Claude-Mythos-5-1M-MTP-BF16-BARO-3824e20.gguf` embeds all kernel +
+  engine sources (11 `baro.kernel.src.*` KVs). Closure verified 2026-09-11 (`3824e20`):
   `tools/gguf-closure.sh` builds shim + engine from the file's own sources,
-  PASS 64/64 at 69.69 tok/s_gen. **Re-embed after any kernel/engine change**
+  PASS 64/64 at 136.61 tok/s_gen. **Re-embed after any kernel/engine change**
   (`tools/gguf-embed.py`) or the model ships stale kernels — that bug already
   happened once, and the pre-`9b8a399` file sat 78 commits stale.
   **`serve/registry.mojo` MUST be in the file list**: `engine.mojo` does
