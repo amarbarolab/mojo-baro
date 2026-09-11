@@ -18,8 +18,8 @@ comptime TCAP = 1 << 24
 
 
 @always_inline
-def kv_off[NAT: Int](t: Int, att_i: Int, kvh: Int) -> Int:
-    return (((t >> KVPSH) * NAT + att_i) * NKVH + kvh) * KVHSTR + (t & (KVPAGE - 1)) * HD
+def kv_off[NAT: Int, HD_: Int = HD, NKVH_: Int = NKVH](t: Int, att_i: Int, kvh: Int) -> Int:
+    return (((t >> KVPSH) * NAT + att_i) * NKVH_ + kvh) * (KVPAGE * HD_ + KVPAD) + (t & (KVPAGE - 1)) * HD_
 
 
 def amar_head_rmsnorm[
@@ -51,7 +51,7 @@ def amar_head_rmsnorm[
 @always_inline
 def attn_head_span[
     QLayout: TensorLayout, KLayout: TensorLayout,
-    QsL: TensorLayout, ScL: TensorLayout, RdL: TensorLayout, NAT: Int
+    QsL: TensorLayout, ScL: TensorLayout, RdL: TensorLayout, NAT: Int, HD_: Int = HD, NKVH_: Int = NKVH
 ](
     Q: TileTensor[f32, QLayout, MutAnyOrigin],
     Kc: TileTensor[KVT, KLayout, MutAnyOrigin],
@@ -63,8 +63,9 @@ def attn_head_span[
 ) -> SIMD[f32, 4]:
     comptime assert Q.flat_rank == 2 and Kc.flat_rank == 1 and Vc.flat_rank == 1
     comptime assert qs.flat_rank == 1 and scores.flat_rank == 1 and red.flat_rank == 1
+    comptime assert HD_ % WARP_SIZE == 0
     var wave = tid // WARP_SIZE
-    if tid < HD:
+    if tid < HD_:
         qs[tid] = rebind[qs.ElementType](Q[qrow, tid])
     barrier()
     var qv = qs.vectorize[8]()
@@ -77,13 +78,13 @@ def attn_head_span[
     while t0 < t_hi:
         barrier()
         var s = Float32(-3.4e38)
-        if tid < HD:
+        if tid < HD_:
             var t = t0 + tid
             if t < t_hi:
-                var kb = kv_off[NAT](t, att_i, kvh)
-                var Kr = TileTensor(kp.unsafe_offset(kb), row_major[HD]()).vectorize[8]()
+                var kb = kv_off[NAT, HD_, NKVH_](t, att_i, kvh)
+                var Kr = TileTensor(kp.unsafe_offset(kb), row_major[HD_]()).vectorize[8]()
                 var acc: Float32 = 0
-                for d8 in range(HD // 8):
+                for d8 in range(HD_ // 8):
                     var k8 = rebind[SIMD[KVT, 8]](Kr[d8]).cast[f32]()
                     var q8 = rebind[SIMD[f32, 8]](qv[d8])
                     comptime for j in range(8):
@@ -95,14 +96,14 @@ def attn_head_span[
                 red[wave] = rebind[red.ElementType](wmax)
         barrier()
         var cmax = Float32(-3.4e38)
-        comptime for w in range(HD // WARP_SIZE):
+        comptime for w in range(HD_ // WARP_SIZE):
             var sc = rebind[Scalar[f32]](red[w])
             if sc > cmax:
                 cmax = sc
         var m_new = max(m_run, cmax)
         var alpha = exp(m_run - m_new)
         barrier()
-        if tid < HD:
+        if tid < HD_:
             var e = exp(s - m_new)
             scores[tid] = rebind[scores.ElementType](e)
             var wsum = warp.sum(e)
@@ -110,29 +111,29 @@ def attn_head_span[
                 red[wave] = rebind[red.ElementType](wsum)
         barrier()
         var csum = Float32(0)
-        comptime for w in range(HD // WARP_SIZE):
+        comptime for w in range(HD_ // WARP_SIZE):
             csum += rebind[Scalar[f32]](red[w])
         l_run = l_run * alpha + csum
         m_run = m_new
         o = o * alpha
-        if tid < HD:
+        if tid < HD_:
             var n = t_hi - t0
-            if n > HD:
-                n = HD
+            if n > HD_:
+                n = HD_
             var tt = 0
             while tt + 8 <= n:
                 var v = InlineArray[Float32, 8](uninitialized=True)
                 var sc = InlineArray[Float32, 8](uninitialized=True)
                 comptime for j in range(8):
-                    v[j] = vp[unsafe_offset=kv_off[NAT](t0 + tt + j, att_i, kvh) + tid].cast[f32]()
+                    v[j] = vp[unsafe_offset=kv_off[NAT, HD_, NKVH_](t0 + tt + j, att_i, kvh) + tid].cast[f32]()
                     sc[j] = rebind[Scalar[f32]](scores[tt + j])
                 comptime for j in range(8):
                     o += sc[j] * v[j]
                 tt += 8
             while tt < n:
-                o += rebind[Scalar[f32]](scores[tt]) * vp[unsafe_offset=kv_off[NAT](t0 + tt, att_i, kvh) + tid].cast[f32]()
+                o += rebind[Scalar[f32]](scores[tt]) * vp[unsafe_offset=kv_off[NAT, HD_, NKVH_](t0 + tt, att_i, kvh) + tid].cast[f32]()
                 tt += 1
-        t0 += HD
+        t0 += HD_
     return SIMD[f32, 4](m_run, l_run, o, 0)
 
 
