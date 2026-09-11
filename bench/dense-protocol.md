@@ -35,3 +35,14 @@ Frozen predictions:
 
 Kill: any violation in 1 or 2 stops the lane after three repair attempts; 3 failing at HD 64
 or 128 is reported, not repaired by changing the kernel family.
+
+### KATT results (2026-09-11, commits `26fffe3`, `356d22f`; evidence `.work/KATT-gate.txt`)
+
+| # | prediction | result |
+|---|---|---|
+| 1 | parity, 0 violations | PASS: 0/4096, 0/7168, 0/8192 per mode at HD 64/128/256; max abs err 1.5e-3 (HD 64 swa); 99.88-100% of elements equal the bf16 rounding of the float64 reference |
+| 2a | HD 256 test output byte-identical to base | PASS: `o_full`, `o_swa`, appended row identical (`cmp`) |
+| 2b | engine disassembly unchanged | PASS: 16/16 Spark and 186/186 qwen35 engine code objects identical after normalisation; base-vs-base control identical |
+| 3 | 0 spills, VGPR(64,128) <= VGPR(256) | PASS: attention VGPR 34/36/40, rope 15/15/15, 0 spills, 0 scratch |
+| 4 | census rc 0 | PASS |
+| 5 | suite green, +1 test binary | PASS: exit 0 before and after; 101 -> 102 PASS lines |
