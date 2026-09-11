@@ -31,12 +31,20 @@ check() { # check RUNLOG -> identity against the snapshot, and the fixture must 
 # still embed an engine.mojo with main() and build as before.
 if [ -f "$dir/src/window.mojo" ] && ! grep -q '^def main' "$dir/src/engine.mojo" 2>/dev/null; then
   kcommit=$(python3 -c "import json;print(json.load(open('$dir/meta.json'))['baro.kernel.commit'])")
-  git show "$kcommit:serve/engine.mojo" > "$dir/harness.mojo" || { echo "no serve/engine.mojo at gguf commit $kcommit"; exit 1; }
-  entry=harness.mojo; echo "split layout: harness serve/engine.mojo@$kcommit, body window.mojo"
+  # harness/ also carries every local module the harness imports that the gguf
+  # does not embed (serve/harness.mojo, serve/prefix.mojo since 5a82337/7b4b9d0),
+  # from git at the same commit; the entry is not named harness.mojo, which
+  # would shadow the imported module of that name.
+  rm -rf "$dir/harness"; mkdir -p "$dir/harness"
+  git show "$kcommit:serve/engine.mojo" > "$dir/harness/closure_main.mojo" || { echo "no serve/engine.mojo at gguf commit $kcommit"; exit 1; }
+  for m in $(sed -n 's/^from \([a-z_]*\) import.*/\1/p' "$dir/harness/closure_main.mojo"); do
+    [ -f "$dir/src/$m.mojo" ] || ! git cat-file -e "$kcommit:serve/$m.mojo" 2>/dev/null || git show "$kcommit:serve/$m.mojo" > "$dir/harness/$m.mojo"
+  done
+  split=1; entry=harness/closure_main.mojo; echo "split layout: harness serve/engine.mojo@$kcommit, body window.mojo"
 else
-  entry=src/engine.mojo
+  split=0; entry=src/engine.mojo
 fi
-./.venv/bin/mojo build "$dir/$entry" -I "$dir/src" -o "$dir/champion-engine" > "$dir/champion-build.log" 2>&1 || { echo "champion build failed: $(grep -m1 error: "$dir/champion-build.log")"; exit 1; }
+./.venv/bin/mojo build "$dir/$entry" -I "$dir/src" -I "$dir/harness" -o "$dir/champion-engine" > "$dir/champion-build.log" 2>&1 || { echo "champion build failed: $(grep -m1 error: "$dir/champion-build.log")"; exit 1; }
 cw=(); ct=()
 for k in 1 2 3; do
   s0=$(date +%s%N); ./"$dir/champion-engine" > "$dir/champion-run$k.log" 2>&1 || { echo "champion run $k failed"; exit 1; }; s1=$(date +%s%N)
@@ -75,7 +83,7 @@ for d in "$dir"/cand-*.diff; do
   # Split layout: the clock is not in the candidate's files at all, so the
   # stopwatch identifiers come off the list (pos/ring/e are honest window state
   # there); profiling, prints, file writes and fixture paths stay banned.
-  if [ "$entry" = harness.mojo ]; then
+  if [ "$split" = 1 ]; then
     scope_pat='^[+-].*(BARO_PROFILE|perf_counter_ns|tok/s|check-tokens|ref-tokens|getenv|print\(|open\(|synchronize|engine-pack|GEN_N|\b(prof|pf2|pf3|pf4|pf_[a-z]+|tq|tp|nw|now[0-9]?|t_acc)\b)'
   else
     scope_pat='^[+-].*(BARO_PROFILE|perf_counter_ns|tok/s|check-tokens|ref-tokens|getenv|print\(|open\(|synchronize|engine-pack|GEN_N|generated|toks_h|\b(prof|pf2|pf3|pf4|pf_[a-z]+|t0|tq|tp|dt|nw|now[0-9]?|t_acc|t_load|t_host|t_prefill_end|prefill_done|prefill_s|decode_s)\b)'
@@ -99,8 +107,8 @@ for d in "$dir"/cand-*.diff; do
     fi
   done
   [ -n "$mode" ] || { fail apply "patch does not apply (hunks renumbered: $nfix)"; continue; }
-  [ "$entry" = harness.mojo ] && cp "$dir/harness.mojo" "$work/harness.mojo"
-  ./.venv/bin/mojo build "$work/$entry" -I "$work/src" -o "$work/engine" > "$work/build.log" 2>&1 || { fail compile "$(grep -m1 error: "$work/build.log" | cut -c1-160)"; continue; }
+  [ "$split" = 1 ] && cp -r "$dir/harness" "$work/harness"
+  ./.venv/bin/mojo build "$work/$entry" -I "$work/src" -I "$work/harness" -o "$work/engine" > "$work/build.log" 2>&1 || { fail compile "$(grep -m1 error: "$work/build.log" | cut -c1-160)"; continue; }
   # stage 2: token identity at 64
   ./"$work/engine" > "$work/run0.log" 2>&1 || { fail run "engine exited $?"; continue; }
   check "$work/run0.log" > "$work/gate.log" 2>&1 || { fail identity "$(head -1 "$work/gate.log")"; continue; }
