@@ -353,3 +353,42 @@ Findings:
 - p20 at k=4, traced run: one 120.6 ms stall between two dispatches (rmsnorm_cast
   -> matmul_skinny, row 2822 of 17081), decode_s 1.59 vs 0.56 bare. Host-side,
   cause not diagnosed. Dropping it moves the k=4 median g by 0.04 pp.
+
+## Amendment FR-Spec (frozen 2026-09-11 before any build or run, tree `3c1f877`)
+
+Question: does restricting the MTP draft head to a frequency-ranked vocabulary
+subset (FR-Spec, MiniCPM4 paper arXiv 2506.07900 section 4.1.1) raise
+speculative tok/s_gen on the q4 pack without changing the output?
+
+**Change.** The draft head (`blk32_forward`, `do_head`) computes logits over
+`FR_K = 62080` rows (25% of 248320) of `output.weight`, taken from the q4
+pack's own rows in frequency order, then maps the argmax back to the full id
+with one int gather. The verify step still uses the full vocabulary, so a draft
+outside the subset is simply rejected; output must not change. Switch:
+`BARO_FR=1` on a pack built by `tools/fr-draft.py`. Frequency table:
+`tools/fr-vocab.py` over `bench/ruler/data/essays.txt` plus the repo's
+tracked `serve/`, `kernels/`, `tools/*.py`, `docs/*.md`, `bench/*.md`
+text (about 2.3 MB). The 20 `bench/mtp-prompts/` prompts are not in it.
+
+**Estimate behind the predictions.** The q4 head is about 572 MB (248320 x 4096
+nibbles plus fp16 scales), about 0.7 ms per draft-head call at ~800 GB/s. A k=2
+window makes 2 draft-head calls in 14.27 ms (MSPEC step 1 median), about 10%;
+k=4 makes 4 in 19.31 ms, about 15%. FR_K = 25% removes 75% of that.
+
+**Instrument.** `bench/mtp-prompts.sh` on the 20 prompts, same engine binary,
+same session, GPU through `gpu-wait`: arm A (no spec), B2/B4 (`BARO_SPEC=1`,
+k=2/4, full head), F2/F4 (`BARO_SPEC=1 BARO_FR=1`, k=2/4). P1 receipts from each
+log: `BARO_SPEC:`, `spec k:`, `BARO_FR:` (True only on F arms), `pack q4
+trunk: True`, `mtp: drafted/accepted`, `tok/s_gen`.
+
+**Predictions (20-prompt medians, F vs B at the same k).**
+- P-FR1 identity: GENERATED of every F run equals arm A. Hard gate; any
+  mismatch voids the round.
+- P-FR2 k=2: tok/s_gen +3% to +9%.
+- P-FR3 k=4: tok/s_gen +5% to +13%.
+- P-FR4 acceptance (accepted/drafted) falls by at most 3 points at each k.
+- P-FR5 corpus coverage: the top 62080 ids cover >= 95% of corpus tokens.
+
+**Falsifier.** k=2 gain under +1%, or acceptance down more than 5 points: the
+subset from this corpus does not pay on this model, and the change stays off by
+default. Claim rule: default-on only if P-FR1 holds and both P-FR2 and P-FR3 hold.
