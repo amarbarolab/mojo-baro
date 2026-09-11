@@ -39,7 +39,7 @@ $HOME/llama.cpp/build/bin/llama-server -m $HOME/Models/RegesCore-1.0-35/RegesCor
 For each prompt, the script sends this request to `/completion`:
 
 ```json
-{"prompt":"<contents of prompt .txt>","n_predict":64,"temperature":0,"top_k":1,"seed":1,"cache_prompt":false,"return_tokens":true}
+{"prompt":"<contents of prompt .txt>","n_predict":64,"temperature":0,"top_k":1,"seed":1,"ignore_eos":true,"cache_prompt":false,"return_tokens":true}
 ```
 
 ## Repetitions and metrics
@@ -57,7 +57,7 @@ The receipt records the llama.cpp commit, binary version/build, build flags as r
 - Missing or contradictory effective-parameter read-back before the first timed request.
 - Any GPU launch not mediated by the specified `gpu-wait` command, or a concurrent GPU workload reported by the wait wrapper.
 - Wrong model, model hash, llama.cpp binary, prompt set, prompt source, context, batch, threads, KV type, GPU-layer setting, sampling, or generation length.
-- Failed server health, incomplete response, non-finite timing, or fewer than five measured repetitions for any prompt.
+- Failed server health, incomplete response, fewer than 64 generated tokens, non-finite timing, or fewer than five measured repetitions for any prompt.
 - Any prompt response that does not report both decode and prompt timing.
 
 No prediction is made about the engine lane. A later comparison must use the same model, prompt text, generation length, sampling policy, and explicit warm or cold cache state.

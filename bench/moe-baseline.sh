@@ -38,7 +38,7 @@ if len(prompts) != 20:
     raise SystemExit(f"expected 20 prompts, found {len(prompts)}")
 
 def request(prompt):
-    body = json.dumps({"prompt": prompt, "n_predict": 64, "temperature": 0, "top_k": 1, "seed": 1, "cache_prompt": False, "return_tokens": True}).encode()
+    body = json.dumps({"prompt": prompt, "n_predict": 64, "temperature": 0, "top_k": 1, "seed": 1, "ignore_eos": True, "cache_prompt": False, "return_tokens": True}).encode()
     req = urllib.request.Request(f"http://127.0.0.1:{port}/completion", data=body, headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=900) as response:
         return json.load(response)
@@ -54,7 +54,7 @@ for path in prompts:
         timings = result.get("timings", {})
         decode = timings.get("predicted_per_second")
         prefill = timings.get("prompt_per_second")
-        if not isinstance(decode, (int, float)) or not isinstance(prefill, (int, float)) or decode <= 0 or prefill <= 0:
+        if not isinstance(decode, (int, float)) or not isinstance(prefill, (int, float)) or decode <= 0 or prefill <= 0 or timings.get("predicted_n") != 64:
             raise SystemExit(f"invalid timings for {path.name} rep {rep}: {timings}")
         measured.append((float(decode), float(prefill)))
         raw.append({"prompt": path.name, "rep": rep, "timings": timings, "n_tokens": result.get("tokens"), "content": result.get("content", "")})
