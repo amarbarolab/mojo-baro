@@ -823,3 +823,60 @@ same process before timing.
 **Gate.** `./run-tests.sh` exit 0 with the census at +3 kernels and 0
 orphans, `kernels/test_sample.mojo` PASS on P-K1 to P-K5, P-K6 recorded
 against its bands; both captured to `.work/KSAMP-gate.txt`.
+
+**Result, first build (`21fe9e4`, 2026-09-11, `.work/KSAMP-run2.txt`).**
+P-K1 to P-K5 PASS: Philox KATs match; temperature 0 equals
+`amar_argmax_row` on 13/13 rows at V = 248320; six chi-square configs all
+below the p = 0.001 critical value with zero draws outside the truncated
+set; probabilities within 1.4e-8 of exact; same seed 10k/10k equal;
+acceptance 0.5394 vs exact 0.5373 (sigma 0.0050), spec vs direct
+two-sample chi2 23.5 at df 21 (crit 46.9). One fixture correction before
+that run: the third Philox KAT's last word was transcribed from memory as
+`24f7f839`; Random123's vector is `24126ea1`, and the implementation
+matched the other three words exactly, which a wrong Philox cannot do.
+
+P-K6 **falsified**: greedy 28.5 us (band 5-15), T0.7/k20/p0.8 483 us
+(50-110), T0.8/k40/p0.95/min-p 0.05 485 us, k off/p 0.95 432 us (30-70),
+plain T1 206 us; `amar_argmax_row` itself 129 us at this V with its 256
+threads. Diagnosis by subtraction (inferred, not profiled): a scalar
+strided pass over the 1 MB row costs ~28 us with 1024 threads (load
+latency, not bandwidth: 256 threads take 4.5x longer), not 6.5 us; the
+band pass's two u64 LDS atomics per element cost ~175 us; the plain
+arm's final pass spends ~178 us because every element computes a full
+Philox call and uses one of its four words.
+
+## KSAMP-b: fewer and cheaper passes (frozen 2026-09-11, before its build)
+
+**Change.** (1) Every pass over the row loads 4 consecutive floats per
+thread per group and keeps two groups in flight; the Gumbel noise takes
+all four words of one Philox call per group. (2) Fast path for the cut:
+after `lmax`, one pass accumulates, per thread and without atomics, the
+count and fixed-point mass of valid tokens within D nats of `lmax` for
+D in {0.5, 1, 2, 3, 4, 6, 8}, reduced across the block; the smallest D
+whose set holds the top-k boundary (or, with top-k off, the top-p mass)
+and has at most CAP = 2048 tokens is compacted into LDS as
+`(key << 32) | ~index`, bitonic-sorted descending, and top-k, top-p and
+min-p are read off the sorted prefix with the same integer masses and
+`W = ceil(top_p * Z)` as the general path, so both paths cut the same
+set and, the noise being keyed by index, draw the same token. (3) When
+no D qualifies the first build's band-and-radix path runs unchanged.
+`CAP` is a comptime parameter with default 2048 so the test can force
+the general path.
+
+**Predictions.**
+- P-K7 P-K1 to P-K5 still pass; for every P-K3 configuration and the
+  P-K5 draws, the fast path and the forced general path (`CAP = 16`)
+  give identical tokens on 10,000/10,000 rows and probabilities within
+  1e-6.
+- P-K8 Time per call at V = 248320, R = 1, hot row, same test harness:
+  greedy 6-12 us; Gaussian row (sigma 2.5, five tokens boosted to
+  10-14) T0.7/k20/p0.8 and T0.8/k40/p0.95/min-p 0.05: 25-60 us (fast
+  path); an LM-like peaked row (same bulk, boosted to 20-24) with the
+  same two presets and k off/p 0.95: 25-60 us; plain T1 on the Gaussian
+  row 60-120 us; k off/p 0.95 on the Gaussian row takes the general path
+  (its nucleus is the bulk), recorded, no band.
+- Falsifier: greedy above 15 us means a vectorised pass is not
+  load-latency bound as inferred; read the ISA (`isa-loops`) before any
+  further change.
+
+**Gate.** As KSAMP, plus P-K7; P-K8 recorded against its bands.
