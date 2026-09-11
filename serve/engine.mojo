@@ -287,6 +287,34 @@ def main() raises:
                 pf_tail = MROWS
         var prefill_rows = len(prompt) - 1 - cached
         print("TMAX:", tmax, " kv dtype:", String(KVT), " prefill chunk:", pf_chunk, " prefill rows:", pf_rows, " cached:", cached, " replay rows:", prefill_rows)
+        # BARO_FORCE=<ids>: teacher-forced agreement. After each decode step the
+        # argmax is compared with the reference id at that position and the
+        # reference id is written back, so every position sees the reference
+        # history. Runs after t_prefill_end, so prefill_s is untouched; tok/s_gen
+        # of a forced run is not a timing.
+        var force = List[Int]()
+        var force_path = getenv("BARO_FORCE", "")
+        if force_path != "":
+            if spec:
+                print("BARO_FORCE needs BARO_SPEC=0")
+                exit(2)
+            with open(force_path, "r") as f:
+                var fd = f.read_bytes()
+                var fv = 0
+                var fh = False
+                for i in range(len(fd)):
+                    var b = Int(fd[i])
+                    if b >= 48 and b <= 57:
+                        fv = fv * 10 + (b - 48)
+                        fh = True
+                    else:
+                        if fh:
+                            force.append(fv)
+                        fv = 0
+                        fh = False
+                if fh:
+                    force.append(fv)
+        print("BARO_FORCE:", force_path, " ref tokens:", len(force))
 
         # --- decode loop ---------------------------------------------------------
 
@@ -330,6 +358,10 @@ def main() raises:
         wst.pos = cached
         wst.pos_prev = cached
         var prefill_done = False
+        var f1_h = ctx.enqueue_create_host_buffer[DType.int32](1)
+        var forced_got = List[Int]()
+        var n_agree = 0
+        var first_dis = -1
         # The stopwatch stays here, in the harness that is never embedded in a
         # gguf: step_window cannot reach t0, t_prefill_end or dt (P-A, 2026-09-08).
         while wst.pos < n_total - 1:
@@ -340,6 +372,21 @@ def main() raises:
                 ctx.synchronize()
                 t_prefill_end = perf_counter_ns()
                 prefill_done = True
+            if len(force) > 0 and wst.pos >= len(prompt):
+                var gi = wst.pos - len(prompt)
+                var tok1 = DeviceBuffer[DType.int32](ctx, toks_d.unsafe_ptr() + wst.pos, 1, owning=False)
+                ctx.enqueue_copy(dst_buf=f1_h, src_buf=tok1)
+                ctx.synchronize()
+                var got = Int(f1_h[0])
+                forced_got.append(got)
+                if gi < len(force):
+                    if got == force[gi]:
+                        n_agree += 1
+                    elif first_dis < 0:
+                        first_dis = gi
+                    f1_h[0] = Int32(force[gi])
+                    ctx.enqueue_copy(dst_buf=tok1, src_buf=f1_h)
+                    ctx.synchronize()
 
         var t_host = Float64(perf_counter_ns() - t0) / 1e9
         ctx.synchronize()
@@ -456,6 +503,12 @@ def main() raises:
         for i in range(len(generated)):
             line += String(generated[i]) + " "
         print("GENERATED:", line)
+        if len(force) > 0:
+            var fl = String("")
+            for i in range(len(forced_got)):
+                fl += String(forced_got[i]) + " "
+            print("FORCE agree:", n_agree, "/", min(len(force), len(forced_got)), " first_disagree:", first_dis)
+            print("FORCED_ARGMAX:", fl)
         if spec:
             print("mtp: drafted", wst.n_drafted, " accepted", wst.n_accepted, " k", kcfg)
         if serve:
