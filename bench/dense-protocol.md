@@ -91,6 +91,22 @@ Verdict: llama-arch (interleaved rope, tied embeddings, SiLU, no bias, no gate) 
 end to end through the new `--dense` packer and the profile-driven engine. Server:
 `llama-server -ngl 99 -fa on -ctk f16 -ctv f16`, native Q4_K_M (no requant).
 
+### Result: Qwen2.5-7B-Instruct-Q4_K_M (2026-09-11, `.work/dense/qwen25-7b-run/`)
+
+Same method and thresholds as Llama-3.2-1B above. This target exercises QKV_BIAS for the
+first time (the fused-QKV bias-add kernel and the offset-stride generalization) and
+ROPE_NEOX=True with a non-tied output head, neither previously run end to end.
+
+| # | prediction | result |
+|---|---|---|
+| 1 | >=90% agreement, >=18/20 prompts | **PASS, 20/20**: range 62-64/64 (96.9-100%), three prompts ended their llama.cpp completion early (14/14, 23/23, 33/33) and matched fully |
+| 2 | tok/s_gen positive/finite, no crash | **PASS**: 96.8-97.8 tok/s_gen across all 20 prompts (7B vs 1B model, expected slower) |
+| 3 | chat smoke | **N/A as predicted**, not attempted |
+
+Verdict: QKV_BIAS is correct (the bias-add kernel and the generalized per-layer offset
+stride both work as designed), and qwen2-arch (neox rope, biased QKV, non-tied output) is
+correct end to end.
+
 ## KATT: head dimension as a comptime parameter
 
 Scope: the attention kernels the Spark path calls, `amar_attn_decode_swa_gated` and
