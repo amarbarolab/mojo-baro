@@ -39,6 +39,46 @@ Predictions (step 2, recipe-flag scaffolding only -- not exercised end to end):
 Kill: any mismatch in 1-3 stops the lane after three repair attempts and is reported, not
 silently downgraded to "close enough".
 
+## PROFILE step 3: per-target build + verify (frozen before the Llama-3.2-1B run)
+
+Both blockers landed on main before this section was written (KATT `088c940` head-dim
+parameterization, TOK `3c1f877` SPM + llama-bpe/qwen2/granite-docling), so step 3 is in scope
+now. New in this step, found while building the packer (not in the plan's original flag list):
+**HAS_GATE** (spark2_5's per-head attention output gate has no analogue in llama/qwen2/granite;
+without a way to disable it every non-spark target's attention output would be silently
+multiplied by sigmoid(0)=0.5) and **activation** (spark2_5 uses GELU, llama/qwen2/granite use
+SiLU; `amar_gemv_q8` gets a new EPI=3 branch). Both are commits before this run, not part of it.
+
+New tool: `tools/engine-pack.py --dense MODEL.gguf OUTDIR` -- Q/K/V weight fusion (three
+separate GGUF tensors concatenated into one `[QKV, H]` matrix, matching how the fused-QKV
+kernel splits its output back into Q/K/V sub-ranges) plus Ornith's existing K-quant dequant,
+for the plain-transformer archs KATT and this profile system now support. Verified by: the
+packed model runs, produces syntactically well-formed generation, and decodes (via
+`tools/baro-tokenize.mojo`) to fluent on-topic text for a prompt about water molecule
+structure -- necessary but not sufficient; the BARO_FORCE run below is the real gate.
+
+Method: 20 prompts (`bench/mtp-prompts/p*.txt`) tokenized once by our own tokenizer (already
+gated against `llama-tokenize` by TOK), the same ids sent to both llama.cpp
+(`/completion`, `n_predict 64`, `temperature 0`, `top_k 1`) and our engine
+(`BARO_PROMPT=<ids>` no-spec for tok/s_gen, then `BARO_FORCE=<llama's greedy ids>` for
+agreement). Server: `llama-server -ngl 99 -fa on -ctk f16 -ctv f16` (fastest config per
+`spark-ab-protocol.md`), native K-quant GGUF (no requant needed, unlike spark2_5's Q8_0 arm).
+
+Frozen predictions, Llama-3.2-1B-Instruct-Q4_K_M:
+1. Forced agreement >= 90% of generated positions on at least 18/20 prompts (a Q4_K_M
+   requant candidate is not expected to hit spark2_5's 98-100% bar; llama.cpp's own f16-KV
+   config disagrees with its f32 reference on some fraction of the same 20-prompt set per
+   this repo's CLAUDE.md, so <100% agreement is not by itself a failure).
+2. tok/s_gen positive and finite on all 20 prompts (no crash, no NaN-shaped hang); no
+   specific ratio vs llama.cpp claimed -- this lane is a correctness port, not a perf round.
+3. Chat completions smoke: NOT applicable. `serve/src/engine.rs` drives a long-running
+   request/response protocol that only `serve/engine.mojo` implements; `serve/spark.mojo` is
+   a one-shot CLI with no such protocol, and wiring it up is out of this lane's file list.
+   Reported, not attempted.
+
+Kill: prediction 1 failing (under 18/20 prompts clearing 90%) after three repair attempts is
+reported as a real disagreement, not re-thresholded down to make it pass.
+
 ## KATT: head dimension as a comptime parameter
 
 Scope: the attention kernels the Spark path calls, `amar_attn_decode_swa_gated` and

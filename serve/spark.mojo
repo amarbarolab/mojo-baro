@@ -16,7 +16,8 @@ from spark_kernels import (
 )
 from profile import (
     H, FFN, VOCAB, N_LAYERS, NQH, NKVH, HD, NORM_EPS, NROT_FULL, BASE_FULL, NROT_SWA, BASE_SWA,
-    SWA_WIN, SWA_PERIOD, SWA_FULL_PHASE, ROPE_NEOX, QKV_BIAS, HAS_GATE, ATTN_SCALE, TMAX,
+    SWA_WIN, SWA_PERIOD, SWA_FULL_PHASE, ROPE_NEOX, QKV_BIAS, HAS_GATE, ATTN_SCALE,
+    ACTIVATION_GELU, TMAX,
 )
 
 comptime f32 = DType.float32
@@ -91,7 +92,7 @@ comptime k_att = amar_attn_decode_swa_gated[type_of(q_l), type_of(cache_l), type
 comptime k_gate = amar_gemv_q8[0, type_of(xb_l), type_of(q_gate), type_of(s_gate), type_of(gate_l), type_of(dummy_l)]
 comptime k_o = amar_gemv_q8[1, type_of(aob_l), type_of(q_o), type_of(s_o), type_of(h1_l), type_of(dummy_l)]
 comptime k_ffn_gate = amar_gemv_q8[0, type_of(xb_l), type_of(q_ffn), type_of(s_ffn), type_of(ffn1_l), type_of(dummy_l)]
-comptime k_ffn_up = amar_gemv_q8[2, type_of(xb_l), type_of(q_ffn), type_of(s_ffn), type_of(ffn1_l), type_of(ffn1_l)]
+comptime k_ffn_up = amar_gemv_q8[2 if ACTIVATION_GELU else 3, type_of(xb_l), type_of(q_ffn), type_of(s_ffn), type_of(ffn1_l), type_of(ffn1_l)]
 comptime k_down = amar_gemv_q8[1, type_of(fgb_l), type_of(q_down), type_of(s_down), type_of(h1_l), type_of(dummy_l)]
 comptime k_head = amar_gemv_q8[0, type_of(xb_l), type_of(q_out), type_of(s_out), type_of(v1_l), type_of(dummy_l)]
 comptime k_argmax = amar_argmax_part[AM_NB, type_of(v1_l), type_of(amv_l), type_of(amv_l)]

@@ -109,10 +109,14 @@ def amar_gemv_q8[
             C[row] = rebind[C.ElementType](total)
         elif EPI == 1:
             C[row] = rebind[C.ElementType](rebind[Scalar[f32]](C[row]) + total)
-        else:
+        elif EPI == 2:
             var g = rebind[Scalar[f32]](C[row])
             var gelu = 0.5 * g * (1 + tanh(0.7978845608028654 * g * (1 + 0.044715 * g * g)))
             Ob[row] = rebind[Ob.ElementType]((gelu * total).cast[DType.bfloat16]())
+        else:
+            var g = rebind[Scalar[f32]](C[row])
+            var silu = g / (1 + exp(-g))
+            Ob[row] = rebind[Ob.ElementType]((silu * total).cast[DType.bfloat16]())
 
 
 def amar_rope_kv_append[
