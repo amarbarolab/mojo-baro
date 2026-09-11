@@ -1,9 +1,10 @@
-"""Device sampler checks for kernels/sample.mojo (KSAMP, bench/chat-protocol.md P-K1..P-K6).
+"""Device sampler checks for kernels/sample.mojo (KSAMP, bench/chat-protocol.md P-K1..P-K10).
 
 Philox4x32-10 known-answer vectors; temperature 0 equal to amar_argmax_row at the real
 vocabulary; chi-square on 10k draws per sampling configuration against the exact float64
 distribution; reproducibility; exact speculative acceptance against a mismatched draft;
-time per call at V = 248320.
+fast path and forced general path (CAP 16) draw identical tokens; time per call at
+V = 248320 on a Gaussian and an LM-like peaked row.
 """
 from std.math import cos, exp, log, sin, sqrt
 from std.sys import has_accelerator
@@ -14,7 +15,7 @@ from max.gpu.host import DeviceBuffer, DeviceContext
 from layout import TileTensor, row_major
 
 from elementwise import amar_argmax_row, EW_THREADS
-from sample import amar_sample_row, amar_sample_probs, amar_spec_accept, philox4x32, SAMP_THREADS
+from sample import amar_sample_row, amar_sample_probs, amar_spec_accept, philox4x32, SAMP_THREADS, SAMP_CAP
 
 comptime VR = 248320
 comptime VS = 64
@@ -191,11 +192,13 @@ def hist_of(h: List[Int32]) -> List[Int]:
     return c^
 
 
-def draw(
+def draw[
+    CAP: Int = SAMP_CAP
+](
     ctx: DeviceContext, mut x: DeviceBuffer[f32], mut t: DeviceBuffer[i32], mut p: DeviceBuffer[f32],
     c: Cfg, seed: UInt64, counter: UInt64,
 ) raises -> Tuple[List[Int32], List[Float32]]:
-    comptime k = amar_sample_row[type_of(xs_l), type_of(ts_l), type_of(ts_l)]
+    comptime k = amar_sample_row[type_of(xs_l), type_of(ts_l), type_of(ts_l), CAP]
     ctx.enqueue_function[k](
         TileTensor(x, xs_l), TileTensor(t, ts_l), TileTensor(p, ts_l), Int32(VS),
         c.t, Int32(c.k), c.p, c.mp, seed, counter, grid_dim=ND, block_dim=SAMP_THREADS,
@@ -213,7 +216,7 @@ def draw(
     return (toks^, probs^)
 
 
-def probs_row(ctx: DeviceContext, l: List[Float32], c: Cfg) raises -> List[Float32]:
+def probs_row[CAP: Int = SAMP_CAP](ctx: DeviceContext, l: List[Float32], c: Cfg) raises -> List[Float32]:
     var xh = ctx.enqueue_create_host_buffer[f32](VS)
     ctx.synchronize()
     for i in range(VS):
@@ -221,7 +224,7 @@ def probs_row(ctx: DeviceContext, l: List[Float32], c: Cfg) raises -> List[Float
     var xd = ctx.enqueue_create_buffer[f32](VS)
     var pd = ctx.enqueue_create_buffer[f32](VS)
     ctx.enqueue_copy(dst_buf=xd, src_buf=xh)
-    comptime k = amar_sample_probs[type_of(x1_l), type_of(x1_l)]
+    comptime k = amar_sample_probs[type_of(x1_l), type_of(x1_l), CAP]
     ctx.enqueue_function[k](
         TileTensor(xd, x1_l), TileTensor(pd, x1_l), Int32(VS), c.t, Int32(c.k), c.p, c.mp,
         grid_dim=1, block_dim=SAMP_THREADS,
@@ -243,6 +246,68 @@ def fill_rows(ctx: DeviceContext, mut d: DeviceBuffer[f32], l: List[Float32]) ra
             h[r * VS + i] = l[i]
     ctx.enqueue_copy(dst_buf=d, src_buf=h)
     ctx.synchronize()
+
+
+def path_identity(
+    ctx: DeviceContext, mut xd: DeviceBuffer[f32], mut td: DeviceBuffer[i32], mut pd: DeviceBuffer[f32],
+    l: List[Float32], c: Cfg, toks: List[Int32], probs: List[Float32], prow: List[Float32],
+    seed: UInt64, counter: UInt64,
+) raises:
+    var rf = draw[16](ctx, xd, td, pd, c, seed, counter)
+    var prf = probs_row[16](ctx, l, c)
+    var same = 0
+    var pe = 0.0
+    for i in range(ND):
+        if rf[0][i] == toks[i]:
+            same += 1
+        pe = max(pe, abs(Float64(rf[1][i]) - Float64(probs[i])))
+    for i in range(VS):
+        pe = max(pe, abs(Float64(prf[i]) - Float64(prow[i])))
+    print("P-K7", c.name, ": fast vs general path (CAP 16) tokens equal", same, "of", ND, "prob max diff", pe)
+    if same != ND or pe > 1e-6:
+        fail(c.name + ": fast and general path disagree")
+
+
+def med3(xs: List[Float64]) -> Tuple[Float64, Float64, Float64]:
+    var s = xs.copy()
+    for a in range(1, len(s)):
+        var j = a
+        while j > 0 and s[j] < s[j - 1]:
+            s.swap_elements(j, j - 1)
+            j -= 1
+    return (s[0], s[len(s) // 2], s[len(s) - 1])
+
+
+def time_arm(
+    ctx: DeviceContext, mut rd: DeviceBuffer[f32], mut r1: DeviceBuffer[i32], mut p1: DeviceBuffer[f32],
+    row: String, c: Cfg,
+) raises:
+    comptime sm1 = amar_sample_row[type_of(xr_l), type_of(t1_l), type_of(t1_l)]
+    var XR = TileTensor(rd, xr_l)
+    var TR = TileTensor(r1, t1_l)
+    var PR = TileTensor(p1, t1_l)
+    for w in range(200):
+        ctx.enqueue_function[sm1](
+            XR, TR, PR, Int32(VR), c.t, Int32(c.k), c.p, c.mp, UInt64(9), UInt64(w),
+            grid_dim=1, block_dim=SAMP_THREADS,
+        )
+    ctx.synchronize()
+    var blocks = List[Float64]()
+    for b in range(11):
+        var t0 = perf_counter_ns()
+        for w in range(100):
+            ctx.enqueue_function[sm1](
+                XR, TR, PR, Int32(VR), c.t, Int32(c.k), c.p, c.mp, UInt64(9), UInt64(b * 100 + w),
+                grid_dim=1, block_dim=SAMP_THREADS,
+            )
+        ctx.synchronize()
+        blocks.append(Float64(perf_counter_ns() - t0) / 1e3 / 100.0)
+    var s = med3(blocks)
+    print(
+        "P-K8 arm amar_sample_row", row, c.name, "| V", VR, "R 1 grid 1 block", SAMP_THREADS,
+        "CAP", SAMP_CAP, "T", c.t, "k", c.k, "p", c.p, "minp", c.mp,
+        ": median", s[1], "us/call, min", s[0], "max", s[2], "(11 blocks x 100)",
+    )
 
 
 def kat() raises:
@@ -383,6 +448,7 @@ def main() raises:
         print("     prob max err", worst, "| probs row max err", pw, "sum", sum)
         if worst > 1e-5 or pw > 1e-5 or abs(sum - 1.0) > 1e-5:
             fail(c.name + ": probability mismatch")
+        path_identity(ctx, xd, td, pd, l, c, r[0], r[1], pr, UInt64(1000 + ci), UInt64(7))
         if ci == 0 or ci == 1:
             var r2 = draw(ctx, xd, td, pd, c, UInt64(1000 + ci), UInt64(7))
             var r3 = draw(ctx, xd, td, pd, c, UInt64(5000 + ci), UInt64(7))
@@ -426,6 +492,7 @@ def main() raises:
     ctx.enqueue_copy(dst_buf=oh, src_buf=oud)
     ctx.enqueue_copy(dst_buf=ah, src_buf=acd)
     ctx.synchronize()
+    path_identity(ctx, xd, td, pd, ld, cs, dr[0], dr[1], pd_row, UInt64(11), UInt64(5))
     var ys = List[Int32]()
     var nacc = 0
     for i in range(ND):
@@ -444,7 +511,8 @@ def main() raises:
     var direct = draw(ctx, xd, td, pd, cs, UInt64(13), UInt64(5))
     chi2("direct p_t draws", hist_of(direct[0]), qt, ND)
     chi2_two("spec vs direct", hist_of(ys), hist_of(direct[0]))
-    print("P-K5 PASS")
+    path_identity(ctx, xd, td, pd, la, cs, direct[0], direct[1], pt_row, UInt64(13), UInt64(5))
+    print("P-K5 PASS, P-K7 PASS")
 
     var rh = ctx.enqueue_create_host_buffer[f32](VR)
     ctx.synchronize()
@@ -459,20 +527,22 @@ def main() raises:
     ctx.synchronize()
     var XR = TileTensor(rd, xr_l)
     var TR = TileTensor(r1, t1_l)
-    var PR = TileTensor(p1, t1_l)
     comptime am1 = amar_argmax_row[type_of(xr_l), type_of(t1_l)]
-    comptime sm1 = amar_sample_row[type_of(xr_l), type_of(t1_l), type_of(t1_l)]
-    comptime WARM = 200
-    comptime ITERS = 1000
-    for _ in range(WARM):
+    for _ in range(200):
         ctx.enqueue_function[am1](XR, TR, Int32(VR), grid_dim=1, block_dim=EW_THREADS)
     ctx.synchronize()
-    var t0 = perf_counter_ns()
-    for _ in range(ITERS):
-        ctx.enqueue_function[am1](XR, TR, Int32(VR), grid_dim=1, block_dim=EW_THREADS)
-    ctx.synchronize()
-    var us_ref = Float64(perf_counter_ns() - t0) / 1e3 / Float64(ITERS)
-    print("P-K6 arm amar_argmax_row V", VR, "R 1 grid 1 block", EW_THREADS, ":", us_ref, "us/call")
+    var blocks = List[Float64]()
+    for _ in range(11):
+        var t0 = perf_counter_ns()
+        for _ in range(100):
+            ctx.enqueue_function[am1](XR, TR, Int32(VR), grid_dim=1, block_dim=EW_THREADS)
+        ctx.synchronize()
+        blocks.append(Float64(perf_counter_ns() - t0) / 1e3 / 100.0)
+    var s = med3(blocks)
+    print(
+        "P-K8 arm amar_argmax_row gaussian | V", VR, "R 1 grid 1 block", EW_THREADS,
+        ": median", s[1], "us/call, min", s[0], "max", s[2], "(11 blocks x 100)",
+    )
     var tcfg = List[Cfg]()
     tcfg.append(Cfg("greedy T0", 0.0, 0, 1.0, 0.0))
     tcfg.append(Cfg("qwen T0.7 k20 p0.8", 0.7, 20, 0.8, 0.0))
@@ -480,23 +550,11 @@ def main() raises:
     tcfg.append(Cfg("p-only T1 k- p0.95", 1.0, 0, 0.95, 0.0))
     tcfg.append(Cfg("plain T1 k- p-", 1.0, 0, 1.0, 0.0))
     for ci in range(len(tcfg)):
-        ref c = tcfg[ci]
-        for w in range(WARM):
-            ctx.enqueue_function[sm1](
-                XR, TR, PR, Int32(VR), c.t, Int32(c.k), c.p, c.mp, UInt64(9), UInt64(w),
-                grid_dim=1, block_dim=SAMP_THREADS,
-            )
-        ctx.synchronize()
-        t0 = perf_counter_ns()
-        for w in range(ITERS):
-            ctx.enqueue_function[sm1](
-                XR, TR, PR, Int32(VR), c.t, Int32(c.k), c.p, c.mp, UInt64(9), UInt64(w),
-                grid_dim=1, block_dim=SAMP_THREADS,
-            )
-        ctx.synchronize()
-        var us = Float64(perf_counter_ns() - t0) / 1e3 / Float64(ITERS)
-        print(
-            "P-K6 arm amar_sample_row", c.name, "| V", VR, "R 1 grid 1 block", SAMP_THREADS,
-            "T", c.t, "k", c.k, "p", c.p, "minp", c.mp, ":", us, "us/call",
-        )
+        time_arm(ctx, rd, r1, p1, "gaussian", tcfg[ci])
+    for j in range(5):
+        rh[Int(hu(21, j) * Float64(VR))] = Float32(20.0 + Float64(j))
+    ctx.enqueue_copy(dst_buf=rd, src_buf=rh)
+    ctx.synchronize()
+    for ci in range(1, 4):
+        time_arm(ctx, rd, r1, p1, "peaked", tcfg[ci])
     print("PASS: device sampler")

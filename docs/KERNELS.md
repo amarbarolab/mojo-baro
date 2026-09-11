@@ -66,8 +66,8 @@ must be reachable from `serve/registry.mojo`, a bench, or a test.
 | `amar_moe_sig_gate` | `moe.mojo` | `XLayout: TensorLayout, GLayout: TensorLayout, OLayout: TensorLayout` |  | kernels/test_moe_block.mojo |
 | `amar_realign_gather` | `realign_kernels.mojo` | `TLayout: TensorLayout, PLayout: TensorLayout, PartLayout: TensorLayout` |  | kernels/test_realign.mojo |
 | `amar_realign_reduce` | `realign_kernels.mojo` | `PartLayout: TensorLayout, ELayout: TensorLayout` |  | kernels/test_realign.mojo |
-| `amar_sample_probs` | `sample.mojo` | `XLayout: TensorLayout, PLayout: TensorLayout` |  | kernels/test_sample.mojo |
-| `amar_sample_row` | `sample.mojo` | `XLayout: TensorLayout, OLayout: TensorLayout, PLayout: TensorLayout` |  | kernels/test_sample.mojo |
+| `amar_sample_probs` | `sample.mojo` | `XLayout: TensorLayout, PLayout: TensorLayout, CAP: Int = SAMP_CAP` |  | kernels/test_sample.mojo |
+| `amar_sample_row` | `sample.mojo` | `XLayout: TensorLayout, OLayout: TensorLayout, PLayout: TensorLayout, CAP: Int = SAMP_CAP` |  | kernels/test_sample.mojo |
 | `amar_spec_accept` | `sample.mojo` | `PLayout: TensorLayout, TLayout: TensorLayout` |  | kernels/test_sample.mojo |
 | `amar_argmax_final` | `spark_kernels.mojo` | `NB: Int, VLayout: TensorLayout, ILayout: TensorLayout, OLayout: TensorLayout` |  | serve/spark.mojo |
 | `amar_argmax_part` | `spark_kernels.mojo` | `NB: Int, XLayout: TensorLayout, VLayout: TensorLayout, ILayout: TensorLayout` |  | serve/spark.mojo |
@@ -109,6 +109,6 @@ Every `kernels/test_*.mojo`, the gate script that runs it, and its first docstri
 | `test_prefix.mojo` | run-tests.sh | Byte-exact prefix checkpoint restore (bench/chat-protocol.md M1a, P-F1). |
 | `test_q8_gemm.mojo` | manual | Milestone-6 checks: int8 dequant-in-kernel GEMM + fused SwiGLU epilogue. |
 | `test_realign.mojo` | manual | REALIGN live test (round 3): for 5 real prompts on .work/engine-pack-q4, prefill through the prompt under mega=True (the E9/HARNESS configuration -- bench_latent_handoff.mojo runs every latent step through the megakernel), call realign_expected_embedding and final_norm_hidden on the final row, and dump the row's pre-final-norm hidden (b.x_d), e, and the f32 post-final-norm hidden (h, round 3) to .work/realign-dump/ for tools/realign_oracle.py (numpy) to recompute independently off the dumped hidden state and the pack's own weights -- never against a Mojo-side logits/hn_d dump (see serve/realign.mojo's docstring for why b.logits_d/b.hn_d are not usable here). |
-| `test_sample.mojo` | manual | Device sampler checks for kernels/sample.mojo (KSAMP, bench/chat-protocol.md P-K1..P-K6). |
+| `test_sample.mojo` | manual | Device sampler checks for kernels/sample.mojo (KSAMP, bench/chat-protocol.md P-K1..P-K10). |
 | `test_ssm_block.mojo` | manual | Parity: one decode token through the qwen35 gated-delta-net block on GPU vs the numpy reference (tools/ssm-ref.py implementing docs/qwen35-ssm-notes.md). |
 | `test_ternary_gemm.mojo` | manual | Parity check for the three ternary wave-per-row GEMV kernels (matmul_ternary.mojo: q2b3row = Q2_B3/B3S, tq1row = TQ1_0, tq2row = TQ2_0) against the C reference codec. |

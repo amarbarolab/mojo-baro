@@ -951,3 +951,50 @@ of ten).
   the phase timers before any other change.
 
 **Gate.** As KSAMP-b; P-K10 recorded against its bands.
+
+**Harness fix before the verdict (P6).** The P-K8 arms were one mean
+over 1000 back-to-back launches. A stamped copy timed three ways in one
+process (`.work/ksamp-diag/phases-c2.txt`) read the same kernel on the
+same row at 71 us back-to-back and 640 us synced (peaked, T0.7/k20/p0.8)
+with sclk at 3305 MHz and the queue empty: one-workgroup kernels see
+large run-to-run interference. Every arm is now 11 blocks of 100
+launches, min/median/max printed; the first build's and KSAMP-b's
+single-mean P-K6/P-K8 numbers carry that caveat.
+
+**Result, KSAMP-c (`512294d` + block-median harness, 2026-09-11,
+`.work/KSAMP-gate.txt`, queue empty, clock-probe sclk 3305-3311 MHz).**
+Gate PASS: `run-tests.sh` exit 0 (85 kernels, 38 in registry, 0
+orphans), `test_sample` exit 0. P-K9 PASS: P-K1 to P-K5 unchanged, P-K7
+10,000/10,000 identical tokens in all eight comparisons.
+
+P-K10, median per call (min-max), V = 248320:
+
+| row | arm | median (min-max) | band | verdict |
+|---|---|---|---|---|
+| gaussian | greedy | 9.2 (9.1-9.3) | 5-10 | held |
+| gaussian | T0.7/k20/p0.8 | 69.4 (69.2-70.8) | 35-65 | missed by 7 % |
+| gaussian | T0.8/k40/p0.95/min-p 0.05 | 120.3 (117.6-121.4) | 35-65 | missed, 1.85x |
+| peaked | T0.7/k20/p0.8 | 69.4 (69.4-70.4) | 35-65 | missed by 7 % |
+| peaked | T0.8/k40/p0.95/min-p 0.05 | 145.5 (143.5-148.5) | 35-65 | **falsifier, 2.24x** |
+| peaked | k off/p 0.95 | 179.5 (177.6-181.6) | 35-65 | **falsifier, 2.76x** |
+| gaussian | plain T1 | 129.1 (128.0-130.0) | 80-110 | missed |
+| gaussian | k off/p 0.95 (general path) | 490.1 (487.9-492.3) | none | recorded |
+| gaussian | `amar_argmax_row` (reference) | 129.3 (128.7-133.9) | - | - |
+
+What the falsifier asked for is already on disk (phase stamps,
+`.work/ksamp-diag/phases-c2.txt`): the two falsified arms retried the
+compaction (llama presets 2 passes, peaked k off/p 0.95 3 passes, one
+compaction ~28-35 us each), because the subsample estimate lands below
+the window the exact check accepts. One compaction costs ~32 us against
+KSAMP-b's 13 us for the same loop shape; that difference is not
+explained (ISA diff not done). The final pass costs 22-37 us. Against
+the first build (single means) the LM-like peaked row at T0.7/k20/p0.8
+went 552 -> 69.4 us and the Gaussian preset 483 -> 69.4 us.
+
+**Round closed here.** Levers not taken, for whoever picks the sampler
+up again: (1) find why the compaction loop costs 2.5x KSAMP-b's (ISA
+diff of the two loops); (2) widen the estimated window by one step for
+min-p and top-p so one compaction suffices; (3) two loads in flight in
+the compaction and final passes, as pass A has; (4) the general path
+(k off, flat rows) still pays ~480 us in its band pass and radix
+refinement.
