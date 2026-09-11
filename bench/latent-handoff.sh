@@ -54,7 +54,8 @@ echo "VRAM before both loads: ${vram_before}"
 # 512 was requested (2026-09-09). Forward the arm-defining vars explicitly with
 # `env` so they cannot go inert, and let the binary read them back (PROTOCOL-RULES P1).
 e8_env=()
-for v in BARO_E8_ANS_MAX BARO_E8_RECV_MAX BARO_E8_TMAX BARO_E8_NOTHINK BARO_PACK BARO_E8_GGUF; do
+tasks="${BARO_E8_TASKS:-bench/data/e8_tasks.json}"
+for v in BARO_E8_ANS_MAX BARO_E8_RECV_MAX BARO_E8_TMAX BARO_E8_NOTHINK BARO_PACK BARO_E8_GGUF BARO_E8_TASKS; do
   [ -n "${!v-}" ] && e8_env+=("$v=${!v}")
 done
 gpu-wait run --priority 30 --vram 14 -- \
@@ -82,7 +83,7 @@ vram_args=(--vram-before "$vram_before")
 if [ -n "$vram_after" ]; then
   vram_args+=(--vram-after "$vram_after")
 fi
-python3 bench/e8_score.py "${out_prefix}.raw.json" bench/data/e8_tasks.json \
+python3 bench/e8_score.py "${out_prefix}.raw.json" "$tasks" \
   "${out_prefix}.json" "${out_prefix}.md" \
   "${vram_args[@]}" --topology2-status "$topo2_status"
 

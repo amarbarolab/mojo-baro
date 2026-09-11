@@ -74,6 +74,12 @@ def score_arm(task, arm):
         subset = subset_match(parsed, task["expected"])
         reason = "" if exact else f"parsed {parsed!r} vs expected {task['expected']!r}"
         return exact, subset, reason
+    if task["type"] == "ruler":
+        # RULER string_match_all: every answer a case-insensitive substring.
+        low = scored.lower()
+        missing = [a for a in task["expected"] if a.lower() not in low]
+        ok = not missing
+        return ok, ok, "" if ok else f"missing {missing!r}"
     return False, False, "unknown task type " + task["type"]
 
 

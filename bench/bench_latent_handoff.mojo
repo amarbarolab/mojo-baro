@@ -658,8 +658,12 @@ def main() raises:
     var recv_json_ids = tok.encode(
         String("<|im_end|>\n<|im_start|>user\nGive only the JSON object. No explanation.<|im_end|>\n<|im_start|>assistant\n"),
         add_special=False)
+    # E12-long: RULER items (bench/ruler/to_e8.py) answer with short strings.
+    var recv_ruler_ids = tok.encode(
+        String("<|im_end|>\n<|im_start|>user\nGive only the answer. No working.<|im_end|>\n<|im_start|>assistant\n"),
+        add_special=False)
     if recv_max > 0:
-        print("recv-capped: budget", recv_max, " math_ids", len(recv_math_ids), " json_ids", len(recv_json_ids))
+        print("recv-capped: budget", recv_max, " math_ids", len(recv_math_ids), " json_ids", len(recv_json_ids), " ruler_ids", len(recv_ruler_ids))
 
     var wstA = WindowState(pos=0, pos_prev=0, ring=0, n_drafted=0, n_accepted=0, n_spec_windows=0, n_dumped=0, tp=0, tq=0, pf_att=0, pf_ssm=0, pf_ffn=0, pf_head=0, pf_proc=0, pf_draft=0, fc=[0, 0, 0, 0, 0, 0], pc=[0, 0, 0, 0, 0, 0, 0, 0], p3=[0, 0, 0, 0])
     var wstB = WindowState(pos=0, pos_prev=0, ring=0, n_drafted=0, n_accepted=0, n_spec_windows=0, n_dumped=0, tp=0, tq=0, pf_att=0, pf_ssm=0, pf_ffn=0, pf_head=0, pf_proc=0, pf_draft=0, fc=[0, 0, 0, 0, 0, 0], pc=[0, 0, 0, 0, 0, 0, 0, 0], p3=[0, 0, 0, 0])
@@ -672,7 +676,7 @@ def main() raises:
     var chainA = Chain(ctx, kv_cap)
     var chainB = Chain(ctx, kv_cap)
 
-    var doc = parse_json_file("bench/data/e8_tasks.json")
+    var doc = parse_json_file(getenv("BARO_E8_TASKS", "bench/data/e8_tasks.json"))
     var root = doc.get(doc.root)
     var n_avail = len(root.arr)
     var run_indices = List[Int]()
@@ -711,7 +715,12 @@ def main() raises:
         var capped = recv_max > 0
         var hand_ids = turn_ids.copy()
         if capped:
-            hand_ids = recv_json_ids.copy() if task_type == "json" else recv_math_ids.copy()
+            if task_type == "json":
+                hand_ids = recv_json_ids.copy()
+            elif task_type == "ruler":
+                hand_ids = recv_ruler_ids.copy()
+            else:
+                hand_ids = recv_math_ids.copy()
         var gen_budget = recv_max if capped else ans_max
 
         if not first_item:

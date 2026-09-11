@@ -24,7 +24,7 @@ import sys
 import time
 from collections import defaultdict
 
-TASKS = "bench/data/e8_tasks.json"
+TASKS = os.environ.get("BARO_E8_TASKS", "bench/data/e8_tasks.json")
 ARMS = "0,T,L8-raw,L8-soft,L32-soft"
 
 
