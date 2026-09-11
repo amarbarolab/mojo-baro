@@ -10,7 +10,7 @@ Parity target: byte-identical token ids vs llama.cpp on the same GGUF.
 """
 from std.ffi import c_ssize_t, external_call
 from std.math import ceildiv
-from std.memory import memcpy
+from std.memory import memcpy, unsafe_memcpy
 from std.os import getenv
 from std.sys import exit, has_accelerator
 from std.time import perf_counter_ns
@@ -283,6 +283,125 @@ def parse_request(
 
 
 
+# --- engine state file (LatentOS use 2: a saved prefix survives the process) --
+# BAROST01 | int64 pos, conv_n, ssm_n, kv_n | pack salt (32 B) | int32 tokens[pos]
+# | f32 conv[conv_n] | f32 ssm[ssm_n] | f32 K[kv_n] | f32 V[kv_n]
+# K/V are the first ceil(pos/KVPAGE) pages of the page-major pool, so every
+# position below pos is included; the checkpoint is the one saved at pos.
+def _put_i64(mut out: List[UInt8], v: Int):
+    for b in range(8):
+        out.append(UInt8((v >> (8 * b)) & 0xFF))
+
+
+def _get_i64(data: List[UInt8], off: Int) -> Int:
+    var v = 0
+    for b in range(8):
+        v |= Int(data[off + b]) << (8 * b)
+    return v
+
+
+def save_state(
+    ctx: DeviceContext, chain: Chain, kc_d: DeviceBuffer[KVT], vc_d: DeviceBuffer[KVT],
+    path: String, prompt: List[Int], pos: Int,
+) raises:
+    comptime assert KVT == DType.float32, "state file stores f32 KV"
+    var idx = -1
+    for i in range(len(chain.items)):
+        if chain.items[i].valid and chain.items[i].pos == pos:
+            idx = i
+    if idx < 0:
+        raise Error("BARO_STATE_SAVE: no committed checkpoint at pos " + String(pos))
+    var kvn = ceildiv(pos, KVPAGE) * N_ATT * NKVH * KVHSTR
+    var kh = ctx.enqueue_create_host_buffer[KVT](kvn)
+    var vh = ctx.enqueue_create_host_buffer[KVT](kvn)
+    ctx.enqueue_copy(dst_buf=kh, src_buf=DeviceBuffer[KVT](ctx, kc_d.unsafe_ptr(), kvn, owning=False))
+    ctx.enqueue_copy(dst_buf=vh, src_buf=DeviceBuffer[KVT](ctx, vc_d.unsafe_ptr(), kvn, owning=False))
+    ctx.synchronize()
+    var head = List[UInt8]()
+    var magic = String("BAROST01")
+    for i in range(8):
+        head.append(magic.as_bytes()[i])
+    _put_i64(head, pos)
+    _put_i64(head, CONV_SLOT)
+    _put_i64(head, SSM_SLOT)
+    _put_i64(head, kvn)
+    for b in chain.salt:
+        head.append(b)
+    for t in range(pos):
+        for b in range(4):
+            head.append(UInt8((prompt[t] >> (8 * b)) & 0xFF))
+    with open(path, "w") as f:
+        f.write_bytes(Span(head))
+        f.write_bytes(Span[UInt8](unsafe_ptr=chain.items[idx].conv_h.unsafe_ptr().unsafe_bitcast[UInt8](), length=CONV_SLOT * 4))
+        f.write_bytes(Span[UInt8](unsafe_ptr=chain.items[idx].ssm_h.unsafe_ptr().unsafe_bitcast[UInt8](), length=SSM_SLOT * 4))
+        f.write_bytes(Span[UInt8](unsafe_ptr=kh.unsafe_ptr().unsafe_bitcast[UInt8](), length=kvn * 4))
+        f.write_bytes(Span[UInt8](unsafe_ptr=vh.unsafe_ptr().unsafe_bitcast[UInt8](), length=kvn * 4))
+    print("state saved:", path, " pos", pos, " kv pages", ceildiv(pos, KVPAGE))
+
+
+def load_state(
+    ctx: DeviceContext, mut chain: Chain, kc_d: DeviceBuffer[KVT], vc_d: DeviceBuffer[KVT],
+    path: String, tmax: Int,
+) raises -> Int:
+    comptime assert KVT == DType.float32, "state file stores f32 KV"
+    var data: List[UInt8]
+    with open(path, "r") as f:
+        data = f.read_bytes()
+    var magic = String("BAROST01")
+    if len(data) < 72:
+        raise Error("BARO_STATE_LOAD: file too short")
+    for i in range(8):
+        if data[i] != magic.as_bytes()[i]:
+            raise Error("BARO_STATE_LOAD: not a BAROST01 state file")
+    var pos = _get_i64(data, 8)
+    var kvn = _get_i64(data, 32)
+    if _get_i64(data, 16) != CONV_SLOT or _get_i64(data, 24) != SSM_SLOT:
+        raise Error("BARO_STATE_LOAD: slot sizes differ from this engine build")
+    for i in range(32):
+        if data[40 + i] != chain.salt[i]:
+            raise Error("BARO_STATE_LOAD: saved from a different pack")
+    if pos < 1 or pos >= tmax or kvn != ceildiv(pos, KVPAGE) * N_ATT * NKVH * KVHSTR:
+        raise Error("BARO_STATE_LOAD: bad pos/kv size for TMAX " + String(tmax))
+    var off = 72
+    var tokens = List[Int](capacity=pos)
+    for t in range(pos):
+        var v = 0
+        for b in range(4):
+            v |= Int(data[off + 4 * t + b]) << (8 * b)
+        tokens.append(v)
+    off += 4 * pos
+    if len(data) != off + (CONV_SLOT + SSM_SLOT + 2 * kvn) * 4:
+        raise Error("BARO_STATE_LOAD: payload length mismatch")
+    if chain.cap == 0:
+        raise Error("BARO_STATE_LOAD: needs a checkpoint slot")
+    var idx = 0
+    for i in range(len(chain.items)):
+        if not chain.items[i].valid:
+            idx = i
+            break
+    chain.gen += 1
+    chain.items[idx].pos = pos
+    chain.items[idx].hash = prefix_hash(chain.salt, tokens, pos)
+    chain.items[idx].gen = chain.gen
+    chain.items[idx].valid = True
+    chain.items[idx].pending = False
+    chain.items[idx].pinned = True
+    chain.items[idx].boundary = True
+    unsafe_memcpy(dest=chain.items[idx].conv_h.unsafe_ptr().unsafe_bitcast[UInt8](), src=data.unsafe_ptr() + off, count=CONV_SLOT * 4)
+    off += CONV_SLOT * 4
+    unsafe_memcpy(dest=chain.items[idx].ssm_h.unsafe_ptr().unsafe_bitcast[UInt8](), src=data.unsafe_ptr() + off, count=SSM_SLOT * 4)
+    off += SSM_SLOT * 4
+    var kh = ctx.enqueue_create_host_buffer[KVT](kvn)
+    var vh = ctx.enqueue_create_host_buffer[KVT](kvn)
+    ctx.synchronize()
+    unsafe_memcpy(dest=kh.unsafe_ptr().unsafe_bitcast[UInt8](), src=data.unsafe_ptr() + off, count=kvn * 4)
+    unsafe_memcpy(dest=vh.unsafe_ptr().unsafe_bitcast[UInt8](), src=data.unsafe_ptr() + off + kvn * 4, count=kvn * 4)
+    ctx.enqueue_copy(dst_buf=DeviceBuffer[KVT](ctx, kc_d.unsafe_ptr(), kvn, owning=False), src_buf=kh)
+    ctx.enqueue_copy(dst_buf=DeviceBuffer[KVT](ctx, vc_d.unsafe_ptr(), kvn, owning=False), src_buf=vh)
+    ctx.synchronize()
+    return pos
+
+
 def main() raises:
     comptime assert has_accelerator(), "Requires a GPU"
     var ctx = DeviceContext()
@@ -391,8 +510,16 @@ def main() raises:
     var ckpt_cap = atol(getenv("BARO_CKPT", "8")) if serve else 0
     if ckpt_cap < 0:
         ckpt_cap = 0
+    var state_load = getenv("BARO_STATE_LOAD", "")
+    var state_save = getenv("BARO_STATE_SAVE", "")
+    if ckpt_cap == 0 and (state_load != "" or state_save != ""):
+        ckpt_cap = 1
     var chain = Chain(ctx, ckpt_cap, packdir)
     print("checkpoints: cap", ckpt_cap, ", bytes", Float64(CKPT_BYTES) / 1e6, "MB each, period", CKPT_PERIOD)
+    if state_load != "":
+        var t_ld = perf_counter_ns()
+        var lpos = load_state(ctx, chain, bufs.kc_d, bufs.vc_d, state_load, tmax)
+        print("state loaded:", state_load, " pos", lpos, " in", Float64(perf_counter_ns() - t_ld) / 1e9, "s")
     var req_id = 0
     if serve:
         print("{\"ready\":true,\"tmax\":" + String(tmax) + ",\"mrows\":" + String(MROWS) + ",\"kmax\":" + String(KMAX) + ",\"spec_k\":" + String(kcfg) + ",\"kv\":\"" + String(KVT) + "\",\"pack\":\"" + packdir + "\"}")
@@ -473,6 +600,14 @@ def main() raises:
                 if have:
                     prompt.append(val)
             print("prompt tokens:", len(prompt))
+            if chain.cap > 0:
+                ckpt_idx = chain.lookup(prompt, len(prompt) - 1 if spec else len(prompt))
+                cached = chain.pos_of(ckpt_idx)
+                if ckpt_idx >= 0:
+                    var t_rs = perf_counter_ns()
+                    chain.restore(ctx, bufs.convstate_d, bufs.sstate_d, 0, ckpt_idx)
+                    ctx.synchronize()
+                    restore_s = Float64(perf_counter_ns() - t_rs) / 1e9
 
         var pf_rows = 0
         var pf_tail = 0
@@ -597,6 +732,8 @@ def main() raises:
         var t_host = Float64(perf_counter_ns() - t0) / 1e9
         ctx.synchronize()
         chain.commit()
+        if state_save != "":
+            save_state(ctx, chain, bufs.kc_d, bufs.vc_d, state_save, prompt, len(prompt) - 1)
         var dt = Float64(perf_counter_ns() - t0) / 1e9
         print("host_enqueue_s:", t_host, " gpu_total_s:", dt)
         var flw = ctx.enqueue_create_host_buffer[DType.uint32](3)
