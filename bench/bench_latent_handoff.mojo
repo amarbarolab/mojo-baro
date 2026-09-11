@@ -587,6 +587,7 @@ def main() raises:
     # prompt, giving T no private information and the gate no assay sensitivity
     # (runs/latent-os/E8-pilot-2026-09-09.md). 0 keeps the pilot's behaviour.
     var recv_max = atol(getenv("BARO_E8_RECV_MAX", "0"))
+    var share_a = getenv("BARO_E8_SHARE_A", "0") == "1"
     var nothink = getenv("BARO_E8_NOTHINK", "1") == "1"
     var packdir = getenv("BARO_PACK", ".work/engine-pack-q4")
     var gguf_path = getenv(
@@ -730,6 +731,12 @@ def main() raises:
         out += ",\"expected\":" + json_value_to_string(doc, doc.get_field(idx, "expected"))
         out += ",\"arms\":["
         var first_arm = True
+        # BARO_E8_SHARE_A=1 (E12-long 32k amendment): KV reuses T's producer run
+        # instead of re-decoding it. B never touches bufsA, so A's KV pages and
+        # SSM state are still at T's trim point when the KV arm mints them.
+        var share_ids = List[Int]()
+        var share_s: Float64 = 0.0
+        var have_share = False
 
         for arm_i in range(len(arms)):
             var arm = String(arms[arm_i])
@@ -763,6 +770,10 @@ def main() raises:
                     # (runs/latent-os/E12-smoke-2026-09-11.md). Same greedy ids.
                     var rA = run_generate_to_stop(ctx, bufsA, wstA, pack_q4, q4_off, eA, tokens, COT_MAX, tmax, stops)
                     var cot_ids = trim_at_stop(rA.ids, stops)
+                    if share_a:
+                        share_ids = rA.ids.copy()
+                        share_s = rA.elapsed_s
+                        have_share = True
                     var b_context = tokens.copy()
                     extend_ids(b_context, cot_ids)
                     extend_ids(b_context, hand_ids)
@@ -821,9 +832,17 @@ def main() raises:
                     out += arm_json(arm, producer_s, receiver_s, gen_ids, text, scored, sv, "")
 
                 elif arm == "KV":
-                    var rA = run_generate_to_stop(ctx, bufsA, wstA, pack_q4, q4_off, eA, tokens, COT_MAX, tmax, stops)
+                    var a_ids = List[Int]()
+                    var a_s: Float64 = 0.0
+                    if share_a and have_share:
+                        a_ids = share_ids.copy()
+                        a_s = share_s
+                    else:
+                        var rA = run_generate_to_stop(ctx, bufsA, wstA, pack_q4, q4_off, eA, tokens, COT_MAX, tmax, stops)
+                        a_ids = rA.ids.copy()
+                        a_s = rA.elapsed_s
                     var a_ctx = tokens.copy()
-                    extend_ids(a_ctx, rA.ids)
+                    extend_ids(a_ctx, a_ids)
                     var hand_pos = len(a_ctx)
                     if wstA.pos != hand_pos:
                         raise Error("KV: producer at pos " + String(wstA.pos) + ", handoff at " + String(hand_pos))
@@ -878,7 +897,7 @@ def main() raises:
                         scored = strip_for_math(text)
                     var kv_extra = String(",\"handoff_pos\":") + String(hand_pos) + ",\"handoff_hash\":\"" + String(hand_hash) + "\""
                     kv_extra += ",\"kv_pages\":" + String(kv_pages) + ",\"mint_s\":" + String(mint_s) + ",\"ingest_s\":" + String(ingest_s)
-                    out += arm_json(arm, rA.elapsed_s, receiver_s, gen_ids, text, scored, sv, "", kv_extra)
+                    out += arm_json(arm, a_s, receiver_s, gen_ids, text, scored, sv, "", kv_extra)
 
                 else:
                     out += arm_json(arm, 0.0, 0.0, List[Int](), "", "", -1, "unknown arm " + arm)

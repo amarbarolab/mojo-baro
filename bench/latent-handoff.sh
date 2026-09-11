@@ -55,7 +55,7 @@ echo "VRAM before both loads: ${vram_before}"
 # `env` so they cannot go inert, and let the binary read them back (PROTOCOL-RULES P1).
 e8_env=()
 tasks="${BARO_E8_TASKS:-bench/data/e8_tasks.json}"
-for v in BARO_E8_ANS_MAX BARO_E8_RECV_MAX BARO_E8_TMAX BARO_E8_NOTHINK BARO_PACK BARO_E8_GGUF BARO_E8_TASKS; do
+for v in BARO_E8_ANS_MAX BARO_E8_RECV_MAX BARO_E8_TMAX BARO_E8_NOTHINK BARO_PACK BARO_E8_GGUF BARO_E8_TASKS BARO_E8_SHARE_A; do
   [ -n "${!v-}" ] && e8_env+=("$v=${!v}")
 done
 gpu-wait run --priority 30 --vram 14 -- \
