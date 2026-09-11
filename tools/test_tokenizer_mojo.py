@@ -132,8 +132,7 @@ def main():
     prompts = json.loads((ROOT / "bench/mtp-prompts/prompts.json").read_text())
     for stem in prompts:
         txt = (ROOT / "bench/mtp-prompts" / f"{stem}.txt").read_text()
-        ref = [int(x) for x in (ROOT / "bench/mtp-prompts" / f"{stem}.tokens").read_text().split()]
-        cases.append((f"prompt:{stem}", txt, ref))
+        cases.append((f"prompt:{stem}", txt, encode_ref(a.llama_tokenize, gguf, txt)))
     for name, text in HARD_SET.items():
         cases.append((f"hard:{name}", text, encode_ref(a.llama_tokenize, gguf, text)))
     chat = render_chat(gguf, [{"role": "user", "content": "What is 2+2?"}])
