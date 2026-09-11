@@ -41,6 +41,6 @@
   changes.** It auto-prints at SessionStart, so a stale baton misinforms every later
   session before it reads anything else; run `board-vs-reality` before building on
   any board claim.
-- Mojo builds that touch `serve/tokenizer.mojo` / `serve/spark.mojo` need `-I ~/Projects/mojo-uregex/src -I ~/Projects/mojo-minja/src` (regex engine + chat-template renderer, own repos).
+- Mojo builds that touch `serve/tokenizer.mojo` / `serve/spark.mojo` need `-I ~/Projects/mojo/mojo-uregex/src -I ~/Projects/mojo/mojo-minja/src` (regex engine + chat-template renderer, own repos).
 - Verify: `./run-tests.sh`, `./bench/run.py [bench-src.mojo]`, parity tests
   in `kernels/test_*.mojo` (build AOT into `.work/`, `-I kernels`).

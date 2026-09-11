@@ -14,8 +14,8 @@ import re, sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-EXT = {"uregex": Path.home() / "Projects/mojo-uregex/src/uregex",
-       "minja": Path.home() / "Projects/mojo-minja/src/minja"}
+EXT = {"uregex": Path.home() / "Projects/mojo/mojo-uregex/src/uregex",
+       "minja": Path.home() / "Projects/mojo/mojo-minja/src/minja"}
 ARCH = {"qwythos": (["serve/window.mojo", "serve/registry.mojo"], "serve/engine.mojo"),
         "spark": (["serve/spark.mojo"], "serve/spark.mojo"),
         "qwen35moe": (["kernels/test_moe_block.mojo"], "kernels/test_moe_block.mojo")}

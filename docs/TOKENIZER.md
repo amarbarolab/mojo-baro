@@ -154,12 +154,12 @@ and the gate decides.
 
 `serve/tokenizer.mojo` reads the same `tokenizer.ggml.*` keys straight from the
 GGUF header (96 MB cap, no tensors) and runs byte-level BPE in Mojo; pre-tokenizer
-regexes run on [`mojo-uregex`](~/Projects/mojo-uregex) (`-I ~/Projects/mojo-uregex/src`).
+regexes run on [`mojo-uregex`](~/Projects/mojo/mojo-uregex) (`-I ~/Projects/mojo/mojo-uregex/src`).
 Pre types: qwen2 / deepseek-r1-qwen, qwen35, llama3 / llama-bpe, spark2_5 (4-pass
 Sequence), gpt-2 / default. Load 0.06 s for a 131k vocab.
 
 ```
-./.venv/bin/mojo build tools/baro-tokenize.mojo -I serve -I ~/Projects/mojo-uregex/src -o .work/baro-tokenize
+./.venv/bin/mojo build tools/baro-tokenize.mojo -I serve -I ~/Projects/mojo/mojo-uregex/src -o .work/baro-tokenize
 .work/baro-tokenize (encode TEXT | decode IDS | decode-keep IDS | batch NUL_TEXTS | info) MODEL.gguf
 ./.venv/bin/python3 tools/test_tokenizer_mojo.py --gguf <Qwythos.gguf> \
     --extra <Spark.gguf>:.work/spark/prompt.txt:.work/spark/ref/prompt-tokens.txt
@@ -174,7 +174,7 @@ oracle-side builder for HF `tokenizer.json` consumers.
 ### Chat templates (2026-09-08)
 
 `serve/spark.mojo` renders `tokenizer.chat_template` in-process with
-[`mojo-minja`](~/Projects/mojo-minja) (`-I ~/Projects/mojo-minja/src`):
+[`mojo-minja`](~/Projects/mojo/mojo-minja) (`-I ~/Projects/mojo/mojo-minja/src`):
 `BARO_CHAT=<case.json> BARO_GGUF=<gguf>` where the JSON is
 `{"messages": [...], "add_generation_prompt": true, "enable_thinking": false, ...}`.
 Oracle `tools/spark-chat-ref.sh` (llama-server `/apply-template` → `/tokenize` →
