@@ -439,3 +439,22 @@ Predictions (F vs B at the same k, 20-prompt medians):
   head size is unchanged, so only acceptance can move the result.
 Falsifier: acceptance worse than round 1 at both k, which would mean a bigger
 general corpus ranks the model's actual tokens worse than the small one.
+
+### Result FR-Spec round 2 (2026-09-11, same engine, pack `.work/engine-pack-q4-fr-ac`)
+
+Receipts as round 1 (all 80 speculative logs carry the right `BARO_FR`); arm A
+median 136.92 / 136.99.
+
+| | full head | FR head | change | prediction | verdict |
+|---|---|---|---|---|---|
+| identity k=2 / k=4 | 20/20 / 20/20 | 20/20 / 20/20 | | 20/20 (P-FR6) | held |
+| acceptance k=2 | 65.9% | 64.6% | -1.3 pt (round 1: -0.9) | no worse than round 1 (P-FR7) | **failed** |
+| acceptance k=4 | 47.9% | 46.2% | -1.7 pt (round 1: -1.1) | no worse than round 1 (P-FR7) | **failed** |
+| tok/s_gen k=2 | 149.09 | 164.49 | +10.33% | within 2 pt of +7.29% (P-FR8) | missed high |
+| tok/s_gen k=4 | 127.37 | 141.53 | +11.12% | within 2 pt of +8.55% (P-FR8) | missed high |
+
+Falsifier triggered: acceptance is worse than round 1 at both k, so a larger
+general corpus ranks this model's own tokens worse than the small one did. The
+larger tok/s gain is partly run-to-run noise (round 1's full-head arms read 150.80
+and 129.37). Next: rank by the model's own output (`bench/fr-gen-corpus.sh`,
+option B) rather than by general text. FR-Spec stays off by default.
