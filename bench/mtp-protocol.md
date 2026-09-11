@@ -297,3 +297,59 @@ q4 is ~57% of q8's bytes, so the m=3 launch-path window is ~11-14 ms against
 q8's 21.3 ms. Falsifier for the reasoning (not the decision): g outside
 4-20% at k=2 means the per-dispatch gap model is wrong and the Result says
 what the trace shows instead.
+
+### Result MSPEC step 1 (2026-09-11, tree `7df2c61`, engine sha256 `ddbb7fcc`)
+
+Receipts (`.work/mspec/run1/receipts.txt`): 100/100 speculative runs read back
+`BARO_SPEC: True`, `spec k: 2|4`, `BARO_MEGA: True`, `BARO_MEGA_WIN: False`,
+`pack q4 trunk: True`; identity PASS 100/100 against arm A's `GENERATED`; pack
+`.work/engine-pack-q4`, sha256 index `d2c11dff`, pack.bin `7e44a51f`. Traced
+and bare runs of the same arm drafted and accepted the same counts. Per-prompt
+table `.work/mspec/run1/summary.md` (`bench/mspec_gaps.mojo`); a Python csv
+oracle with the same definitions (`oracle.txt`) gives the same g on all 40
+traces, 0 malformed windows. `rocprof-kernels` was not the instrument: it
+aggregates per kernel and has no timeline segmentation, which the per-window
+gap share needs.
+
+| median over 20 prompts | k=2 | k=4 |
+|---|---|---|
+| dispatches per verify window | 678 | 678 |
+| verify window W, ms | 14.27 | 19.31 |
+| **gap share g** (min-max) | **15.65%** (15.49-16.23) | **14.95%** (14.69-20.51) |
+| g_lo, tracer cost charged to gaps (not preregistered) | 8.35% | 9.21% |
+| host accept sync per window, us | 58 | 60 |
+| B tok/s_gen | 150.96 | 127.01 |
+| tok/s_ub (ub/B) | 174.71 (1.16x) | 144.68 (1.14x) |
+| ub_lo/B | 1.08x | 1.08x |
+| T/B (tracer cost) | 0.93 | 0.95 |
+
+Arm A (no spec) median 137.02 tok/s_gen: on q4, k=2 speculation is 1.10x and
+k=4 is 0.93x of no-spec. No llama.cpp arm ran this session, so no ratio against
+it is claimed (P4).
+
+Scoring: dispatches HIT/HIT; W HIT / MISS (19.31 vs 12-19); g HIT (point 11
+missed by +4.7 pp) / MISS (14.95 vs 5-13); ub/B MISS/MISS (1.16, 1.14 vs
+1.05-1.15, 1.04-1.12); T/B HIT/HIT. Reasoning falsifier (g outside 4-20% at k=2)
+did not fire.
+
+**Verdict by the frozen rule: g = 15.65% >= 10%, step 1 does not kill; step 2
+waits for the maintainer.** The trace-overhead check fired (T/B 0.93 < 0.95), so g is an
+upper bound. This amendment said what an inflated g below 10% means and nothing
+about one above it. Charging the tracer's whole extra decode time to window
+gaps gives 8.35%; charging only the windows' share of dispatches (678 of ~753 per
+k=2 iteration) gives ~9.2% on p01. The untraced share lies in [8.35, 15.65]% and
+the best estimates sit below the kill line, so the rule passes on the upper
+bound only.
+
+Findings:
+- Gap per dispatch: 3.3 us traced at k=2, ~1.8 us at g_lo. The m=1 launch floor
+  (2.57 us back-to-back, `launch-fusion-protocol.md`) sits between.
+- The gap grows with rows at a fixed dispatch count: 2.23 ms at k=2, 2.89 ms at
+  k=4. Part of what the trace calls a gap scales with m (drain/ramp at dependent
+  boundaries), which a megakernel's grid barriers also pay.
+- W3 (`megakernel-mrow-protocol.md`) measured the m=3 megakernel's GEMM phases at
+  1.6x of m=1 against 1.5x native, and its head +300 us. A loss of that size
+  against a realistic +8% ceiling leaves no margin.
+- p20 at k=4, traced run: one 120.6 ms stall between two dispatches (rmsnorm_cast
+  -> matmul_skinny, row 2822 of 17081), decode_s 1.59 vs 0.56 bare. Host-side,
+  cause not diagnosed. Dropping it moves the k=4 median g by 0.04 pp.
