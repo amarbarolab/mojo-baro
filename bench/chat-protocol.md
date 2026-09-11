@@ -732,3 +732,269 @@ and no cost to decode. That is the honest claim. The 100x-class number needs
 M1b.
 
 Not run: nothing further; M1b preregistration is unwritten.
+
+---
+
+## KSAMP: device sampler and speculative acceptance kernels (frozen 2026-09-11, before its build)
+
+Plan: `~/Brain/mojo/mojo-baro/briefs/2026-09-11-chat-engine-next.md`, item KSAMP.
+Lane `lane-KSAMP`, files `kernels/sample.mojo` and `kernels/test_sample.mojo`.
+No engine wiring, no greedy-path change, no penalties (the KSAMP interface has none;
+they belong to the CHAT host path and a later kernel step).
+
+**Interface (fixed by the plan, spelled in this repo's kernel form).** Rows are
+`X: [R, V] f32`, one block per row, the same shape as `amar_argmax_row`, so the
+caller swaps one launch for the other.
+- `amar_sample_row(X, Out[R] i32, Prob[R] f32, n, temperature, top_k, top_p,
+  min_p, seed: u64, counter: u64)`: token id and its probability under the
+  distribution it was drawn from.
+- `amar_spec_accept(Pt, Pd, Dtok, Out, Acc, n, seed, counter)`: per row, accept
+  the drafted token `x` when `u * p_d(x) < p_t(x)` (probability
+  `min(1, p_t/p_d)`), otherwise emit a draw from the normalised
+  `max(0, p_t - p_d)`. The uniform `u` and the resample noise come from the
+  same counter RNG as the sampler, in separate streams.
+- Addition flagged for CHAT: `amar_sample_probs(X, P, n, ...same params)`
+  writes the full truncated, tempered distribution row. `amar_spec_accept`
+  needs `p_t` and `p_d` as rows and nothing in the fixed interface produces
+  them; this kernel shares the sampler's selection code, so the probabilities
+  the acceptance rule sees are the ones the sampler draws from.
+
+**Semantics (llama.cpp order, design §5).** Valid logits are finite and not
+NaN. top-k (0 or >= valid count = off) keeps the k largest; top-p (>= 1 = off)
+keeps the shortest prefix, in descending order, whose softmax mass over the
+top-k set at temperature 1 reaches `top_p`, the crossing token included;
+min-p (<= 0 = off) keeps tokens with `p >= min_p * p_max` at temperature 1;
+then temperature scales the survivors and one token is drawn. Ties in value
+are ordered by lower index first, so every cut is a prefix of one total order
+(value descending, index ascending) and the three filters commute.
+`temperature <= 0` returns `amar_argmax_row`'s token (same rule: lowest index
+among the maximum, NaN ignored, all-invalid row gives 0) with probability 1.
+A sampled row with no valid logit gives token -1, probability 0.
+
+**Mechanism.** Counter RNG = Philox4x32-10 (Random123 constants), key = seed,
+counter = (counter lo, counter hi, row, stream << 28 | element / 4). The draw
+is Gumbel-max over the survivors, `argmax((l - lmax) / T + G_i)` with `G_i`
+keyed by the element index, so the token does not depend on thread count or
+summation order: a (seed, counter) pair reproduces bit-exactly. Cuts are found
+without a sort: pass 1 finds `lmax`; pass 2 builds a 257-bucket histogram of
+`(lmax - l) * 8` (1/8-nat bands, one tail bucket) with counts and fixed-point
+masses (`exp(l - lmax) * 2^40` as u64, so sums are exact and order-free); the
+band holding the k-th token (or the top-p crossing) is refined by a four-digit
+8-bit radix select on the order-preserving u32 key of the logit, restricted to
+that band, then by index for ties. One block of 1024 threads per row.
+
+**Predictions.**
+- P-K1 Philox4x32-10 matches the Random123 known-answer vectors (zero and
+  all-ones counter/key).
+- P-K2 Temperature 0: token equal to `amar_argmax_row` on 8 random rows at the
+  real vocabulary V = 248320 plus edge rows (value ties, +0/-0, -inf, NaN, all
+  -inf), 100 % of rows.
+- P-K3 Distribution: fixed logits over V = 64, 10,000 draws per configuration
+  (T 1.0 / k off / p off; T 0.7 / k 20 / p 0.8; T 1.3 / k 12 / p 0.9 / min-p
+  0.05; T 0.5 / k off / p 0.6; a tie-heavy row with k cutting inside a tie),
+  Pearson chi-square against the exact float64 distribution (bins pooled to
+  expected >= 5) below the p = 0.001 critical value, **zero** draws outside
+  the truncated set, returned probability within 1e-5 of the exact value,
+  `amar_sample_probs` row within 1e-5 of exact and summing to 1 within 1e-5.
+- P-K4 Reproducibility: two launches with the same (seed, counter) give the
+  same 10,000 tokens; a different seed changes at least half of them on the
+  flat configuration.
+- P-K5 Speculation: a deliberately mismatched draft (different logits, same
+  sampling parameters), drafts drawn by `amar_sample_row` from `p_d`, then
+  `amar_spec_accept`; 10,000 rows, accepted-or-resampled tokens pass the
+  chi-square against `p_t`; acceptance rate within 4 sigma of
+  `sum_i min(p_t, p_d)`; a two-sample chi-square between these tokens and
+  direct `amar_sample_row` draws from `p_t` passes at p = 0.001
+  (speculation on and off indistinguishable).
+- P-K6 Time per call at V = 248320, R = 1, logits Gaussian sigma 2.5 with a
+  few boosted tokens, row hot in L2 (as in the engine, where the lm-head
+  writes it just before): greedy 5-15 us (one pass); Qwen preset
+  (T 0.7 / k 20 / p 0.8) 50-110 us (12 passes over 1 MB at ~6.5 us per pass
+  for one block); llama.cpp default (T 0.8 / k 40 / p 0.95 / min-p 0.05)
+  same band; k off / p 0.95: 30-70 us (7 passes). Falsifier: either
+  sampling preset above 150 us means the per-pass cost model is wrong;
+  look at LDS atomic contention in the band pass before anything else.
+
+**Verification before timing (P1).** The test prints grid, block, V, R and
+every sampling parameter of each timed arm from the values it launched with,
+in the same binary that is timed, and runs the P-K2 and P-K3 checks in the
+same process before timing.
+
+**Gate.** `./run-tests.sh` exit 0 with the census at +3 kernels and 0
+orphans, `kernels/test_sample.mojo` PASS on P-K1 to P-K5, P-K6 recorded
+against its bands; both captured to `.work/KSAMP-gate.txt`.
+
+**Result, first build (`21fe9e4`, 2026-09-11, `.work/KSAMP-run2.txt`).**
+P-K1 to P-K5 PASS: Philox KATs match; temperature 0 equals
+`amar_argmax_row` on 13/13 rows at V = 248320; six chi-square configs all
+below the p = 0.001 critical value with zero draws outside the truncated
+set; probabilities within 1.4e-8 of exact; same seed 10k/10k equal;
+acceptance 0.5394 vs exact 0.5373 (sigma 0.0050), spec vs direct
+two-sample chi2 23.5 at df 21 (crit 46.9). One fixture correction before
+that run: the third Philox KAT's last word was transcribed from memory as
+`24f7f839`; Random123's vector is `24126ea1`, and the implementation
+matched the other three words exactly, which a wrong Philox cannot do.
+
+P-K6 **falsified**: greedy 28.5 us (band 5-15), T0.7/k20/p0.8 483 us
+(50-110), T0.8/k40/p0.95/min-p 0.05 485 us, k off/p 0.95 432 us (30-70),
+plain T1 206 us; `amar_argmax_row` itself 129 us at this V with its 256
+threads. Diagnosis by subtraction (inferred, not profiled): a scalar
+strided pass over the 1 MB row costs ~28 us with 1024 threads (load
+latency, not bandwidth: 256 threads take 4.5x longer), not 6.5 us; the
+band pass's two u64 LDS atomics per element cost ~175 us; the plain
+arm's final pass spends ~178 us because every element computes a full
+Philox call and uses one of its four words.
+
+## KSAMP-b: fewer and cheaper passes (frozen 2026-09-11, before its build)
+
+**Change.** (1) Every pass over the row loads 4 consecutive floats per
+thread per group and keeps two groups in flight; the Gumbel noise takes
+all four words of one Philox call per group. (2) Fast path for the cut:
+after `lmax`, one pass accumulates, per thread and without atomics, the
+count and fixed-point mass of valid tokens within D nats of `lmax` for
+D in {0.5, 1, 2, 3, 4, 6, 8}, reduced across the block; the smallest D
+whose set holds the top-k boundary (or, with top-k off, the top-p mass)
+and has at most CAP = 2048 tokens is compacted into LDS as
+`(key << 32) | ~index`, bitonic-sorted descending, and top-k, top-p and
+min-p are read off the sorted prefix with the same integer masses and
+`W = ceil(top_p * Z)` as the general path, so both paths cut the same
+set and, the noise being keyed by index, draw the same token. (3) When
+no D qualifies the first build's band-and-radix path runs unchanged.
+`CAP` is a comptime parameter with default 2048 so the test can force
+the general path.
+
+**Predictions.**
+- P-K7 P-K1 to P-K5 still pass; for every P-K3 configuration and the
+  P-K5 draws, the fast path and the forced general path (`CAP = 16`)
+  give identical tokens on 10,000/10,000 rows and probabilities within
+  1e-6.
+- P-K8 Time per call at V = 248320, R = 1, hot row, same test harness:
+  greedy 6-12 us; Gaussian row (sigma 2.5, five tokens boosted to
+  10-14) T0.7/k20/p0.8 and T0.8/k40/p0.95/min-p 0.05: 25-60 us (fast
+  path); an LM-like peaked row (same bulk, boosted to 20-24) with the
+  same two presets and k off/p 0.95: 25-60 us; plain T1 on the Gaussian
+  row 60-120 us; k off/p 0.95 on the Gaussian row takes the general path
+  (its nucleus is the bulk), recorded, no band.
+- Falsifier: greedy above 15 us means a vectorised pass is not
+  load-latency bound as inferred; read the ISA (`isa-loops`) before any
+  further change.
+
+**Gate.** As KSAMP, plus P-K7; P-K8 recorded against its bands.
+
+**Result, KSAMP-b build (2026-09-11, `.work/KSAMP-b-run.txt`, queue empty
+before the run).** P-K1 to P-K5 unchanged and PASS (identical chi-square
+numbers: the noise is keyed by element index, so the first build's draws
+reproduce). P-K7 PASS: fast path and forced general path (`CAP = 16`)
+agree on 10,000/10,000 tokens for all six P-K3 configurations and both
+P-K5 draw sets, probabilities bit-equal (the final pass is shared).
+
+P-K8, per call at V = 248320:
+
+| row | arm | measured | band |
+|---|---|---|---|
+| gaussian | greedy | 9.3 us | 6-12, **held** |
+| gaussian | T0.7/k20/p0.8 | 120.0 us | 25-60, missed |
+| gaussian | T0.8/k40/p0.95/min-p 0.05 | 121.3 us | 25-60, missed |
+| gaussian | plain T1 | 125.7 us | 60-120, missed |
+| gaussian | k off/p 0.95 (general path) | 422.4 us | none |
+| peaked | T0.7/k20/p0.8 | 552.2 us | 25-60, missed |
+| peaked | T0.8/k40/p0.95/min-p 0.05 | 664.9 us | 25-60, missed |
+| peaked | k off/p 0.95 | 137.7 us | 25-60, missed |
+| gaussian | `amar_argmax_row` (reference) | 129.5 us | - |
+
+The falsifier did not fire (greedy 9.3 us: a vectorised pass is cheap).
+Two misses are design facts, read off the arms: on the peaked row the
+20th token sits in the bulk, 12+ nats below `lmax`, beyond the widest
+8-nat window, so k20/k40 fall back to the general path (552/665 us); the
+Gaussian presets take the fast path yet cost 120 us, which the pass count
+(four vectorised passes at ~9 us) does not explain. Not yet diagnosed:
+phase timers next, before any KSAMP-c prediction.
+
+**Diagnosis (measured, `.work/ksamp-diag/phases.txt`).** An uncommitted
+copy of the kernel with a block barrier and a `llvm.readsteadycounter`
+stamp at each phase boundary, 100 runs per arm after 20 warm-up, Gaussian
+row, T0.7/k20/p0.8, microseconds from kernel start: pass A + reductions
+15.0, threshold pass 73.1 (58 us), compaction 86.0 (13), sort 90.0 (4),
+prefix scan 91.2, final pass 113.6 (22), end 115.0. Peaked row, same
+preset: general path 13.7 -> 510.3. ISA receipt (`tools/isa-receipt.py`):
+every sampler kernel 47-50 VGPR, 0 scratch, 0 spills, so the threshold
+pass is ALU and divergence (each element inside the 8-nat window runs
+the 8-lane accumulate), not spilling. Widening the window to reach the
+peaked row's 20th token (12+ nats) would put the whole bulk inside it.
+
+## KSAMP-c: sampled window, exact compaction (frozen 2026-09-11, before its build)
+
+**Change.** The threshold pass is replaced by a 16-chunk contiguous
+subsample of 16,384 elements (all of the row when V is smaller). Per
+thread it counts elements, and for top-k off their masses, within
+D of `lmax` for 16 values of D from 0.25 to 32 nats. The window is the
+smallest D whose estimate holds 2k + 16 tokens (top-k on) or the top-p
+mass with half the remaining margin (top-k off). The compaction pass
+then counts exactly, accumulating the exact fixed-point `Z` when top-k
+is off. On overflow of CAP it steps D down, on too few tokens or too
+little mass it steps D up, at most four compactions, then the general
+path. Sort, prefix scan and the cut rule are unchanged, so P-K7's
+identity must still hold. The final pass tests membership against the
+cut's float value instead of re-deriving the key. Block reductions go
+through `warp` shuffles plus one 32-entry LDS step (two barriers instead
+of ten).
+
+**Predictions.**
+- P-K9 P-K1 to P-K5 and P-K7 unchanged and PASS.
+- P-K10 Per call at V = 248320: greedy 5-10 us; Gaussian and peaked rows,
+  T0.7/k20/p0.8 and T0.8/k40/p0.95/min-p 0.05: 35-65 us; peaked row k
+  off/p 0.95: 35-65 us; plain T1 80-110 us (Philox and two logs per
+  element, untouched); Gaussian k off/p 0.95 takes the general path,
+  recorded, no band.
+- Falsifier: a preset at 35-65 missing by more than 2x means the phase
+  model (pass 12 us, compaction 13, sort 4, final 12) is wrong; re-run
+  the phase timers before any other change.
+
+**Gate.** As KSAMP-b; P-K10 recorded against its bands.
+
+**Harness fix before the verdict (P6).** The P-K8 arms were one mean
+over 1000 back-to-back launches. A stamped copy timed three ways in one
+process (`.work/ksamp-diag/phases-c2.txt`) read the same kernel on the
+same row at 71 us back-to-back and 640 us synced (peaked, T0.7/k20/p0.8)
+with sclk at 3305 MHz and the queue empty: one-workgroup kernels see
+large run-to-run interference. Every arm is now 11 blocks of 100
+launches, min/median/max printed; the first build's and KSAMP-b's
+single-mean P-K6/P-K8 numbers carry that caveat.
+
+**Result, KSAMP-c (`512294d` + block-median harness, 2026-09-11,
+`.work/KSAMP-gate.txt`, queue empty, clock-probe sclk 3305-3311 MHz).**
+Gate PASS: `run-tests.sh` exit 0 (85 kernels, 38 in registry, 0
+orphans), `test_sample` exit 0. P-K9 PASS: P-K1 to P-K5 unchanged, P-K7
+10,000/10,000 identical tokens in all eight comparisons.
+
+P-K10, median per call (min-max), V = 248320:
+
+| row | arm | median (min-max) | band | verdict |
+|---|---|---|---|---|
+| gaussian | greedy | 9.2 (9.1-9.3) | 5-10 | held |
+| gaussian | T0.7/k20/p0.8 | 69.4 (69.2-70.8) | 35-65 | missed by 7 % |
+| gaussian | T0.8/k40/p0.95/min-p 0.05 | 120.3 (117.6-121.4) | 35-65 | missed, 1.85x |
+| peaked | T0.7/k20/p0.8 | 69.4 (69.4-70.4) | 35-65 | missed by 7 % |
+| peaked | T0.8/k40/p0.95/min-p 0.05 | 145.5 (143.5-148.5) | 35-65 | **falsifier, 2.24x** |
+| peaked | k off/p 0.95 | 179.5 (177.6-181.6) | 35-65 | **falsifier, 2.76x** |
+| gaussian | plain T1 | 129.1 (128.0-130.0) | 80-110 | missed |
+| gaussian | k off/p 0.95 (general path) | 490.1 (487.9-492.3) | none | recorded |
+| gaussian | `amar_argmax_row` (reference) | 129.3 (128.7-133.9) | - | - |
+
+What the falsifier asked for is already on disk (phase stamps,
+`.work/ksamp-diag/phases-c2.txt`): the two falsified arms retried the
+compaction (llama presets 2 passes, peaked k off/p 0.95 3 passes, one
+compaction ~28-35 us each), because the subsample estimate lands below
+the window the exact check accepts. One compaction costs ~32 us against
+KSAMP-b's 13 us for the same loop shape; that difference is not
+explained (ISA diff not done). The final pass costs 22-37 us. Against
+the first build (single means) the LM-like peaked row at T0.7/k20/p0.8
+went 552 -> 69.4 us and the Gaussian preset 483 -> 69.4 us.
+
+**Round closed here.** Levers not taken, for whoever picks the sampler
+up again: (1) find why the compaction loop costs 2.5x KSAMP-b's (ISA
+diff of the two loops); (2) widen the estimated window by one step for
+min-p and top-p so one compaction suffices; (3) two loads in flight in
+the compaction and final passes, as pass A has; (4) the general path
+(k off, flat rows) still pays ~480 us in its band pass and radix
+refinement.
