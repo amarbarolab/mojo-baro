@@ -506,7 +506,7 @@ def main() raises:
     var bufs = alloc_bufs(ctx, pack, tmax)
     var toks_d = bufs.toks_d
 
-    var wst = WindowState(pos=0, pos_prev=0, ring=0, n_drafted=0, n_accepted=0, n_spec_windows=0, n_dumped=0, tp=0, tq=0, pf_att=0, pf_ssm=0, pf_ffn=0, pf_head=0, pf_proc=0, pf_draft=0, fc=[0, 0, 0, 0, 0, 0], pc=[0, 0, 0, 0, 0, 0, 0, 0], p3=[0, 0, 0, 0])
+    var wst = WindowState(pos=0, pos_prev=0, ring=0, n_drafted=0, n_accepted=0, n_spec_windows=0, n_dumped=0, tp=0, tq=0, pf_att=0, pf_ssm=0, pf_ffn=0, pf_head=0, pf_proc=0, pf_draft=0, fc=[0, 0, 0, 0, 0, 0], pc=[0, 0, 0, 0, 0, 0, 0, 0], p3=[0, 0, 0, 0], pfx=[0, 0, 0, 0])
     var ckpt_cap = atol(getenv("BARO_CKPT", "8")) if serve else 0
     if ckpt_cap < 0:
         ckpt_cap = 0
@@ -618,6 +618,12 @@ def main() raises:
                 pf_tail = MROWS
         var prefill_rows = len(prompt) - 1 - cached
         print("TMAX:", tmax, " kv dtype:", String(KVT), " prefill chunk:", pf_chunk, " prefill rows:", pf_rows, " cached:", cached, " replay rows:", prefill_rows)
+        # BARO_MARGIN=1 (with BARO_FORCE): after each forced step, recompute the
+        # head from that step's final residual (final rmsnorm, q4 head GEMM,
+        # reduce) and print the top-2 logits and their gap next to the argmax
+        # the engine produced.
+        var margin = getenv("BARO_MARGIN", "0") == "1" and len(force) > 0
+        print("BARO_MARGIN:", margin)
 
         # --- decode loop ---------------------------------------------------------
 
@@ -667,6 +673,7 @@ def main() raises:
         var stopped = False
         var predicted = List[Int]()
         var force_tok_h = ctx.enqueue_create_host_buffer[DType.int32](1)
+        var lg_h = ctx.enqueue_create_host_buffer[f32](VOCAB if margin else 1)
         # The stopwatch stays here, in the harness that is never embedded in a
         # gguf: step_window cannot reach t0, t_prefill_end or dt (P-A, 2026-09-08).
         while wst.pos < n_total - 1:
@@ -687,7 +694,28 @@ def main() raises:
                 if fi < len(force):
                     ctx.enqueue_copy(dst_buf=force_tok_h, src_buf=DeviceBuffer[DType.int32](ctx, toks_d.unsafe_ptr() + wst.pos, 1, owning=False))
                     ctx.synchronize()
-                    predicted.append(Int(force_tok_h[0]))
+                    var got = Int(force_tok_h[0])
+                    predicted.append(got)
+                    if margin:
+                        var wf = 1 + N_SSM * 10 + N_ATT * 7 + N_LAYERS * 4
+                        var Xm = TileTensor(bufs.x_d, xm_layout)
+                        var CurBm = TileTensor(bufs.curb_d, xm_layout)
+                        ctx.enqueue_function[rmsc_k](Xm, tens_f32(ctx, bufs.wbuf, bufs.off[wf], H, h_layout), CurBm, Int32(H), Float32(1e-6), grid_dim=1, block_dim=256)
+                        var Pv = TileTensor(bufs.p_v_d, p_v)
+                        gemm_w[VOCAB, H](ctx, CurBm, bufs.wbuf, bufs.off[wf + 1], pack_q4, Pv, 1)
+                        ctx.enqueue_function[r_head](Pv, TileTensor(bufs.logits_d, vm_layout), Int32(1), Int32(VOCAB), grid_dim=ceildiv(VOCAB, 256), block_dim=256)
+                        ctx.enqueue_copy(dst_buf=lg_h, src_buf=DeviceBuffer[f32](ctx, bufs.logits_d.unsafe_ptr(), VOCAB, owning=False))
+                        ctx.synchronize()
+                        var i1 = 0
+                        var i2 = -1
+                        for i in range(1, VOCAB):
+                            if lg_h[i] > lg_h[i1]:
+                                i2 = i1
+                                i1 = i
+                            elif i2 < 0 or lg_h[i] > lg_h[i2]:
+                                i2 = i
+                        var refv = force[fi]
+                        print("MARGIN pos", fi, " engine_argmax", got, " ref", refv, " top1", i1, lg_h[i1], " top2", i2, lg_h[i2], " gap", lg_h[i1] - lg_h[i2], " ref_logit", lg_h[refv])
                     force_tok_h[0] = Int32(force[fi])
                     ctx.enqueue_copy(dst_buf=DeviceBuffer[DType.int32](ctx, toks_d.unsafe_ptr() + wst.pos, 1, owning=False), src_buf=force_tok_h)
                     ctx.synchronize()

@@ -356,6 +356,7 @@ def prefill_forward(
     mut convp_d: DeviceBuffer[f32], mut sop_d: DeviceBuffer[f32], mut resbp_d: DeviceBuffer[bf16], mut qfp_d: DeviceBuffer[f32],
     mut qp_d: DeviceBuffer[f32], mut gatep_d: DeviceBuffer[f32], mut kp_d: DeviceBuffer[f32], mut vp_d: DeviceBuffer[f32],
     mut aop_d: DeviceBuffer[f32], mut gp_d: DeviceBuffer[f32], mut up_d: DeviceBuffer[f32], mut fgbp_d: DeviceBuffer[bf16],
+    mut pfx: List[Int],
 ) raises:
     # Prompt rows pos .. pos+m-1 through the 32-block trunk in one chunk
     # (bench/prefill-protocol.md): WMMA GEMMs over the weight-native q4/q8
@@ -408,7 +409,14 @@ def prefill_forward(
             ctx.enqueue_function[rope_kp](Khd, Int32(pos), Int32(NKVH), grid_dim=(NKVH, m), block_dim=32)
             ctx.enqueue_function[append_p](Kc, Khd, Int32(pos), Int32(att_i), grid_dim=(NKVH, m), block_dim=HD)
             ctx.enqueue_function[append_p](Vc, Vhd, Int32(pos), Int32(att_i), grid_dim=(NKVH, m), block_dim=HD)
-            ctx.enqueue_function[attp_k](Qp, Kc, Vc, Aop, Int32(pos), Int32(m), Float32(0.0625), Int32(att_i), grid_dim=(NKVH, ceildiv(m, PA_ROWS)), block_dim=256)
+            var ta = 0
+            if prof:
+                ctx.synchronize()
+                ta = perf_counter_ns()
+            ctx.enqueue_function[attpw_k](Qp, Kc, Vc, Aop, Int32(pos), Int32(m), Float32(0.0625), Int32(att_i), grid_dim=(NKVH, ceildiv(m, PW_ROWS)), block_dim=PW_THREADS)
+            if prof:
+                ctx.synchronize()
+                pfx[0] += Int(perf_counter_ns() - ta)
             ctx.enqueue_function[gmul_p](Aopflat, Gatep, AoBp, Int32(m * H), grid_dim=ceildiv(m * H, 256), block_dim=256)
             gemm_pw[H, H, True](ctx, AoBpm, wbuf, off[w + 6], pack_q4, Xp, m, prof, gemm_ns)
             att_i += 1
@@ -431,11 +439,18 @@ def prefill_forward(
             gemm_pw[H, H, False](ctx, CurBp, wbuf, off[w + 2], pack_q4, Zp, m, prof, gemm_ns)
             gemm_pw[NH_V, H, False](ctx, CurBp, wbuf, off[w + 3], pack_q4, Arp, m, prof, gemm_ns)
             gemm_pw[NH_V, H, False](ctx, CurBp, wbuf, off[w + 4], pack_q4, Brp, m, prof, gemm_ns)
+            var ts = 0
+            if prof:
+                ctx.synchronize()
+                ts = perf_counter_ns()
             ctx.enqueue_function[gates_p](Arp, Brp, Egp, Betap, SsmA, DtB, Int32(m), grid_dim=ceildiv(m * NH_V, 256), block_dim=256)
             ctx.enqueue_function[conv_p](Qkvp, ConvStateAll, Cw, Convp, Int32(ring), Int32(ssm_i), Int32(SLOTS), Int32(m), grid_dim=ceildiv(CONV, 256), block_dim=256)
             ctx.enqueue_function[l2_p](Convp, Int32(m), grid_dim=(NH_V, m), block_dim=SSTATE)
-            ctx.enqueue_function[delta_p](SStateAll, Convp, Egp, Betap, Sop, Int32(ring), Int32(ssm_i), Int32(SLOTS), Int32(m), grid_dim=NH_V, block_dim=SSTATE)
+            ctx.enqueue_function[deltaw_p](SStateAll, Convp, Egp, Betap, Sop, Int32(ring), Int32(ssm_i), Int32(SLOTS), Int32(m), grid_dim=DC_BLOCKS, block_dim=32)
             ctx.enqueue_function[gated_p](Sop, Zp, Nw, ResBp, grid_dim=(NH_V, m), block_dim=SSTATE)
+            if prof:
+                ctx.synchronize()
+                pfx[1] += Int(perf_counter_ns() - ts)
             gemm_pw[H, H, True](ctx, ResBp, wbuf, off[w + 9], pack_q4, Xp, m, prof, gemm_ns)
             ssm_i += 1
             w += 10
@@ -451,6 +466,8 @@ def prefill_forward(
     if prof:
         ctx.synchronize()
         var chunk_ns = Int(perf_counter_ns() - t_chunk)
+        pfx[2] += gemm_ns
+        pfx[3] += chunk_ns
         print("prefill profile: rows", m, " gemm_s", Float64(gemm_ns) / 1e9, " chunk_s", Float64(chunk_ns) / 1e9, " share", Float64(gemm_ns) / Float64(chunk_ns))
 
 
@@ -583,6 +600,7 @@ struct WindowState(Copyable, Movable):
     var fc: List[Int]
     var pc: List[Int]
     var p3: List[Int]
+    var pfx: List[Int]
 
     def reset(mut self, t0: Int):
         # per request; n_dumped spans requests (BARO_DUMP)
@@ -603,6 +621,7 @@ struct WindowState(Copyable, Movable):
         self.fc = [0, 0, 0, 0, 0, 0]
         self.pc = [0, 0, 0, 0, 0, 0, 0, 0]
         self.p3 = [0, 0, 0, 0]
+        self.pfx = [0, 0, 0, 0]
 
 
 def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: WindowState) raises:
@@ -618,11 +637,14 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
         var mc = min(cfg.pf_chunk, cfg.pf_rows - st.pos)
         prefill_forward(ctx, b.wbuf, b.off, cfg.pack_q4, mc, st.pos, st.ring, cfg.prof, b.toks_d, b.convstate_d, b.sstate_d, b.kc_d, b.vc_d,
             b.xp_d, b.curbp_d, b.qkvp_d, b.zp_d, b.arp_d, b.brp_d, b.egp_d, b.betap_d, b.convp_d, b.sop_d, b.resbp_d, b.qfp_d,
-            b.qp_d, b.gatep_d, b.kp_d, b.vp_d, b.aop_d, b.gp_d, b.up_d, b.fgbp_d)
+            b.qp_d, b.gatep_d, b.kp_d, b.vp_d, b.aop_d, b.gp_d, b.up_d, b.fgbp_d, st.pfx)
         st.ring = (st.ring + mc) % SLOTS
         st.pos_prev = st.pos
         st.pos += mc
         if st.pos == cfg.pf_rows:
+            if cfg.prof:
+                var other = st.pfx[3] - st.pfx[0] - st.pfx[1] - st.pfx[2]
+                print("prefill split s: attn", Float64(st.pfx[0]) / 1e9, " ssm_scan", Float64(st.pfx[1]) / 1e9, " gemm", Float64(st.pfx[2]) / 1e9, " other", Float64(other) / 1e9, " total", Float64(st.pfx[3]) / 1e9)
             var Xtail = row_f32(ctx, b.xp_d, (mc - cfg.pf_tail) * H, MROWS * H, xm_layout)
             ctx.enqueue_function[rms_m](
                 Xtail, tens_f32(ctx, b.wbuf, b.off[1 + N_SSM * 10 + N_ATT * 7 + N_LAYERS * 4], H, h_layout),

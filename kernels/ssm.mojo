@@ -459,3 +459,88 @@ def amar_ssm_gated_out_rows_bf16[
     Res[r, h * SSTATE + j] = rebind[Res.ElementType](
         (v * scale * rebind[Scalar[f32]](NormW[j]) * (z / (1 + exp(-z)))).cast[DType.bfloat16]()
     )
+
+
+comptime DC_COLS = 8
+comptime DC_IQ = WARP_SIZE // DC_COLS
+comptime DC_IL = SSTATE // DC_IQ
+comptime DC_GROUPS = SSTATE // DC_COLS
+comptime DC_BLOCKS = NH_V * DC_GROUPS
+
+
+@always_inline
+def dc_load[CLayout: TensorLayout](
+    ConvOut: TileTensor[f32, CLayout, MutAnyOrigin], r: Int, base: Int
+) -> SIMD[f32, DC_IL]:
+    comptime assert ConvOut.flat_rank == 2
+    var Cv = ConvOut.vectorize[1, 8]()
+    var b8 = base // 8
+    var a = rebind[SIMD[f32, 8]](Cv[r, b8]).join(rebind[SIMD[f32, 8]](Cv[r, b8 + 1]))
+    var b = rebind[SIMD[f32, 8]](Cv[r, b8 + 2]).join(rebind[SIMD[f32, 8]](Cv[r, b8 + 3]))
+    return rebind[SIMD[f32, DC_IL]](a.join(b))
+
+
+def amar_ssm_delta_chunk_w[
+    S0Layout: TensorLayout, CLayout: TensorLayout, GLayout: TensorLayout,
+    OLayout: TensorLayout
+](
+    SAll: TileTensor[f32, S0Layout, MutAnyOrigin],
+    ConvOut: TileTensor[f32, CLayout, MutAnyOrigin],
+    Eg: TileTensor[f32, GLayout, MutAnyOrigin],
+    Beta: TileTensor[f32, GLayout, MutAnyOrigin],
+    O: TileTensor[f32, OLayout, MutAnyOrigin],
+    ring: Int32, ssm_i: Int32, slots: Int32, m: Int32,
+):
+    comptime assert SAll.flat_rank == 5 and ConvOut.flat_rank == 2
+    comptime assert Eg.flat_rank == 2 and O.flat_rank == 3
+    comptime assert DC_IL == 32
+    var h = Int(block_idx.x) // DC_GROUPS
+    var lane = Int(thread_idx.x)
+    var jj = lane // DC_IQ
+    var iq = lane % DC_IQ
+    var j = (Int(block_idx.x) % DC_GROUPS) * DC_COLS + jj
+    var i0 = iq * DC_IL
+    var kh = h % NH_K
+    var si = Int(ssm_i)
+    var rs = Int(ring) % Int(slots)
+    var ws = (Int(ring) + Int(m)) % Int(slots)
+    var M = Int(m)
+    var qb = kh * SSTATE + i0
+    var kb = KDIM + kh * SSTATE + i0
+    var vb = 2 * KDIM + h * SSTATE + j
+
+    var col = SIMD[f32, DC_IL]()
+    comptime for i in range(DC_IL):
+        col[i] = rebind[Scalar[f32]](SAll[rs, si, h, i0 + i, j])
+    var kc = dc_load(ConvOut, 0, kb)
+    var qc = dc_load(ConvOut, 0, qb)
+    var vc = rebind[Scalar[f32]](ConvOut[0, vb])
+    var ec = rebind[Scalar[f32]](Eg[0, h])
+    var bc = rebind[Scalar[f32]](Beta[0, h])
+    for r in range(M):
+        var rn = min(r + 1, M - 1)
+        var kn = dc_load(ConvOut, rn, kb)
+        var qn = dc_load(ConvOut, rn, qb)
+        var vn = rebind[Scalar[f32]](ConvOut[rn, vb])
+        var en = rebind[Scalar[f32]](Eg[rn, h])
+        var bn = rebind[Scalar[f32]](Beta[rn, h])
+
+        var ce = col * ec
+        var sk = (ce * kc).reduce_add()
+        sk += warp.shuffle_xor(sk, UInt32(1))
+        sk += warp.shuffle_xor(sk, UInt32(2))
+        var d = (vc - sk) * bc
+        col = ce + kc * d
+        var o = (col * qc).reduce_add()
+        o += warp.shuffle_xor(o, UInt32(1))
+        o += warp.shuffle_xor(o, UInt32(2))
+        if iq == 0:
+            O[r, h, j] = rebind[O.ElementType](o)
+
+        kc = kn
+        qc = qn
+        vc = vn
+        ec = en
+        bc = bn
+    comptime for i in range(DC_IL):
+        SAll[ws, si, h, i0 + i, j] = rebind[SAll.ElementType](col[i])
