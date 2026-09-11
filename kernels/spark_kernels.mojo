@@ -28,7 +28,7 @@ def amar_embed_lookup_f32[
 
 
 def amar_rope_plain[
-    NROT_: Int, XLayout: TensorLayout
+    NROT_: Int, XLayout: TensorLayout, NEOX: Bool = True
 ](
     X: TileTensor[f32, XLayout, MutAnyOrigin],
     pos: Int32,
@@ -45,10 +45,16 @@ def amar_rope_plain[
     var c = cos(theta)
     var s = sin(theta)
     var row = r * Int(nh) + h
-    var x0 = rebind[Scalar[f32]](X[row, j])
-    var x1 = rebind[Scalar[f32]](X[row, j + NROT_ // 2])
-    X[row, j] = rebind[X.ElementType](x0 * c - x1 * s)
-    X[row, j + NROT_ // 2] = rebind[X.ElementType](x0 * s + x1 * c)
+    comptime if NEOX:
+        var x0 = rebind[Scalar[f32]](X[row, j])
+        var x1 = rebind[Scalar[f32]](X[row, j + NROT_ // 2])
+        X[row, j] = rebind[X.ElementType](x0 * c - x1 * s)
+        X[row, j + NROT_ // 2] = rebind[X.ElementType](x0 * s + x1 * c)
+    else:
+        var x0 = rebind[Scalar[f32]](X[row, 2 * j])
+        var x1 = rebind[Scalar[f32]](X[row, 2 * j + 1])
+        X[row, 2 * j] = rebind[X.ElementType](x0 * c - x1 * s)
+        X[row, 2 * j + 1] = rebind[X.ElementType](x0 * s + x1 * c)
 
 
 def amar_gemv_q8[
@@ -110,7 +116,7 @@ def amar_gemv_q8[
 
 
 def amar_rope_kv_append[
-    NROT_: Int, NAT: Int, CLayout: TensorLayout, NLayout: TensorLayout, HD_: Int = HD, NKVH_: Int = NKVH
+    NROT_: Int, NAT: Int, CLayout: TensorLayout, NLayout: TensorLayout, HD_: Int = HD, NKVH_: Int = NKVH, NEOX: Bool = True
 ](
     Kc: TileTensor[KVT, CLayout, MutAnyOrigin],
     Vc: TileTensor[KVT, CLayout, MutAnyOrigin],
@@ -130,17 +136,42 @@ def amar_rope_kv_append[
         return
     var val = rebind[Scalar[f32]](K[h, d])
     if d < NROT_:
-        var half = NROT_ // 2
-        var j = d if d < half else d - half
-        var theta = Float32(Int(pos)) * exp(
-            Float32(-2 * j) / Float32(NROT_) * log(freq_base)
-        )
-        var c = cos(theta)
-        var s = sin(theta)
-        var x0 = rebind[Scalar[f32]](K[h, j])
-        var x1 = rebind[Scalar[f32]](K[h, j + half])
-        val = x0 * c - x1 * s if d < half else x0 * s + x1 * c
+        comptime if NEOX:
+            var half = NROT_ // 2
+            var j = d if d < half else d - half
+            var theta = Float32(Int(pos)) * exp(
+                Float32(-2 * j) / Float32(NROT_) * log(freq_base)
+            )
+            var c = cos(theta)
+            var s = sin(theta)
+            var x0 = rebind[Scalar[f32]](K[h, j])
+            var x1 = rebind[Scalar[f32]](K[h, j + half])
+            val = x0 * c - x1 * s if d < half else x0 * s + x1 * c
+        else:
+            var j = d // 2
+            var theta = Float32(Int(pos)) * exp(
+                Float32(-2 * j) / Float32(NROT_) * log(freq_base)
+            )
+            var c = cos(theta)
+            var s = sin(theta)
+            var x0 = rebind[Scalar[f32]](K[h, 2 * j])
+            var x1 = rebind[Scalar[f32]](K[h, 2 * j + 1])
+            val = x0 * c - x1 * s if d % 2 == 0 else x0 * s + x1 * c
     Kc.ptr[unsafe_offset=cb] = rebind[Scalar[KVT]](val.cast[KVT]())
+
+
+def amar_bias_add[
+    XLayout: TensorLayout, BLayout: TensorLayout
+](
+    X: TileTensor[f32, XLayout, MutAnyOrigin],
+    Bias: TileTensor[f32, BLayout, MutAnyOrigin],
+    n: Int32,
+):
+    comptime assert X.flat_rank == 1 and Bias.flat_rank == 1
+    var i = global_idx.x
+    if i >= Int(n):
+        return
+    X[i] = rebind[X.ElementType](rebind[Scalar[f32]](X[i]) + rebind[Scalar[f32]](Bias[i]))
 
 
 def amar_attn_decode_swa_gated[

@@ -3,6 +3,42 @@
 Preregistration for the dense-families plan (`~/Brain/mojo/mojo-baro/briefs/2026-09-11-dense-families.md`).
 Each lane owns one section; predictions are frozen by the commit that adds them, before any build or run.
 
+## PROFILE: comptime profile module from GGUF metadata (steps 1-2)
+
+**Process note: this section is written after the step-1 build and gate ran, not before** --
+the item started mid-conversation from the coordinator with KATT still in flight, and the
+build/gate work (`tools/gen-profile.mojo`, the spark2_5 profile wiring) was already done and
+verified before this preregistration was written up. Flagged here rather than silently
+back-dated; no other lane's rule violation is implied.
+
+Scope: `tools/gen-profile.mojo` (new), `serve/spark.mojo` (import constants from a generated
+profile instead of a hardcoded block; recipe flags behind comptime ifs), `kernels/spark_kernels.mojo`
+(ROPE_NEOX dispatch in `amar_rope_plain`/`amar_rope_kv_append`, new `amar_bias_add`).
+
+Predictions (step 1, spark2_5 default profile):
+1. `tools/gen-profile.mojo` run against all 5 targets' real GGUFs reproduces the plan's table
+   (L, H, FFN, heads q/kv, HD) exactly, VOCAB read off `token_embd.weight`'s own tensor shape.
+2. Spark rebuilt with `-I` pointed at the generated spark2_5 profile is bit-identical to the
+   pre-change build on: the two frozen fixture gates (`.work/spark/ref` text 64/64,
+   `.work/spark/chat-ref` chat 43/43) and a fresh 20-prompt greedy A/B against a baseline build
+   of the same pre-change source (`bench/mtp-prompts/p*.txt`, `BARO_GEN=64`), 20/20.
+3. `./run-tests.sh` exits 0 with the same PASS count as before the change (KATT's floor: 102).
+
+Predictions (step 2, recipe-flag scaffolding only -- not exercised end to end):
+4. QKV_BIAS's new `amar_bias_add` path is numerically inert (bit-identical output) when wired
+   in with an all-zero synthetic bias on the spark2_5 shapes, proving the new offset-stride and
+   kernel-launch code executes correctly without changing decode when the bias is zero.
+5. ROPE_NEOX=False (the "norm"/interleaved rope path, needed for llama/lily) is not exercisable
+   against a real model this round -- Spark's own weights are neox-native -- so it is verified
+   only against a numpy rope reference on synthetic data, not an end-to-end model.
+6. GRANITE_MULT's embedding/residual/logit scale multipliers are NOT wired into `spark.mojo`
+   this round (design deviation, see report): they fold cleanly into pack-time weight scaling
+   instead of runtime kernel branches, and that packer does not exist yet. Only `ATTN_SCALE` is
+   wired (already generic; no boolean branch needed since it's a parameter substitution).
+
+Kill: any mismatch in 1-3 stops the lane after three repair attempts and is reported, not
+silently downgraded to "close enough".
+
 ## KATT: head dimension as a comptime parameter
 
 Scope: the attention kernels the Spark path calls, `amar_attn_decode_swa_gated` and
