@@ -12,10 +12,10 @@ Qwythos-9B (H=4096, FFN=12288, NQH=16, NKVH=4, HD=256, SSM inner 4096, state 128
 conv 4, full attention every 4th layer, VOCAB 248320, tokenizer sha-identical to Qwythos), but
 it exists ONLY as K-quants (223 Q4_K, 35 Q6_K, 184 F32 — no bf16/f32 source). `tools/engine-pack.py`
 dequantises each K-quant tensor to f32 with gguf-py (`gguf.quants.dequantize`), rounds to bf16,
-then quantises through the existing `--q8` path unchanged. That dequantised f32 IS the exact
-ground truth for the source weights (gguf-py implements the same block math as ggml/llama.cpp),
-so it doubles as the reference forward pass: `tools/model-ref.py`'s numpy stack is shape-driven,
-not source-format-driven, and needs no change to run over the Ornith pack.
+then quantises through the existing `--q8` path unchanged. `tools/model-ref.py`'s numpy stack is
+shape-driven, not source-format-driven, so it needs no change to run over the Ornith pack — its
+`q8` tensor path (cached dequantise, seconds/token) is what makes a 20-prompt sweep practical; the
+plain-bf16 path re-dequantises every weight on every call with no cache and was ruled out on time.
 
 **Amendment (mid-lane, coordinator-approved 2026-09-11):** step 3a's teacher-forced agreement
 needs `BARO_FORCE` in `serve/engine.mojo`, which did not exist (only `serve/spark.mojo` had it).
@@ -36,10 +36,14 @@ Own commit, named in the report.
 - **ours**: `.work/engine` built from `serve/engine.mojo` (this lane's `BARO_FORCE` addition),
   `BARO_PACK=.work/engine-pack-ornith-q8` (`tools/engine-pack.py MODEL.gguf OUTDIR --q8`, K-quant
   path), greedy (`BARO_SPEC=0`) unless noted.
-- **ours/f32-ref**: `tools/model-ref.py` (`BARO_PACK` pointed at a plain, unquantised copy of the
-  Ornith pack — `engine-pack.py` with no `--q8`/`--q4` flag — so the numpy stack reads gguf-py's
-  own dequantised bf16 values, one rounding step closer to the K-quant source than the q8 pack).
-  Not a timed arm; it produces the reference id stream for teacher forcing.
+- **ours/numpy**: `tools/model-ref.py decode 64`, `BARO_PACK` pointed at the SAME q8 pack as
+  `ours` — its `q8` tensor path is cached and dequantises once per tensor (`_Q8_CACHE`), so this
+  runs in seconds/token, unlike a fresh bf16 numpy pass over ~9B params per token (measured
+  impractical: no caching on the plain-bf16 `T()` path, ruled out for a 20-prompt x 64-token
+  sweep). Not a timed arm; its greedy stream over the identical dequantised weights `ours` uses is
+  the "our own math" reference (same role as G1 in `bench/q8-protocol.md`), and is INDEPENDENT of
+  whether the K-quant->q8 chain lost anything relative to llama.cpp's own quantisation — it only
+  tests whether the kernels compute what the pack's numbers say they should.
 - **llama.cpp**: `~/llama.cpp/build/bin/llama-server -m Ornith-1.5-9B-Q4_K_M.gguf -c 8192 -ngl 99
   -fa on -b 2048 -ub 512 -t 8 -ctk q8_0 -ctv q8_0`, greedy (`temperature 0, top_k 1`), token-id
   prompt (`tools/llama-ref-run.sh` pattern), its own native K-quant kernels — not requantised
@@ -64,20 +68,29 @@ Qwythos q4 pack, greedy, temperature 0. Land rule: 20/20 identical `GENERATED` l
 new `if len(force) > 0:` branch around unchanged code should not be able to move output, but the
 branch itself must be proven never taken, not assumed. Falsifier: any of the 20 differs.
 
-**Step 3a — identity.** `BARO_FORCE=<ours/f32-ref stream>` on `ours`, at the same 20 prompts x 64
-positions; `llama.cpp` runs its own greedy (not forced) and is compared position-by-position to
-the same `ours/f32-ref` stream. Per CLAUDE.md, greedy 64-token equality is not itself the gate
-past ~256 ids, but at exactly 64 ids — the identity length already used repo-wide for this class
-of check (`bench/q8-protocol.md` G1/G2, `bench/spark-prefill-protocol.md`) — teacher-forced
-agreement is still the metric of record because `ours` and `llama.cpp` take genuinely different
-paths from the same K-quant bytes (ours: dequant -> bf16 -> int8; llama.cpp: native mixed-K-quant
-GEMV) and are not expected to be bit-identical. **Land rule: per-prompt, ours' agreement against
-the f32-ref stream >= llama.cpp's own agreement against the same stream, median over 20 prompts.**
-Falsifier: ours' median agreement below llama.cpp's median agreement (ours would be *less* faithful
-to the exact dequantised weights than llama.cpp's own quantisation, which the error-budget math in
-G1 says should not happen: llama.cpp's Q4_K/Q6_K quantisation of the SAME source is a different
-lossy step, not a strictly better one, but its per-block error is not obviously worse than our
-K-quant-to-q8 chain either — no directional claim beyond "roughly comparable" is frozen here).
+**G3 (kernel self-consistency, cheap, run before 3a):** `ours` greedy (no `BARO_FORCE`) vs
+`ours/numpy` greedy, one representative prompt, 64 positions. This is the same identity class
+`bench/q8-protocol.md` G1 already meets on Qwythos (engine == numpy over the same dequantised
+pack), so greedy equality is the right check here (CLAUDE.md's "never greedy past ~256 ids" is
+about betting a *cross-implementation* identity claim on a long coin-flip tail, not about a
+same-numbers kernel-vs-reference check at 64 ids). **Prediction: 64/64 or a single-digit number of
+late near-tie divergences, not a kernel bug.** Falsifier: divergence before position ~32, or on
+more than one prompt if a second is checked — that would point at the K-quant path, not float
+ordering, and 3a's numbers would need a kernel bisect first.
+
+**Step 3a — teacher-forced agreement vs llama.cpp.** `llama.cpp` generates its own 64-token greedy
+stream per prompt (temperature 0); that stream is fed to `ours` as `BARO_FORCE`. Agreement =
+fraction of the 64 positions where `ours`' own argmax (recorded as "predicted", before the forced
+id overwrites the context) equals llama.cpp's token at that position. This is a description of how
+often the two quantisation paths would have made the same choice, not an equality gate (per
+CLAUDE.md, no greedy-identity pass/fail is frozen past 64 ids either way) — **no absolute threshold
+is frozen**, because there is no independent ground truth here to call one arm "right": G3 already
+shows `ours`' kernels match `ours`' own numbers, so a low agreement number means quantisation-path
+divergence between K-quant->q8 and llama.cpp's native mixed-K-quant, not a bug. Recorded alongside
+G3's near-100% self-consistency so a reader can tell the two apart. **Prediction: 60-90% median
+agreement** (two independent ~4-8 bit quantisations of the same weights, on a model neither path
+has been tuned against) — reported, not gated. Falsifier: <30% median, which would say one of the
+two paths is doing something qualitatively wrong, not just accumulating more rounding error.
 
 **Step 3b — decode speed, 20-prompt median (P4).** Derivation: the Ornith q8 pack measured **9.99
 GiB** (`.work/engine-pack-ornith-q8/`), matching the Qwythos-shape q8 prediction (10.35 GB,
