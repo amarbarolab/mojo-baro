@@ -32,6 +32,12 @@ comptime QK_K = 256
 comptime Q4_K_BYTES = 144
 comptime Q6_K_BYTES = 210
 
+# Routing facts, not host-buffer dimensions: not part of the model profile
+# (serve/model_qwen35moe.mojo), stated once here (brief / plan doc, real
+# pack: 256 experts of ffn_*_exps.weight per layer, 8 selected per token).
+comptime N_EXP = 256
+comptime TOPK = 8
+
 comptime KVPAGE = 128
 comptime KVPAD = 0
 comptime KVHSTR = KVPAGE * P.HD + KVPAD
@@ -114,7 +120,7 @@ def resolve_expert(
     var name = "blk." + String(layer) + ".ffn_" + proj + suffix
     if name not in tensors:
         raise Error("unresolved tensor " + name)
-    var info = tensors[name]
+    var info = tensors[name].copy()
     var geom = block_geometry(info.dtype)
     var block_elems = geom[0]
     var block_bytes = geom[1]
@@ -135,7 +141,7 @@ def resolve_plain(tensors: Dict[String, TensorInfo], name: String) raises -> Ten
     """Router / norm / non-expert tensor: whole-tensor offset, by name."""
     if name not in tensors:
         raise Error("unresolved tensor " + name)
-    return tensors[name]
+    return tensors[name].copy()
 
 
 @fieldwise_init
