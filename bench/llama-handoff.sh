@@ -51,13 +51,15 @@ env BARO_PACK="$pack" BARO_TMAX="$tmax" BARO_PROMPT="$pq" BARO_STATE_LOAD="$out/
 env BARO_PACK="$pack" BARO_TMAX="$tmax" BARO_PROMPT="$pq" BARO_STATE_LOAD="$out/llama.state" \
   BARO_FORCE="$out/cold-pq.gen" "$eng" > "$out/force-pq.log" 2>&1
 
+grep -q "cached: $np " "$out/load-pq.log" || { echo "VOID: the loaded state was not reused (prefix lookup missed)"; grep -hE 'cached: [0-9]+' "$out/load-pq.log"; exit 3; }
+
 # 6. layout check
 ./.venv/bin/python tools/state_diff.py "$out/ours.state" "$out/llama.state" > "$out/state-diff.txt" 2>&1 || true
 
 echo "== receipts"
 python3 -c "import json;t=json.load(open('$out/completion.json'))['timings'];print('llama prompt_n',t.get('prompt_n'),'prompt_ms',round(t.get('prompt_ms',0),1))"
 python3 -c "import json;print('slot save',json.load(open('$out/save.json')))"
-echo "convert_s $(echo "$t1 - $t0" | bc)"; cat "$out/convert.log"
+echo "convert_s $(python3 -c "print(round($t1 - $t0, 3))")"; cat "$out/convert.log"
 grep -hE 'state loaded|cached: [0-9]+' "$out/load-pq.log" | head -3
 grep -hE 'prefill_s|tok/s_gen' "$out/cold-pq.log" "$out/load-pq.log" | head -4
 [ "$(grep '^GENERATED' "$out/cold-pq.log")" = "$(grep '^GENERATED' "$out/load-pq.log")" ] && echo "greedy identical to cold" || echo "greedy differs from cold"

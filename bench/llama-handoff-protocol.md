@@ -37,3 +37,13 @@ Receipts: llama `timings.prompt_ms`, slot save ms, convert s, `state loaded ... 
 
 Falsifier: any section's relative error above 0.3, or agreement below 50%:
 the state does not map, whatever the timing.
+
+### Run 1 (2026-09-11): VOID, instrument bug, no result recorded
+
+The slot's token list is `server_tokens::serialize()` output, framed as
+`[-1, 1, n, ids..., 0]` (8004 entries for the 8000-token prompt; the spec's open
+item 5 had assumed a flat list). The converter wrote the frame header into the
+state's token prefix, the prefix hash missed, and the engine prefilled cold
+(`cached: 0`, 8016 replay rows). Its "greedy identical" and "64/64" compare a cold
+run with a cold run and say nothing about the handoff. Fix: the converter reads
+the framed ids and refuses any other framing. Predictions unchanged; run 2 next.

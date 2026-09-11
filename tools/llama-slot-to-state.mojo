@@ -73,10 +73,22 @@ def main() raises:
         raise Error("not a llama.cpp seq state file v3 (magic/version)")
     var ntok = u32(d, 8)
     var o = 12
-    var tokens = List[Int](capacity=ntok)
+    var raw = List[Int](capacity=ntok)
     for t in range(ntok):
-        tokens.append(i32(d, o + 4 * t))
+        raw.append(i32(d, o + 4 * t))
     o += 4 * ntok
+    # The server writes server_tokens::serialize(), not a flat id list: a text
+    # run is framed as [-1, 1, n, ids..., 0] (measured on a real slot, 8004
+    # entries for an 8000-token prompt). Take the ids; refuse other framings.
+    var tokens = List[Int]()
+    if ntok >= 4 and raw[0] == -1:
+        var n = raw[2]
+        if raw[1] != 1 or 3 + n + 1 != ntok or raw[3 + n] != 0:
+            raise Error("unrecognised server_tokens framing: [" + String(raw[0]) + ", " + String(raw[1]) + ", " + String(raw[2]) + ", ...]")
+        for t in range(n):
+            tokens.append(raw[3 + t])
+    else:
+        tokens = raw^
 
     # --- KV cache (8 full-attention layers) ---------------------------------
     if u32(d, o) != 1:
