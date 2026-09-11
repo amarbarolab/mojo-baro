@@ -92,6 +92,71 @@ def from_gguf(path, layer):
     )
 
 
+def write_q4k_artifacts(path, layer, x, wg, wu, wd):
+    """Write raw expert blocks plus a small decoder vector and offset semantics."""
+    import gguf
+
+    reader = gguf.GGUFReader(path)
+    prefix = f"blk.{layer}."
+    wanted = {
+        "ffn_gate_exps.weight": ("gate", E_FFN, H),
+        "ffn_up_exps.weight": ("up", E_FFN, H),
+        "ffn_down_exps.weight": ("down", H, E_FFN),
+    }
+    entries = []
+    raw_first = None
+    for tensor in reader.tensors:
+        short = tensor.name[len(prefix):] if tensor.name.startswith(prefix) else ""
+        if short not in wanted:
+            continue
+        label, rows, k = wanted[short]
+        raw = np.asarray(tensor.data, dtype=np.uint8)
+        out = D / f"moe_q4k_{label}.bin"
+        out.write_bytes(raw.tobytes())
+        row_bytes = k // 256 * 144
+        entries.append({
+            "tensor": tensor.name,
+            "projection": label,
+            "expert_count": N_EXP,
+            "rows_per_expert": rows,
+            "k": k,
+            "row_bytes": row_bytes,
+            "source_shape": list(raw.shape),
+            "source_bytes": int(raw.nbytes),
+        })
+        if label == "gate":
+            raw_first = raw[0, 0].reshape(-1)[:144]
+
+    if len(entries) != 3 or raw_first is None:
+        raise RuntimeError("missing q4_k expert tensors")
+
+    vals = wg[0, 0, :256].astype(np.float32)
+    vector = {
+        "tensor": f"blk.{layer}.ffn_gate_exps.weight",
+        "expert": 0,
+        "row": 0,
+        "k": 256,
+        "raw_block": raw_first.tolist(),
+        "dequantized": vals.tolist(),
+        "dot_input": x[:256].astype(np.float32).tolist(),
+        "dot": float(np.dot(x[:256].astype(np.float32), vals)),
+    }
+    (D / "moe_q4k_vector.json").write_text(json.dumps(vector, indent=2) + "\n")
+    vals.astype(np.float32).tofile(D / "moe_q4k_vector.bin")
+    pack_index = Path(".work/moe-w1/pack/index.txt")
+    pack_lines = {}
+    if pack_index.exists():
+        for line in pack_index.read_text().splitlines():
+            parts = line.split()
+            if len(parts) == 4:
+                pack_lines[parts[0]] = {
+                    "dtype": parts[1], "offset": int(parts[2]), "n_elem": int(parts[3])
+                }
+    for entry in entries:
+        entry["pack"] = pack_lines.get(f"blk.{layer}.{entry['tensor'].split('.', 2)[-1]}")
+    (D / "moe_q4k_map.json").write_text(json.dumps({"layer": layer, "tensors": entries}, indent=2) + "\n")
+
+
 def synthetic(rng):
     return (
         (rng.standard_normal((N_EXP, H)) * 0.02).astype(np.float32),
@@ -120,6 +185,7 @@ def main():
 
     if args.gguf:
         wr, wsg, wg, wu, wd, wgs, wus, wds = from_gguf(args.gguf, args.layer)
+        write_q4k_artifacts(args.gguf, args.layer, x, wg, wu, wd)
     else:
         wr, wsg, wg, wu, wd, wgs, wus, wds = synthetic(rng)
 

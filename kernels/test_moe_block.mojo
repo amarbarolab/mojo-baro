@@ -22,12 +22,14 @@ from matmul_skinny import amar_matmul_skinny_m1_row, ROW_WAVES, ROW_THREADS
 from ssm import amar_cast_bf16
 from moe import (
     amar_moe_router_top8, amar_moe_sig_gate, amar_moe_gate_up, amar_moe_down,
+    amar_moe_gate_up_q4k, amar_moe_down_q4k, q4k_decode_vector,
     N_EXP, TOPK, E_FFN, SH_FFN, MOE_H, MOE_WAVES, MOE_THREADS,
 )
 
 comptime f32 = DType.float32
 comptime bf16 = DType.bfloat16
 comptime i32 = DType.int32
+comptime u8 = DType.uint8
 
 comptime x_1 = row_major[MOE_H]()
 comptime x_2 = row_major[1, MOE_H]()
@@ -96,6 +98,10 @@ def main() raises:
 
     comptime N_EW = N_EXP * E_FFN * MOE_H
     comptime N_DW = N_EXP * MOE_H * E_FFN
+    comptime Q4K_BYTES = 144
+    comptime Q4K = 256
+    comptime Q4_G_BYTES = N_EXP * E_FFN * (MOE_H // 256) * Q4K_BYTES
+    comptime Q4_D_BYTES = N_EXP * MOE_H * (E_FFN // 256) * Q4K_BYTES
 
     var x_h = ctx.enqueue_create_host_buffer[f32](MOE_H)
     var wr_h = ctx.enqueue_create_host_buffer[f32](N_EXP * MOE_H)
@@ -103,6 +109,9 @@ def main() raises:
     var wg_h = ctx.enqueue_create_host_buffer[bf16](N_EW)
     var wu_h = ctx.enqueue_create_host_buffer[bf16](N_EW)
     var wd_h = ctx.enqueue_create_host_buffer[bf16](N_DW)
+    var qg_h = ctx.enqueue_create_host_buffer[u8](Q4_G_BYTES)
+    var qu_h = ctx.enqueue_create_host_buffer[u8](Q4_G_BYTES)
+    var qd_h = ctx.enqueue_create_host_buffer[u8](Q4_D_BYTES)
     var wgs_h = ctx.enqueue_create_host_buffer[bf16](SH_FFN * MOE_H)
     var wus_h = ctx.enqueue_create_host_buffer[bf16](SH_FFN * MOE_H)
     var wds_h = ctx.enqueue_create_host_buffer[bf16](MOE_H * SH_FFN)
@@ -115,6 +124,9 @@ def main() raises:
     load_into(D + "moe_wg.bin", wg_h.unsafe_ptr().unsafe_bitcast[UInt8](), N_EW * 2)
     load_into(D + "moe_wu.bin", wu_h.unsafe_ptr().unsafe_bitcast[UInt8](), N_EW * 2)
     load_into(D + "moe_wd.bin", wd_h.unsafe_ptr().unsafe_bitcast[UInt8](), N_DW * 2)
+    load_into(D + "moe_q4k_gate.bin", qg_h.unsafe_ptr(), Q4_G_BYTES)
+    load_into(D + "moe_q4k_up.bin", qu_h.unsafe_ptr(), Q4_G_BYTES)
+    load_into(D + "moe_q4k_down.bin", qd_h.unsafe_ptr(), Q4_D_BYTES)
     load_into(D + "moe_wgs.bin", wgs_h.unsafe_ptr().unsafe_bitcast[UInt8](), SH_FFN * MOE_H * 2)
     load_into(D + "moe_wus.bin", wus_h.unsafe_ptr().unsafe_bitcast[UInt8](), SH_FFN * MOE_H * 2)
     load_into(D + "moe_wds.bin", wds_h.unsafe_ptr().unsafe_bitcast[UInt8](), MOE_H * SH_FFN * 2)
@@ -132,6 +144,9 @@ def main() raises:
     var wg_d = ctx.enqueue_create_buffer[bf16](N_EW)
     var wu_d = ctx.enqueue_create_buffer[bf16](N_EW)
     var wd_d = ctx.enqueue_create_buffer[bf16](N_DW)
+    var qg_d = ctx.enqueue_create_buffer[u8](Q4_G_BYTES)
+    var qu_d = ctx.enqueue_create_buffer[u8](Q4_G_BYTES)
+    var qd_d = ctx.enqueue_create_buffer[u8](Q4_D_BYTES)
     var wgs_d = ctx.enqueue_create_buffer[bf16](SH_FFN * MOE_H)
     var wus_d = ctx.enqueue_create_buffer[bf16](SH_FFN * MOE_H)
     var wds_d = ctx.enqueue_create_buffer[bf16](MOE_H * SH_FFN)
@@ -141,6 +156,8 @@ def main() raises:
     var hsb_d = ctx.enqueue_create_buffer[bf16](SH_FFN)
     var routed_d = ctx.enqueue_create_buffer[f32](MOE_H)
     var shared_d = ctx.enqueue_create_buffer[f32](MOE_H)
+    var routed_q4_d = ctx.enqueue_create_buffer[f32](MOE_H)
+    var qv_d = ctx.enqueue_create_buffer[f32](Q4K)
 
     ctx.enqueue_copy(dst_buf=x_d, src_buf=x_h)
     ctx.enqueue_copy(dst_buf=wr_d, src_buf=wr_h)
@@ -148,6 +165,9 @@ def main() raises:
     ctx.enqueue_copy(dst_buf=wg_d, src_buf=wg_h)
     ctx.enqueue_copy(dst_buf=wu_d, src_buf=wu_h)
     ctx.enqueue_copy(dst_buf=wd_d, src_buf=wd_h)
+    ctx.enqueue_copy(dst_buf=qg_d, src_buf=qg_h)
+    ctx.enqueue_copy(dst_buf=qu_d, src_buf=qu_h)
+    ctx.enqueue_copy(dst_buf=qd_d, src_buf=qd_h)
     ctx.enqueue_copy(dst_buf=wgs_d, src_buf=wgs_h)
     ctx.enqueue_copy(dst_buf=wus_d, src_buf=wus_h)
     ctx.enqueue_copy(dst_buf=wds_d, src_buf=wds_h)
@@ -177,6 +197,9 @@ def main() raises:
     var hsb2 = TileTensor(hsb_d, hs_2)
     var routed = TileTensor(routed_d, o_1)
     var shared = TileTensor(shared_d, o_1)
+    var routed_q4 = TileTensor(routed_q4_d, o_1)
+    comptime qv_1 = row_major[Q4K]()
+    var qv = TileTensor(qv_d, qv_1)
 
     comptime k_cast = amar_cast_bf16[type_of(x_1), type_of(x_1)]
     ctx.enqueue_function[k_cast](
@@ -251,6 +274,17 @@ def main() raises:
     )
     ctx.synchronize()
 
+    comptime k_q4v = q4k_decode_vector[type_of(qv_1)]
+    ctx.enqueue_function[k_q4v](
+        qg_d.unsafe_ptr(), qv, grid_dim=1, block_dim=256,
+    )
+    var qv_got = ctx.enqueue_create_host_buffer[f32](Q4K)
+    ctx.enqueue_copy(dst_buf=qv_got, src_buf=qv_d)
+    ctx.synchronize()
+    var qv_ref = alloc[Float32](Q4K)
+    load_into(D + "moe_q4k_vector.bin", qv_ref.unsafe_bitcast[UInt8](), Q4K * 4)
+    check("q4k decoder", qv_got.unsafe_ptr(), qv_ref, Q4K, 1e-6)
+
     var idx_got = ctx.enqueue_create_host_buffer[i32](TOPK)
     var wt_got = ctx.enqueue_create_host_buffer[f32](TOPK)
     var routed_got = ctx.enqueue_create_host_buffer[f32](MOE_H)
@@ -284,6 +318,37 @@ def main() raises:
     check("routed", routed_got.unsafe_ptr(), routed_ref, MOE_H)
     check("shared", shared_got.unsafe_ptr(), shared_ref, MOE_H)
     check("y", y_got, y_ref, MOE_H)
+
+    comptime k_gu_q4 = amar_moe_gate_up_q4k[
+        TOPK, E_FFN, type_of(x_2), type_of(idx_1), type_of(h_1)
+    ]
+    ctx.enqueue_function[k_gu_q4](
+        xb2, qg_d.unsafe_ptr(), qu_d.unsafe_ptr(), idx, h1, Int32(MOE_H),
+        grid_dim=ceildiv(TOPK * E_FFN, MOE_WAVES), block_dim=MOE_THREADS,
+    )
+    ctx.enqueue_function[k_cast_h](
+        TileTensor(h_d, h_1), TileTensor(hb_d, h_1), Int32(TOPK * E_FFN),
+        grid_dim=ceildiv(TOPK * E_FFN, 256), block_dim=256,
+    )
+    comptime k_down_q4 = amar_moe_down_q4k[
+        TOPK, E_FFN, type_of(h_2), type_of(idx_1), type_of(wt_1), type_of(o_1)
+    ]
+    ctx.enqueue_function[k_down_q4](
+        hb2, qd_d.unsafe_ptr(), idx, wt, routed_q4, Int32(MOE_H),
+        grid_dim=ceildiv(MOE_H, MOE_WAVES), block_dim=MOE_THREADS,
+    )
+    ctx.synchronize()
+    var routed_q4_got = ctx.enqueue_create_host_buffer[f32](MOE_H)
+    ctx.enqueue_copy(dst_buf=routed_q4_got, src_buf=routed_q4_d)
+    ctx.synchronize()
+    var y_q4 = alloc[Float32](MOE_H)
+    for i in range(MOE_H):
+        y_q4[unsafe_offset=i] = (
+            routed_q4_got[i] + shared_got[i]
+        )
+    check("q4k routed", routed_q4_got.unsafe_ptr(), routed_ref, MOE_H)
+    check("q4k y", y_q4, y_ref, MOE_H)
+    print("PASS: raw Q4_K routed experts match the bf16-rounded GGUF oracle")
     print("PASS: qwen35moe sparse-MoE block matches numpy reference (m=1)")
 
     # Feasibility measurement, NOT a preregistered perf claim (CLAUDE.md /
@@ -350,3 +415,53 @@ def main() raises:
               mb / us * 1000.0, "GB/s")
         print("  40 layers ->", us * 40.0 / 1000.0, "ms/token =",
               1000.0 / (us * 40.0 / 1000.0), "tok/s ceiling from expert traffic alone")
+
+        for a in range(ARMS):
+            var sel = DeviceBuffer[i32](
+                ctx, arm_d.unsafe_ptr() + a * TOPK, TOPK, owning=False
+            )
+            var seltt = rebind[TileTensor[i32, type_of(idx_1), MutAnyOrigin]](
+                TileTensor(sel, idx_1)
+            )
+            ctx.enqueue_function[k_gu_q4](
+                xb2, qg_d.unsafe_ptr(), qu_d.unsafe_ptr(), seltt, h1, Int32(MOE_H),
+                grid_dim=ceildiv(TOPK * E_FFN, MOE_WAVES), block_dim=MOE_THREADS,
+            )
+            ctx.enqueue_function[k_cast_h](
+                TileTensor(h_d, h_1), TileTensor(hb_d, h_1), Int32(TOPK * E_FFN),
+                grid_dim=ceildiv(TOPK * E_FFN, 256), block_dim=256,
+            )
+            ctx.enqueue_function[k_down_q4](
+                hb2, qd_d.unsafe_ptr(), seltt, wt, routed_q4, Int32(MOE_H),
+                grid_dim=ceildiv(MOE_H, MOE_WAVES), block_dim=MOE_THREADS,
+            )
+        ctx.synchronize()
+        var tq0 = perf_counter_ns()
+        for it in range(ITERS):
+            var a = it % arms_rt
+            var sel = DeviceBuffer[i32](
+                ctx, arm_d.unsafe_ptr() + a * TOPK, TOPK, owning=False
+            )
+            var seltt = rebind[TileTensor[i32, type_of(idx_1), MutAnyOrigin]](
+                TileTensor(sel, idx_1)
+            )
+            ctx.enqueue_function[k_gu_q4](
+                xb2, qg_d.unsafe_ptr(), qu_d.unsafe_ptr(), seltt, h1, Int32(MOE_H),
+                grid_dim=ceildiv(TOPK * E_FFN, MOE_WAVES), block_dim=MOE_THREADS,
+            )
+            ctx.enqueue_function[k_cast_h](
+                TileTensor(h_d, h_1), TileTensor(hb_d, h_1), Int32(TOPK * E_FFN),
+                grid_dim=ceildiv(TOPK * E_FFN, 256), block_dim=256,
+            )
+            ctx.enqueue_function[k_down_q4](
+                hb2, qd_d.unsafe_ptr(), seltt, wt, routed_q4, Int32(MOE_H),
+                grid_dim=ceildiv(MOE_H, MOE_WAVES), block_dim=MOE_THREADS,
+            )
+        ctx.synchronize()
+        var tq1 = perf_counter_ns()
+        var qus = Float64(tq1 - tq0) / 1000.0 / Float64(ITERS)
+        var qmb = Float64(TOPK) * 3.0 * Float64(E_FFN) * Float64(MOE_H) * 144.0 / 256.0 / 1e6
+        print("moe q4k routed block: arms", arms_rt, ":", qus, "us/token/layer,", qmb, "MB q4k touched,",
+              qmb / qus * 1000.0, "GB/s")
+        print("  40 layers ->", qus * 40.0 / 1000.0, "ms/token =",
+              1000.0 / (qus * 40.0 / 1000.0), "tok/s ceiling from expert traffic alone")

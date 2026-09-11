@@ -189,4 +189,24 @@ this protocol, and the lane report. No output is written to `/tmp`.
 
 ### Result
 
-Pending W2 build and gates.
+W2 passed on 2026-09-12 against preregistration `3bd08d6`. The raw Q4_K
+decoder vector was exact on the real GGUF block format. Real layer 0 and
+layer 3 cases both selected the exact 8/8 expert ids and stayed below the
+5e-3 output bound. Layer 0 q4 routed and q4 y max relative errors were
+`8.789e-8` and `1.333e-4`; layer 3 values were `1.483e-6` and `1.598e-6`.
+The extended `test_moe_block` exited 0, and `./run-tests.sh` exited 0.
+
+The rotating-cache timing receipt used eight disjoint expert arms. It
+measured bf16 `90.27 us/token/layer` and q4k `213.43 us/token/layer`, with
+14.16 MB q4k expert traffic per token/layer. This falsifies the registered
+55 to 100 us q4k performance prediction, but does not fail the correctness
+gate because timing was registered as a measurement rather than a hard
+threshold.
+
+The inherited W0 engine A/B binaries were not a valid W2 regression target:
+the qwen35moe candidate rejected its compiled mega setting, and with
+`BARO_MEGA=0` it faulted with illegal instruction before producing agreement
+lines. This is recorded in the lane report; the dedicated W2 kernel and full
+GPU test gates remain passing.
+
+Implementation commit: see the W2 lane commit recorded in the lane report.
