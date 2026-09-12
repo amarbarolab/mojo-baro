@@ -150,6 +150,13 @@ The full teacher-forced runner was launched against this committed binary
 and stopped at p01 because its required `64/64` assertion failed at `32/64`;
 no 20/20 claim is made. Receipt: `.work/moe-w3/gate2-force-4d255da/`.
 
+Prompt-length diagnosis confirmed from the source and table: `PF_MIN=16` and
+`MROWS=8`; prompts with 18 or more tokens enter `prefill_forward` with `m>1`,
+while short prompts replay through `step_window` at `m=1`. `prefill_forward`
+contains no `moe_ffn` call and still follows the dense positional FFN path.
+This explains the exact bimodal results: the 11 short prompts reach the W3
+MoE wiring, while the 9 longer prompts exercise the deferred W5 m>1 path.
+
 ## W4
 
 Pending W3 and preregistration.
