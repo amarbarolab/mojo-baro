@@ -157,6 +157,14 @@ contains no `moe_ffn` call and still follows the dense positional FFN path.
 This explains the exact bimodal results: the 11 short prompts reach the W3
 MoE wiring, while the 9 longer prompts exercise the deferred W5 m>1 path.
 
+the maintainer confirmed the engine headers: p13 (9 tokens) has `prefill rows: 0` and
+replays 8 rows at m=1; p15 (18 tokens) has `prefill rows: 17` and gets 0/64;
+p17 (59 tokens) has `prefill rows: 58` and gets 0/64. Gate 2 therefore covers
+only the m=1 MoE path until the scope choice is preregistered: pull m>1 MoE
+forward from W5, or force qwen35moe prefill replay at m=1. The latter is the
+smaller correctness-preserving option but makes long-prompt prefill slow and
+must be reported in W4.
+
 ## W4
 
 Pending W3 and preregistration.
