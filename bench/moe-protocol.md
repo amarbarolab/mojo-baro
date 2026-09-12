@@ -258,3 +258,24 @@ lines. This is recorded in the lane report; the dedicated W2 kernel and full
 GPU test gates remain passing.
 
 Implementation commit: `b5293b9`.
+
+## W3 Gate 2 amendment: qwen35moe m=1 prefill replay
+
+The adopted W3 plan explicitly excludes m>1 MoE prefill: “Prefill runs the
+same sequence per row (m>1 MoE is W5); correctness first.” Gate 2 therefore
+forces prefill replay at m=1 for the `qwen35moe` profile only. The dense path
+keeps its existing batched prefill unchanged; this is proven by the required
+20/20 `bench/force-ab.sh` regression against a main-built dense engine.
+
+Expected cost is accepted in advance: a 59-token prompt becomes 58 sequential
+prefill steps. W4 must label the resulting qwen35moe prefill measurement as a
+deliberately slow correctness path and must not compare it with llama.cpp's
+batched prefill as though it were the real MoE prefill path.
+
+Pass condition is unchanged: qwen35moe non-mega m=1 engine passes the GPU test
+suite on a clean fixture, reaches 20/20 prompts at 64/64 teacher-forced
+agreement against llama.cpp, and serves one non-empty Rust-front
+`/v1/chat/completions` answer with `BARO_PACK` set to the MoE pack. Falsifier:
+if the nine long prompts leave 0/64 but do not reach 64/64 after replay is
+forced, m>1 was not the only remaining defect; stop and report without further
+iteration.
