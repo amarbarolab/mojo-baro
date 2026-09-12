@@ -135,10 +135,16 @@ Layer-0 diagnostic remains open. An opt-in four-slot capture was built from
 the working tree (post-SSM residual, post-FFN norm, post-MoE residual,
 post-final norm) as `.work/moe-w3/diag-layer0.f32`; the fresh diagnostic binary
 hash is `7cc046c841c9b7c462580ef59cf08de515b334171f1229062fdb84fa222859f5`.
-A candidate correction that fed normalized `CurBm` to the router/shared gate
-also built and produced a fresh p01 receipt, but remained `0/64`; it is not
-committed. No first-divergence claim is recorded until the four points are
-compared against a correctly matched real-pack reference.
+A follow-up diagnostic correction is committed as `4d255da`. The prior
+four-slot dump was invalid because ordinary per-layer writes overwrote custom
+slots 1-3; the corrected capture suppresses those writes. It also fixed two
+real MoE-path defects: router/shared gating consumed the unnormalized
+residual, and normalized, routed, shared, and residual values aliased
+`p_h_d`. A fresh qwen35moe build hash
+`56d7fba8f27c0a683a45dc72b824bdccee0dbeda67a68d4fa7b58a4e0752e696`
+produces p01 `32/64` forced agreement (`mega fail word: 0`, `42.48
+tok/s_gen`). Gate 2 remains UNVERIFIED pending the full 20-prompt gate and
+Rust-front request.
 
 ## W4
 
