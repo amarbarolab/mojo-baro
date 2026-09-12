@@ -102,7 +102,7 @@ def yarn_cos_sin(pos):
     j = np.arange(NROT // 2, dtype=np.float32)
     theta_extrap = pos * FREQ_BASE ** (-2.0 * j / NROT)
     theta_interp = FREQ_SCALE * theta_extrap
-    ramp = (1 - np.clip((j - low) / max(high - low, 0.001), 0, 1)) * EXT_FACTOR
+    ramp = np.clip((j - low) / max(high - low, 0.001), 0, 1) * EXT_FACTOR
     theta = theta_interp * (1 - ramp) + theta_extrap * ramp
     mscale = ATTN_FACTOR * (1 + 0.1 * np.log(1 / FREQ_SCALE)) if EXT_FACTOR != 0 else ATTN_FACTOR
     return (np.cos(theta) * mscale).astype(np.float32), (np.sin(theta) * mscale).astype(np.float32)

@@ -741,7 +741,7 @@ def rope_cs(j: Int, pos: Int) -> SIMD[f32, 2]:
     var theta_ex = Float32(pos) * exp(Float32(-2 * j) / Float32(NROT) * log(FREQ_BASE))
     var theta_in = FREQ_SCALE * theta_ex
     var ramp = (Float32(j) - YARN_LOW) / max(YARN_HIGH - YARN_LOW, 0.001)
-    ramp = 1 - min(max(ramp, 0), 1)
+    ramp = min(max(ramp, 0), 1)
     var theta = theta_in * (1 - ramp) + theta_ex * ramp
     return SIMD[f32, 2](cos(theta) * MSCALE, sin(theta) * MSCALE)
 
