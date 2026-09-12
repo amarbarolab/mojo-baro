@@ -356,3 +356,47 @@ NOT IN THIS ROUND. Widening the expert GEMMs, the SSM path, or attention to
 f32. Those are a separate and much larger question about the engine's whole
 accuracy/speed tradeoff (PROTOCOL-RULES P14 records the engine-wide 0.44%
 floor); this round tests one mechanism on one path.
+
+## W3 Gate 2: restated bar, and status
+
+The original bar was "20 prompts at 64/64 teacher-forced agreement against
+llama.cpp". That is unreachable by ANY configuration of this engine, and was
+treated as "MoE is broken" for a whole session. Measured 2026-09-12 on a
+quant-matched arm (our q4 pack against Qwythos-9B Q4_0-pure, engine
+318cc092, 20 prompts):
+
+    dense, the path that ships and is verified   51.90 mean, min 38, max 60
+    MoE, lane-MOE at dcdf4a2                     53.20 mean, min 40, max 60
+
+The MoE path is ABOVE the ceiling of the known-good path. The cause of the
+residual gap is not a defect: our activations pass through bf16 before every
+matmul while llama keeps f32 (2^-8 = 0.39% against a measured 0.44%
+per-layer floor), amplified by MoE's discrete top-8-of-256 routing.
+PROTOCOL-RULES P14 records the general rule this violated.
+
+RESTATED BAR, measured rather than wished for:
+
+1. mean teacher-forced agreement over the 20-prompt set at or above the
+   dense path's 51.90, AND no single prompt below the dense path's own
+   minimum of 38
+2. ./run-tests.sh green on a clean fixture
+3. one non-empty Rust-front /v1/chat/completions answer with BARO_PACK set
+   to the MoE pack
+
+STATUS 2026-09-12:
+
+1. PASS. 53.20 mean, min 40, max 60, measured on the resident gate
+   (bench/moe-gate-resident.sh, one process, engine sha printed by the run).
+2. PASS. ./run-tests.sh exit 0, kernel census 89 kernels, 41 in registry,
+   0 orphans, on a fixture cleaned of .work/draft-logits.bin and
+   .work/draft-hn.bin.
+3. BLOCKED, and not on the engine. /v1/chat/completions is a text endpoint;
+   baro-serve needs a tokenizer.json beside the pack and RegesCore has none.
+   The dense pack carries one copied from its HF repo; the MoE pack was
+   built without it and no tokenizer.json ships with the RegesCore GGUF.
+   Producing one means extracting the tokenizer from the GGUF KV block
+   (vocab, merges, pre-tokenizer config) -- real work, unrelated to whether
+   the MoE path decodes correctly.
+
+So gate 2 is 2 of 3, with the third blocked on a missing artifact. It is NOT
+closed, and the lane is not claimed as finished.
