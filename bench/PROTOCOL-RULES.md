@@ -108,3 +108,116 @@ Run receipts include `pack loaded in` next to `tok/s_gen`.
 Why: the engine loader copied 10.7 GB with a per-byte loop, 12.6 s of every
 17 s run; a 100-run sweep cost 30 min and a whole optimisation stint was
 planned around waiting for it. memcpy: 1.8 s.
+
+## P7. The arm file must be written by the run, never alongside it
+
+Every A/B harness prints each arm's binary sha256 **from inside the code path
+that executes that arm**, and refuses to run when the two arms hash equal.
+An arm file assembled separately from the execution can name a binary that
+never ran.
+
+Why: 2026-09-12, the YaRN ramp A/B. The harness ran `.work/engine-yarn$arm`
+in a loop while a `sed` had rewritten only the arm-header line to say
+`engine-yarnB2`. The receipt reported sha `dbb3a84c`; the binary that
+actually decoded was `96752fb4`. The numbers were real, reproducible, and
+described the wrong experiment. `bench/force-ab.sh` had the refusal check
+from the start and is the pattern to copy.
+
+## P8. A null result is not a finding until the changed code is proven reached
+
+A change that compiles, produces a different binary hash, and moves nothing
+has two explanations: the hypothesis is wrong, or the edited line never
+executed. Distinguish them before recording a falsifier. Cheapest proof:
+make the change absurd (invert it, zero it, delete the call) and confirm the
+output *does* move; then apply the real change.
+
+Why, three times in this repo:
+- The FREQ_SCALE falsifier edited `kernels/attn.mojo` where those constants
+  no longer lived. Byte-identical binary; would have read as "rope
+  exonerated" from an experiment that never ran. Only the matching hash
+  exposed it.
+- The MoE name-resolution change rewrote every weight offset in `moe_ffn`
+  and produced twenty prompts identical to the digit. Reached, correct, and
+  equivalent: the old arithmetic already resolved to the same addresses.
+  Proven only by corrupting it deliberately (gate/up swap -> 1/64).
+- The YaRN ramp flip patched `kernels/attn.mojo` while dense decode runs the
+  megakernel's own copy at `kernels/mega.mojo:747`. 15 of 20 prompts came
+  back byte-identical, which is impossible if 14 of 32 rotary pairs had
+  changed. The data shape caught it, not the hash.
+
+Corollary: when one formula exists in more than one file, a fix that lands
+in some of them is the default outcome. The YaRN ramp has five copies
+(`kernels/attn.mojo`, `kernels/mega.mojo`, `tools/attn-ref.py`,
+`tools/draft-ref.py`, `tools/model-ref.py`).
+
+## P9. A sum is not a comparison
+
+Compare tensors element by element. Aggregates cancel: sign-mixed vectors of
+2048 elements agree in sum while disagreeing everywhere.
+
+Why: layer 0's post-SSM residual matched llama.cpp to 1.2% on the sum while
+its individual components were 6%, 12% and 78% out. That sum is why the SSM
+was not a suspect for three rounds. The RMS of an RMSNorm output is the
+right diagnostic for scale; mean-abs is not, and neither is a sum for
+direction.
+
+## P10. A gate that never runs is not coverage, and a void is a failure
+
+Every committed gate script is executed once, in the commit that adds it.
+A gate that skips, voids or errors reports FAIL and exits non-zero; it never
+averages over the arms that survived.
+
+Why: `bench/force-ab-serve.sh` was committed at `ba9b832` and first run on
+2026-09-12, where it returned 19 of 20 arms VOID and printed
+`prompts 1/20  min 100.0%  mean 100.0%`, which reads as a pass. The void was
+a real bug in the shipped serve path: the cancel probe read a line from fd 0
+mid-generation and discarded it when it was not a cancel, so every queued
+request after the first was eaten.
+
+## P11. Prove the gate can fail before trusting that it passed
+
+A gate is characterised by feeding it a known-bad input and confirming it
+fails loudly. Until that is on record, a pass means the gate ran, not that
+the artifact is correct.
+
+Why: W3 gate 1 passes at ~1e-4 on all four layers while decode produced
+garbage, because gate 1 feeds the MoE block the **oracle's** fixed-seed
+input and never the engine's own activation. It was also confirmed
+falsifiable (`gate 1 expert id mismatch at 0` on another layer's fixtures),
+which is what makes its pass meaningful. Separately,
+`bench/moe-gate2-force.sh` hardcoded `BARO_PREFILL=0` two commits before the
+m=1 replay it was meant to validate was preregistered, so it would have
+produced identical numbers with or without the commit under test.
+
+## P12. Reading the code produces hypotheses; only the oracle produces findings
+
+Before proposing a cause from a code reading, state it as a hypothesis with
+the measurement that would kill it. Where a reference implementation can run
+the same input, diff against it rather than reasoning about intent.
+
+Why: three consecutive confident readings of the MoE SSM path were wrong
+(positional offsets, SPLITK partials, head-layout transpose). The actual
+defects, found in one pass by comparing against llama.cpp's own per-tensor
+dump, were that `ssm_alpha`/`ssm_beta` are f32 in the MoE pack and were read
+through a q8_0 kernel, and that both projections launched `grid_dim=1`
+against a kernel writing 8 rows per block so 24 of 32 heads were never
+computed. The tell was in the data, not the source: 24 beta values sitting
+at exactly 0.5000, which is sigmoid(0) on memory nobody wrote.
+
+`tools/llama-oracle.py` parses `llama-eval-callback` into per-tensor sums and
+sample values (1398 tensors for RegesCore), and is the reference arm for any
+model llama.cpp can run.
+
+## P13. Verify a lane's claim by rebuilding from its committed tree
+
+A dispatched lane's report is a claim. Rebuild from the commit it names, in
+your own worktree, and re-run the gate before believing any number. Check
+that the receipt postdates the commit it describes.
+
+Why: in the MoE lane the receipt predated its own commit five times
+(W0 gate 00:04 vs commit 00:09; "corrected binary" 02:23 vs 02:25; 9e5cc60
+log 02:53:58 vs commit 02:56:48; gate2-force-m1prefill dir 03:44:24 vs
+commit 03:44:39). Every number happened to be accurate; none of the receipts
+covered the tree being claimed. The same lane's falsifier verdict was
+reported from 2 of 20 prompts, and the one long prompt it tested was the
+shortest of the nine that mattered.

@@ -79,3 +79,50 @@ which would make both mixes moot and point the disagreement elsewhere.
 `kernels/mega.mojo` carry the same ramp. They are only updated once the
 measurement decides, so the numpy oracles keep describing arm A until then
 and cannot silently drag the comparison with them.
+
+## Result: FALSIFIER FIRED, ramp NOT changed
+
+Valid arm, third attempt (the first two were void, below):
+
+    armA=.work/engine-yarnA(7753b733fcabf5f8)   A ran 7753b733fcabf5f8
+    armB=.work/engine-yarnB2(dbb3a84ce6a3c2c5)  B ran dbb3a84ce6a3c2c5
+    A: 47 57 49 51 55 53 58 58 38 59 41 58 47 49 51 51 56 47 57 56   mean 51.90
+    B: 47 56 50 51 57 53 58 56 38 61 40 58 48 49 50 50 56 45 60 56   mean 51.95
+    delta +0.05; B better 5/20, worse 6/20, same 9/20
+
+The frozen bar was "+2 tokens per prompt and worse on at most 2 of 20".
+Observed is noise around zero. Per the preregistration the change is
+REVERTED and rope is not iterated on. Both kernels are back to `main`'s
+ramp; nothing landed.
+
+WHAT THIS DOES AND DOES NOT SETTLE. It settles that the ramp direction has
+no measurable effect on 64-token decode at positions under ~130 on this
+model. It does NOT clear the ramp at long context, which is where the
+defect was originally measured (rotated K dims off by 0.75*theta_ex(j) for
+pairs 0-13, error growing with position, seen in the LatentOS use-1 state
+diff at 32k). This gate is insensitive to that regime by construction: the
+whole 20-prompt set fits in ~130 positions. A long-context arm is the only
+thing that would decide it, and the preregistration did not include one.
+
+So the honest status is: inverted against llama.cpp and HF on inspection,
+no measurable consequence at short context, unmeasured at long context.
+Not a bug worth landing blind, and not yet cleared either.
+
+## Two void runs, recorded because they both looked like clean results
+
+VOID 1. Arm B patched only `kernels/attn.mojo`. Dense decode runs the
+megakernel's own copy of the same eight lines at `kernels/mega.mojo:747`,
+so the changed code never executed during decode. Result read
+delta -0.05 with 15 of 20 prompts byte-identical, which is impossible if 14
+of 32 rotary pairs had changed; the data shape is what exposed it, not the
+binary hash, which differed as expected.
+
+VOID 2. Arm B2 patched both kernels and built a genuinely new binary
+(`dbb3a84c`), but the harness loop ran `.work/engine-yarn$arm` while a `sed`
+had rewritten only the arm-header line. The receipt named `dbb3a84c`; the
+binary that ran was still `96752fb4`. Identical output to VOID 1 on a
+supposedly different binary is what exposed it.
+
+Both are now rules: `bench/PROTOCOL-RULES.md` P7 (the arm file is written by
+the run, and equal hashes are refused) and P8 (a null result is not a
+finding until the changed code is proven reached).
