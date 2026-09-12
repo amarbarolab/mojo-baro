@@ -307,9 +307,12 @@ def main() raises:
     for a in argv():
         if a == "--check":
             check = True
+    var stale = False
     if not check:
         with open("docs/KERNELS.md", "w") as f:
             f.write(out)
+    else:
+        stale = read("docs/KERNELS.md") != out
 
     var in_reg = 0
     var orphans = List[String]()
@@ -321,5 +324,8 @@ def main() raises:
     print(len(names), "kernels,", in_reg, "in registry,", len(orphans), "orphans")
     for n in orphans:
         print("ORPHAN:", n, file[n])
-    if len(orphans) > 0:
+    if stale:
+        print("STALE: docs/KERNELS.md does not match the kernels on disk;")
+        print("       regenerate with tools/kernel-census.mojo (no --check)")
+    if len(orphans) > 0 or stale:
         exit(1)
