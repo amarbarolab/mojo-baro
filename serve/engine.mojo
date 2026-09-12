@@ -477,7 +477,9 @@ def main() raises:
     var pf_chunk = min(atol(getenv("BARO_PREFILL_C", String(CP))), CP)
     if pf_chunk < PF_MIN:
         pf_chunk = PF_MIN
-    var pf_on = getenv("BARO_PREFILL", "1") == "1"
+    # qwen35moe has no m>1 MoE prefill yet (W5); replay its prompt rows through
+    # the verified m=1 path. Dense profiles retain their batched prefill.
+    var pf_on = MEGA_ALLOWED and getenv("BARO_PREFILL", "1") == "1"
     var spec_env = MEGA_ALLOWED and getenv("BARO_SPEC", "0") == "1"
     print("BARO_SPEC:", spec_env)
     var spec_dbg = getenv("BARO_SPEC_DBG", "0") == "1"
