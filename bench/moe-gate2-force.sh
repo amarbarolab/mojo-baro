@@ -6,7 +6,15 @@ engine=${2:-.work/moe-engine-g2}
 out=${3:-.work/moe-w3/gate2-force}
 port=${4:-18083}
 mkdir -p "$out"
-"$HOME/llama.cpp/build/bin/llama-server" -m "$model" -c 4096 -ngl 99 -fa on -ctk f16 -ctv f16 -b 2048 -ub 512 -t 8 -np 1 --no-cont-batching --host 127.0.0.1 --port "$port" > "$out/llama.log" 2>&1 &
+llama_bin="$HOME/llama.cpp/build/bin/llama-server"
+for arm in "$llama_bin" "$engine"; do
+    [ -x "$arm" ] || { echo "missing executable arm: $arm" >&2; exit 2; }
+done
+llama_hash=$(sha256sum "$llama_bin" | cut -d' ' -f1)
+engine_hash=$(sha256sum "$engine" | cut -d' ' -f1)
+[ "$llama_hash" != "$engine_hash" ] || { echo "REFUSED: arm hashes are equal" >&2; exit 2; }
+echo "llama=$llama_bin shaLlama=$llama_hash engine=$engine shaEngine=$engine_hash" | tee "$out/arm.txt"
+"$llama_bin" -m "$model" -c 4096 -ngl 99 -fa on -ctk f16 -ctv f16 -b 2048 -ub 512 -t 8 -np 1 --no-cont-batching --host 127.0.0.1 --port "$port" > "$out/llama.log" 2>&1 &
 pid=$!
 cleanup() { kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; }
 trap cleanup EXIT
