@@ -400,3 +400,39 @@ STATUS 2026-09-12:
 
 So gate 2 is 2 of 3, with the third blocked on a missing artifact. It is NOT
 closed, and the lane is not claimed as finished.
+
+## W3 Gate 2: CLOSED 2026-09-12
+
+Condition 3 was recorded BLOCKED earlier the same day on the grounds that
+RegesCore ships no tokenizer.json. That was correct about the artifact and
+wrong about the conclusion: the GGUF repo (iBossonline/RegesCore-1.0-35) is
+GGUF-only, duplicated from unsloth/Ornith-1.0-35B-GGUF, and the tokenizer
+lives in the BASE repo, unsloth/Ornith-1.0-35B. 20 MB, fetched.
+
+Verified before use rather than assumed: config.json says
+Qwen3_5MoeForConditionalGeneration with hidden_size 2048, matching
+RegesCore, and all four test prompts round-trip to byte-identical ids
+including the 59-token one. Vocab 248044 + 33 added tokens, padded to the
+GGUF's 248320 (a multiple of 256), consistent with the dense pack.
+
+Local ~/Models/ornith-1.5-9b-q4_K_M does NOT serve: it is Ornith 1.5 9B,
+arch qwen35 (dense), a different model, and GGUF-only as well. Both carry
+vocab 248320, which is why the fetched tokenizer was likely to be right.
+
+FINAL STATUS, all three conditions met:
+
+1. PASS. 53.20 mean over 20 prompts, min 40, max 60, against a restated bar
+   of the dense path's measured 51.90 mean / 38 min.
+2. PASS. ./run-tests.sh exit 0 on the merged tree, 93 kernels, 43 in
+   registry, 0 orphans, zero deprecation warnings.
+3. PASS. Rust front /v1/chat/completions on the MoE pack returned 24 tokens
+   of coherent text at 42.66 tok/s_gen, prefill_rows 11, finish_reason
+   length. Receipt .work/gate2-rust/answer.json.
+
+A defect found while closing condition 3, worth its own fix: baro-serve
+launches the engine with BARO_MEGA defaulted on and has no per-profile
+awareness, so serving the MoE pack fails with "BARO_MEGA=1 is not supported
+by the qwen35moe model profile" unless the caller knows to set BARO_MEGA=0.
+It fails loudly only because of the profile guard added in this lane;
+without it this was a SIGILL. The front should read the profile from the
+pack rather than requiring the caller to know.
