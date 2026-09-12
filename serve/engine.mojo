@@ -494,7 +494,7 @@ def main() raises:
     # and the reference id is force-fed into the next step's context
     # regardless of what the model chose, same file format and semantics as
     # serve/spark.mojo:260-261.
-    var force = List[Int]()
+    var force_env = List[Int]()
     var force_path = getenv("BARO_FORCE", "")
     if force_path != "":
         with open(force_path, "r") as ff:
@@ -508,12 +508,12 @@ def main() raises:
                     fhave = True
                 else:
                     if fhave:
-                        force.append(fval)
+                        force_env.append(fval)
                     fval = 0
                     fhave = False
             if fhave:
-                force.append(fval)
-        print("BARO_FORCE:", force_path, " (", len(force), "ids )")
+                force_env.append(fval)
+        print("BARO_FORCE:", force_path, " (", len(force_env), "ids )")
     var bufs = alloc_bufs(ctx, pack, tmax)
     # The dense path consumes Pack.off's historical order.  The MoE pack is
     # lexical by tensor name, so build a per-block semantic order by name;
@@ -585,6 +585,7 @@ def main() raises:
         var ckpt_idx = -1
         var cached = 0
         var restore_s = 0.0
+        var force = force_env.copy()
         var stop_seqs = List[List[Int]]()
         var ckpt_hints = List[Int]()
         var sample = default_sample_params()
@@ -609,6 +610,26 @@ def main() raises:
             if req_has_spec:
                 spec = req_spec
             print("prompt tokens:", len(prompt), " n:", gen_n, " spec:", spec)
+            # Per-request teacher forcing. BARO_FORCE is read once at startup,
+            # so a forced run used to need one process per prompt: 20 pack
+            # loads for a 20-prompt gate, 1.4 s each on the MoE pack. A
+            # "force":[ids] field lets one resident process serve the whole
+            # gate. Absent, the request inherits BARO_FORCE.
+            var fi2 = json_key(line_in.value(), "force")
+            if fi2 >= 0:
+                force = List[Int]()
+                var fb = line_in.value().as_bytes()
+                if fi2 < len(fb) and fb[fi2] == 91:
+                    fi2 += 1
+                    while True:
+                        while fi2 < len(fb) and (fb[fi2] == 32 or fb[fi2] == 44):
+                            fi2 += 1
+                        if fi2 >= len(fb) or fb[fi2] == 93:
+                            break
+                        var fv = 0
+                        if not json_int(line_in.value(), fi2, fv):
+                            break
+                        force.append(fv)
             # M1a prefix checkpoint: restore the SSM slot for the longest
             # hashed prefix and keep the KV pool (position addressed, [0, cached)
             # still in place); the draft KV is never prefilled, so it is zeroed
@@ -846,8 +867,19 @@ def main() raises:
                     names.append(String("attn_residual-") + String(dump_layer)); slots.append(0); lens.append(H)
                     names.append(String("attn_post_norm-") + String(dump_layer)); slots.append(1); lens.append(H)
                     names.append(String("l_out-") + String(dump_layer)); slots.append(2); lens.append(H)
-                    names.append(String("attn_output-") + String(dump_layer)); slots.append(4); lens.append(ATT)
-                    names.append(String("attn_oproj-") + String(dump_layer)); slots.append(6); lens.append(H)
+                    # Names are llama's, exactly. The first pass called our
+                    # pre-gate Ao "attn_output" and the o_proj result
+                    # "attn_oproj"; llama calls those attn_pregate and
+                    # attn_output, so tdiff was joining unrelated tensors of
+                    # different lengths and reported relL2 22.69 on a layer
+                    # whose downstream was provably at floor.
+                    names.append(String("attn_pregate-") + String(dump_layer)); slots.append(4); lens.append(ATT)
+                    names.append(String("attn_output-") + String(dump_layer)); slots.append(6); lens.append(H)
+                    names.append(String("Qcur_full-") + String(dump_layer)); slots.append(8); lens.append(QF)
+                    names.append(String("Qcur_normed-") + String(dump_layer)); slots.append(12); lens.append(ATT)
+                    names.append(String("Qcur-") + String(dump_layer)); slots.append(14); lens.append(ATT)
+                    names.append(String("Kcur_normed-") + String(dump_layer)); slots.append(16); lens.append(KV)
+                    names.append(String("Kcur-") + String(dump_layer)); slots.append(17); lens.append(KV)
                 elif dump4:
                     # SSM layer sub-block captures, slot order set in window.mojo
                     names.append(String("attn_residual-") + String(dump_layer)); slots.append(0)
