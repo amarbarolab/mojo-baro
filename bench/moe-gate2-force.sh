@@ -33,9 +33,31 @@ for tf in bench/mtp-prompts/p*.tokens; do
 done
 cleanup
 trap - EXIT
+echo "prompt agree checked status" > "$out/results.txt"
 for tf in bench/mtp-prompts/p*.tokens; do
     p=$(basename "$tf" .tokens)
-    BARO_MEGA=0 BARO_PACK=.work/moe-w1/pack BARO_PROMPT="$tf" BARO_FORCE="$out/$p.ref.ids" "$engine" > "$out/$p.cand.log" 2>&1
-    grep -q '^forced agreement: 64 / 64' "$out/$p.cand.log"
+    if ! BARO_SPEC=0 BARO_MEGA=0 BARO_PACK=.work/moe-w1/pack BARO_PROMPT="$tf" BARO_FORCE="$out/$p.ref.ids" "$engine" > "$out/$p.cand.log" 2>&1; then
+        echo "$p 0 0 VOID(run)" >> "$out/results.txt"
+        continue
+    fi
+    agreement=$(sed -n 's/^forced agreement: \([0-9][0-9]*\) \/ \([0-9][0-9]*\)$/\1 \2/p' "$out/$p.cand.log")
+    set -- $agreement
+    if [ "$#" -ne 2 ] || [ "$2" -eq 0 ]; then
+        echo "$p 0 0 VOID(result)" >> "$out/results.txt"
+        continue
+    fi
+    echo "$p $1 $2 $([ "$1" -eq 64 ] && [ "$2" -eq 64 ] && echo PASS || echo FAIL)" >> "$out/results.txt"
 done
+column -t "$out/results.txt"
+python3 - "$out/results.txt" <<'PY'
+import sys
+
+rows = [line.split() for line in open(sys.argv[1]).read().splitlines()[1:]]
+void = [row[0] for row in rows if row[3].startswith("VOID")]
+valid = [row for row in rows if not row[3].startswith("VOID")]
+mean = sum(int(row[1]) for row in valid) / len(valid) if valid else float("nan")
+passed = len(rows) == 20 and not void and all(row[1:3] == ["64", "64"] for row in rows)
+print(f"prompts {len(valid)}/{len(rows)} mean {mean:.2f}/64 void: {void or 'none'}")
+raise SystemExit(0 if passed else 1)
+PY
 echo "20/20 prompts, 64/64 forced agreement"
