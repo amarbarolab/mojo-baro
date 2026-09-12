@@ -1564,3 +1564,51 @@ not claimed done. Falsifier as frozen ("two concurrent requests at pool
 size 2 that still serialise onto one engine") did not trigger either,
 because pool size 2 could not start at all -- a stronger negative result
 than the falsifier anticipated.
+
+## L1 — engine exports prefix checkpoints to latentos-agent (frozen 2026-09-12, before its build)
+
+Frozen before the change is written.
+
+CONTEXT. `serve/latent.mojo` and the `serve/latentos` package landed at
+`0a406b0` / `506e91d` and have never been called: `EngineLatentClient` has
+**zero callers in the repo**, so the sidecar is built, committed, and unwired.
+`lane-chat` looked like the wiring, but its `engine.mojo` only IMPORTS those
+symbols and never calls them, on a base 265 commits behind main. There is
+nothing to recover from that branch; this is the wiring, written fresh.
+
+CLAIM. The engine can hand its prefix checkpoints to an out-of-process
+`latentos-agent` over a unix socket, as sealed memfds, without changing what
+it generates.
+
+CHANGE. One new env var, `BARO_LATENT_SOCK`. Unset (the default) the engine
+does not open a socket, constructs no client, and runs exactly as today. Set,
+the engine connects once at startup via `ipc.connect_unix_socket`, and after
+`chain.commit()` exports every chain slot that this request newly minted,
+using `EngineLatentClient.export_chain_slot`. A connect failure RAISES at
+startup rather than degrading to a silent no-op: a handoff that quietly does
+not happen is the failure mode this whole sidecar exists to make visible.
+
+PREDICTION.
+- P-L1a: with `BARO_LATENT_SOCK` unset, `bench/force-ab.sh` stays 20/20 at
+  64/64 against a main-built engine, and the decode median does not move
+  outside run-to-run noise. The export path is not reached at all.
+- P-L1b: with an agent listening, a multi-turn replay that mints N boundary
+  checkpoints causes the agent to receive exactly N handles, each with a
+  valid `LatentHeader`.
+- P-L1c: a checkpoint exported and then ingested back is **byte-identical**
+  in its conv and ssm payloads to the one the engine minted.
+
+GATE. `tools/latent-gate.sh`, committed with the change, which builds the
+agent and the engine from the committed tree, prints both shas, runs the
+three checks above and exits non-zero on any of them. An unrun gate is not a
+gate (this repo has shipped that mistake twice: `ba9b832`, and the census
+`--check` at `d75163a`), so the gate runs in the same commit that adds it.
+
+FALSIFIER. If P-L1a fails, the wiring is not free and comes straight back
+out: no export feature is worth a change in what the engine generates. If
+P-L1c fails, the mint/ingest pair is wrong and the sidecar is not ready to be
+wired at all, whatever the socket does.
+
+NOT IN THIS ROUND. KV page export (`export_kv_pages` stays uncalled), the
+hidden-state latents, ingest-on-startup, and any agent-side policy. This
+round proves one direction of one payload type over a real socket.
