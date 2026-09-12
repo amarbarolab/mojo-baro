@@ -24,6 +24,7 @@ from registry import *
 from window import *
 from harness import *
 from prefix import *
+from moe_pack import parse_moe_index, resolve_plain
 
 
 def read_line(fd: Int) raises -> Optional[String]:
@@ -506,6 +507,45 @@ def main() raises:
                 force.append(fval)
         print("BARO_FORCE:", force_path, " (", len(force), "ids )")
     var bufs = alloc_bufs(ctx, pack, tmax)
+    # The dense path consumes Pack.off's historical order.  The MoE pack is
+    # lexical by tensor name, so rebuild the window's logical order by name;
+    # the offsets remain byte offsets into the same Pack.wbuf blob.
+    comptime if not MEGA_ALLOWED:
+        var moe_tensors = parse_moe_index(packdir + "/index.txt")
+        var moe_logical = List[Int]()
+        moe_logical.append(resolve_plain(moe_tensors, "token_embd.weight").offset)
+        for layer in range(N_LAYERS):
+            var pfx = "blk." + String(layer) + "."
+            if is_attn(layer):
+                for name in [
+                    "attn_norm.weight", "attn_q.weight", "attn_k.weight",
+                    "attn_v.weight", "attn_q_norm.weight", "attn_k_norm.weight",
+                    "attn_output.weight",
+                ]:
+                    moe_logical.append(resolve_plain(moe_tensors, pfx + name).offset)
+            else:
+                for name in [
+                    "attn_norm.weight", "attn_qkv.weight", "attn_gate.weight",
+                    "ssm_alpha.weight", "ssm_beta.weight", "ssm_conv1d.weight",
+                    "ssm_a", "ssm_dt.bias", "ssm_norm.weight", "ssm_out.weight",
+                ]:
+                    moe_logical.append(resolve_plain(moe_tensors, pfx + name).offset)
+            moe_logical.append(resolve_plain(moe_tensors, pfx + "post_attention_norm.weight").offset)
+            moe_logical.append(resolve_plain(moe_tensors, pfx + "ffn_gate_exps.weight").offset)
+            moe_logical.append(resolve_plain(moe_tensors, pfx + "ffn_up_exps.weight").offset)
+            moe_logical.append(resolve_plain(moe_tensors, pfx + "ffn_down_exps.weight").offset)
+        moe_logical.append(resolve_plain(moe_tensors, "output_norm.weight").offset)
+        moe_logical.append(resolve_plain(moe_tensors, "output.weight").offset)
+        for layer in range(N_LAYERS):
+            var pfx = "blk." + String(layer) + "."
+            for name in [
+                "ffn_gate_inp.weight", "ffn_gate_shexp.weight",
+                "ffn_up_shexp.weight", "ffn_down_shexp.weight",
+                "ffn_gate_inp_shexp.weight",
+            ]:
+                moe_logical.append(resolve_plain(moe_tensors, pfx + name).offset)
+        off = moe_logical.copy()
+        bufs.off = moe_logical.copy()
     var toks_d = bufs.toks_d
 
     var wst = WindowState(pos=0, pos_prev=0, ring=0, n_drafted=0, n_accepted=0, n_spec_windows=0, n_dumped=0, tp=0, tq=0, pf_att=0, pf_ssm=0, pf_ffn=0, pf_head=0, pf_proc=0, pf_draft=0, fc=[0, 0, 0, 0, 0, 0], pc=[0, 0, 0, 0, 0, 0, 0, 0], p3=[0, 0, 0, 0], pfx=[0, 0, 0, 0])

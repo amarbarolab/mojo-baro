@@ -13,6 +13,14 @@ from std.time import perf_counter_ns
 from max.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
 from layout import TileTensor, TensorLayout, row_major
 from registry import *
+from moe import (
+    moe_embed_q8_0_pos, moe_matmul_q8_0_m1, moe_add3,
+    amar_moe_router_top8, amar_moe_sig_gate, moe_gate_up_q4k_pack,
+    amar_moe_down_q4k, amar_moe_down_q6k, moe_gate_up_q8_0, moe_down_q8_0,
+    MOE_WAVES, MOE_THREADS, N_EXP, TOPK, E_FFN, SH_FFN,
+)
+from matmul_skinny import amar_matmul_skinny_m1_row
+from ssm import amar_cast_bf16
 from dattn import dattn_nsplit
 from mega import DATT_NLD
 
@@ -624,6 +632,64 @@ struct WindowState(Copyable, Movable):
         self.pfx = [0, 0, 0, 0]
 
 
+comptime moe_router_layout = row_major[N_EXP, H]()
+comptime moe_one_layout = row_major[1]()
+comptime moe_vec_layout = row_major[H]()
+comptime moe_logits_layout = row_major[N_EXP]()
+comptime moe_idx_layout = row_major[TOPK]()
+comptime moe_expert_layout = row_major[TOPK, E_FFN]()
+comptime moe_shared_layout = row_major[1, SH_FFN]()
+comptime moe_expert_f_layout = row_major[TOPK * E_FFN]()
+comptime moe_shared_f_layout = row_major[SH_FFN]()
+comptime moe_expert_flat_layout = row_major[TOPK * E_FFN]()
+comptime moe_shared_flat_layout = row_major[SH_FFN]()
+comptime MOE_EXTRA_BASE = 1 + N_SSM * 10 + N_ATT * 7 + N_LAYERS * 4 + 2
+
+
+def moe_ffn(ctx: DeviceContext, mut b: WindowBufs, Xm: TileTensor[f32, type_of(xm_layout), MutAnyOrigin], CurBm: TileTensor[bf16, type_of(xm_layout), MutAnyOrigin], w: Int, layer: Int) raises:
+    var X = row_f32(ctx, b.x_d, 0, H, moe_vec_layout)
+    var Router = tens_f32(ctx, b.wbuf, b.off[MOE_EXTRA_BASE + layer * 5], N_EXP * H, moe_router_layout)
+    var Logits = row_f32(ctx, b.logits_d, 0, N_EXP, moe_logits_layout)
+    var Idx = TileTensor[DType.int32, type_of(moe_idx_layout), MutAnyOrigin](b.hidx_d, moe_idx_layout)
+    var Wt = TileTensor[f32, type_of(moe_idx_layout), MutAnyOrigin](b.hmax_d, moe_idx_layout)
+    comptime k_router = amar_matmul_skinny_m1_row[f32, 2, type_of(xm_layout), type_of(moe_router_layout), type_of(moe_logits_layout)]
+    ctx.enqueue_function[k_router](Xm, Router, Logits, Int32(N_EXP), Int32(H), grid_dim=ceildiv(N_EXP, ROW_WAVES), block_dim=ROW_THREADS)
+    ctx.enqueue_function[amar_moe_router_top8[type_of(moe_logits_layout), type_of(moe_idx_layout), type_of(moe_idx_layout)]](Logits, Idx, Wt, grid_dim=1, block_dim=N_EXP)
+    var routed = row_f32(ctx, b.p_h_d, 0, H, moe_vec_layout)
+    var shared = row_f32(ctx, b.p_qf_d, 0, H, moe_vec_layout)
+    var routed_f = row_f32(ctx, b.p_ffn_d, 0, TOPK * E_FFN, moe_expert_f_layout)
+    var routed_h_flat = TileTensor[bf16, type_of(moe_expert_flat_layout), MutAnyOrigin](b.fgb_d, moe_expert_flat_layout)
+    ctx.enqueue_function[moe_gate_up_q4k_pack[TOPK, E_FFN, type_of(xm_layout), type_of(moe_idx_layout), type_of(moe_expert_f_layout)]](
+        CurBm, b.wbuf.unsafe_ptr() + b.off[w + 1], Idx, routed_f, Int32(H), Int32(b.off[w + 2] - b.off[w + 1]), grid_dim=ceildiv(TOPK * E_FFN, MOE_WAVES), block_dim=MOE_THREADS)
+    ctx.enqueue_function[amar_cast_bf16[type_of(moe_expert_f_layout), type_of(moe_expert_flat_layout)]](routed_f, routed_h_flat, Int32(TOPK * E_FFN), grid_dim=ceildiv(TOPK * E_FFN, 256), block_dim=256)
+    var routed_h = TileTensor[bf16, type_of(moe_expert_layout), MutAnyOrigin](b.fgb_d, moe_expert_layout)
+    if layer == 34 or layer == 38 or layer == 39:
+        ctx.enqueue_function[amar_moe_down_q6k[TOPK, E_FFN, type_of(moe_expert_layout), type_of(moe_idx_layout), type_of(moe_idx_layout), type_of(moe_vec_layout)]](
+            routed_h, b.wbuf.unsafe_ptr() + b.off[w + 3], Idx, Wt, routed, Int32(H), grid_dim=ceildiv(H, MOE_WAVES), block_dim=MOE_THREADS)
+    else:
+        ctx.enqueue_function[amar_moe_down_q4k[TOPK, E_FFN, type_of(moe_expert_layout), type_of(moe_idx_layout), type_of(moe_idx_layout), type_of(moe_vec_layout)]](
+            routed_h, b.wbuf.unsafe_ptr() + b.off[w + 3], Idx, Wt, routed, Int32(H), grid_dim=ceildiv(H, MOE_WAVES), block_dim=MOE_THREADS)
+    var idx0b = DeviceBuffer[DType.int32](ctx, b.hidx_d.unsafe_ptr(), 1, owning=False)
+    var idx0 = TileTensor[DType.int32, type_of(moe_one_layout), MutAnyOrigin](idx0b, moe_one_layout)
+    var idx0_h = ctx.enqueue_create_host_buffer[DType.int32](1)
+    idx0_h[0] = 0
+    ctx.enqueue_copy(dst_buf=idx0b, src_buf=idx0_h)
+    var shared_f = row_f32(ctx, b.p_ffn2_d, 0, SH_FFN, moe_shared_f_layout)
+    var shared_h_flat = TileTensor[bf16, type_of(moe_shared_flat_layout), MutAnyOrigin](b.fgbp_d, moe_shared_flat_layout)
+    var sigmoid = row_f32(ctx, b.p_v_d, 0, 1, moe_one_layout)
+    var shared_gate = b.wbuf.unsafe_ptr() + b.off[MOE_EXTRA_BASE + layer * 5 + 1]
+    var shared_up = b.wbuf.unsafe_ptr() + b.off[MOE_EXTRA_BASE + layer * 5 + 2]
+    ctx.enqueue_function[amar_moe_sig_gate[type_of(moe_vec_layout), type_of(h_layout), type_of(moe_one_layout)]](
+        X, tens_f32(ctx, b.wbuf, b.off[MOE_EXTRA_BASE + layer * 5 + 4], H, h_layout), sigmoid, Int32(H), grid_dim=1, block_dim=32)
+    ctx.enqueue_function[moe_gate_up_q8_0[1, SH_FFN, type_of(xm_layout), type_of(moe_one_layout), type_of(moe_shared_f_layout)]](
+        CurBm, shared_gate, idx0, shared_f, Int32(H), Int32((H // 32) * 34), Int32(shared_up - shared_gate), grid_dim=ceildiv(SH_FFN, MOE_WAVES), block_dim=MOE_THREADS)
+    ctx.enqueue_function[amar_cast_bf16[type_of(moe_shared_f_layout), type_of(moe_shared_flat_layout)]](shared_f, shared_h_flat, Int32(SH_FFN), grid_dim=ceildiv(SH_FFN, 256), block_dim=256)
+    var shared_h = TileTensor[bf16, type_of(moe_shared_layout), MutAnyOrigin](b.fgbp_d, moe_shared_layout)
+    ctx.enqueue_function[moe_down_q8_0[1, SH_FFN, type_of(moe_shared_layout), type_of(moe_one_layout), type_of(moe_one_layout), type_of(moe_vec_layout)]](
+        shared_h, b.wbuf.unsafe_ptr() + b.off[MOE_EXTRA_BASE + layer * 5 + 3], idx0, sigmoid, shared, Int32(H), Int32((SH_FFN // 32) * 34), grid_dim=ceildiv(H, MOE_WAVES), block_dim=MOE_THREADS)
+    ctx.enqueue_function[moe_add3[type_of(moe_vec_layout), type_of(moe_vec_layout), type_of(moe_vec_layout)]](routed, shared, X, Int32(H), grid_dim=ceildiv(H, 256), block_dim=256)
+
+
 def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: WindowState) raises:
     var Xm = TileTensor(b.x_d, xm_layout)
     var CurBm = TileTensor(b.curb_d, xm_layout)
@@ -654,9 +720,14 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
     else:
         var m = 1
         var win_spec = False
-        if st.pos + 1 < cfg.n_prompt:
-            m = min(MROWS, cfg.n_prompt - 1 - st.pos)
-        elif cfg.spec:
+        comptime if MEGA_ALLOWED:
+            if st.pos + 1 < cfg.n_prompt:
+                m = min(MROWS, cfg.n_prompt - 1 - st.pos)
+        else:
+            # Gate 2 is deliberately the smallest decode path: one row per
+            # call, including prompt replay.
+            m = 1
+        if cfg.spec and not (st.pos + 1 < cfg.n_prompt):
             # process: tokens st.pos_prev+1..pos through the draft head with the
             # trunk's h rows (row r = h(st.pos_prev + r)); last row = draft step 0.
             var nproc = st.pos - st.pos_prev
@@ -691,10 +762,16 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                 ctx.synchronize()
                 st.pf_draft += Int(perf_counter_ns() - st.tp)
 
-        ctx.enqueue_function[embed_k](
-            Embd, Xm, Toks, Int32(st.pos), Int32(H),
-            grid_dim=(ceildiv(H, 256), m), block_dim=256,
-        )
+        comptime if MEGA_ALLOWED:
+            ctx.enqueue_function[embed_k](
+                Embd, Xm, Toks, Int32(st.pos), Int32(H),
+                grid_dim=(ceildiv(H, 256), m), block_dim=256,
+            )
+        else:
+            ctx.enqueue_function[moe_embed_q8_0_pos[type_of(xm_layout), type_of(toks_layout)]](
+                b.wbuf.unsafe_ptr() + b.off[0], Xm, Toks, Int32(st.pos), Int32(H),
+                Int32((H // 32) * 34), grid_dim=(ceildiv(H, 256), m), block_dim=256,
+            )
 
         var w = 1
         var ssm_i = 0
@@ -796,11 +873,26 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                 var AoB = TileTensor(b.resb_d, xflat_layout)
                 var AoBm = TileTensor(b.resb_d, xm_layout)
 
-                gemm_w[QF, H](ctx, CurBm, b.wbuf, b.off[w + 1], cfg.pack_q4, Pqf, m)
+                comptime if MEGA_ALLOWED:
+                    gemm_w[QF, H](ctx, CurBm, b.wbuf, b.off[w + 1], cfg.pack_q4, Pqf, m)
+                else:
+                    ctx.enqueue_function[moe_matmul_q8_0_m1[type_of(h_layout), type_of(xm_layout)]](
+                        CurBm, b.wbuf.unsafe_ptr() + b.off[w + 1], row_f32(ctx, b.p_qf_d, 0, QF, h_layout), Int32(QF), Int32(H), Int32((H // 32) * 34),
+                        grid_dim=ceildiv(QF, 8), block_dim=256)
                 ctx.enqueue_function[r_qf](Pqf, Qfm, Int32(m), Int32(QF), grid_dim=ceildiv(m * QF, 256), block_dim=256)
-                gemm_w[KV, H](ctx, CurBm, b.wbuf, b.off[w + 2], cfg.pack_q4, Pkv, m)
+                comptime if MEGA_ALLOWED:
+                    gemm_w[KV, H](ctx, CurBm, b.wbuf, b.off[w + 2], cfg.pack_q4, Pkv, m)
+                else:
+                    ctx.enqueue_function[moe_matmul_q8_0_m1[type_of(h_layout), type_of(xm_layout)]](
+                        CurBm, b.wbuf.unsafe_ptr() + b.off[w + 2], row_f32(ctx, b.p_kv_d, 0, KV, h_layout), Int32(KV), Int32(H), Int32((H // 32) * 34),
+                        grid_dim=ceildiv(KV, 8), block_dim=256)
                 ctx.enqueue_function[r_kv](Pkv, Kflat, Int32(m), Int32(KV), grid_dim=ceildiv(m * KV, 256), block_dim=256)
-                gemm_w[KV, H](ctx, CurBm, b.wbuf, b.off[w + 3], cfg.pack_q4, Pkv, m)
+                comptime if MEGA_ALLOWED:
+                    gemm_w[KV, H](ctx, CurBm, b.wbuf, b.off[w + 3], cfg.pack_q4, Pkv, m)
+                else:
+                    ctx.enqueue_function[moe_matmul_q8_0_m1[type_of(h_layout), type_of(xm_layout)]](
+                        CurBm, b.wbuf.unsafe_ptr() + b.off[w + 3], row_f32(ctx, b.p_kv_d, 0, KV, h_layout), Int32(KV), Int32(H), Int32((H // 32) * 34),
+                        grid_dim=ceildiv(KV, 8), block_dim=256)
                 ctx.enqueue_function[r_kv](Pkv, Vflat, Int32(m), Int32(KV), grid_dim=ceildiv(m * KV, 256), block_dim=256)
                 ctx.enqueue_function[split_k](Qfm, Q, Gate, grid_dim=(NQH, m), block_dim=HD)
                 ctx.enqueue_function[hrms_q](Q, Qn, Float32(1e-6), grid_dim=m * NQH, block_dim=HD)
@@ -818,7 +910,12 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                 else:
                     ctx.enqueue_function[att_k](Q, Kc, Vc, Ao, Int32(st.pos + 1), Float32(0.0625), Int32(att_i), grid_dim=(NQH, m), block_dim=HD)
                 ctx.enqueue_function[gmul_k](Aoflat, Gate, AoB, Int32(m * H), grid_dim=ceildiv(m * H, 256), block_dim=256)
-                gemm_w[H, H](ctx, AoBm, b.wbuf, b.off[w + 6], cfg.pack_q4, Ph, m)
+                comptime if MEGA_ALLOWED:
+                    gemm_w[H, H](ctx, AoBm, b.wbuf, b.off[w + 6], cfg.pack_q4, Ph, m)
+                else:
+                    ctx.enqueue_function[moe_matmul_q8_0_m1[type_of(h_layout), type_of(xm_layout)]](
+                        AoBm, b.wbuf.unsafe_ptr() + b.off[w + 6], row_f32(ctx, b.p_h_d, 0, H, h_layout), Int32(H), Int32(H), Int32((H // 32) * 34),
+                        grid_dim=ceildiv(H, 8), block_dim=256)
                 ctx.enqueue_function[r_add](Ph, Xm, Int32(m), Int32(H), grid_dim=ceildiv(m * H, 256), block_dim=256)
                 att_i += 1
                 w += 7
@@ -849,10 +946,24 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                 var So = TileTensor(b.so_d, om_layout)
                 var ResBm = TileTensor(b.resb_d, xm_layout)
 
-                gemm_w[CONV, H](ctx, CurBm, b.wbuf, b.off[w + 1], cfg.pack_q4, Pq, m)
-                gemm_w[H, H](ctx, CurBm, b.wbuf, b.off[w + 2], cfg.pack_q4, Ph, m)
-                gemm_w[NH_V, H](ctx, CurBm, b.wbuf, b.off[w + 3], cfg.pack_q4, Pab, m)
-                gemm_w[NH_V, H](ctx, CurBm, b.wbuf, b.off[w + 4], cfg.pack_q4, Pab2, m)
+                comptime if MEGA_ALLOWED:
+                    gemm_w[CONV, H](ctx, CurBm, b.wbuf, b.off[w + 1], cfg.pack_q4, Pq, m)
+                    gemm_w[H, H](ctx, CurBm, b.wbuf, b.off[w + 2], cfg.pack_q4, Ph, m)
+                    gemm_w[NH_V, H](ctx, CurBm, b.wbuf, b.off[w + 3], cfg.pack_q4, Pab, m)
+                    gemm_w[NH_V, H](ctx, CurBm, b.wbuf, b.off[w + 4], cfg.pack_q4, Pab2, m)
+                else:
+                    ctx.enqueue_function[moe_matmul_q8_0_m1[type_of(h_layout), type_of(xm_layout)]](
+                        CurBm, b.wbuf.unsafe_ptr() + b.off[w + 1], row_f32(ctx, b.p_qf_d, 0, CONV, h_layout), Int32(CONV), Int32(H), Int32((H // 32) * 34),
+                        grid_dim=ceildiv(CONV, 8), block_dim=256)
+                    ctx.enqueue_function[moe_matmul_q8_0_m1[type_of(h_layout), type_of(xm_layout)]](
+                        CurBm, b.wbuf.unsafe_ptr() + b.off[w + 2], row_f32(ctx, b.p_h_d, 0, H, h_layout), Int32(H), Int32(H), Int32((H // 32) * 34),
+                        grid_dim=ceildiv(H, 8), block_dim=256)
+                    ctx.enqueue_function[moe_matmul_q8_0_m1[type_of(h_layout), type_of(xm_layout)]](
+                        CurBm, b.wbuf.unsafe_ptr() + b.off[w + 3], row_f32(ctx, b.p_32_d, 0, NH_V, h_layout), Int32(NH_V), Int32(H), Int32((H // 32) * 34),
+                        grid_dim=1, block_dim=256)
+                    ctx.enqueue_function[moe_matmul_q8_0_m1[type_of(h_layout), type_of(xm_layout)]](
+                        CurBm, b.wbuf.unsafe_ptr() + b.off[w + 4], row_f32(ctx, b.p_32b_d, 0, NH_V, h_layout), Int32(NH_V), Int32(H), Int32((H // 32) * 34),
+                        grid_dim=1, block_dim=256)
                 ctx.enqueue_function[r_qf](Pq, Qkvm, Int32(m), Int32(CONV), grid_dim=ceildiv(m * CONV, 256), block_dim=256)
                 ctx.enqueue_function[r_h](Ph, Zm, Int32(m), Int32(H), grid_dim=ceildiv(m * H, 256), block_dim=256)
 
@@ -892,7 +1003,12 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                     var nw = perf_counter_ns()
                     st.pc[5] += Int(nw - st.tq)
                     st.tq = nw
-                gemm_w[H, H](ctx, ResBm, b.wbuf, b.off[w + 9], cfg.pack_q4, Ph, m)
+                comptime if MEGA_ALLOWED:
+                    gemm_w[H, H](ctx, ResBm, b.wbuf, b.off[w + 9], cfg.pack_q4, Ph, m)
+                else:
+                    ctx.enqueue_function[moe_matmul_q8_0_m1[type_of(h_layout), type_of(xm_layout)]](
+                        ResBm, b.wbuf.unsafe_ptr() + b.off[w + 9], row_f32(ctx, b.p_h_d, 0, H, h_layout), Int32(H), Int32(H), Int32((H // 32) * 34),
+                        grid_dim=ceildiv(H, 8), block_dim=256)
                 ctx.enqueue_function[r_add](Ph, Xm, Int32(m), Int32(H), grid_dim=ceildiv(m * H, 256), block_dim=256)
                 ssm_i += 1
                 w += 10
@@ -923,6 +1039,8 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                 var nw = perf_counter_ns()
                 st.fc[0] += Int(nw - st.tq)
                 st.tq = nw
+            comptime if not MEGA_ALLOWED:
+                moe_ffn(ctx, b, Xm, CurBm, w, layer)
             var Wfgq = tens_q8q(ctx, b.wbuf, b.off[w + 1], H * FFN, q_h_ffn)
             var Wfgs = tens_q8s(ctx, b.wbuf, b.off[w + 1], H * FFN, s_h_ffn)
             var Wfuq = tens_q8q(ctx, b.wbuf, b.off[w + 2], H * FFN, q_h_ffn)
@@ -940,7 +1058,8 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                 quant_rows(ctx, CurBm, AqH, AsH, m, H)
                 gemm_q8dot(ctx, AqH, AsH, Wfgq, Wfgs, Pg, m, FFN, H)
             else:
-                gemm_w[FFN, H](ctx, CurBm, b.wbuf, b.off[w + 1], cfg.pack_q4, Pg, m)
+                if MEGA_ALLOWED or cfg.mega:
+                    gemm_w[FFN, H](ctx, CurBm, b.wbuf, b.off[w + 1], cfg.pack_q4, Pg, m)
             if cfg.pf4:
                 ctx.synchronize()
                 var nw = perf_counter_ns()
@@ -949,13 +1068,15 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
             if use_dot:
                 gemm_q8dot(ctx, AqH, AsH, Wfuq, Wfus, Pu, m, FFN, H)
             else:
-                gemm_w[FFN, H](ctx, CurBm, b.wbuf, b.off[w + 2], cfg.pack_q4, Pu, m)
+                if MEGA_ALLOWED or cfg.mega:
+                    gemm_w[FFN, H](ctx, CurBm, b.wbuf, b.off[w + 2], cfg.pack_q4, Pu, m)
             if cfg.pf4:
                 ctx.synchronize()
                 var nw = perf_counter_ns()
                 st.fc[2] += Int(nw - st.tq)
                 st.tq = nw
-            ctx.enqueue_function[r_swiglu](Pg, Pu, FgBm, Int32(m), Int32(FFN), grid_dim=ceildiv(m * FFN, 256), block_dim=256)
+            if MEGA_ALLOWED or cfg.mega:
+                ctx.enqueue_function[r_swiglu](Pg, Pu, FgBm, Int32(m), Int32(FFN), grid_dim=ceildiv(m * FFN, 256), block_dim=256)
             if cfg.pf4:
                 ctx.synchronize()
                 var nw = perf_counter_ns()
@@ -967,13 +1088,15 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                 quant_rows(ctx, FgBm, AqF, AsF, m, FFN)
                 gemm_q8dot(ctx, AqF, AsF, Wfdq, Wfds, Ph2, m, H, FFN)
             else:
-                gemm_w[H, FFN](ctx, FgBm, b.wbuf, b.off[w + 3], cfg.pack_q4, Ph2, m)
+                if MEGA_ALLOWED or cfg.mega:
+                    gemm_w[H, FFN](ctx, FgBm, b.wbuf, b.off[w + 3], cfg.pack_q4, Ph2, m)
             if cfg.pf4:
                 ctx.synchronize()
                 var nw = perf_counter_ns()
                 st.fc[4] += Int(nw - st.tq)
                 st.tq = nw
-            ctx.enqueue_function[r_add](Ph2, Xm, Int32(m), Int32(H), grid_dim=ceildiv(m * H, 256), block_dim=256)
+            if MEGA_ALLOWED or cfg.mega:
+                ctx.enqueue_function[r_add](Ph2, Xm, Int32(m), Int32(H), grid_dim=ceildiv(m * H, 256), block_dim=256)
             if cfg.pf4:
                 ctx.synchronize()
                 var nw = perf_counter_ns()

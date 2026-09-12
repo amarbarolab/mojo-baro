@@ -26,6 +26,8 @@ comptime MOE_VEC = 8
 
 comptime Q4K = 256
 comptime Q4K_BYTES = 144
+comptime Q6K = 256
+comptime Q6K_BYTES = 210
 
 
 @always_inline
@@ -282,6 +284,47 @@ def q4k_decode_vector[
 
 
 @always_inline
+def q6k_value(
+    w: MutPointer[Scalar[u8], MutAnyOrigin], row_base: Int, k: Int
+) -> Scalar[f32]:
+    var block = k // Q6K
+    var within = k % Q6K
+    var half = within // 128
+    var group = (within % 128) // 32
+    var lane = within % 32
+    var base = row_base + block * Q6K_BYTES
+    var ql_index = lane if group == 0 or group == 2 else lane + 32
+    var ql = Int(w[unsafe_offset=base + half * 64 + ql_index])
+    var qh = Int(w[unsafe_offset=base + 128 + half * 32 + lane])
+    var shift = 0 if group == 0 else 2 if group == 1 else 4 if group == 2 else 6
+    var q = ((ql >> (0 if group < 2 else 4)) & 0x0F) | (((qh >> shift) & 0x03) << 4)
+    var scale_index = half * 8 + (lane // 16) + group * 2
+    var sc = bitcast[i8, 1](SIMD[u8, 1](w[unsafe_offset=base + 192 + scale_index]))[0]
+    var dbits = Int(w[unsafe_offset=base + 208]) | (Int(w[unsafe_offset=base + 209]) << 8)
+    var d = bitcast[f16, 1](SIMD[u16, 1](UInt16(dbits)))[0].cast[f32]()
+    return d * Scalar[f32](Int(sc)) * Scalar[f32](q - 32)
+
+
+@always_inline
+def q6k_row_dot[
+    XLayout: TensorLayout,
+](
+    X: TileTensor[bf16, XLayout, MutAnyOrigin],
+    W: MutPointer[Scalar[u8], MutAnyOrigin],
+    x_row: Int,
+    row_base: Int,
+    k_dim: Int,
+) -> Scalar[f32]:
+    comptime assert X.flat_rank == 2
+    var acc = Scalar[f32](0)
+    var k = Int(lane_id())
+    while k < k_dim:
+        acc += rebind[Scalar[bf16]](X[x_row, k]).cast[f32]() * q6k_value(W, row_base, k)
+        k += WARP_SIZE
+    return warp.sum(acc)
+
+
+@always_inline
 def q8_0_value(w: MutPointer[Scalar[u8], MutAnyOrigin], row_base: Int, k: Int) -> Scalar[f32]:
     var block = k // 32
     var in_block = k % 32
@@ -348,6 +391,24 @@ def moe_matmul_q8_0_m1[
     var dot = q8_0_row_dot(A, W, 0, row * Int(row_bytes), Int(k_dim))
     if lane_id() == 0:
         O[row] = rebind[O.ElementType](dot)
+
+
+def moe_add3[
+    ALayout: TensorLayout, BLayout: TensorLayout, XLayout: TensorLayout,
+](
+    A: TileTensor[f32, ALayout, MutAnyOrigin],
+    B: TileTensor[f32, BLayout, MutAnyOrigin],
+    X: TileTensor[f32, XLayout, MutAnyOrigin],
+    n: Int32,
+):
+    comptime assert A.flat_rank == 1 and B.flat_rank == 1 and X.flat_rank == 1
+    var i = global_idx.x
+    if i < Int(n):
+        X[i] = rebind[X.ElementType](
+            rebind[Scalar[f32]](X[i])
+            + rebind[Scalar[f32]](A[i])
+            + rebind[Scalar[f32]](B[i])
+        )
 
 
 def moe_sig_gate_q8_0[
@@ -494,4 +555,32 @@ def amar_moe_down_q4k[
         var dot = q4k_row_dot(Hb, WD, j, row_base, FFN)
         out += rebind[Scalar[f32]](WT[j]) * dot
     if lane == 0:
+        O[c] = rebind[O.ElementType](out)
+
+
+def amar_moe_down_q6k[
+    NSEL: Int, FFN: Int,
+    HLayout: TensorLayout, ILayout: TensorLayout, WLayout: TensorLayout,
+    OLayout: TensorLayout
+](
+    Hb: TileTensor[bf16, HLayout, MutAnyOrigin],
+    WD: MutPointer[Scalar[u8], MutAnyOrigin],
+    IDX: TileTensor[i32, ILayout, MutAnyOrigin],
+    WT: TileTensor[f32, WLayout, MutAnyOrigin],
+    O: TileTensor[f32, OLayout, MutAnyOrigin],
+    n: Int32,
+):
+    comptime assert Hb.flat_rank == 2 and IDX.flat_rank == 1 and WT.flat_rank == 1 and O.flat_rank == 1
+    var c = Int(block_idx.x) * MOE_WAVES + Int(thread_idx.x) // WARP_SIZE
+    var N = Int(n)
+    if c >= N:
+        return
+    var out = Scalar[f32](0)
+    var row_bytes = (FFN // Q6K) * Q6K_BYTES
+    for j in range(NSEL):
+        var e = Int(rebind[Scalar[i32]](IDX[j]))
+        var row_base = e * N * row_bytes + c * row_bytes
+        var dot = q6k_row_dot(Hb, WD, j, row_base, FFN)
+        out += rebind[Scalar[f32]](WT[j]) * dot
+    if lane_id() == 0:
         O[c] = rebind[O.ElementType](out)

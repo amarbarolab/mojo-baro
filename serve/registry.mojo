@@ -27,6 +27,7 @@ from attn import (
     amar_attn_prefill, amar_attn_prefill_wmma, HD, NQH, NKVH, KVT, TCAP, KVPAGE, KVHSTR, PA_ROWS, PW_ROWS, PW_THREADS,
 )
 from model import H, FFN, VOCAB, QF, KV, N_LAYERS, N_SSM, N_ATT, MEGA_ALLOWED
+from moe import amar_moe_down_q6k
 
 comptime TMAX = 1088
 comptime GEN_N = 64
