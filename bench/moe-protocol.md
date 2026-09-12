@@ -436,3 +436,40 @@ by the qwen35moe model profile" unless the caller knows to set BARO_MEGA=0.
 It fails loudly only because of the profile guard added in this lane;
 without it this was a SIGILL. The front should read the profile from the
 pack rather than requiring the caller to know.
+
+### RESULT, 2026-09-12: FALSIFIED, reverted
+
+Both arms built by me from the committed tree, each printing the sha it ran,
+same resident gate, same 20 prompts, same llama reference ids.
+
+| arm | engine sha | mean | per-prompt |
+|---|---|---|---|
+| baseline, main `5284f96` | `8d9e3af7bce23d34` | **53.20** | 54 58 56 49 57 46 57 57 40 56 50 59 55 53 50 45 45 57 60 60 |
+| f32 router | `4408f748b90d43b3` | **53.10** | 54 58 56 49 57 46 57 57 40 56 48 59 55 53 50 45 44 57 60 61 |
+
+Delta **-0.10**, inside the frozen +-0.5 band, so the falsifier fires and the
+change is reverted rather than kept for being "more correct". The baseline
+arm reproduces the 53.20 on record digit for digit, so the bar is not drifting.
+
+The change WAS live, which is what makes this a real null and not a repeat of
+the rope near-miss: three prompts moved (p11 50 -> 48, p17 45 -> 44, p20
+60 -> 61) on a distinct binary. Four tokens lost, three gained.
+
+CONCLUSION. bf16 on the ROUTER INPUT is not the limiter. The discrete
+top-8-of-256 argument is sound in principle and simply does not bind here:
+perturbing the router input at the 0.4% level flips few enough experts, and
+those flips help about as often as they hurt. The residual against llama.cpp
+is not concentrated in the routing decision.
+
+TWO DEFECTS IN MY OWN IMPLEMENTATION, recorded because the first one nearly
+read as a result. The first build normalised with `b.off[extra_base - 1]`,
+from misreading `moe_ffn`'s positional parameters: `routed_base` is the
+fourth positional (`moe_base + 8/11`), so the post-attention norm weight is
+`routed_base - 1`, and `extra_base - 1` is a different tensor entirely. That
+arm scored **7.5**, a collapse. Had the prediction been "routing is fragile",
+a 7.5 would have looked like confirmation that the router is exquisitely
+sensitive. Second, the scratch was first taken from the head of `p_ffn2_d`;
+swapping it for a disjoint region of `p_v_d` reproduced 7.5 **to the digit**
+on a different binary, which is what ruled aliasing out and sent me back to
+the weight index. A collapse is a bug in the experiment until proven
+otherwise (P8).
