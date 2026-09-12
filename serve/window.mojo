@@ -993,8 +993,6 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                         Xg, tens_f32(ctx, b.wbuf, b.off[moe_base + 4], NH_V * H, ssm_gate_w_layout),
                         row_f32(ctx, b.p_32b_d, 0, NH_V, ssm_gate_o_layout), Int32(NH_V), Int32(H),
                         grid_dim=ceildiv(NH_V, ROW_WAVES), block_dim=ROW_THREADS)
-                if cfg.dump4 and layer < 3 and st.pos == 0:
-                    print("SSMOFF layer", layer, "base", moe_base, ":", b.off[moe_base + 1], b.off[moe_base + 2], b.off[moe_base + 3], b.off[moe_base + 4])
                 ctx.enqueue_function[r_qf](Pq, Qkvm, Int32(m), Int32(CONV), grid_dim=ceildiv(m * CONV, 256), block_dim=256)
                 comptime if MEGA_ALLOWED:
                     ctx.enqueue_function[r_h](Ph, ZmOld, Int32(m), Int32(H), grid_dim=ceildiv(m * H, 256), block_dim=256)
