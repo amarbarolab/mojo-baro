@@ -10,34 +10,12 @@ builder, so they are looked up from a small per-arch table below, same as
 any other recipe fact read out of llama.cpp source as spec.
 
 Usage: tools/gen-profile.mojo MODEL.gguf OUT.mojo [--tmax N]
-Build:  ./.venv/bin/mojo build tools/gen-profile.mojo -I serve \
-          -I ~/Projects/mojo/mojo-uregex/src -o .work/gen-profile
+Build:  ./.venv/bin/mojo build tools/gen-profile.mojo -I tools -o .work/gen-profile
+(tools/gguf_reader.mojo is a symlink to ~/iTools/lib/mojo/gguf-reader.mojo)
 """
-from std.collections import Dict
 from std.math import sqrt
-from std.memory import bitcast
 from std.sys import argv
-from tokenizer import Reader
-
-comptime HEADER_MAX = 96 << 20
-
-
-def scalar_f32(mut r: Reader) raises -> Float64:
-    r.need(4)
-    var bits: UInt32 = 0
-    for i in range(4):
-        bits |= UInt32(r.buf[r.pos + i]) << UInt32(8 * i)
-    r.pos += 4
-    return Float64(bitcast[DType.float32, 1](bits)[0])
-
-
-def scalar_f64(mut r: Reader) raises -> Float64:
-    r.need(8)
-    var bits: UInt64 = 0
-    for i in range(8):
-        bits |= UInt64(r.buf[r.pos + i]) << UInt64(8 * i)
-    r.pos += 8
-    return bitcast[DType.float64, 1](bits)[0]
+from gguf_reader import GGUFModel
 
 
 def is_rope_neox_arch(arch: String) -> Bool:
@@ -90,92 +68,6 @@ def mojo_bool(b: Bool) -> String:
     return "True" if b else "False"
 
 
-struct Model:
-    var arch: String
-    var ints: Dict[String, Int]
-    var floats: Dict[String, Float64]
-    var int_arrays: Dict[String, List[Int]]
-    var tensor_dims: Dict[String, List[Int]]
-
-    def __init__(out self, path: String) raises:
-        self.arch = String("")
-        self.ints = Dict[String, Int]()
-        self.floats = Dict[String, Float64]()
-        self.int_arrays = Dict[String, List[Int]]()
-        self.tensor_dims = Dict[String, List[Int]]()
-        var buf: List[UInt8]
-        with open(path, "r") as f:
-            buf = f.read_bytes(HEADER_MAX)
-        var r = Reader(buf^)
-        var magic = r.u32()
-        if magic != 0x46554747:
-            raise Error("gguf: bad magic")
-        var version = r.u32()
-        if version != 3:
-            raise Error("gguf: unsupported version " + String(version))
-        var n_tensors = r.u64()
-        var n_kv = r.u64()
-        for _ in range(n_kv):
-            var key = r.string()
-            var vtype = r.u32()
-            if vtype == 8:
-                var s = r.string()
-                if key == "general.architecture":
-                    self.arch = s
-            elif vtype == 9:
-                self._array(r, key)
-            elif vtype == 6:
-                self.floats[key] = scalar_f32(r)
-            elif vtype == 12:
-                self.floats[key] = scalar_f64(r)
-            else:
-                self.ints[key] = r.scalar_int(vtype)
-        if self.arch == "":
-            raise Error("gguf: no general.architecture key")
-        for _ in range(n_tensors):
-            var name = r.string()
-            var n_dims = r.u32()
-            var dims = List[Int]()
-            for _ in range(n_dims):
-                dims.append(r.u64())
-            _ = r.u32()  # tensor type, unused
-            _ = r.u64()  # data offset, unused
-            self.tensor_dims[name] = dims^
-
-    def _array(mut self, mut r: Reader, key: String) raises:
-        var etype = r.u32()
-        var n = r.u64()
-        if etype == 8:
-            for _ in range(n):
-                _ = r.string()
-            return
-        if etype == 9:
-            raise Error("gguf: nested arrays unsupported")
-        var small_int = etype == 0 or etype == 1 or etype == 2 or etype == 3 or etype == 4 or etype == 5 or etype == 7 or etype == 10 or etype == 11
-        if small_int and n <= 512:
-            var vals = List[Int]()
-            for _ in range(n):
-                vals.append(r.scalar_int(etype))
-            self.int_arrays[key] = vals^
-            return
-        for _ in range(n):
-            if etype == 6:
-                _ = scalar_f32(r)
-            elif etype == 12:
-                _ = scalar_f64(r)
-            else:
-                r.skip_scalar(etype)
-
-    def akv_int(self, suffix: String, default: Int) -> Int:
-        return self.ints.get(self.arch + "." + suffix, default)
-
-    def akv_float(self, suffix: String, default: Float64) -> Float64:
-        return self.floats.get(self.arch + "." + suffix, default)
-
-    def tensor_present(self, name: String) -> Bool:
-        return len(self.tensor_dims.get(name, List[Int]())) > 0
-
-
 def main() raises:
     var args = argv()
     if len(args) < 3:
@@ -188,7 +80,7 @@ def main() raises:
         if String(args[i]) == "--tmax" and i + 1 < len(args):
             tmax = atol(String(args[i + 1]))
 
-    var m = Model(model_path)
+    var m = GGUFModel(model_path)
     var arch = m.arch
 
     var h = m.akv_int("embedding_length", 0)

@@ -57,6 +57,12 @@ done
 if [ -z "$missing" ]; then ok "P1-P6 all present"
 else bad "PROTOCOL-RULES.md lost rules:$missing"; fi
 
+step "vendored tools/gguf_reader.mojo matches its upstream"
+UP=~/iTools/lib/mojo/gguf-reader.mojo
+if [ ! -f "$UP" ]; then ok "upstream not on this machine, nothing to compare"
+elif diff -q <(tail -n +6 tools/gguf_reader.mojo) "$UP" >/dev/null; then ok "vendored copy is in sync"
+else bad "tools/gguf_reader.mojo has drifted from $UP"; diff -u <(tail -n +6 tools/gguf_reader.mojo) "$UP" | head -20; fi
+
 step "referenced protocol and doc files exist"
 if python3 - <<'PY'
 import pathlib, re, sys
