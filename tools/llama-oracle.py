@@ -67,7 +67,7 @@ def parse(path):
             # layer); keep the first occurrence, which is the one the graph
             # reaches first.
             sums.setdefault(name, {}).setdefault(layer, total)
-            vals.setdefault(cur, rows[:2])
+            vals.setdefault(cur, rows)
             cur, rows = None, []
     return sums, vals
 

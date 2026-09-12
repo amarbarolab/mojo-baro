@@ -11,6 +11,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("oracle")
     parser.add_argument("dump")
+    parser.add_argument("--row", choices=("first", "last"), default="first")
     args = parser.parse_args()
     spec = importlib.util.spec_from_file_location("oracle", "tools/llama-oracle.py")
     oracle = importlib.util.module_from_spec(spec)
@@ -23,7 +24,7 @@ def main():
     print("layer tensor sampled_rel_l2 max_abs ours_first3 oracle_first3")
     for layer in range(40):
         for half, name in enumerate(("attn_residual", "l_out")):
-            row = rows[f"{name}-{layer}"][0]
+            row = rows[f"{name}-{layer}"][0 if args.row == "first" else -1]
             expected = [float(x) for x in re.findall(r"[-+]?\d+\.\d+(?:[eE][-+]?\d+)?", row)]
             assert len(expected) == 6, (name, layer, row)
             offset = (2 * layer + half) * 2048

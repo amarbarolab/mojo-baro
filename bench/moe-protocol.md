@@ -280,6 +280,20 @@ The full 20-prompt teacher-forced mean will exceed 45/64. Before scoring, an
 absurd attention bypass must move the single-token output, proving this path is
 live. The fix is accepted only after a committed-tree rebuild.
 
+## W3 Gate 2 fix 6: YaRN ramp ordering
+
+Fix 5 moved p01 from 32/64 to 53/64. The 13-token p01 oracle then localized
+the first context-dependent divergence to layer 3 RoPE. Sampled pre-RoPE Q
+and K values agree within 1.8% to 4.5%, while post-RoPE sampled relative error
+reaches 1.50. This confirms the YaRN ramp inversion already recorded for phase
+3 is an active gate 2 blocker, so that correction moves ahead of gate closure.
+
+Registered prediction: matching llama.cpp's ramp direction improves p01 above
+53/64 and makes the 20-prompt mean exceed 45/64. If the mean does not exceed
+45/64 after this second distinct fix, the W3 falsifier fires and iteration
+stops with the first oracle divergence reported. The correction is scored only
+from a committed-tree rebuild with distinct arm hashes.
+
 ## W3 Gate 2 amendment: qwen35moe m=1 prefill replay
 
 The adopted W3 plan explicitly excludes m>1 MoE prefill: “Prefill runs the
