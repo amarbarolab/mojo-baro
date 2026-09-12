@@ -49,7 +49,7 @@ grep '^GENERATED' "$out/cold-pq.log" | sed 's/^GENERATED: *//' > "$out/cold-pq.g
 # 5. load the converted state: greedy, then teacher-forced on step 4's tokens
 env BARO_PACK="$pack" BARO_TMAX="$tmax" BARO_PROMPT="$pq" BARO_STATE_LOAD="$out/llama.state" "$eng" > "$out/load-pq.log" 2>&1
 env BARO_PACK="$pack" BARO_TMAX="$tmax" BARO_PROMPT="$pq" BARO_STATE_LOAD="$out/llama.state" \
-  BARO_FORCE="$out/cold-pq.gen" "$eng" > "$out/force-pq.log" 2>&1
+  BARO_SPEC=0 BARO_FORCE="$out/cold-pq.gen" "$eng" > "$out/force-pq.log" 2>&1
 
 grep -q "cached: $np " "$out/load-pq.log" || { echo "VOID: the loaded state was not reused (prefix lookup missed)"; grep -hE 'cached: [0-9]+' "$out/load-pq.log"; exit 3; }
 

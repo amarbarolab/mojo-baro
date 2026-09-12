@@ -474,7 +474,13 @@ def main() raises:
     if pf_chunk < PF_MIN:
         pf_chunk = PF_MIN
     var pf_on = getenv("BARO_PREFILL", "1") == "1"
-    var spec_env = getenv("BARO_SPEC", "0") == "1"
+    # Default ON since 2026-09-12: FR-Spec draft decode measured 1.124x with
+    # 20/20 teacher-forced identity. Every BARO_FORCE caller pins BARO_SPEC=0
+    # explicitly (bench/force-ab.sh, force-ab-serve.sh, dense-run.sh,
+    # ornith-run.sh, llama-handoff.sh); the engine raises if the two are
+    # combined, so an unpinned identity gate fails loudly rather than
+    # silently measuring the wrong arm.
+    var spec_env = getenv("BARO_SPEC", "1") == "1"
     print("BARO_SPEC:", spec_env)
     var spec_dbg = getenv("BARO_SPEC_DBG", "0") == "1"
     # Teacher-forced agreement (identity gate, CLAUDE.md: never greedy equality

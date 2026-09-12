@@ -22,7 +22,7 @@ echo "== build engine =="
 ok build "engine"
 
 echo "== G3: kernel self-consistency, ours vs ours/numpy, p01-water =="
-BARO_PACK=$PACK BARO_PROMPT=bench/mtp-prompts/p01-water.tokens ./.work/engine \
+BARO_PACK=$PACK BARO_SPEC=0 BARO_PROMPT=bench/mtp-prompts/p01-water.tokens ./.work/engine \
   > "$OUT/g3-ours.log" 2>&1 || die g3 "engine exit $?"
 cp bench/mtp-prompts/p01-water.tokens "$PACK/prompt-tokens.txt"
 BARO_PACK=$PACK ./.venv/bin/python tools/model-ref.py decode 64 > "$OUT/g3-numpy.log" 2>&1 \
@@ -68,11 +68,11 @@ for tf in bench/mtp-prompts/p*.tokens; do
   echo "$resp" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(" ".join(str(t) for t in d["tokens"]))' \
     > "$OUT/$p.llama-tokens.txt" || die 3a "$p: bad llama /completion response: $resp"
 
-  BARO_PACK=$PACK BARO_PROMPT="$tf" ./.work/engine > "$OUT/$p.ours-nospec.log" 2>&1 \
+  BARO_PACK=$PACK BARO_SPEC=0 BARO_PROMPT="$tf" ./.work/engine > "$OUT/$p.ours-nospec.log" 2>&1 \
     || die 3b "$p: engine exit $?"
   ts=$(grep -oE 'tok/s_gen: [0-9.]+' "$OUT/$p.ours-nospec.log" | cut -d' ' -f2)
 
-  BARO_PACK=$PACK BARO_PROMPT="$tf" BARO_FORCE="$OUT/$p.llama-tokens.txt" ./.work/engine \
+  BARO_PACK=$PACK BARO_SPEC=0 BARO_PROMPT="$tf" BARO_FORCE="$OUT/$p.llama-tokens.txt" ./.work/engine \
     > "$OUT/$p.ours-forced.log" 2>&1 || die 3a "$p: forced engine exit $?"
   agree=$(grep '^forced agreement:' "$OUT/$p.ours-forced.log" | sed 's/forced agreement: //; s/ \/ /\//')
 
@@ -82,7 +82,7 @@ cleanup_llama; trap - EXIT
 ok 3ab "$(cat "$OUT/results.txt")"
 
 echo "== step 3c: MTP identical to no-spec, 20 prompts, k=2 =="
-BARO_PACK=$PACK bench/mtp-prompts.sh .work/engine "$OUT/mtp" 2 > "$OUT/mtp-run.log" 2>&1 \
+BARO_PACK=$PACK BARO_SPEC=0 bench/mtp-prompts.sh .work/engine "$OUT/mtp" 2 > "$OUT/mtp-run.log" 2>&1 \
   || die 3c "mtp-prompts.sh exit $?"
 n_pass=$(grep -c ' PASS$' "$OUT/mtp/results.txt" || true)
 n_total=$(ls bench/mtp-prompts/p*.tokens | wc -l)

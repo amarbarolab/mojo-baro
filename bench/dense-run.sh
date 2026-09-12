@@ -51,11 +51,11 @@ for tf in bench/mtp-prompts/p*.txt; do
   echo "$resp" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(" ".join(str(t) for t in d["tokens"]))' \
     > "$OUT/$p.llama-tokens.txt" || die run "$p: bad /completion response: $resp"
 
-  env BARO_PROMPT="$OUT/$p.ids" BARO_PACK="$PACK" BARO_GEN=64 "$BIN" > "$OUT/$p.ours-nospec.log" 2>&1 \
+  env BARO_PROMPT="$OUT/$p.ids" BARO_PACK="$PACK" BARO_GEN=64 BARO_SPEC=0 "$BIN" > "$OUT/$p.ours-nospec.log" 2>&1 \
     || die run "$p: engine exit $?"
   ts=$(grep -oE 'tok/s_gen: [0-9.]+' "$OUT/$p.ours-nospec.log" | cut -d' ' -f2)
 
-  env BARO_PROMPT="$OUT/$p.ids" BARO_PACK="$PACK" BARO_GEN=64 BARO_FORCE="$OUT/$p.llama-tokens.txt" "$BIN" \
+  env BARO_PROMPT="$OUT/$p.ids" BARO_PACK="$PACK" BARO_GEN=64 BARO_SPEC=0 BARO_FORCE="$OUT/$p.llama-tokens.txt" "$BIN" \
     > "$OUT/$p.ours-forced.log" 2>&1 || die run "$p: forced engine exit $?"
   agree=$(grep '^forced agreement:' "$OUT/$p.ours-forced.log" | sed 's/forced agreement: //; s/ \/ /\//')
 
