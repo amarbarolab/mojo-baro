@@ -477,7 +477,7 @@ def main() raises:
     if pf_chunk < PF_MIN:
         pf_chunk = PF_MIN
     var pf_on = getenv("BARO_PREFILL", "1") == "1"
-    var spec_env = getenv("BARO_SPEC", "0") == "1"
+    var spec_env = MEGA_ALLOWED and getenv("BARO_SPEC", "0") == "1"
     print("BARO_SPEC:", spec_env)
     var spec_dbg = getenv("BARO_SPEC_DBG", "0") == "1"
     # Teacher-forced agreement (identity gate, CLAUDE.md: never greedy equality
@@ -508,7 +508,7 @@ def main() raises:
         print("BARO_FORCE:", force_path, " (", len(force), "ids )")
     var bufs = alloc_bufs(ctx, pack, tmax)
     # The dense path consumes Pack.off's historical order.  The MoE pack is
-    # lexical by tensor name, so rebuild the window's logical order by name;
+    # lexical by tensor name, so build a per-block semantic order by name;
     # the offsets remain byte offsets into the same Pack.wbuf blob.
     comptime if not MEGA_ALLOWED:
         var moe_tensors = parse_moe_index(packdir + "/index.txt")
@@ -523,6 +523,13 @@ def main() raises:
                     "attn_output.weight",
                 ]:
                     moe_logical.append(resolve_plain(moe_tensors, pfx + name).offset)
+                moe_logical.append(resolve_plain(moe_tensors, pfx + "post_attention_norm.weight").offset)
+                for name in [
+                    "ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight",
+                    "ffn_gate_inp.weight", "ffn_gate_shexp.weight", "ffn_up_shexp.weight",
+                    "ffn_down_shexp.weight", "ffn_gate_inp_shexp.weight",
+                ]:
+                    moe_logical.append(resolve_plain(moe_tensors, pfx + name).offset)
             else:
                 for name in [
                     "attn_norm.weight", "attn_qkv.weight", "attn_gate.weight",
@@ -530,20 +537,15 @@ def main() raises:
                     "ssm_a", "ssm_dt.bias", "ssm_norm.weight", "ssm_out.weight",
                 ]:
                     moe_logical.append(resolve_plain(moe_tensors, pfx + name).offset)
-            moe_logical.append(resolve_plain(moe_tensors, pfx + "post_attention_norm.weight").offset)
-            moe_logical.append(resolve_plain(moe_tensors, pfx + "ffn_gate_exps.weight").offset)
-            moe_logical.append(resolve_plain(moe_tensors, pfx + "ffn_up_exps.weight").offset)
-            moe_logical.append(resolve_plain(moe_tensors, pfx + "ffn_down_exps.weight").offset)
+                moe_logical.append(resolve_plain(moe_tensors, pfx + "post_attention_norm.weight").offset)
+                for name in [
+                    "ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight",
+                    "ffn_gate_inp.weight", "ffn_gate_shexp.weight", "ffn_up_shexp.weight",
+                    "ffn_down_shexp.weight", "ffn_gate_inp_shexp.weight",
+                ]:
+                    moe_logical.append(resolve_plain(moe_tensors, pfx + name).offset)
         moe_logical.append(resolve_plain(moe_tensors, "output_norm.weight").offset)
         moe_logical.append(resolve_plain(moe_tensors, "output.weight").offset)
-        for layer in range(N_LAYERS):
-            var pfx = "blk." + String(layer) + "."
-            for name in [
-                "ffn_gate_inp.weight", "ffn_gate_shexp.weight",
-                "ffn_up_shexp.weight", "ffn_down_shexp.weight",
-                "ffn_gate_inp_shexp.weight",
-            ]:
-                moe_logical.append(resolve_plain(moe_tensors, pfx + name).offset)
         off = moe_logical.copy()
         bufs.off = moe_logical.copy()
     var toks_d = bufs.toks_d
@@ -946,6 +948,9 @@ def main() raises:
                 done_line += ",\"drafted\":" + String(wst.n_drafted) + ",\"accepted\":" + String(wst.n_accepted) + ",\"k\":" + String(kcfg)
             print(done_line + "}")
             continue
+
+        if not MEGA_ALLOWED:
+            return
 
         # MTP (NextN) draft head receipt, blk.32: last generated token paired with
         # the last trunk hidden row, attended at position 0 (arm A: empty draft
