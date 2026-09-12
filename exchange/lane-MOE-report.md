@@ -146,6 +146,10 @@ produces p01 `32/64` forced agreement (`mega fail word: 0`, `42.48
 tok/s_gen`). Gate 2 remains UNVERIFIED pending the full 20-prompt gate and
 Rust-front request.
 
+The full teacher-forced runner was launched against this committed binary
+and stopped at p01 because its required `64/64` assertion failed at `32/64`;
+no 20/20 claim is made. Receipt: `.work/moe-w3/gate2-force-4d255da/`.
+
 ## W4
 
 Pending W3 and preregistration.
