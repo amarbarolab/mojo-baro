@@ -165,6 +165,17 @@ forward from W5, or force qwen35moe prefill replay at m=1. The latter is the
 smaller correctness-preserving option but makes long-prompt prefill slow and
 must be reported in W4.
 
+The replay implementation was preregistered as `230b1ae` and committed as
+`d79d78a`. It gates prefill on `MEGA_ALLOWED`, leaving dense batched prefill
+unchanged. The dense regression against the main-built engine passes 20/20 at
+64/64; receipt `.work/moe-w3/dense-regression-m1/`.
+
+The qwen falsifier fired: replay makes p15 report `prefill rows: 0` and replay
+17 rows at m=1, but p01 remains `32/64` and p15 is `27/64`, not `64/64`.
+Receipt `.work/moe-w3/gate2-force-m1prefill/`. Per the preregistration, stop
+without further iteration: m>1 was not the only remaining defect. Gate 2
+remains UNVERIFIED; the Rust-front check was not run.
+
 ## W4
 
 Pending W3 and preregistration.
