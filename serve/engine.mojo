@@ -392,15 +392,15 @@ def load_state(
     chain.items[idx].pending = False
     chain.items[idx].pinned = True
     chain.items[idx].boundary = True
-    unsafe_memcpy(dest=chain.items[idx].conv_h.unsafe_ptr().unsafe_bitcast[UInt8](), src=data.unsafe_ptr() + off, count=CONV_SLOT * 4)
+    unsafe_memcpy(dest=chain.items[idx].conv_h.unsafe_ptr().unsafe_bitcast[UInt8](), src=data.unsafe_ptr().unsafe_offset(off), count=CONV_SLOT * 4)
     off += CONV_SLOT * 4
-    unsafe_memcpy(dest=chain.items[idx].ssm_h.unsafe_ptr().unsafe_bitcast[UInt8](), src=data.unsafe_ptr() + off, count=SSM_SLOT * 4)
+    unsafe_memcpy(dest=chain.items[idx].ssm_h.unsafe_ptr().unsafe_bitcast[UInt8](), src=data.unsafe_ptr().unsafe_offset(off), count=SSM_SLOT * 4)
     off += SSM_SLOT * 4
     var kh = ctx.enqueue_create_host_buffer[KVT](kvn)
     var vh = ctx.enqueue_create_host_buffer[KVT](kvn)
     ctx.synchronize()
-    unsafe_memcpy(dest=kh.unsafe_ptr().unsafe_bitcast[UInt8](), src=data.unsafe_ptr() + off, count=kvn * 4)
-    unsafe_memcpy(dest=vh.unsafe_ptr().unsafe_bitcast[UInt8](), src=data.unsafe_ptr() + off + kvn * 4, count=kvn * 4)
+    unsafe_memcpy(dest=kh.unsafe_ptr().unsafe_bitcast[UInt8](), src=data.unsafe_ptr().unsafe_offset(off), count=kvn * 4)
+    unsafe_memcpy(dest=vh.unsafe_ptr().unsafe_bitcast[UInt8](), src=data.unsafe_ptr().unsafe_offset(off + kvn * 4), count=kvn * 4)
     ctx.enqueue_copy(dst_buf=DeviceBuffer[KVT](ctx, kc_d.unsafe_ptr(), kvn, owning=False), src_buf=kh)
     ctx.enqueue_copy(dst_buf=DeviceBuffer[KVT](ctx, vc_d.unsafe_ptr(), kvn, owning=False), src_buf=vh)
     ctx.synchronize()
@@ -710,7 +710,7 @@ def main() raises:
                     raise Error("BARO_FORCE: step advanced by more than one position (spec/prefill batching) -- void arm")
                 var fi = pos_before - (len(prompt) - 1)
                 if fi < len(force):
-                    ctx.enqueue_copy(dst_buf=force_tok_h, src_buf=DeviceBuffer[DType.int32](ctx, toks_d.unsafe_ptr() + wst.pos, 1, owning=False))
+                    ctx.enqueue_copy(dst_buf=force_tok_h, src_buf=DeviceBuffer[DType.int32](ctx, toks_d.unsafe_ptr().unsafe_offset(wst.pos), 1, owning=False))
                     ctx.synchronize()
                     var got = Int(force_tok_h[0])
                     predicted.append(got)
@@ -735,7 +735,7 @@ def main() raises:
                         var refv = force[fi]
                         print("MARGIN pos", fi, " engine_argmax", got, " ref", refv, " top1", i1, lg_h[i1], " top2", i2, lg_h[i2], " gap", lg_h[i1] - lg_h[i2], " ref_logit", lg_h[refv])
                     force_tok_h[0] = Int32(force[fi])
-                    ctx.enqueue_copy(dst_buf=DeviceBuffer[DType.int32](ctx, toks_d.unsafe_ptr() + wst.pos, 1, owning=False), src_buf=force_tok_h)
+                    ctx.enqueue_copy(dst_buf=DeviceBuffer[DType.int32](ctx, toks_d.unsafe_ptr().unsafe_offset(wst.pos), 1, owning=False), src_buf=force_tok_h)
                     ctx.synchronize()
             if ckpt_cap > 0 and wst.pos > cached and wst.pos < len(prompt):
                 if wst.pos == len(prompt) - 1 or wst.pos % CKPT_PERIOD == 0:
@@ -811,6 +811,21 @@ def main() raises:
                 ffn_us += b
             var head_us = Float64(ph[16 * N_LAYERS + 3] - ph[16 * N_LAYERS]) / 100.0
             print("mega profile (last token, us): ssm sub-blocks", sub_ssm, " attn sub-blocks", sub_att, " ffn", ffn_us, " head", head_us, " total", Float64(ph[16 * N_LAYERS + 3] - ph[0]) / 100.0, " fail", fl[2])
+            # BARO_PROFILE=5 raw: the prof buffer verbatim, 16 slots per layer
+            # plus 4 tail slots, s_sendmsg.rtn(131) REALTIME ticks at 100 MHz.
+            # Printed as raw ticks AND as us relative to slot 0 of layer 0, so
+            # a reader can re-derive every aggregate above instead of taking
+            # it on trust.
+            print("PROFRAW slots", 16 * N_LAYERS + 4, " hz 100000000  base", ph[0])
+            for layer in range(N_LAYERS):
+                var line = String("PROFRAW L") + String(layer) + (" attn" if is_attn(layer) else " ssm ")
+                for i in range(16):
+                    line += " " + String(ph[16 * layer + i])
+                print(line)
+            var tail = String("PROFRAW TAIL")
+            for i in range(4):
+                tail += " " + String(ph[16 * N_LAYERS + i])
+            print(tail)
             # per-phase sums over the layers of each kind, in stamp order (us)
             var ssm_seq: List[Int] = [0, 12, 1, 2, 3, 4, 5, 6, 7]
             var att_seq: List[Int] = [0, 1, 2, 3, 4, 5, 7]

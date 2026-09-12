@@ -68,7 +68,7 @@ def grid_barrier(
 @always_inline
 def stamp(prof: MutPointer[Scalar[i64], MutAnyOrigin], idx: Int):
     if block_idx.x == 0 and thread_idx.x == 0:
-        prof[idx] = llvm_intrinsic["llvm.amdgcn.s.sendmsg.rtn", Int64](Int32(131))
+        prof[unsafe_offset=idx] = llvm_intrinsic["llvm.amdgcn.s.sendmsg.rtn", Int64](Int32(131))
 
 
 @always_inline
@@ -967,22 +967,22 @@ def attn_phases[
 
 @always_inline
 def wq[N: Int, K: Int, Q4: Bool](wbuf: MutPointer[Scalar[u8], MutAnyOrigin], o: Int) -> TileTensor[u8 if Q4 else i8, type_of(row_major[N, (K // 2) if Q4 else K]()), MutAnyOrigin]:
-    return TileTensor((wbuf + o).unsafe_bitcast[Scalar[u8 if Q4 else i8]](), row_major[N, (K // 2) if Q4 else K]())
+    return TileTensor(wbuf.unsafe_offset(o).unsafe_bitcast[Scalar[u8 if Q4 else i8]](), row_major[N, (K // 2) if Q4 else K]())
 
 
 @always_inline
 def ws[N: Int, K: Int, Q4: Bool](wbuf: MutPointer[Scalar[u8], MutAnyOrigin], o: Int) -> TileTensor[f16, type_of(row_major[N, K // 32]()), MutAnyOrigin]:
-    return TileTensor((wbuf + o + ((N * K // 2) if Q4 else (N * K))).unsafe_bitcast[Scalar[f16]](), row_major[N, K // 32]())
+    return TileTensor(wbuf.unsafe_offset(o + ((N * K // 2) if Q4 else (N * K))).unsafe_bitcast[Scalar[f16]](), row_major[N, K // 32]())
 
 
 @always_inline
 def wf[N: Int](wbuf: MutPointer[Scalar[u8], MutAnyOrigin], o: Int) -> TileTensor[f32, type_of(row_major[N]()), MutAnyOrigin]:
-    return TileTensor((wbuf + o).unsafe_bitcast[Scalar[f32]](), row_major[N]())
+    return TileTensor(wbuf.unsafe_offset(o).unsafe_bitcast[Scalar[f32]](), row_major[N]())
 
 
 @always_inline
 def wf2[N: Int, M: Int](wbuf: MutPointer[Scalar[u8], MutAnyOrigin], o: Int) -> TileTensor[f32, type_of(row_major[N, M]()), MutAnyOrigin]:
-    return TileTensor((wbuf + o).unsafe_bitcast[Scalar[f32]](), row_major[N, M]())
+    return TileTensor(wbuf.unsafe_offset(o).unsafe_bitcast[Scalar[f32]](), row_major[N, M]())
 
 
 @always_inline
@@ -1125,7 +1125,7 @@ def mega_body[
         if dump != 0 and block_idx.x == 0:
             var i = Int(thread_idx.x)
             while i < H:
-                dbg[(2 * layer) * H + i] = rebind[Scalar[f32]](X_[0, i])
+                dbg[unsafe_offset=(2 * layer) * H + i] = rebind[Scalar[f32]](X_[0, i])
                 i += ROW_THREADS
         var f0 = Int(rebind[Scalar[i64]](off[w]))
         var f1 = Int(rebind[Scalar[i64]](off[w + 1]))
@@ -1146,7 +1146,7 @@ def mega_body[
         if dump != 0 and block_idx.x == 0:
             var i = Int(thread_idx.x)
             while i < H:
-                dbg[(2 * layer + 1) * H + i] = rebind[Scalar[f32]](X_[0, i])
+                dbg[unsafe_offset=(2 * layer + 1) * H + i] = rebind[Scalar[f32]](X_[0, i])
                 i += ROW_THREADS
     if fold_head == 0:
         return
@@ -1200,8 +1200,8 @@ def mega_body[
                 if v > pv or (v == pv and ix < pi):
                     pv = v
                     pi = ix
-            hmax[r * nblk + bid] = pv
-            hidx[r * nblk + bid] = pi
+            hmax[unsafe_offset=r * nblk + bid] = pv
+            hidx[unsafe_offset=r * nblk + bid] = pi
     if not grid_barrier(ctrh, genh, fail):
         return
     stamp(prof, 16 * NL + 2)
@@ -1211,8 +1211,8 @@ def mega_body[
                 var fv = Float32(-3.4e38)
                 var fi: Int32 = 0
                 for k in range(nblk):
-                    var v = hmax[r * nblk + k]
-                    var ix = hidx[r * nblk + k]
+                    var v = hmax[unsafe_offset=r * nblk + k]
+                    var ix = hidx[unsafe_offset=r * nblk + k]
                     if v > fv or (v == fv and ix < fi):
                         fv = v
                         fi = ix

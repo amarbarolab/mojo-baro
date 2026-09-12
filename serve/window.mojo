@@ -31,7 +31,7 @@ def wbf16(
 ) -> DeviceBuffer[DType.bfloat16]:
     return DeviceBuffer[DType.bfloat16](
         ctx,
-        (wbuf.unsafe_ptr() + o).unsafe_bitcast[Scalar[DType.bfloat16]](),
+        (wbuf.unsafe_ptr().unsafe_offset(o)).unsafe_bitcast[Scalar[DType.bfloat16]](),
         n, owning=False,
     )
 
@@ -41,7 +41,7 @@ def wf32(
 ) -> DeviceBuffer[DType.float32]:
     return DeviceBuffer[DType.float32](
         ctx,
-        (wbuf.unsafe_ptr() + o).unsafe_bitcast[Scalar[DType.float32]](),
+        (wbuf.unsafe_ptr().unsafe_offset(o)).unsafe_bitcast[Scalar[DType.float32]](),
         n, owning=False,
     )
 
@@ -62,7 +62,7 @@ def tens_q8q[
     ctx: DeviceContext, wbuf: DeviceBuffer[DType.uint8], o: Int, n: Int, lt: LT
 ) -> TileTensor[DType.int8, LT, MutAnyOrigin]:
     var b = DeviceBuffer[DType.int8](
-        ctx, (wbuf.unsafe_ptr() + o).unsafe_bitcast[Scalar[DType.int8]](), n, owning=False
+        ctx, (wbuf.unsafe_ptr().unsafe_offset(o)).unsafe_bitcast[Scalar[DType.int8]](), n, owning=False
     )
     var t = TileTensor(b, lt)
     return rebind[TileTensor[DType.int8, LT, MutAnyOrigin]](t)
@@ -74,7 +74,7 @@ def tens_q8s[
     ctx: DeviceContext, wbuf: DeviceBuffer[DType.uint8], o: Int, n: Int, lt: LT
 ) -> TileTensor[DType.float16, LT, MutAnyOrigin]:
     var b = DeviceBuffer[DType.float16](
-        ctx, (wbuf.unsafe_ptr() + o + n).unsafe_bitcast[Scalar[DType.float16]](), n // 32, owning=False
+        ctx, (wbuf.unsafe_ptr().unsafe_offset(o + n)).unsafe_bitcast[Scalar[DType.float16]](), n // 32, owning=False
     )
     var t = TileTensor(b, lt)
     return rebind[TileTensor[DType.float16, LT, MutAnyOrigin]](t)
@@ -86,7 +86,7 @@ def tens_q4q[
     ctx: DeviceContext, wbuf: DeviceBuffer[DType.uint8], o: Int, n: Int, lt: LT
 ) -> TileTensor[DType.uint8, LT, MutAnyOrigin]:
     var b = DeviceBuffer[DType.uint8](
-        ctx, (wbuf.unsafe_ptr() + o).unsafe_bitcast[Scalar[DType.uint8]](), n // 2, owning=False
+        ctx, (wbuf.unsafe_ptr().unsafe_offset(o)).unsafe_bitcast[Scalar[DType.uint8]](), n // 2, owning=False
     )
     var t = TileTensor(b, lt)
     return rebind[TileTensor[DType.uint8, LT, MutAnyOrigin]](t)
@@ -98,7 +98,7 @@ def tens_i32[
     ctx: DeviceContext, wbuf: DeviceBuffer[DType.uint8], o: Int, n: Int, lt: LT
 ) -> TileTensor[DType.int32, LT, MutAnyOrigin]:
     var b = DeviceBuffer[DType.int32](
-        ctx, (wbuf.unsafe_ptr() + o).unsafe_bitcast[Scalar[DType.int32]](), n, owning=False
+        ctx, (wbuf.unsafe_ptr().unsafe_offset(o)).unsafe_bitcast[Scalar[DType.int32]](), n, owning=False
     )
     var t = TileTensor(b, lt)
     return rebind[TileTensor[DType.int32, LT, MutAnyOrigin]](t)
@@ -110,7 +110,7 @@ def tens_q4s[
     ctx: DeviceContext, wbuf: DeviceBuffer[DType.uint8], o: Int, n: Int, lt: LT
 ) -> TileTensor[DType.float16, LT, MutAnyOrigin]:
     var b = DeviceBuffer[DType.float16](
-        ctx, (wbuf.unsafe_ptr() + o + n // 2).unsafe_bitcast[Scalar[DType.float16]](), n // 32, owning=False
+        ctx, (wbuf.unsafe_ptr().unsafe_offset(o + n // 2)).unsafe_bitcast[Scalar[DType.float16]](), n // 32, owning=False
     )
     var t = TileTensor(b, lt)
     return rebind[TileTensor[DType.float16, LT, MutAnyOrigin]](t)
@@ -131,7 +131,7 @@ def row_f32[
 ](
     ctx: DeviceContext, b: DeviceBuffer[f32], o: Int, n: Int, lt: LT
 ) -> TileTensor[f32, LT, MutAnyOrigin]:
-    var s = DeviceBuffer[f32](ctx, b.unsafe_ptr() + o, n, owning=False)
+    var s = DeviceBuffer[f32](ctx, b.unsafe_ptr().unsafe_offset(o), n, owning=False)
     var t = TileTensor(s, lt)
     return rebind[TileTensor[f32, LT, MutAnyOrigin]](t)
 
@@ -141,7 +141,7 @@ def row_bf16[
 ](
     ctx: DeviceContext, b: DeviceBuffer[bf16], o: Int, n: Int, lt: LT
 ) -> TileTensor[bf16, LT, MutAnyOrigin]:
-    var s = DeviceBuffer[bf16](ctx, b.unsafe_ptr() + o, n, owning=False)
+    var s = DeviceBuffer[bf16](ctx, b.unsafe_ptr().unsafe_offset(o), n, owning=False)
     var t = TileTensor(s, lt)
     return rebind[TileTensor[bf16, LT, MutAnyOrigin]](t)
 
@@ -677,7 +677,7 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                 st.tp = perf_counter_ns()
             var hrow = nproc - 1
             for j in range(1, m - 1):
-                var hd_row = DeviceBuffer[f32](ctx, b.hd_d.unsafe_ptr() + hrow * H, H, owning=False)
+                var hd_row = DeviceBuffer[f32](ctx, b.hd_d.unsafe_ptr().unsafe_offset(hrow * H), H, owning=False)
                 blk32_forward(ctx, b.wbuf, b.off, cfg.e, 1, st.pos + j, st.pos + j, True, hd_row,
                     b.x_d, b.curb_d, b.qf_d, b.q_d, b.k_d, b.v_d, b.gate_d, b.ao_d, b.resb_d, b.fgb_d, b.p_qf_d, b.p_kv_d, b.p_h_d,
                     b.p_ffn_d, b.p_ffn2_d, b.p_v_d, b.logits_d, b.cc_d, b.de_d, b.hd_d, b.kc32_d, b.vc32_d, b.toks_d, b.dtok_d,
@@ -909,7 +909,7 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                 st.tp = now
                 st.tq = now
             if cfg.dump and m == 1 and st.pos + 1 >= cfg.n_prompt:
-                ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr() + (2 * layer) * H, H, owning=False), src_buf=DeviceBuffer[f32](ctx, b.x_d.unsafe_ptr(), H, owning=False))
+                ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr().unsafe_offset((2 * layer) * H), H, owning=False), src_buf=DeviceBuffer[f32](ctx, b.x_d.unsafe_ptr(), H, owning=False))
             # -- ffn sub-block --
             if cfg.pf4:
                 ctx.synchronize()
@@ -981,7 +981,7 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                 st.tq = nw
             w += 4
             if cfg.dump and m == 1 and st.pos + 1 >= cfg.n_prompt:
-                ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr() + (2 * layer + 1) * H, H, owning=False), src_buf=DeviceBuffer[f32](ctx, b.x_d.unsafe_ptr(), H, owning=False))
+                ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr().unsafe_offset((2 * layer + 1) * H), H, owning=False), src_buf=DeviceBuffer[f32](ctx, b.x_d.unsafe_ptr(), H, owning=False))
             if cfg.prof:
                 ctx.synchronize()
                 var now = perf_counter_ns()
@@ -991,7 +991,7 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
         if use_mega or use_mega_win:
             w = 1 + N_SSM * 10 + N_ATT * 7 + N_LAYERS * 4
         if cfg.dump and m == 1 and st.pos + 1 >= cfg.n_prompt and st.n_dumped < GEN_N:
-            ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dump_h.unsafe_ptr() + st.n_dumped * 2 * N_LAYERS * H, 2 * N_LAYERS * H, owning=False), src_buf=b.dbg_d)
+            ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dump_h.unsafe_ptr().unsafe_offset(st.n_dumped * 2 * N_LAYERS * H), 2 * N_LAYERS * H, owning=False), src_buf=b.dbg_d)
             st.n_dumped += 1
         # -- head --
         if cfg.prof:
@@ -1025,7 +1025,7 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                     ctx.synchronize()
                     t_acc = perf_counter_ns()
                 ctx.enqueue_copy(dst_buf=b.dtok_h, src_buf=DeviceBuffer[DType.int32](ctx, b.dtok_d.unsafe_ptr(), KMAX + 1, owning=False))
-                ctx.enqueue_copy(dst_buf=b.win_h, src_buf=DeviceBuffer[DType.int32](ctx, b.toks_d.unsafe_ptr() + st.pos + 1, KMAX + 1, owning=False))
+                ctx.enqueue_copy(dst_buf=b.win_h, src_buf=DeviceBuffer[DType.int32](ctx, b.toks_d.unsafe_ptr().unsafe_offset(st.pos + 1), KMAX + 1, owning=False))
                 ctx.synchronize()
                 var n_acc = 0
                 while n_acc < m - 1 and b.dtok_h[n_acc] == b.win_h[n_acc]:
@@ -1049,7 +1049,7 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                         print(tok_line(cfg.req_id, Int(b.win_h[i])))
                     print(tok_line(cfg.req_id, Int(b.dtok_h[m - 1])))
                 else:
-                    ctx.enqueue_copy(dst_buf=b.stream_h.create_sub_buffer[DType.int32](0, m), src_buf=DeviceBuffer[DType.int32](ctx, b.toks_d.unsafe_ptr() + st.pos + 1, m, owning=False))
+                    ctx.enqueue_copy(dst_buf=b.stream_h.create_sub_buffer[DType.int32](0, m), src_buf=DeviceBuffer[DType.int32](ctx, b.toks_d.unsafe_ptr().unsafe_offset(st.pos + 1), m, owning=False))
                     ctx.synchronize()
                     for i in range(m):
                         print(tok_line(cfg.req_id, Int(b.stream_h[i])))

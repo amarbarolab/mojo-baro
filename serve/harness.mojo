@@ -112,10 +112,10 @@ def load_pack(ctx: DeviceContext, packdir: String) raises -> Pack:
                         fd, sptr.unsafe_offset(got), hi - got, Int64(done + got)
                     )
                     if n <= 0:
-                        rerr_ptr[t] = 1
+                        rerr_ptr[unsafe_offset=t] = 1
                         return
                     got += Int(n)
-                rerr_ptr[t] = 0
+                rerr_ptr[unsafe_offset=t] = 0
             parallelize(rchunk, RSPLIT)
             for t in range(RSPLIT):
                 if rerr[t] != 0:
@@ -124,7 +124,7 @@ def load_pack(ctx: DeviceContext, packdir: String) raises -> Pack:
             # read has overlapped it, and always before this stage is enqueued.
             ctx.synchronize()
             var dslice = DeviceBuffer[DType.uint8](
-                ctx, wbuf.unsafe_ptr() + done, want, owning=False
+                ctx, wbuf.unsafe_ptr().unsafe_offset(done), want, owning=False
             )
             var hslice = stage.create_sub_buffer[DType.uint8](0, want) if want != CHUNK else stage
             ctx.enqueue_copy(dst_buf=dslice, src_buf=hslice)

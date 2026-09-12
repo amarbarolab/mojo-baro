@@ -299,8 +299,8 @@ struct Chain(Movable):
         self.items[idx].pending = True
         self.items[idx].pinned = pinned
         self.items[idx].boundary = boundary
-        var cs = DeviceBuffer[f32](ctx, convstate_d.unsafe_ptr() + slot * CONV_SLOT, CONV_SLOT, owning=False)
-        var ss = DeviceBuffer[f32](ctx, sstate_d.unsafe_ptr() + slot * SSM_SLOT, SSM_SLOT, owning=False)
+        var cs = DeviceBuffer[f32](ctx, convstate_d.unsafe_ptr().unsafe_offset(slot * CONV_SLOT), CONV_SLOT, owning=False)
+        var ss = DeviceBuffer[f32](ctx, sstate_d.unsafe_ptr().unsafe_offset(slot * SSM_SLOT), SSM_SLOT, owning=False)
         ctx.enqueue_copy(dst_buf=self.items[idx].conv_h, src_buf=cs)
         ctx.enqueue_copy(dst_buf=self.items[idx].ssm_h, src_buf=ss)
 
@@ -313,8 +313,8 @@ struct Chain(Movable):
     def restore(
         self, ctx: DeviceContext, convstate_d: DeviceBuffer[f32], sstate_d: DeviceBuffer[f32], slot: Int, idx: Int
     ) raises:
-        var cs = DeviceBuffer[f32](ctx, convstate_d.unsafe_ptr() + slot * CONV_SLOT, CONV_SLOT, owning=False)
-        var ss = DeviceBuffer[f32](ctx, sstate_d.unsafe_ptr() + slot * SSM_SLOT, SSM_SLOT, owning=False)
+        var cs = DeviceBuffer[f32](ctx, convstate_d.unsafe_ptr().unsafe_offset(slot * CONV_SLOT), CONV_SLOT, owning=False)
+        var ss = DeviceBuffer[f32](ctx, sstate_d.unsafe_ptr().unsafe_offset(slot * SSM_SLOT), SSM_SLOT, owning=False)
         ctx.enqueue_copy(dst_buf=cs, src_buf=self.items[idx].conv_h)
         ctx.enqueue_copy(dst_buf=ss, src_buf=self.items[idx].ssm_h)
 
