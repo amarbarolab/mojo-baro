@@ -314,3 +314,45 @@ agreement against llama.cpp, and serves one non-empty Rust-front
 if the nine long prompts leave 0/64 but do not reach 64/64 after replay is
 forced, m>1 was not the only remaining defect; stop and report without further
 iteration.
+
+## W3 round: f32 router input
+
+Frozen before the change is written.
+
+CLAIM. The MoE router's input passes through bf16 and loses precision the
+routing decision is sensitive to. `rmsc_k` writes the post-attention norm as
+bf16 into `curb_d`; `moe_ffn` then widens that bf16 back to f32 (`X2` from
+`p_h_d`) and feeds the router. The widen cannot restore what the cast
+dropped. bf16 carries 8 mantissa bits, 2^-8 = 0.39% relative, and the
+measured per-layer floor against llama.cpp is 0.44%.
+
+Routing is a DISCRETE top-8-of-256 choice, so unlike a GEMM it does not
+average the error away: a perturbation near a boundary flips an expert and
+changes that token's output substantially. This is the one mechanism that
+plausibly converts a 0.4% activation error into whole-token divergence.
+
+CHANGE. Compute the norm a second time in f32 (`rms_h2`, the existing
+amar_rmsnorm f32-in/f32-out) straight from the f32 residual `Xm`, into
+scratch, and feed the router from that. The expert GEMMs keep reading the
+bf16 `CurBm`, so the extra cost is one norm pass and one H-wide f32 buffer
+per layer, not a precision change to the matmuls.
+
+PREDICTION. Teacher-forced agreement over the 20-prompt set rises above the
+53.20 measured at `dcdf4a2`. A rise of even 1 token per prompt is meaningful
+here: the dense path's own ceiling on a quant-matched arm is 51.90, so this
+would put MoE clearly above the engine's demonstrated ceiling.
+
+FALSIFIER. If the mean does not move (within +-0.5), bf16 on the ROUTER is
+not the limiter, and the change is reverted rather than kept "because it is
+more correct". A no-op that costs a norm pass per layer is a regression.
+
+PASS CONDITIONS. Measured on the resident gate (`bench/moe-gate-resident.sh`,
+one process, same 20 prompts, same llama reference ids), with the engine sha
+printed by the run. The dense path must be unaffected: the change is inside
+`moe_ffn`, which only the MoE profile reaches, and `bench/force-ab.sh` must
+still be 20/20 at 64/64 against a main-built dense engine.
+
+NOT IN THIS ROUND. Widening the expert GEMMs, the SSM path, or attention to
+f32. Those are a separate and much larger question about the engine's whole
+accuracy/speed tradeoff (PROTOCOL-RULES P14 records the engine-wide 0.44%
+floor); this round tests one mechanism on one path.
