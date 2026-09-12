@@ -825,6 +825,49 @@ def main() raises:
                 var dpp = bufs.dump_h.unsafe_ptr().unsafe_bitcast[UInt8]()
                 f.write_bytes(Span[UInt8](unsafe_ptr=dpp, length=wst.n_dumped * 2 * N_LAYERS * H * 4))
             print("dumped", wst.n_dumped, "tokens x", N_LAYERS, "layers to", dump_path)
+        if dump and getenv("BARO_DUMP_DIR", "") != "":
+            # Same container the packer writes and tools/tdiff.mojo reads:
+            # data.bin plus one "name f32 byte_offset n_elem" line per tensor.
+            # Names match llama.cpp's own (attn_residual-N, attn_post_norm-N,
+            # l_out-N, linear_attn_out-N) so a dump joins against
+            # llama-eval-callback's LLAMA_DUMP_DIR output by name, with no
+            # mapping table to drift.
+            var ddir = getenv("BARO_DUMP_DIR", "")
+            ctx.synchronize()
+            var dpp = bufs.dump_h.unsafe_ptr()
+            var names = List[String]()
+            var slots = List[Int]()
+            comptime if not MEGA_ALLOWED:
+                if dump4:
+                    # layer 0 sub-block captures, slot order set in window.mojo
+                    names.append(String("attn_residual-0")); slots.append(0)
+                    names.append(String("attn_post_norm-0")); slots.append(1)
+                    names.append(String("l_out-0")); slots.append(2)
+                    names.append(String("final_norm-0")); slots.append(3)
+                    names.append(String("ssm_gates-0")); slots.append(5)
+                    names.append(String("ssm_state_out-0")); slots.append(6)
+                    names.append(String("linear_attn_out-0")); slots.append(7)
+                    names.append(String("conv_out-0")); slots.append(8)
+                else:
+                    for layer in range(N_LAYERS):
+                        names.append(String("attn_residual-") + String(layer))
+                        slots.append(2 * layer)
+            var off = 0
+            var idx = String("")
+            with open(ddir + "/data.bin", "w") as fb:
+                for i in range(len(names)):
+                    var base = slots[i] * H
+                    fb.write_bytes(
+                        Span[UInt8](
+                            unsafe_ptr=dpp.unsafe_offset(base).unsafe_bitcast[UInt8](),
+                            length=H * 4,
+                        )
+                    )
+                    idx += names[i] + " f32 " + String(off) + " " + String(H) + "\n"
+                    off += H * 4
+            with open(ddir + "/index.txt", "w") as fi:
+                fi.write(idx)
+            print("dump dir:", ddir, len(names), "tensors")
         if pf5:
             var ph = ctx.enqueue_create_host_buffer[DType.int64](16 * N_LAYERS + 4)
             ctx.enqueue_copy(dst_buf=ph, src_buf=bufs.prof_d)
