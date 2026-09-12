@@ -31,12 +31,23 @@ Model weights are not distributed with this repo.
 
 Same box, same GGUF, 20-prompt medians unless noted
 ([`bench/q8-protocol.md`](bench/q8-protocol.md),
-[`bench/ornith-protocol.md`](bench/ornith-protocol.md)).
+[`bench/ornith-protocol.md`](bench/ornith-protocol.md),
+[`bench/q4-protocol.md`](bench/q4-protocol.md),
+[`bench/attn-latency-protocol.md`](bench/attn-latency-protocol.md)).
 
 | model, weights | llama.cpp tok/s | mojo-baro tok/s | ratio |
 |---|---|---|---|
+| **Qwythos-9B, Q4_0 both sides (`llama-quantize --pure Q4_0`)** | **110.0** | **130.7** | **1.19x** |
 | Qwythos-9B, q8 (5-token race prompt) | 74.1 | 68.8 | 0.94x |
 | Ornith-1.5-9B, from Q4_K_M | 88.8 | 80.8 | 0.91x |
+
+The arms disagree because they are different arms, not different days. On
+matched Q4_0 weights the megakernel decode path is ahead; on q8 and on a pack
+built from Q4_K_M it is behind. Our Q4_0 side has since moved to 136.1 to 136.8
+tok/s on the same twenty prompts (`bench/attn-protocol.md` Round A/C A/B), so
+the current ratio is higher than 1.19x, but the llama.cpp bar has not been
+re-measured since, and a ratio is only worth quoting when both sides were
+measured in the same stint.
 
 Speculative decode with the model's own MTP head is opt-in (`BARO_SPEC=1`) and
 output-identical to plain greedy decode on every prompt tested. On the q4 pack
