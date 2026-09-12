@@ -12,7 +12,7 @@ from matmul_skinny import (
 )
 from ssm import (
     amar_ssm_reduce_gates, amar_ssm_conv, amar_ssm_qk_l2norm,
-    amar_ssm_delta_step, amar_ssm_gated_out_bf16, amar_cast_bf16, CONV, NH_V, SSTATE,
+    amar_ssm_delta_step, amar_ssm_gated_out_bf16, amar_cast_bf16, amar_widen_bf16, CONV, NH_V, SSTATE,
     amar_ssm_gates_rows, amar_ssm_conv_chunk, amar_ssm_qk_l2norm_rows, amar_ssm_delta_chunk,
     amar_ssm_gated_out_rows_bf16, amar_ssm_delta_chunk_w, DC_BLOCKS,
 )
@@ -186,6 +186,10 @@ comptime rms_h2 = amar_rmsnorm[type_of(h2_layout), type_of(h_layout), type_of(h2
 comptime rmsc_h2 = amar_rmsnorm_cast[type_of(h2_layout), type_of(h_layout), type_of(h2_layout)]
 comptime cast_m = amar_cast_bf16[type_of(xflat_layout), type_of(xflat_layout)]
 comptime cast_1 = amar_cast_bf16[type_of(h_layout), type_of(h_layout)]
+# window.mojo widens bf16 activations back to f32 on the MoE path; the kernel
+# census only scans registry/engine/spark/bench/test, so a kernel reached only
+# from window.mojo reads as an orphan without an alias here.
+comptime widen_1 = amar_widen_bf16[type_of(h_layout), type_of(h_layout)]
 comptime tokcp_k = amar_tok_copy[type_of(dtok_layout), type_of(toks_layout)]
 comptime tokcp_b = amar_tok_copy[type_of(toks_layout), type_of(dtok_layout)]
 comptime frmap_layout = row_major[VOCAB]()
