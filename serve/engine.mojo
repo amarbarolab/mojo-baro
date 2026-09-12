@@ -433,6 +433,7 @@ def main() raises:
     var dump_path = getenv("BARO_DUMP", "")
     var dump = dump_path != ""
     var dump4 = getenv("BARO_DUMP4", "0") == "1"
+    var dump_layer = atol(getenv("BARO_DUMP_LAYER", "0"))
 
     var serve = getenv("BARO_SERVE", "0") == "1"
     print("BARO_SERVE:", serve)
@@ -713,7 +714,7 @@ def main() raises:
         # stage sum exceeds the unsynchronized sub-block time; compare stages
         # within an arm and the same stage across m, never add these into a budget.
         var pf4 = getenv("BARO_PROFILE", "0") == "4"
-        var cfg = WindowCfg(pack_q4=pack_q4, draft_q4=draft_q4, q4_off=q4_off, e=e, kcfg=kcfg, spec=spec, spec_dbg=spec_dbg, serve=serve, req_id=req_id, prof=prof, pf2=pf2, pf3=pf3, pf4=pf4, dump=dump, dump4=dump4, mega=mega, att_split=att_split, mega_win=mega_win, dot3=dot3, pf_chunk=pf_chunk, pf_rows=pf_rows, pf_tail=pf_tail, n_total=n_total, fr_k=fr_k, fr_off=fr_off, fr_ids_off=fr_ids_off, n_prompt=len(prompt))
+        var cfg = WindowCfg(pack_q4=pack_q4, draft_q4=draft_q4, q4_off=q4_off, e=e, kcfg=kcfg, spec=spec, spec_dbg=spec_dbg, serve=serve, req_id=req_id, prof=prof, pf2=pf2, pf3=pf3, pf4=pf4, dump=dump, dump4=dump4, dump_layer=dump_layer, mega=mega, att_split=att_split, mega_win=mega_win, dot3=dot3, pf_chunk=pf_chunk, pf_rows=pf_rows, pf_tail=pf_tail, n_total=n_total, fr_k=fr_k, fr_off=fr_off, fr_ids_off=fr_ids_off, n_prompt=len(prompt))
         if len(force) > 0 and cfg.spec:
             raise Error("BARO_FORCE requires BARO_SPEC=0 (teacher forcing is a no-spec identity gate)")
         wst.reset(t0)
@@ -837,34 +838,45 @@ def main() raises:
             var dpp = bufs.dump_h.unsafe_ptr()
             var names = List[String]()
             var slots = List[Int]()
+            var lens = List[Int]()
             comptime if not MEGA_ALLOWED:
-                if dump4:
-                    # layer 0 sub-block captures, slot order set in window.mojo
-                    names.append(String("attn_residual-0")); slots.append(0)
-                    names.append(String("attn_post_norm-0")); slots.append(1)
-                    names.append(String("l_out-0")); slots.append(2)
-                    names.append(String("final_norm-0")); slots.append(3)
-                    names.append(String("ssm_gates-0")); slots.append(5)
-                    names.append(String("ssm_state_out-0")); slots.append(6)
-                    names.append(String("linear_attn_out-0")); slots.append(7)
-                    names.append(String("conv_out-0")); slots.append(8)
+                if dump4 and (dump_layer + 1) % 4 == 0:
+                    # attention layer: the SSM slots never fire, and slots 4-6
+                    # carry the attention captures instead.
+                    names.append(String("attn_residual-") + String(dump_layer)); slots.append(0); lens.append(H)
+                    names.append(String("attn_post_norm-") + String(dump_layer)); slots.append(1); lens.append(H)
+                    names.append(String("l_out-") + String(dump_layer)); slots.append(2); lens.append(H)
+                    names.append(String("attn_output-") + String(dump_layer)); slots.append(4); lens.append(ATT)
+                    names.append(String("attn_oproj-") + String(dump_layer)); slots.append(6); lens.append(H)
+                elif dump4:
+                    # SSM layer sub-block captures, slot order set in window.mojo
+                    names.append(String("attn_residual-") + String(dump_layer)); slots.append(0)
+                    names.append(String("attn_post_norm-") + String(dump_layer)); slots.append(1); lens.append(H)
+                    names.append(String("l_out-") + String(dump_layer)); slots.append(2); lens.append(H)
+                    names.append(String("final_norm-") + String(dump_layer)); slots.append(3); lens.append(H)
+                    names.append(String("ssm_gates-") + String(dump_layer)); slots.append(5); lens.append(H)
+                    names.append(String("ssm_state_out-") + String(dump_layer)); slots.append(6); lens.append(H)
+                    names.append(String("linear_attn_out-") + String(dump_layer)); slots.append(7); lens.append(H)
+                    names.append(String("conv_out-") + String(dump_layer)); slots.append(8); lens.append(H)
                 else:
                     for layer in range(N_LAYERS):
                         names.append(String("attn_residual-") + String(layer))
                         slots.append(2 * layer)
+                        lens.append(H)
             var off = 0
             var idx = String("")
             with open(ddir + "/data.bin", "w") as fb:
                 for i in range(len(names)):
                     var base = slots[i] * H
+                    var ln = lens[i]
                     fb.write_bytes(
                         Span[UInt8](
                             unsafe_ptr=dpp.unsafe_offset(base).unsafe_bitcast[UInt8](),
-                            length=H * 4,
+                            length=ln * 4,
                         )
                     )
-                    idx += names[i] + " f32 " + String(off) + " " + String(H) + "\n"
-                    off += H * 4
+                    idx += names[i] + " f32 " + String(off) + " " + String(ln) + "\n"
+                    off += ln * 4
             with open(ddir + "/index.txt", "w") as fi:
                 fi.write(idx)
             print("dump dir:", ddir, len(names), "tensors")

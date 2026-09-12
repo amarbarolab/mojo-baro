@@ -578,6 +578,10 @@ struct WindowCfg(Copyable, Movable):
     var pf4: Bool
     var dump: Bool
     var dump4: Bool
+    # BARO_DUMP_LAYER: which layer the dump4 sub-block captures come
+    # from. Was hardcoded to 0; the first all-layer tdiff run put the
+    # divergence at layer 31, which layer-0-only captures cannot reach.
+    var dump_layer: Int
     var mega: Bool
     var att_split: Int
     var mega_win: Bool
@@ -922,6 +926,10 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                         ctx.enqueue_function[dcomb_k](Pa, Ao, Int32(dns), grid_dim=m * NQH, block_dim=ROW_THREADS)
                 else:
                     ctx.enqueue_function[att_k](Q, Kc, Vc, Ao, Int32(st.pos + 1), Float32(0.0625), Int32(att_i), grid_dim=(NQH, m), block_dim=HD)
+                if cfg.dump4 and cfg.dump and m == 1 and layer == cfg.dump_layer and st.pos + 1 >= cfg.n_prompt:
+                    # slots 4-5: attention output before the gate and the output
+                    # projection, ATT=4096 floats, i.e. llama's attn_output-N.
+                    ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr() + 4 * H, ATT, owning=False), src_buf=DeviceBuffer[f32](ctx, b.ao_d.unsafe_ptr(), ATT, owning=False))
                 ctx.enqueue_function[gmul_k](Aoflat, Gate, AoB, Int32(m * ATT), grid_dim=ceildiv(m * ATT, 256), block_dim=256)
                 comptime if MEGA_ALLOWED:
                     gemm_w[H, ATT](ctx, AoBm, b.wbuf, b.off[w + 6], cfg.pack_q4, Ph, m)
@@ -929,6 +937,11 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                     ctx.enqueue_function[moe_matmul_q8_0_m1[type_of(h_layout), type_of(attm_layout)]](
                         AoBm, b.wbuf.unsafe_ptr() + b.off[moe_base + 6], row_f32(ctx, b.p_h_d, 0, H, h_layout), Int32(H), Int32(ATT), Int32((ATT // 32) * 34),
                         grid_dim=ceildiv(H, 8), block_dim=256)
+                if cfg.dump4 and cfg.dump and m == 1 and layer == cfg.dump_layer and st.pos + 1 >= cfg.n_prompt:
+                    # slot 6: the output projection result, the value added to
+                    # the residual. Splits "attention is wrong" from "o_proj is
+                    # wrong" in one run.
+                    ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr() + 6 * H, H, owning=False), src_buf=DeviceBuffer[f32](ctx, b.p_h_d.unsafe_ptr(), H, owning=False))
                 ctx.enqueue_function[r_add](Ph, Xm, Int32(m), Int32(H), grid_dim=ceildiv(m * H, 256), block_dim=256)
                 att_i += 1
                 w += 7
@@ -1024,7 +1037,7 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                     var nw = perf_counter_ns()
                     st.pc[3] += Int(nw - st.tq)
                     st.tq = nw
-                if cfg.dump4 and cfg.dump and m == 1 and layer == 0 and st.pos + 1 >= cfg.n_prompt:
+                if cfg.dump4 and cfg.dump and m == 1 and layer == cfg.dump_layer and st.pos + 1 >= cfg.n_prompt:
                     # slot 4: conv output after l2norm (llama conv_output_silu /
                     # Qcur_normed). slot 5: the two gate vectors, Eg then Beta,
                     # NH_V each (llama a_softplus / beta_sigmoid).
@@ -1032,7 +1045,7 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                     ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr() + 5 * H, NH_V, owning=False), src_buf=DeviceBuffer[f32](ctx, b.eg_d.unsafe_ptr(), NH_V, owning=False))
                     ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr() + 5 * H + NH_V, NH_V, owning=False), src_buf=DeviceBuffer[f32](ctx, b.beta_d.unsafe_ptr(), NH_V, owning=False))
                 delta_dispatch(ctx, SStateAll, Conv, Eg, Beta, So, Int32(st.ring), Int32(ssm_i), Int32(SLOTS), m)
-                if cfg.dump4 and cfg.dump and m == 1 and layer == 0 and st.pos + 1 >= cfg.n_prompt:
+                if cfg.dump4 and cfg.dump and m == 1 and layer == cfg.dump_layer and st.pos + 1 >= cfg.n_prompt:
                     # slot 6: delta-scan output, before the output gate.
                     ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr() + 6 * H, NH_V * SSTATE, owning=False), src_buf=DeviceBuffer[f32](ctx, b.so_d.unsafe_ptr(), NH_V * SSTATE, owning=False))
                 if cfg.pf2:
@@ -1057,7 +1070,7 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                     ctx.enqueue_function[moe_matmul_q8_0_m1[type_of(h_layout), type_of(moe_inner_m_layout)]](
                         ResBm, b.wbuf.unsafe_ptr() + b.off[decode_base + 9], row_f32(ctx, b.p_h_d, 0, H, h_layout), Int32(H), Int32(NH_V * SSTATE), Int32((NH_V * SSTATE // 32) * 34),
                         grid_dim=ceildiv(H, 8), block_dim=256)
-                if cfg.dump4 and cfg.dump and m == 1 and layer == 0 and st.pos + 1 >= cfg.n_prompt:
+                if cfg.dump4 and cfg.dump and m == 1 and layer == cfg.dump_layer and st.pos + 1 >= cfg.n_prompt:
                     # slot 7: the ssm_out projection result, i.e. llama's
                     # linear_attn_out, the last value before the residual add.
                     ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr() + 7 * H, H, owning=False), src_buf=DeviceBuffer[f32](ctx, b.p_h_d.unsafe_ptr(), H, owning=False))
@@ -1079,7 +1092,7 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
             if cfg.dump and m == 1 and st.pos + 1 >= cfg.n_prompt:
                 if not cfg.dump4:
                     ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr() + (2 * layer) * H, H, owning=False), src_buf=DeviceBuffer[f32](ctx, b.x_d.unsafe_ptr(), H, owning=False))
-                if cfg.dump4 and layer == 0:
+                if cfg.dump4 and layer == cfg.dump_layer:
                     ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr(), H, owning=False), src_buf=DeviceBuffer[f32](ctx, b.x_d.unsafe_ptr(), H, owning=False))
             # -- ffn sub-block --
             if cfg.pf4:
@@ -1092,7 +1105,7 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                 Xm, tens_f32(ctx, b.wbuf, b.off[ffn_norm_base], H, h_layout), CurBm,
                 Int32(H), Float32(1e-6), grid_dim=m, block_dim=256,
             )
-            if cfg.dump4 and cfg.dump and m == 1 and st.pos + 1 >= cfg.n_prompt and layer == 0:
+            if cfg.dump4 and cfg.dump and m == 1 and st.pos + 1 >= cfg.n_prompt and layer == cfg.dump_layer:
                 var DbgNorm = row_f32(ctx, b.p_h_d, 0, H, moe_vec_layout)
                 ctx.enqueue_function[amar_widen_bf16[type_of(moe_vec_layout), type_of(moe_vec_layout)]](row_bf16(ctx, b.curb_d, 0, H, moe_vec_layout), DbgNorm, Int32(H), grid_dim=ceildiv(H, 256), block_dim=256)
                 ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr() + H, H, owning=False), src_buf=DeviceBuffer[f32](ctx, b.p_h_d.unsafe_ptr(), H, owning=False))
@@ -1172,7 +1185,7 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
             if cfg.dump and m == 1 and st.pos + 1 >= cfg.n_prompt:
                 if not cfg.dump4:
                     ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr() + (2 * layer + 1) * H, H, owning=False), src_buf=DeviceBuffer[f32](ctx, b.x_d.unsafe_ptr(), H, owning=False))
-                if cfg.dump4 and layer == 0:
+                if cfg.dump4 and layer == cfg.dump_layer:
                     ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr() + 2 * H, H, owning=False), src_buf=DeviceBuffer[f32](ctx, b.x_d.unsafe_ptr(), H, owning=False))
             if cfg.prof:
                 ctx.synchronize()
