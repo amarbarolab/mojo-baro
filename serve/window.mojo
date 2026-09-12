@@ -642,6 +642,8 @@ comptime moe_expert_layout = row_major[TOPK, E_FFN]()
 comptime moe_shared_layout = row_major[1, SH_FFN]()
 comptime moe_expert_f_layout = row_major[TOPK * E_FFN]()
 comptime moe_shared_f_layout = row_major[SH_FFN]()
+comptime ssm_gate_w_layout = row_major[NH_V, H]()
+comptime ssm_gate_o_layout = row_major[NH_V]()
 comptime moe_expert_flat_layout = row_major[TOPK * E_FFN]()
 comptime moe_shared_flat_layout = row_major[SH_FFN]()
 comptime moe_inner_layout = row_major[NH_V * SSTATE]()
@@ -972,12 +974,27 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                     ctx.enqueue_function[moe_matmul_q8_0_m1[type_of(h_layout), type_of(xm_layout)]](
                         CurBm, b.wbuf.unsafe_ptr() + b.off[moe_base + 2], row_f32(ctx, b.p_h_d, 0, H, h_layout), Int32(H), Int32(H), Int32((H // 32) * 34),
                         grid_dim=ceildiv(H, 8), block_dim=256)
-                    ctx.enqueue_function[moe_matmul_q8_0_m1[type_of(h_layout), type_of(xm_layout)]](
-                        CurBm, b.wbuf.unsafe_ptr() + b.off[moe_base + 3], row_f32(ctx, b.p_32_d, 0, NH_V, h_layout), Int32(NH_V), Int32(H), Int32((H // 32) * 34),
-                        grid_dim=1, block_dim=256)
-                    ctx.enqueue_function[moe_matmul_q8_0_m1[type_of(h_layout), type_of(xm_layout)]](
-                        CurBm, b.wbuf.unsafe_ptr() + b.off[moe_base + 4], row_f32(ctx, b.p_32b_d, 0, NH_V, h_layout), Int32(NH_V), Int32(H), Int32((H // 32) * 34),
-                        grid_dim=1, block_dim=256)
+                    # ssm_alpha/ssm_beta are F32 in the MoE pack; the dense
+                    # pack stores them q4. Reading f32 bytes through the q8_0
+                    # kernel made every beta sigmoid saturate to exactly
+                    # 0.0/1.0 (W3 gate 2 bug 4, 2026-09-12). f32 weights need
+                    # the skinny f32 matmul and an f32 copy of the activation.
+                    ctx.enqueue_memset(b.p_32_d, 0)
+                    ctx.enqueue_memset(b.p_32b_d, 0)
+                    ctx.enqueue_function[amar_widen_bf16[type_of(moe_vec_layout), type_of(moe_vec_layout)]](
+                        row_bf16(ctx, b.curb_d, 0, H, moe_vec_layout), row_f32(ctx, b.logits_d, 0, H, moe_vec_layout),
+                        Int32(H), grid_dim=ceildiv(H, 256), block_dim=256)
+                    var Xg = row_f32(ctx, b.logits_d, 0, H, h2_layout)
+                    ctx.enqueue_function[amar_matmul_skinny_m1_row[f32, 2, type_of(h2_layout), type_of(ssm_gate_w_layout), type_of(ssm_gate_o_layout)]](
+                        Xg, tens_f32(ctx, b.wbuf, b.off[moe_base + 3], NH_V * H, ssm_gate_w_layout),
+                        row_f32(ctx, b.p_32_d, 0, NH_V, ssm_gate_o_layout), Int32(NH_V), Int32(H),
+                        grid_dim=ceildiv(NH_V, ROW_WAVES), block_dim=ROW_THREADS)
+                    ctx.enqueue_function[amar_matmul_skinny_m1_row[f32, 2, type_of(h2_layout), type_of(ssm_gate_w_layout), type_of(ssm_gate_o_layout)]](
+                        Xg, tens_f32(ctx, b.wbuf, b.off[moe_base + 4], NH_V * H, ssm_gate_w_layout),
+                        row_f32(ctx, b.p_32b_d, 0, NH_V, ssm_gate_o_layout), Int32(NH_V), Int32(H),
+                        grid_dim=ceildiv(NH_V, ROW_WAVES), block_dim=ROW_THREADS)
+                if cfg.dump4 and layer < 3 and st.pos == 0:
+                    print("SSMOFF layer", layer, "base", moe_base, ":", b.off[moe_base + 1], b.off[moe_base + 2], b.off[moe_base + 3], b.off[moe_base + 4])
                 ctx.enqueue_function[r_qf](Pq, Qkvm, Int32(m), Int32(CONV), grid_dim=ceildiv(m * CONV, 256), block_dim=256)
                 comptime if MEGA_ALLOWED:
                     ctx.enqueue_function[r_h](Ph, ZmOld, Int32(m), Int32(H), grid_dim=ceildiv(m * H, 256), block_dim=256)
@@ -1009,7 +1026,17 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                     var nw = perf_counter_ns()
                     st.pc[3] += Int(nw - st.tq)
                     st.tq = nw
+                if cfg.dump4 and cfg.dump and m == 1 and layer == 0 and st.pos + 1 >= cfg.n_prompt:
+                    # slot 4: conv output after l2norm (llama conv_output_silu /
+                    # Qcur_normed). slot 5: the two gate vectors, Eg then Beta,
+                    # NH_V each (llama a_softplus / beta_sigmoid).
+                    ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr() + 8 * H, CONV, owning=False), src_buf=DeviceBuffer[f32](ctx, b.conv_d.unsafe_ptr(), CONV, owning=False))
+                    ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr() + 5 * H, NH_V, owning=False), src_buf=DeviceBuffer[f32](ctx, b.eg_d.unsafe_ptr(), NH_V, owning=False))
+                    ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr() + 5 * H + NH_V, NH_V, owning=False), src_buf=DeviceBuffer[f32](ctx, b.beta_d.unsafe_ptr(), NH_V, owning=False))
                 delta_dispatch(ctx, SStateAll, Conv, Eg, Beta, So, Int32(st.ring), Int32(ssm_i), Int32(SLOTS), m)
+                if cfg.dump4 and cfg.dump and m == 1 and layer == 0 and st.pos + 1 >= cfg.n_prompt:
+                    # slot 6: delta-scan output, before the output gate.
+                    ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr() + 6 * H, NH_V * SSTATE, owning=False), src_buf=DeviceBuffer[f32](ctx, b.so_d.unsafe_ptr(), NH_V * SSTATE, owning=False))
                 if cfg.pf2:
                     ctx.synchronize()
                     var nw = perf_counter_ns()
@@ -1032,6 +1059,10 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                     ctx.enqueue_function[moe_matmul_q8_0_m1[type_of(h_layout), type_of(moe_inner_m_layout)]](
                         ResBm, b.wbuf.unsafe_ptr() + b.off[decode_base + 9], row_f32(ctx, b.p_h_d, 0, H, h_layout), Int32(H), Int32(NH_V * SSTATE), Int32((NH_V * SSTATE // 32) * 34),
                         grid_dim=ceildiv(H, 8), block_dim=256)
+                if cfg.dump4 and cfg.dump and m == 1 and layer == 0 and st.pos + 1 >= cfg.n_prompt:
+                    # slot 7: the ssm_out projection result, i.e. llama's
+                    # linear_attn_out, the last value before the residual add.
+                    ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr() + 7 * H, H, owning=False), src_buf=DeviceBuffer[f32](ctx, b.p_h_d.unsafe_ptr(), H, owning=False))
                 ctx.enqueue_function[r_add](Ph, Xm, Int32(m), Int32(H), grid_dim=ceildiv(m * H, 256), block_dim=256)
                 ssm_i += 1
                 w += 10
