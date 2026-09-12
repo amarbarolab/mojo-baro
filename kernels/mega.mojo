@@ -15,6 +15,7 @@ from elementwise import EW_THREADS
 from matmul_skinny import ROW_WAVES, ROW_THREADS, q4_dot_blocks, bf16x16_to_f32
 from ssm import CONV, KDIM, NH_K, NH_V, SSTATE, SSM_EPS
 from attn import HD, NQH, NKVH, KVT, TCAP, KVPAGE, KVPSH, KVHSTR, kv_off, NROT, YARN_LOW, YARN_HIGH, FREQ_BASE, FREQ_SCALE, MSCALE, attn_head_body, attn_head_span
+from model import H, FFN, QF, KV, N_LAYERS, MEGA_ALLOWED
 
 comptime u32 = DType.uint32
 comptime f32 = DType.float32
@@ -29,11 +30,6 @@ comptime MEGA_G_WIN = 96
 comptime SPIN_LIMIT = 1 << 22
 comptime QV = 16
 comptime UNROLL = 4
-comptime H = 4096
-comptime FFN = 12288
-comptime QF = 2 * H
-comptime KV = NKVH * HD
-comptime N_LAYERS = 32
 comptime VOCAB = 248320
 comptime ATT_SCALE = Float32(0.0625)
 comptime DATT_NLD = 4

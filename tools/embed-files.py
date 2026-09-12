@@ -18,7 +18,15 @@ EXT = {"uregex": Path.home() / "Projects/mojo/mojo-uregex/src/uregex",
        "minja": Path.home() / "Projects/mojo/mojo-minja/src/minja"}
 ARCH = {"qwythos": (["serve/window.mojo", "serve/registry.mojo"], "serve/engine.mojo"),
         "spark": (["serve/spark.mojo"], "serve/spark.mojo"),
-        "qwen35moe": (["kernels/test_moe_block.mojo"], "kernels/test_moe_block.mojo")}
+        # The W2 kernel-parity closure, kept for the expert-kernel gate.
+        "qwen35moe-kernels": (["kernels/test_moe_block.mojo"], "kernels/test_moe_block.mojo"),
+        # The real engine closure for the MoE profile: same roots as qwythos,
+        # so the walk picks up kernels/moe.mojo, the three serve/model*.mojo
+        # profiles AND kernels/mega.mojo. The MoE profile does not run the
+        # megakernel (MEGA_ALLOWED is False for qwen35moe), but registry.mojo
+        # instantiates it unconditionally, so it is part of the closure and the
+        # file does not compile without it.
+        "qwen35moe": (["serve/window.mojo", "serve/registry.mojo"], "serve/engine.mojo")}
 
 
 def closure(roots):

@@ -21,7 +21,7 @@ cmake --build "$S" -j"$(nproc)" >/dev/null
 
 # KATT head-dimension parity: the Spark attention path at HD 64/128/256,
 # judged by the numpy float64 oracle (bench/dense-protocol.md, KATT).
-./.venv/bin/mojo build kernels/test_spark_attn.mojo -o .work/test_spark_attn -I kernels
+./.venv/bin/mojo build kernels/test_spark_attn.mojo -o .work/test_spark_attn -I kernels -I serve
 mkdir -p .work/katt
 ./.work/test_spark_attn
 ./.venv/bin/python tools/spark-attn-ref.py .work/katt

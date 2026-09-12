@@ -24,6 +24,7 @@ from registry import *
 from window import *
 from harness import *
 from prefix import *
+from moe_pack import parse_moe_index, resolve_plain
 
 
 def read_line(fd: Int) raises -> Optional[String]:
@@ -410,6 +411,9 @@ def load_state(
 def main() raises:
     comptime assert has_accelerator(), "Requires a GPU"
     var ctx = DeviceContext()
+    var mega = getenv("BARO_MEGA", "1") == "1"
+    if mega and not MEGA_ALLOWED:
+        raise Error("BARO_MEGA=1 is not supported by the qwen35moe model profile")
     var packdir = getenv("BARO_PACK", ".work/engine-pack-q4")
     var pack = load_pack(ctx, packdir)
     var wbuf = pack.wbuf
@@ -427,13 +431,14 @@ def main() raises:
     var dot3 = getenv("BARO_DOT", "0") == "1" and not pack_q4
     print("BARO_DOT:", dot3)
     print("pack q4 trunk:", pack_q4)
-    var mega = getenv("BARO_MEGA", "1") == "1"
     print("BARO_MEGA:", mega)
     var mega_win = getenv("BARO_MEGA_WIN", "0") == "1"
     print("BARO_MEGA_WIN:", mega_win)
     var pf5 = getenv("BARO_PROFILE", "0") == "5"
     var dump_path = getenv("BARO_DUMP", "")
     var dump = dump_path != ""
+    var dump4 = getenv("BARO_DUMP4", "0") == "1"
+    var dump_layer = atol(getenv("BARO_DUMP_LAYER", "0"))
 
     var serve = getenv("BARO_SERVE", "0") == "1"
     print("BARO_SERVE:", serve)
@@ -478,14 +483,20 @@ def main() raises:
     var pf_chunk = min(atol(getenv("BARO_PREFILL_C", String(CP))), CP)
     if pf_chunk < PF_MIN:
         pf_chunk = PF_MIN
-    var pf_on = getenv("BARO_PREFILL", "1") == "1"
-    # Default ON since 2026-09-12: FR-Spec draft decode measured 1.124x with
-    # 20/20 teacher-forced identity. Every BARO_FORCE caller pins BARO_SPEC=0
-    # explicitly (bench/force-ab.sh, force-ab-serve.sh, dense-run.sh,
-    # ornith-run.sh, llama-handoff.sh); the engine raises if the two are
-    # combined, so an unpinned identity gate fails loudly rather than
-    # silently measuring the wrong arm.
-    var spec_env = getenv("BARO_SPEC", "1") == "1"
+    # The MoE profile has no m>1 MoE prefill yet (W5); replay its prompt rows
+    # through the verified m=1 path. Dense profiles retain batched prefill.
+    # Scoped on IS_MOE, not MEGA_ALLOWED: the two coincide today only because
+    # qwen35moe is the single profile with the mega kernel off, so gating on
+    # MEGA_ALLOWED would silently disable batched prefill for the first dense
+    # profile that turns the mega kernel off for its own reasons.
+    var pf_on = not IS_MOE and getenv("BARO_PREFILL", "1") == "1"
+    # Default ON since 2026-09-12: draft decode measured 1.1042x on the frozen
+    # 20-prompt median. Every BARO_FORCE caller pins BARO_SPEC=0 explicitly
+    # (force-ab.sh, force-ab-serve.sh, dense-run.sh, ornith-run.sh,
+    # llama-handoff.sh) and the engine raises if the two are combined, so an
+    # unpinned identity gate fails loudly rather than measuring the wrong arm.
+    # Still gated on MEGA_ALLOWED: the MoE profile has no draft head.
+    var spec_env = MEGA_ALLOWED and getenv("BARO_SPEC", "1") == "1"
     print("BARO_SPEC:", spec_env)
     var spec_dbg = getenv("BARO_SPEC_DBG", "0") == "1"
     # Teacher-forced agreement (identity gate, CLAUDE.md: never greedy equality
@@ -494,7 +505,7 @@ def main() raises:
     # and the reference id is force-fed into the next step's context
     # regardless of what the model chose, same file format and semantics as
     # serve/spark.mojo:260-261.
-    var force = List[Int]()
+    var force_env = List[Int]()
     var force_path = getenv("BARO_FORCE", "")
     if force_path != "":
         with open(force_path, "r") as ff:
@@ -508,13 +519,54 @@ def main() raises:
                     fhave = True
                 else:
                     if fhave:
-                        force.append(fval)
+                        force_env.append(fval)
                     fval = 0
                     fhave = False
             if fhave:
-                force.append(fval)
-        print("BARO_FORCE:", force_path, " (", len(force), "ids )")
+                force_env.append(fval)
+        print("BARO_FORCE:", force_path, " (", len(force_env), "ids )")
     var bufs = alloc_bufs(ctx, pack, tmax)
+    # The dense path consumes Pack.off's historical order.  The MoE pack is
+    # lexical by tensor name, so build a per-block semantic order by name;
+    # the offsets remain byte offsets into the same Pack.wbuf blob.
+    comptime if not MEGA_ALLOWED:
+        var moe_tensors = parse_moe_index(packdir + "/index.txt")
+        var moe_logical = List[Int]()
+        moe_logical.append(resolve_plain(moe_tensors, "token_embd.weight").offset)
+        for layer in range(N_LAYERS):
+            var pfx = "blk." + String(layer) + "."
+            if is_attn(layer):
+                for name in [
+                    "attn_norm.weight", "attn_q.weight", "attn_k.weight",
+                    "attn_v.weight", "attn_q_norm.weight", "attn_k_norm.weight",
+                    "attn_output.weight",
+                ]:
+                    moe_logical.append(resolve_plain(moe_tensors, pfx + name).offset)
+                moe_logical.append(resolve_plain(moe_tensors, pfx + "post_attention_norm.weight").offset)
+                for name in [
+                    "ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight",
+                    "ffn_gate_inp.weight", "ffn_gate_shexp.weight", "ffn_up_shexp.weight",
+                    "ffn_down_shexp.weight", "ffn_gate_inp_shexp.weight",
+                ]:
+                    moe_logical.append(resolve_plain(moe_tensors, pfx + name).offset)
+            else:
+                for name in [
+                    "attn_norm.weight", "attn_qkv.weight", "attn_gate.weight",
+                    "ssm_alpha.weight", "ssm_beta.weight", "ssm_conv1d.weight",
+                    "ssm_a", "ssm_dt.bias", "ssm_norm.weight", "ssm_out.weight",
+                ]:
+                    moe_logical.append(resolve_plain(moe_tensors, pfx + name).offset)
+                moe_logical.append(resolve_plain(moe_tensors, pfx + "post_attention_norm.weight").offset)
+                for name in [
+                    "ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight",
+                    "ffn_gate_inp.weight", "ffn_gate_shexp.weight", "ffn_up_shexp.weight",
+                    "ffn_down_shexp.weight", "ffn_gate_inp_shexp.weight",
+                ]:
+                    moe_logical.append(resolve_plain(moe_tensors, pfx + name).offset)
+        moe_logical.append(resolve_plain(moe_tensors, "output_norm.weight").offset)
+        moe_logical.append(resolve_plain(moe_tensors, "output.weight").offset)
+        off = moe_logical.copy()
+        bufs.off = moe_logical.copy()
     var toks_d = bufs.toks_d
 
     var wst = WindowState(pos=0, pos_prev=0, ring=0, n_drafted=0, n_accepted=0, n_spec_windows=0, n_dumped=0, tp=0, tq=0, pf_att=0, pf_ssm=0, pf_ffn=0, pf_head=0, pf_proc=0, pf_draft=0, fc=[0, 0, 0, 0, 0, 0], pc=[0, 0, 0, 0, 0, 0, 0, 0], p3=[0, 0, 0, 0], pfx=[0, 0, 0, 0])
@@ -547,6 +599,7 @@ def main() raises:
         var ckpt_idx = -1
         var cached = 0
         var restore_s = 0.0
+        var force = force_env.copy()
         var stop_seqs = List[List[Int]]()
         var ckpt_hints = List[Int]()
         var sample = default_sample_params()
@@ -575,6 +628,26 @@ def main() raises:
             if req_has_spec:
                 spec = req_spec
             print("prompt tokens:", len(prompt), " n:", gen_n, " spec:", spec)
+            # Per-request teacher forcing. BARO_FORCE is read once at startup,
+            # so a forced run used to need one process per prompt: 20 pack
+            # loads for a 20-prompt gate, 1.4 s each on the MoE pack. A
+            # "force":[ids] field lets one resident process serve the whole
+            # gate. Absent, the request inherits BARO_FORCE.
+            var fi2 = json_key(line_in.value(), "force")
+            if fi2 >= 0:
+                force = List[Int]()
+                var fb = line_in.value().as_bytes()
+                if fi2 < len(fb) and fb[fi2] == 91:
+                    fi2 += 1
+                    while True:
+                        while fi2 < len(fb) and (fb[fi2] == 32 or fb[fi2] == 44):
+                            fi2 += 1
+                        if fi2 >= len(fb) or fb[fi2] == 93:
+                            break
+                        var fv = 0
+                        if not json_int(line_in.value(), fi2, fv):
+                            break
+                        force.append(fv)
             # M1a prefix checkpoint: restore the SSM slot for the longest
             # hashed prefix and keep the KV pool (position addressed, [0, cached)
             # still in place); the draft KV is never prefilled, so it is zeroed
@@ -680,7 +753,7 @@ def main() raises:
         # stage sum exceeds the unsynchronized sub-block time; compare stages
         # within an arm and the same stage across m, never add these into a budget.
         var pf4 = getenv("BARO_PROFILE", "0") == "4"
-        var cfg = WindowCfg(pack_q4=pack_q4, draft_q4=draft_q4, q4_off=q4_off, e=e, kcfg=kcfg, spec=spec, spec_dbg=spec_dbg, serve=serve, req_id=req_id, prof=prof, pf2=pf2, pf3=pf3, pf4=pf4, dump=dump, mega=mega, att_split=att_split, mega_win=mega_win, dot3=dot3, pf_chunk=pf_chunk, pf_rows=pf_rows, pf_tail=pf_tail, n_total=n_total, fr_k=fr_k, fr_off=fr_off, fr_ids_off=fr_ids_off, n_prompt=len(prompt))
+        var cfg = WindowCfg(pack_q4=pack_q4, draft_q4=draft_q4, q4_off=q4_off, e=e, kcfg=kcfg, spec=spec, spec_dbg=spec_dbg, serve=serve, req_id=req_id, prof=prof, pf2=pf2, pf3=pf3, pf4=pf4, dump=dump, dump4=dump4, dump_layer=dump_layer, mega=mega, att_split=att_split, mega_win=mega_win, dot3=dot3, pf_chunk=pf_chunk, pf_rows=pf_rows, pf_tail=pf_tail, n_total=n_total, fr_k=fr_k, fr_off=fr_off, fr_ids_off=fr_ids_off, n_prompt=len(prompt))
         if len(force) > 0 and cfg.spec:
             raise Error("BARO_FORCE requires BARO_SPEC=0 (teacher forcing is a no-spec identity gate)")
         wst.reset(t0)
@@ -792,6 +865,71 @@ def main() raises:
                 var dpp = bufs.dump_h.unsafe_ptr().unsafe_bitcast[UInt8]()
                 f.write_bytes(Span[UInt8](unsafe_ptr=dpp, length=wst.n_dumped * 2 * N_LAYERS * H * 4))
             print("dumped", wst.n_dumped, "tokens x", N_LAYERS, "layers to", dump_path)
+        if dump and getenv("BARO_DUMP_DIR", "") != "":
+            # Same container the packer writes and tools/tdiff.mojo reads:
+            # data.bin plus one "name f32 byte_offset n_elem" line per tensor.
+            # Names match llama.cpp's own (attn_residual-N, attn_post_norm-N,
+            # l_out-N, linear_attn_out-N) so a dump joins against
+            # llama-eval-callback's LLAMA_DUMP_DIR output by name, with no
+            # mapping table to drift.
+            var ddir = getenv("BARO_DUMP_DIR", "")
+            ctx.synchronize()
+            var dpp = bufs.dump_h.unsafe_ptr()
+            var names = List[String]()
+            var slots = List[Int]()
+            var lens = List[Int]()
+            comptime if not MEGA_ALLOWED:
+                if dump4 and (dump_layer + 1) % 4 == 0:
+                    # attention layer: the SSM slots never fire, and slots 4-6
+                    # carry the attention captures instead.
+                    names.append(String("attn_residual-") + String(dump_layer)); slots.append(0); lens.append(H)
+                    names.append(String("attn_post_norm-") + String(dump_layer)); slots.append(1); lens.append(H)
+                    names.append(String("l_out-") + String(dump_layer)); slots.append(2); lens.append(H)
+                    # Names are llama's, exactly. The first pass called our
+                    # pre-gate Ao "attn_output" and the o_proj result
+                    # "attn_oproj"; llama calls those attn_pregate and
+                    # attn_output, so tdiff was joining unrelated tensors of
+                    # different lengths and reported relL2 22.69 on a layer
+                    # whose downstream was provably at floor.
+                    names.append(String("attn_pregate-") + String(dump_layer)); slots.append(4); lens.append(ATT)
+                    names.append(String("attn_output-") + String(dump_layer)); slots.append(6); lens.append(H)
+                    names.append(String("Qcur_full-") + String(dump_layer)); slots.append(8); lens.append(QF)
+                    names.append(String("Qcur_normed-") + String(dump_layer)); slots.append(12); lens.append(ATT)
+                    names.append(String("Qcur-") + String(dump_layer)); slots.append(14); lens.append(ATT)
+                    names.append(String("Kcur_normed-") + String(dump_layer)); slots.append(16); lens.append(KV)
+                    names.append(String("Kcur-") + String(dump_layer)); slots.append(17); lens.append(KV)
+                elif dump4:
+                    # SSM layer sub-block captures, slot order set in window.mojo
+                    names.append(String("attn_residual-") + String(dump_layer)); slots.append(0)
+                    names.append(String("attn_post_norm-") + String(dump_layer)); slots.append(1); lens.append(H)
+                    names.append(String("l_out-") + String(dump_layer)); slots.append(2); lens.append(H)
+                    names.append(String("final_norm-") + String(dump_layer)); slots.append(3); lens.append(H)
+                    names.append(String("ssm_gates-") + String(dump_layer)); slots.append(5); lens.append(H)
+                    names.append(String("ssm_state_out-") + String(dump_layer)); slots.append(6); lens.append(H)
+                    names.append(String("linear_attn_out-") + String(dump_layer)); slots.append(7); lens.append(H)
+                    names.append(String("conv_out-") + String(dump_layer)); slots.append(8); lens.append(H)
+                else:
+                    for layer in range(N_LAYERS):
+                        names.append(String("attn_residual-") + String(layer))
+                        slots.append(2 * layer)
+                        lens.append(H)
+            var off = 0
+            var idx = String("")
+            with open(ddir + "/data.bin", "w") as fb:
+                for i in range(len(names)):
+                    var base = slots[i] * H
+                    var ln = lens[i]
+                    fb.write_bytes(
+                        Span[UInt8](
+                            unsafe_ptr=dpp.unsafe_offset(base).unsafe_bitcast[UInt8](),
+                            length=ln * 4,
+                        )
+                    )
+                    idx += names[i] + " f32 " + String(off) + " " + String(ln) + "\n"
+                    off += ln * 4
+            with open(ddir + "/index.txt", "w") as fi:
+                fi.write(idx)
+            print("dump dir:", ddir, len(names), "tensors")
         if pf5:
             var ph = ctx.enqueue_create_host_buffer[DType.int64](16 * N_LAYERS + 4)
             ctx.enqueue_copy(dst_buf=ph, src_buf=bufs.prof_d)
@@ -937,6 +1075,9 @@ def main() raises:
                 done_line += ",\"drafted\":" + String(wst.n_drafted) + ",\"accepted\":" + String(wst.n_accepted) + ",\"k\":" + String(kcfg)
             print(done_line + "}")
             continue
+
+        if not MEGA_ALLOWED:
+            return
 
         # MTP (NextN) draft head receipt, blk.32: last generated token paired with
         # the last trunk hidden row, attended at position 0 (arm A: empty draft

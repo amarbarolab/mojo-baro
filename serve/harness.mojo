@@ -2,6 +2,7 @@
 and kernels/test_prefix.mojo. Moved verbatim out of engine.mojo main (M1a);
 no decode-path code lives here.
 """
+from std.collections import Dict
 from std.ffi import c_ssize_t, external_call
 from std.math import ceildiv
 from std.time import perf_counter_ns
@@ -49,6 +50,20 @@ def load_pack(ctx: DeviceContext, packdir: String) raises -> Pack:
     var fr_off = 0
     var fr_ids_off = 0
     var fr_k = 0
+    # pack/profile mismatch guard (serve/moe_pack.mojo, bench/moe-loader-protocol.md):
+    # a pack built for one H/N_LAYERS read under a different profile's offsets
+    # silently walks off its tensors (observed: window.mojo out-of-bounds
+    # abort, exit -4) -- checked below, before any offset is used, against two
+    # numbers read back from the index itself: H implied by token_embd.weight's
+    # own element count, and the real transformer layer count implied by the
+    # blk.N groups. A group is excluded from the layer count entirely if ANY
+    # of its tensors is a "nextn.*" one: qwen35's optional MTP draft head packs
+    # a whole extra "blk.N.*" group (11 ordinary-looking tensor names plus 4
+    # nextn.* ones) appended after the real trunk, so a tensor's own name is
+    # not enough to tell a real layer from the draft head -- only "does this
+    # blk.N group contain a nextn.* tensor at all" is.
+    var h_implied = 0
+    var layer_has_nextn = Dict[Int, Bool]()
     with open(packdir + "/index.txt", "r") as f:
         for line in f.read().splitlines():
             var parts = line.split(" ")
@@ -56,18 +71,39 @@ def load_pack(ctx: DeviceContext, packdir: String) raises -> Pack:
                 continue
             var n = Int(parts[3])
             var dt = String(parts[1])
+            var name = String(parts[0])
             off.append(Int(parts[2]))
+            if name == "token_embd.weight":
+                h_implied = n // VOCAB
+            var dotparts = name.split(".")
+            if len(dotparts) >= 2 and String(dotparts[0]) == "blk":
+                var layer_n = Int(dotparts[1])
+                var is_nextn = len(dotparts) >= 3 and String(dotparts[2]) == "nextn"
+                if layer_n in layer_has_nextn:
+                    if is_nextn:
+                        layer_has_nextn[layer_n] = True
+                else:
+                    layer_has_nextn[layer_n] = is_nextn
             if dt == "bf16":
                 total += n * B2
             elif dt == "f32":
                 total += n * B4
             elif dt == "q8":
                 total += n + (n // 32) * 2
+            elif dt == "q8_0":
+                # raw ggml Q8_0: 32-value blocks, 32 int8 + one f16 scale
+                total += (n // 32) * 34
+            elif dt == "q4_k":
+                # raw ggml Q4_K: 256-value superblocks, 144 bytes each
+                total += (n // 256) * 144
+            elif dt == "q6_k":
+                # raw ggml Q6_K: 256-value superblocks, 210 bytes each
+                total += (n // 256) * 210
             elif dt == "q4":
-                if String(parts[0]) == "output.weight.frdraft":
+                if name == "output.weight.frdraft":
                     # trailing entry (tools/fr-draft.mojo): FR-Spec reduced draft head
                     fr_off = Int(parts[2])
-                elif String(parts[0]) == "output.weight.q4draft":
+                elif name == "output.weight.q4draft":
                     # trailing entry (tools/engine-pack.py --q4-draft): the draft
                     # head's own q4 copy of output.weight, appended after the
                     # trunk order -- excluded from the blk.32 index math below.
@@ -77,12 +113,29 @@ def load_pack(ctx: DeviceContext, packdir: String) raises -> Pack:
                     # --q4 pack: every 2D trunk weight is ggml Q4_0
                     pack_q4 = True
                 total += n // 2 + (n // 32) * 2
-            elif dt == "i32" and String(parts[0]) == "frdraft.ids":
+            elif dt == "i32" and name == "frdraft.ids":
                 fr_ids_off = Int(parts[2])
                 fr_k = n
                 total += n * 4
             else:
                 raise Error("unknown pack dtype " + dt)
+
+    if h_implied > 0 and h_implied != H:
+        raise Error(
+            "pack/profile mismatch: profile H " + String(H)
+            + ", pack " + packdir + " implies H " + String(h_implied)
+            + " from token_embd.weight"
+        )
+    var real_layers = 0
+    for entry in layer_has_nextn.items():
+        if not entry.value:
+            real_layers += 1
+    if real_layers > 0 and real_layers != N_LAYERS:
+        raise Error(
+            "pack/profile mismatch: profile N_LAYERS " + String(N_LAYERS)
+            + ", pack " + packdir + " implies " + String(real_layers)
+            + " real transformer layers (blk.N groups with no nextn.* tensor)"
+        )
 
     # --- load pack into one device buffer -----------------------------------
     print("loading pack:", total, "bytes")
@@ -153,10 +206,10 @@ def alloc_bufs(ctx: DeviceContext, pack: Pack, tmax: Int) raises -> WindowBufs:
     var beta_d = ctx.enqueue_create_buffer[f32](MROWS * NH_V)
     var conv_d = ctx.enqueue_create_buffer[f32](MROWS * CONV)
     var so_d = ctx.enqueue_create_buffer[f32](MROWS * NH_V * SSTATE)
-    var resb_d = ctx.enqueue_create_buffer[bf16](MROWS * H)
+    var resb_d = ctx.enqueue_create_buffer[bf16](MROWS * ATT)
     var qf_d = ctx.enqueue_create_buffer[f32](MROWS * QF)
     var q_d = ctx.enqueue_create_buffer[f32](MROWS * NQH * HD)
-    var gate_d = ctx.enqueue_create_buffer[f32](MROWS * H)
+    var gate_d = ctx.enqueue_create_buffer[f32](MROWS * ATT)
     var k_d = ctx.enqueue_create_buffer[f32](MROWS * KV)
     var v_d = ctx.enqueue_create_buffer[f32](MROWS * KV)
     var ao_d = ctx.enqueue_create_buffer[f32](MROWS * NQH * HD)
@@ -191,10 +244,10 @@ def alloc_bufs(ctx: DeviceContext, pack: Pack, tmax: Int) raises -> WindowBufs:
     var betap_d = ctx.enqueue_create_buffer[f32](CP * NH_V)
     var convp_d = ctx.enqueue_create_buffer[f32](CP * CONV)
     var sop_d = ctx.enqueue_create_buffer[f32](CP * NH_V * SSTATE)
-    var resbp_d = ctx.enqueue_create_buffer[bf16](CP * H)
+    var resbp_d = ctx.enqueue_create_buffer[bf16](CP * ATT)
     var qfp_d = ctx.enqueue_create_buffer[f32](CP * QF)
     var qp_d = ctx.enqueue_create_buffer[f32](CP * NQH * HD)
-    var gatep_d = ctx.enqueue_create_buffer[f32](CP * H)
+    var gatep_d = ctx.enqueue_create_buffer[f32](CP * ATT)
     var kp_d = ctx.enqueue_create_buffer[f32](CP * KV)
     var vp_d = ctx.enqueue_create_buffer[f32](CP * KV)
     var aop_d = ctx.enqueue_create_buffer[f32](CP * NQH * HD)
