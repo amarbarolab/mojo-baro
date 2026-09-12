@@ -110,6 +110,7 @@ Every `kernels/test_*.mojo`, the gate script that runs it, and its first docstri
 | `test_elementwise.mojo` | manual | Host-reference checks for the elementwise/decode kernel pack. |
 | `test_gemm.mojo` | run-tests.sh | Numeric check: shim GEMM on gfx1100 vs a host reference. |
 | `test_gguf_gemm.mojo` | manual | Parity check: real Qwythos bf16 weight through skinny_wt vs numpy reference. |
+| `test_latent.mojo` | run-tests.sh | Mint/ingest round trip for the LatentOS sidecar (serve/latent.mojo). |
 | `test_mega_block.mojo` | tools/mega-gate.sh | Stage 1+2+3 (+ multi-row window) gate of bench/megakernel-protocol.md. |
 | `test_mmq.mojo` | manual | Parity for the int8 MMQ prefill path (bench/prefill-protocol.md R5). |
 | `test_moe_block.mojo` | manual | Parity: one decode token through the qwen35moe sparse-MoE block on GPU vs the numpy reference (tools/moe-ref.py implementing transformers Qwen3_5MoeSparseMoeBlock). |

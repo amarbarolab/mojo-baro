@@ -26,5 +26,12 @@ mkdir -p .work/katt
 ./.work/test_spark_attn
 ./.venv/bin/python tools/spark-attn-ref.py .work/katt
 
+# serve/latent.mojo sat broken from 506e91d to 2e7b5d3 because nothing here
+# built it. This test names both mint and ingest, so the whole sidecar is
+# type-checked: Mojo checks lazily per reached symbol, and building a tool that
+# imports only one side leaves the other side's breakage invisible.
+./.venv/bin/mojo build kernels/test_latent.mojo -I kernels -I serve -o .work/test_latent
+./.work/test_latent
+
 ./.venv/bin/mojo build tools/kernel-census.mojo -o .work/kernel-census
 ./.work/kernel-census --check
