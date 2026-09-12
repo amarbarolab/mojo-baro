@@ -259,6 +259,27 @@ GPU test gates remain passing.
 
 Implementation commit: `b5293b9`.
 
+## W3 Gate 2 fix 5: attention inner width
+
+The single-token per-layer oracle localizes the first material divergence to
+layer 3, the first full-attention layer. Sampled relative L2 error is 0.42% at
+layer 2 output and 23.2% after layer 3 attention. Layer 3 projections remain
+close to llama.cpp: sampled `Qcur_full`, `attn_pregate`, and gate values agree
+within the expected accumulated quantization drift.
+
+The engine then truncates an impossible shape. RegesCore attention produces
+`NQH * HD = 4096` values for both the attention result and its gate, while the
+decode path allocates and multiplies only `H = 2048`, then invokes the output
+projection as `H x H`. llama.cpp reports `blk.3.attn_output.weight` as
+`4096 x 2048`.
+
+Registered prediction: sizing the gate and gated attention buffers to
+`NQH * HD`, multiplying all 4096 elements, and invoking the output projection
+with K=4096 makes layer 3 the same low-error continuation seen through layer 2.
+The full 20-prompt teacher-forced mean will exceed 45/64. Before scoring, an
+absurd attention bypass must move the single-token output, proving this path is
+live. The fix is accepted only after a committed-tree rebuild.
+
 ## W3 Gate 2 amendment: qwen35moe m=1 prefill replay
 
 The adopted W3 plan explicitly excludes m>1 MoE prefill: “Prefill runs the
