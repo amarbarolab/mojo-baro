@@ -116,6 +116,18 @@ with 91 kernels, 41 registry entries, and 0 orphans.
 
 Gate 1 receipt: `.work/moe-w3/gate1.txt`.
 
+Gate 2 remains UNVERIFIED at implementation commit `9e5cc60`. The fix builds
+qwen35moe's attention and SSM records as exact 16/19-entry named maps, uses
+named terminal norm/head offsets, preserves dense positional offsets, and
+exits the non-mega request path before the no-head NextN receipt. The qwen
+build exits 0. `./run-tests.sh` reaches `92 kernels, 42 in registry, 0
+orphans` but has one unrelated pre-existing host sampler failure (`real decode
+row`). The corrected llama reference extractor strips `timings.prompt_n` and
+requests 128 combined tokens for a 64-token continuation. Gate 2 then fails at
+p01 `1/64`; the candidate is non-zero and the reference is not being mistaken
+for a clean run. Receipt: `.work/moe-w3/gate2-force-final2/`; candidate build:
+`.work/moe-engine-positional-fix3`.
+
 ## W4
 
 Pending W3 and preregistration.
