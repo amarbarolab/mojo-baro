@@ -1,0 +1,5 @@
+# Lane CHAT — build brief
+
+Worktree: `$HOME/Projects/mojo/mojo-baro-lanes/CHAT` (branch `lane-CHAT`). Plan: `$HOME/Brain/mojo/mojo-baro/briefs/2026-09-11-chat-engine-next.md`, item **CHAT** — build exactly that item, nothing else.
+Read the `mojo-nightly-lane-builder` skill first (~/.claude/skills/.user/mojo-nightly-lane-builder/SKILL.md): its error table and bug-class list are the review checklist. Standing rules (from the plan's rules block, restated): the gate is the full suite, its output captured to `.work/CHAT-gate.txt`; report the test count before/after against the item's floor; commit each passing sub-step on `lane-CHAT`; three repair attempts, then write `.work/CHAT-failure.md` and stop; never edit or weaken a test to pass; files not listed in the item are out of scope — stop and report. Commit messages: conventional subject + why-body, NO attribution trailers (no Co-Authored-By, no 'Generated with', no session links).
+Report to `$HOME/Projects/mojo/mojo-baro/exchange/lane-CHAT-report.md`: gate command, exit code, test count before/after, evidence path, commits. Then push `DONE -> $HOME/Projects/mojo/mojo-baro/exchange/lane-CHAT-report.md`.
