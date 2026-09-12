@@ -13,24 +13,26 @@ fp16 variant (halves B traffic, doubles its roof).
 ## Gap inventory vs llama.cpp
 
 **The "nothing" column below is the 2026-09-01 state and is now historical.**
-Current state is in the right-hand column, updated 2026-09-05.
+Current state is in the right-hand column, updated 2026-09-12.
 
 | Layer | llama.cpp | mojo-baro 2026-09-01 | mojo-baro today |
 |---|---|---|---|
 | Weight loading | GGUF mmap + every quant format | nothing | GGUF v3 parser + `engine-pack.py` (bf16/q8/q4-draft); q8 pack bit-equal to `llama-quantize` Q8_0 |
-| Tokenizer | own BPE/SPM impl | nothing | still none — packs carry pre-tokenized prompts (deliberate non-goal) |
+| Tokenizer | own BPE/SPM impl | nothing | `serve/tokenizer.mojo`, bit-equal to llama.cpp on the same GGUF, default path since 2026-09-08 (`docs/TOKENIZER.md`) |
 | Elementwise kernels | RMSNorm, RoPE, SwiGLU, softmax | nothing | all present in `kernels/elementwise.mojo`, <=1e-6 vs fp64 host refs |
 | Attention | flash-decode style, GQA | nothing | GQA decode path + hybrid SSM sub-block (`attn.mojo`, `ssm.mojo`) |
 | KV cache | paged, quantized cache | nothing | contiguous f16 cache + (k+1)-slot ring for MTP rollback; not paged, not quantized |
-| Forward pass | graph per arch family | nothing | full Qwythos-9B decode, token-identical to llama.cpp 64/64 |
-| Sampling | full menu | nothing | greedy/argmax only |
-| Server | OpenAI-compatible HTTP | empty `serve/src` | still empty — no HTTP front |
-| Prefill | batched, causal-mask | n/a | **M=1 only; the main unbuilt item** (M5-PLAN 3) |
+| Forward pass | graph per arch family | nothing | four architectures: `qwen35` dense (token-identical to llama.cpp 64/64), `qwen35moe` 256-expert MoE, `spark2_5` in its own engine |
+| Sampling | full menu | nothing | device sampler kernels exist and are distribution-tested, but are not in the decode loop; generation is greedy today |
+| Server | OpenAI-compatible HTTP | empty `serve/src` | `baro-serve` (Rust, axum/tokio): chat + completions with SSE, models, cancel, tokenize, detokenize, health (`serve/PROTOCOL.md`) |
+| Prefill | batched, causal-mask | n/a | batched and chunked, WMMA flash attention + one-wave SSM scan; within ~1.3x of llama.cpp at 8k to 32k (`docs/prefill-long-ctx-2026-09-11.md`) |
 | GEMM decode M=8 | ~roofline via quants | **1.49x over vendor fp32** | q8 wave-per-row `amar_matmul_skinny_q8row`, 855 GB/s |
-| Decode tok/s | 74.1 no-spec / 123.5 MTP (20-prompt) | 25.5 | **68.8 no-spec / 100.7 MTP (20-prompt)** |
+| Decode tok/s | 74.1 no-spec / 123.5 MTP (20-prompt, q8) | 25.5 | q8: 68.8 no-spec / 100.7 MTP. **q4, the current champion: 136.72 no-spec / 150.96 with spec** (20-prompt medians) |
 
-Note the fp32/fp16 framing in the section above is two quantisations out of
-date: the engine is **q8-only** since `c3752e7`. fp16 was never the endpoint.
+Note the fp32/fp16 framing in the section above is several quantisations out of
+date. The engine went q8-only at `c3752e7`, and the default pack is **q4**
+today (`BARO_PACK`, default `.work/engine-pack-q4`). fp16 was never the
+endpoint.
 
 ## Build order — each milestone has a hard verify
 

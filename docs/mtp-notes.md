@@ -260,9 +260,11 @@ Key mechanics:
 
 ## 4. Implications for mojo-baro's engine
 
-mojo-baro (`serve/engine.mojo`) currently does full-model greedy decode,
-one token at a time (milestone 4, see `docs/BASELINE.md` for current KV/
-offset-table/B-layout-transposed conventions). To add draft-MTP:
+Written while the engine still did full-model greedy decode one token at a
+time (milestone 4, see `docs/BASELINE.md` for current KV/offset-table/
+B-layout-transposed conventions). The draft loop described below landed at
+`058dd28` and is on by default since `f4652f4`, so this section is the design
+note, not the current state. What it needed:
 
 - Need to run blk.32 as an *extra* decoder block, structurally = one more
   full-attention transformer layer (own QKVO, own Q/K RMSNorm, own gated

@@ -24,7 +24,7 @@ on datacenter GPUs; this engine optimises, on one 24 GB card:
 | time-to-tool-dispatch after last token of the call | end of stream | at the closing tag, typed event | tap timestamps |
 | decode tok/s_gen, q4 9B | 133.9 (measured) | 140+ (dot-loop schedule) | `bench/ab-prompts.sh` |
 | determinism | greedy only | same bytes for same request+seed, spec on/off | CI byte-compare |
-| receipts per response | none | prefill/cached/decode ms, acceptance, checkpoint hit, prefix churn | `usage.baro` |
+| receipts per response | `usage.baro` with `cached_tokens` and `prefill_rows` | plus decode ms, acceptance, checkpoint hit, prefix churn | `usage.baro` |
 
 ## 1. Shape table and instantiation
 

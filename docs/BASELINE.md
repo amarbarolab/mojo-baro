@@ -60,9 +60,11 @@ reporting throughput and exits non-zero if any variant is wrong.
 
 ## Engine (2026-09-04)
 
-`serve/engine.mojo` runs on the **q8 pack** by default (`BARO_PACK`, default
-`.work/engine-pack-q8`, built by `tools/engine-pack.py MODEL.gguf OUTDIR --q8`;
-`tools/q8-check.py` proves it bit-equal to `llama-quantize Q8_0`). All 2D
+The default pack is **q4** (`BARO_PACK`, default `.work/engine-pack-q4`); the
+q8 numbers in this section are the q8 arm, kept because they are what the
+kernel work below was measured on. The q8 pack is built by
+`tools/engine-pack.py MODEL.gguf OUTDIR --q8` and `tools/q8-check.py` proves it
+bit-equal to `llama-quantize Q8_0`. On that arm, all 2D
 weight GEMMs are `amar_matmul_skinny_q8row`: one wave per weight row over the
 weight-native [out, in] int8 layout plus fp16 block-32 scales, 855 GB/s on
 the ffn shape (62.6 us per 100 MB-equivalent stream). Decode: **68.8 tok/s_gen**,

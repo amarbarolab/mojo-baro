@@ -7,6 +7,7 @@ must be reachable from `serve/registry.mojo`, a bench, or a test.
 |---|---|---|---|---|
 | `amar_attn_decode` | `attn.mojo` | `QLayout: TensorLayout, KLayout: TensorLayout, OLayout: TensorLayout, NAT: Int` | att_k, att_1 | serve/registry.mojo, kernels/test_attn_block.mojo, kernels/test_mega_block.mojo, kernels/test_prefill.mojo |
 | `amar_attn_prefill` | `attn.mojo` | `QLayout: TensorLayout, KLayout: TensorLayout, OLayout: TensorLayout, NAT: Int` | attp_k | serve/registry.mojo, kernels/test_prefill.mojo |
+| `amar_attn_prefill_wmma` | `attn.mojo` | `QLayout: TensorLayout, KLayout: TensorLayout, OLayout: TensorLayout, NAT: Int` | attpw_k | serve/registry.mojo, kernels/test_prefill.mojo |
 | `amar_gate_mul` | `attn.mojo` | `XLayout: TensorLayout, GLayout: TensorLayout` |  | kernels/test_attn_block.mojo |
 | `amar_gate_mul_cast` | `attn.mojo` | `XLayout: TensorLayout, GLayout: TensorLayout, OLayout: TensorLayout` | gmul_k, gmul_p | serve/registry.mojo, kernels/test_mega_block.mojo |
 | `amar_head_rmsnorm` | `attn.mojo` | `XLayout: TensorLayout, GLayout: TensorLayout` | hrms_q, hrms_kv, hrms_qp, hrms_kvp | serve/registry.mojo, kernels/test_attn_block.mojo, kernels/test_mega_block.mojo |
@@ -62,7 +63,10 @@ must be reachable from `serve/registry.mojo`, a bench, or a test.
 | `amar_mega_token` | `mega.mojo` | `MR: Int, RELOAD: Bool, Q4: Bool, XL: TensorLayout, CBL: TensorLayout, QkvL: TensorLayout, G32mL: TensorLayout, ConvL: TensorLayout, OmL: TensorLayout, CsL: TensorLayout, SsL: TensorLayout, QfL: TensorLayout, KvfL: TensorLayout, QmL: TensorLayout, GfL: TensorLayout, PfL: TensorLayout, FbL: TensorLayout, OffL: TensorLayout, CtrL: TensorLayout, TkL: TensorLayout, DkL: TensorLayout, NL: Int, NAT: Int,` | mega_token_k, mega_token_q4_k | serve/registry.mojo, kernels/test_mega_block.mojo |
 | `amar_mega_window` | `mega.mojo` | `MR: Int, RELOAD: Bool, Q4: Bool, XL: TensorLayout, CBL: TensorLayout, QkvL: TensorLayout, G32mL: TensorLayout, ConvL: TensorLayout, OmL: TensorLayout, CsL: TensorLayout, SsL: TensorLayout, QfL: TensorLayout, KvfL: TensorLayout, QmL: TensorLayout, GfL: TensorLayout, PfL: TensorLayout, FbL: TensorLayout, OffL: TensorLayout, CtrL: TensorLayout, TkL: TensorLayout, DkL: TensorLayout, NL: Int, NAT: Int,` | mega_win_k | serve/registry.mojo, kernels/test_mega_block.mojo |
 | `amar_moe_down` | `moe.mojo` | `NSEL: Int, FFN: Int, HLayout: TensorLayout, DLayout: TensorLayout, ILayout: TensorLayout, WLayout: TensorLayout, OLayout: TensorLayout` |  | kernels/test_moe_block.mojo |
+| `amar_moe_down_q4k` | `moe.mojo` | `NSEL: Int, FFN: Int, HLayout: TensorLayout, ILayout: TensorLayout, WLayout: TensorLayout, OLayout: TensorLayout` |  | kernels/test_moe_block.mojo |
+| `amar_moe_down_q6k` | `moe.mojo` | `NSEL: Int, FFN: Int, HLayout: TensorLayout, ILayout: TensorLayout, WLayout: TensorLayout, OLayout: TensorLayout` |  | serve/registry.mojo |
 | `amar_moe_gate_up` | `moe.mojo` | `NSEL: Int, FFN: Int, XLayout: TensorLayout, GLayout: TensorLayout, ULayout: TensorLayout, ILayout: TensorLayout, HLayout: TensorLayout` |  | kernels/test_moe_block.mojo |
+| `amar_moe_gate_up_q4k` | `moe.mojo` | `NSEL: Int, FFN: Int, XLayout: TensorLayout, ILayout: TensorLayout, HLayout: TensorLayout` |  | kernels/test_moe_block.mojo |
 | `amar_moe_router_top8` | `moe.mojo` | `LLayout: TensorLayout, ILayout: TensorLayout, WLayout: TensorLayout` |  | kernels/test_moe_block.mojo |
 | `amar_moe_sig_gate` | `moe.mojo` | `XLayout: TensorLayout, GLayout: TensorLayout, OLayout: TensorLayout` |  | kernels/test_moe_block.mojo |
 | `amar_realign_gather` | `realign_kernels.mojo` | `TLayout: TensorLayout, PLayout: TensorLayout, PartLayout: TensorLayout` |  | kernels/test_realign.mojo |
@@ -83,6 +87,7 @@ must be reachable from `serve/registry.mojo`, a bench, or a test.
 | `amar_ssm_conv` | `ssm.mojo` | `QLayout: TensorLayout, SLayout: TensorLayout, WLayout: TensorLayout, OLayout: TensorLayout` | conv_k | serve/registry.mojo, bench/bench_launch_floor.mojo, kernels/test_mega_block.mojo, kernels/test_prefill.mojo, kernels/test_ssm_block.mojo |
 | `amar_ssm_conv_chunk` | `ssm.mojo` | `QLayout: TensorLayout, SLayout: TensorLayout, WLayout: TensorLayout, OLayout: TensorLayout` | conv_p | serve/registry.mojo, kernels/test_prefill.mojo |
 | `amar_ssm_delta_chunk` | `ssm.mojo` | `S0Layout: TensorLayout, CLayout: TensorLayout, GLayout: TensorLayout, OLayout: TensorLayout` | delta_p | serve/registry.mojo, kernels/test_prefill.mojo |
+| `amar_ssm_delta_chunk_w` | `ssm.mojo` | `S0Layout: TensorLayout, CLayout: TensorLayout, GLayout: TensorLayout, OLayout: TensorLayout` | deltaw_p | serve/registry.mojo, kernels/test_prefill.mojo |
 | `amar_ssm_delta_step` | `ssm.mojo` | `MR: Int, S0Layout: TensorLayout, CLayout: TensorLayout, GLayout: TensorLayout, OLayout: TensorLayout` |  | serve/registry.mojo, bench/bench_launch_floor.mojo, kernels/test_mega_block.mojo, kernels/test_prefill.mojo, kernels/test_ssm_block.mojo |
 | `amar_ssm_gated_out` | `ssm.mojo` | `OLayout: TensorLayout, ZLayout: TensorLayout, NLayout: TensorLayout, RLayout: TensorLayout` |  | kernels/test_ssm_block.mojo |
 | `amar_ssm_gated_out_bf16` | `ssm.mojo` | `OLayout: TensorLayout, ZLayout: TensorLayout, NLayout: TensorLayout, RLayout: TensorLayout` | gated_k | serve/registry.mojo, bench/bench_launch_floor.mojo, kernels/test_mega_block.mojo, kernels/test_prefill.mojo |
@@ -92,6 +97,7 @@ must be reachable from `serve/registry.mojo`, a bench, or a test.
 | `amar_ssm_qk_l2norm` | `ssm.mojo` | `XLayout: TensorLayout` | l2_k | serve/registry.mojo, bench/bench_launch_floor.mojo, kernels/test_mega_block.mojo, kernels/test_prefill.mojo, kernels/test_ssm_block.mojo |
 | `amar_ssm_qk_l2norm_rows` | `ssm.mojo` | `XLayout: TensorLayout` | l2_p | serve/registry.mojo, kernels/test_prefill.mojo |
 | `amar_ssm_reduce_gates` | `ssm.mojo` | `PLayout: TensorLayout, GLayout: TensorLayout, DLayout: TensorLayout` | rgates_k | serve/registry.mojo, bench/bench_launch_floor.mojo, kernels/test_mega_block.mojo |
+| `amar_widen_bf16` | `ssm.mojo` | `XLayout: TensorLayout, OLayout: TensorLayout` | widen_1 | serve/registry.mojo |
 
 ## Tests
 

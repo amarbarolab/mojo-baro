@@ -117,7 +117,9 @@ The right chunk size needs prompt-length/TTFT measurements, not a decode ratio.
 MAX_T=1024 in attn.mojo sizes shared score storage; it is not a chunk size or
 supported context promise. Registry TMAX=128 sizes actual KV/token buffers.
 Long-context work must reconcile these and enforce prompt+generation capacity
-before writes; current main has no such bounds guard. Changing a constant alone
+before writes. That guard now exists: `serve/engine.mojo` rejects a request
+whose prompt plus generation exceeds `tmax` before any write, and checks
+`n_total` again in the decode loop. Changing a constant alone
 is not a prefill implementation. Larger score arrays also increase shared-memory
 pressure. Prefill affects TTFT/total latency, not the decode-only tok/s_gen target.
 

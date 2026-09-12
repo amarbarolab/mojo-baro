@@ -21,7 +21,7 @@ minutes, no model weights needed.
 | Qwythos-9B | `qwen35` (hybrid SSM + attention, MTP head) | main engine: chat server, speculative decode, prefix checkpoints, RULER at 32k |
 | Ornith-1.5-9B | `qwen35` | same engine, packed from a Q4_K GGUF; 98.4% teacher-forced agreement with llama.cpp |
 | Spark-X2.5-4B | `spark2_5` (gated sliding-window attention) | its own engine, `serve/spark.mojo` |
-| RegesCore-35B | `qwen35moe` (256 experts, top 8) | MoE block kernel parity-gated on real weights; not wired into the engine yet |
+| RegesCore-35B | `qwen35moe` (256 experts, top 8) | decodes and serves; 53.20/64 mean teacher-forced agreement with llama.cpp over 20 prompts, above the dense path's own 51.90 on a quant-matched arm. No performance round yet. |
 
 Model weights are not distributed with this repo.
 
@@ -49,9 +49,12 @@ the current ratio is higher than 1.19x, but the llama.cpp bar has not been
 re-measured since, and a ratio is only worth quoting when both sides were
 measured in the same stint.
 
-Speculative decode with the model's own MTP head is opt-in (`BARO_SPEC=1`) and
-output-identical to plain greedy decode on every prompt tested. On the q4 pack
-it gives 1.10x at k=2 ([`bench/mtp-protocol.md`](bench/mtp-protocol.md)).
+Speculative decode with the model's own MTP head is on by default
+(`BARO_SPEC=0` turns it off) and output-identical to plain greedy decode on
+every prompt tested. On the q4 pack it gives 1.1042x at k=2 as a 20-prompt
+median, 150.96 against 136.72 tok/s_gen
+([`bench/mtp-protocol.md`](bench/mtp-protocol.md)). A single prompt read only
+1.012x, which is why that number is a median and not one run.
 Prefill was the known weak spot and is now within about 1.3x of llama.cpp at 8k
 to 32k context, down from 2.5 to 3.3x: 3.29 s at 8k against its 2.56 s (1.29x),
 7.17 s at 16k against 5.60 s (1.28x), 17.42 s at 32k against 13.18 s (1.32x).
@@ -159,7 +162,7 @@ Serving a model (after packing a GGUF with `tools/engine-pack.py`):
 
 | | |
 |---|---|
-| `kernels/` | Mojo GPU kernels and their parity tests (`docs/KERNELS.md` lists all 85) |
+| `kernels/` | Mojo GPU kernels and their parity tests (`docs/KERNELS.md` lists all 93, generated) |
 | `serve/` | the engines (`engine.mojo`, `spark.mojo`), tokenizer, prefix cache, and the Rust server |
 | `bench/` | benchmark harnesses and the frozen protocols |
 | `shim/` | C++ hipBLASLt shim behind a C ABI, the vendor reference arm |
