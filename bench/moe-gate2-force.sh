@@ -27,7 +27,7 @@ cleanup
 trap - EXIT
 for tf in bench/mtp-prompts/p*.tokens; do
     p=$(basename "$tf" .tokens)
-    BARO_MEGA=0 BARO_PREFILL=0 BARO_PACK=.work/moe-w1/pack BARO_PROMPT="$tf" BARO_FORCE="$out/$p.ref.ids" "$engine" > "$out/$p.cand.log" 2>&1
+    BARO_MEGA=0 BARO_PACK=.work/moe-w1/pack BARO_PROMPT="$tf" BARO_FORCE="$out/$p.ref.ids" "$engine" > "$out/$p.cand.log" 2>&1
     grep -q '^forced agreement: 64 / 64' "$out/$p.cand.log"
 done
 echo "20/20 prompts, 64/64 forced agreement"
