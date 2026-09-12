@@ -222,7 +222,7 @@ def blk32_forward(
     var Ph = TileTensor(p_h_d, p_h)
     var Qfm = TileTensor(qf_d, qfm_layout)
     var Q = TileTensor(q_d, qm_layout)
-    var Gate = TileTensor(gate_d, xflat_layout)
+    var Gate = TileTensor(gate_d, attflat_layout)
     var Kflat = TileTensor(k_d, kvm_flat)
     var Khd = TileTensor(k_d, kvm_layout)
     var Vflat = TileTensor(v_d, kvm_flat)
@@ -230,9 +230,9 @@ def blk32_forward(
     var Kc = TileTensor(kc32_d, cache1_layout)
     var Vc = TileTensor(vc32_d, cache1_layout)
     var Ao = TileTensor(ao_d, qm_layout)
-    var Aoflat = TileTensor(ao_d, xflat_layout)
-    var AoB = TileTensor(resb_d, xflat_layout)
-    var AoBm = TileTensor(resb_d, xm_layout)
+    var Aoflat = TileTensor(ao_d, attflat_layout)
+    var AoB = TileTensor(resb_d, attflat_layout)
+    var AoBm = TileTensor(resb_d, attm_layout)
     gemm_w[QF, H](ctx, CurBm, wbuf, off[e + 1], pack_q4, Pqf, m)
     ctx.enqueue_function[r_qf](Pqf, Qfm, Int32(m), Int32(QF), grid_dim=ceildiv(m * QF, 256), block_dim=256)
     gemm_w[KV, H](ctx, CurBm, wbuf, off[e + 2], pack_q4, Pkv, m)
@@ -247,8 +247,8 @@ def blk32_forward(
     ctx.enqueue_function[append_1](Kc, Khd, Int32(pos), Int32(0), grid_dim=(NKVH, m), block_dim=HD)
     ctx.enqueue_function[append_1](Vc, Vhd, Int32(pos), Int32(0), grid_dim=(NKVH, m), block_dim=HD)
     ctx.enqueue_function[att_1](Q, Kc, Vc, Ao, Int32(pos + 1), Float32(0.0625), Int32(0), grid_dim=(NQH, m), block_dim=HD)
-    ctx.enqueue_function[gmul_k](Aoflat, Gate, AoB, Int32(m * H), grid_dim=ceildiv(m * H, 256), block_dim=256)
-    gemm_w[H, H](ctx, AoBm, wbuf, off[e + 6], pack_q4, Ph, m)
+    ctx.enqueue_function[gmul_k](Aoflat, Gate, AoB, Int32(m * ATT), grid_dim=ceildiv(m * ATT, 256), block_dim=256)
+    gemm_w[H, ATT](ctx, AoBm, wbuf, off[e + 6], pack_q4, Ph, m)
     ctx.enqueue_function[r_add](Ph, Xm, Int32(m), Int32(H), grid_dim=ceildiv(m * H, 256), block_dim=256)
 
     var PostAttnNorm = tens_f32(ctx, wbuf, off[e + 7], H, h_layout)
@@ -396,7 +396,7 @@ def prefill_forward(
             var Kn = tens_f32(ctx, wbuf, off[w + 5], HD, hd_layout)
             var Qfp = TileTensor(qfp_d, qfp_layout)
             var Qp = TileTensor(qp_d, qp_layout)
-            var Gatep = TileTensor(gatep_d, xpflat_layout)
+            var Gatep = TileTensor(gatep_d, attpflat_layout)
             var Kflat = TileTensor(kp_d, kvp_flat)
             var Khd = TileTensor(kp_d, kvp_layout)
             var Vflat = TileTensor(vp_d, kvp_flat)
@@ -404,9 +404,9 @@ def prefill_forward(
             var Kc = TileTensor(kc_d, cache_layout)
             var Vc = TileTensor(vc_d, cache_layout)
             var Aop = TileTensor(aop_d, qp_layout)
-            var Aopflat = TileTensor(aop_d, xpflat_layout)
-            var AoBp = TileTensor(resbp_d, xpflat_layout)
-            var AoBpm = TileTensor(resbp_d, xp_layout)
+            var Aopflat = TileTensor(aop_d, attpflat_layout)
+            var AoBp = TileTensor(resbp_d, attpflat_layout)
+            var AoBpm = TileTensor(resbp_d, attp_layout)
             gemm_pw[QF, H, False](ctx, CurBp, wbuf, off[w + 1], pack_q4, Qfp, m, prof, gemm_ns)
             gemm_pw[KV, H, False](ctx, CurBp, wbuf, off[w + 2], pack_q4, Kflat, m, prof, gemm_ns)
             gemm_pw[KV, H, False](ctx, CurBp, wbuf, off[w + 3], pack_q4, Vflat, m, prof, gemm_ns)
@@ -425,8 +425,8 @@ def prefill_forward(
             if prof:
                 ctx.synchronize()
                 pfx[0] += Int(perf_counter_ns() - ta)
-            ctx.enqueue_function[gmul_p](Aopflat, Gatep, AoBp, Int32(m * H), grid_dim=ceildiv(m * H, 256), block_dim=256)
-            gemm_pw[H, H, True](ctx, AoBpm, wbuf, off[w + 6], pack_q4, Xp, m, prof, gemm_ns)
+            ctx.enqueue_function[gmul_p](Aopflat, Gatep, AoBp, Int32(m * ATT), grid_dim=ceildiv(m * ATT, 256), block_dim=256)
+            gemm_pw[H, ATT, True](ctx, AoBpm, wbuf, off[w + 6], pack_q4, Xp, m, prof, gemm_ns)
             att_i += 1
             w += 7
         else:
@@ -866,7 +866,7 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                 var Ph = TileTensor(b.p_h_d, p_h)
                 var Qfm = TileTensor(b.qf_d, qfm_layout)
                 var Q = TileTensor(b.q_d, qm_layout)
-                var Gate = TileTensor(b.gate_d, xflat_layout)
+                var Gate = TileTensor(b.gate_d, attflat_layout)
                 var Kflat = TileTensor(b.k_d, kvm_flat)
                 var Khd = TileTensor(b.k_d, kvm_layout)
                 var Vflat = TileTensor(b.v_d, kvm_flat)
@@ -882,9 +882,9 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                 var Kc = TileTensor(kcb, cache_layout)
                 var Vc = TileTensor(vcb, cache_layout)
                 var Ao = TileTensor(b.ao_d, qm_layout)
-                var Aoflat = TileTensor(b.ao_d, xflat_layout)
-                var AoB = TileTensor(b.resb_d, xflat_layout)
-                var AoBm = TileTensor(b.resb_d, xm_layout)
+                var Aoflat = TileTensor(b.ao_d, attflat_layout)
+                var AoB = TileTensor(b.resb_d, attflat_layout)
+                var AoBm = TileTensor(b.resb_d, attm_layout)
 
                 comptime if MEGA_ALLOWED:
                     gemm_w[QF, H](ctx, CurBm, b.wbuf, b.off[w + 1], cfg.pack_q4, Pqf, m)
@@ -922,12 +922,12 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                         ctx.enqueue_function[dcomb_k](Pa, Ao, Int32(dns), grid_dim=m * NQH, block_dim=ROW_THREADS)
                 else:
                     ctx.enqueue_function[att_k](Q, Kc, Vc, Ao, Int32(st.pos + 1), Float32(0.0625), Int32(att_i), grid_dim=(NQH, m), block_dim=HD)
-                ctx.enqueue_function[gmul_k](Aoflat, Gate, AoB, Int32(m * H), grid_dim=ceildiv(m * H, 256), block_dim=256)
+                ctx.enqueue_function[gmul_k](Aoflat, Gate, AoB, Int32(m * ATT), grid_dim=ceildiv(m * ATT, 256), block_dim=256)
                 comptime if MEGA_ALLOWED:
-                    gemm_w[H, H](ctx, AoBm, b.wbuf, b.off[w + 6], cfg.pack_q4, Ph, m)
+                    gemm_w[H, ATT](ctx, AoBm, b.wbuf, b.off[w + 6], cfg.pack_q4, Ph, m)
                 else:
-                    ctx.enqueue_function[moe_matmul_q8_0_m1[type_of(h_layout), type_of(xm_layout)]](
-                        AoBm, b.wbuf.unsafe_ptr() + b.off[moe_base + 6], row_f32(ctx, b.p_h_d, 0, H, h_layout), Int32(H), Int32(H), Int32((H // 32) * 34),
+                    ctx.enqueue_function[moe_matmul_q8_0_m1[type_of(h_layout), type_of(attm_layout)]](
+                        AoBm, b.wbuf.unsafe_ptr() + b.off[moe_base + 6], row_f32(ctx, b.p_h_d, 0, H, h_layout), Int32(H), Int32(ATT), Int32((ATT // 32) * 34),
                         grid_dim=ceildiv(H, 8), block_dim=256)
                 ctx.enqueue_function[r_add](Ph, Xm, Int32(m), Int32(H), grid_dim=ceildiv(m * H, 256), block_dim=256)
                 att_i += 1

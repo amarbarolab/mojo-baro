@@ -53,6 +53,9 @@ comptime h_layout = row_major[H]()
 comptime h2_layout = row_major[1, H]()
 comptime xm_layout = row_major[MROWS, H]()
 comptime xflat_layout = row_major[MROWS * H]()
+comptime ATT = NQH * HD
+comptime attm_layout = row_major[MROWS, ATT]()
+comptime attflat_layout = row_major[MROWS * ATT]()
 comptime qfm_layout = row_major[MROWS, QF]()
 comptime convm_layout = row_major[MROWS, CONV]()
 comptime qm_layout = row_major[MROWS * NQH, HD]()
@@ -158,6 +161,8 @@ comptime mega_win_k = amar_mega_window[
 
 comptime xp_layout = row_major[CP, H]()
 comptime xpflat_layout = row_major[CP * H]()
+comptime attp_layout = row_major[CP, ATT]()
+comptime attpflat_layout = row_major[CP * ATT]()
 comptime qfp_layout = row_major[CP, QF]()
 comptime g32p_layout = row_major[CP, NH_V]()
 comptime convp_layout = row_major[CP, CONV]()
@@ -200,7 +205,7 @@ comptime l2_k = amar_ssm_qk_l2norm[type_of(convm_layout)]
 comptime gated_k = amar_ssm_gated_out_bf16[
     type_of(om_layout), type_of(xm_layout), type_of(n128_layout), type_of(xm_layout)
 ]
-comptime split_k = amar_qgate_split[type_of(qfm_layout), type_of(qm_layout), type_of(xflat_layout)]
+comptime split_k = amar_qgate_split[type_of(qfm_layout), type_of(qm_layout), type_of(attflat_layout)]
 comptime hrms_q = amar_head_rmsnorm[type_of(qm_layout), type_of(hd_layout)]
 comptime hrms_kv = amar_head_rmsnorm[type_of(kvm_layout), type_of(hd_layout)]
 comptime rope_q = amar_rope_yarn[type_of(qm_layout)]
@@ -211,7 +216,7 @@ comptime att_k = amar_attn_decode[type_of(qm_layout), type_of(cache_layout), typ
 comptime att_1 = amar_attn_decode[type_of(qm_layout), type_of(cache1_layout), type_of(qm_layout), 1]
 comptime datt_k = amar_dattn_split[HD, NQH, NKVH, KVT, N_ATT, DATT_NLD, False, type_of(qm_layout), type_of(cache_layout), type_of(qm_layout), type_of(p_att_layout)]
 comptime dcomb_k = amar_dattn_combine[HD, MEGA_G, type_of(p_att_layout), type_of(qm_layout)]
-comptime gmul_k = amar_gate_mul_cast[type_of(xflat_layout), type_of(xflat_layout), type_of(xflat_layout)]
+comptime gmul_k = amar_gate_mul_cast[type_of(attflat_layout), type_of(attflat_layout), type_of(attflat_layout)]
 
 comptime rmsc_p = amar_rmsnorm_cast[type_of(xp_layout), type_of(h_layout), type_of(xp_layout)]
 comptime embed_p = amar_embed_lookup_pos[type_of(emb_layout), type_of(xp_layout), type_of(toks_layout)]
@@ -221,7 +226,7 @@ comptime l2_p = amar_ssm_qk_l2norm_rows[type_of(convp_layout)]
 comptime delta_p = amar_ssm_delta_chunk[type_of(ssall_layout), type_of(convp_layout), type_of(g32p_layout), type_of(op_layout)]
 comptime deltaw_p = amar_ssm_delta_chunk_w[type_of(ssall_layout), type_of(convp_layout), type_of(g32p_layout), type_of(op_layout)]
 comptime gated_p = amar_ssm_gated_out_rows_bf16[type_of(op_layout), type_of(xp_layout), type_of(n128_layout), type_of(xp_layout)]
-comptime split_p = amar_qgate_split[type_of(qfp_layout), type_of(qp_layout), type_of(xpflat_layout)]
+comptime split_p = amar_qgate_split[type_of(qfp_layout), type_of(qp_layout), type_of(attpflat_layout)]
 comptime hrms_qp = amar_head_rmsnorm[type_of(qp_layout), type_of(hd_layout)]
 comptime hrms_kvp = amar_head_rmsnorm[type_of(kvp_layout), type_of(hd_layout)]
 comptime rope_qp = amar_rope_yarn[type_of(qp_layout)]
@@ -229,7 +234,7 @@ comptime rope_kp = amar_rope_yarn[type_of(kvp_layout)]
 comptime append_p = amar_kv_append[type_of(cache_layout), type_of(kvp_layout), N_ATT]
 comptime attp_k = amar_attn_prefill[type_of(qp_layout), type_of(cache_layout), type_of(qp_layout), N_ATT]
 comptime attpw_k = amar_attn_prefill_wmma[type_of(qp_layout), type_of(cache_layout), type_of(qp_layout), N_ATT]
-comptime gmul_p = amar_gate_mul_cast[type_of(xpflat_layout), type_of(xpflat_layout), type_of(xpflat_layout)]
+comptime gmul_p = amar_gate_mul_cast[type_of(attpflat_layout), type_of(attpflat_layout), type_of(attpflat_layout)]
 comptime swiglu_p = amar_prefill_swiglu_bf16[type_of(ffnp_layout), type_of(ffnp_layout)]
 
 
