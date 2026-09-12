@@ -221,3 +221,37 @@ commit 03:44:39). Every number happened to be accurate; none of the receipts
 covered the tree being claimed. The same lane's falsifier verdict was
 reported from 2 of 20 prompts, and the one long prompt it tested was the
 shortest of the nine that mattered.
+
+## P14. A gate's bar must be a number some known-good configuration has hit
+
+Before a pass threshold is frozen, measure what the mature path on the same
+hardware actually reaches against the same reference on a quant-matched arm.
+A bar nobody has ever cleared is not a bar, it is an open-ended hunt, and it
+will be read as "the new thing is broken" for as long as it stands.
+
+Why: W3 gate 2 required 20 prompts at 64/64 teacher-forced agreement against
+llama.cpp. On 2026-09-12 the MoE path reached 53.20 and was treated as
+failing for a whole session. Measured the same day, our DENSE path -- the one
+that ships, verified, on Qwythos -- reaches **51.90** against llama on a
+quant-matched arm (our q4 pack against Qwythos-9B Q4_0-pure, engine
+318cc092, 20 prompts, min 38, max 60). The MoE path was already ABOVE the
+ceiling of the known-good path while being called broken.
+
+The cause is not a defect: our activations pass through bf16 (`curb_d`)
+before every matmul while llama keeps f32. bf16 carries 8 mantissa bits,
+2^-8 = 0.39% relative, and the measured per-layer floor against llama is
+0.44%. Over 40 layers, with MoE routing making a discrete top-8-of-256
+choice, that is enough to flip a share of tokens.
+
+This repo already knew the principle and did not apply it: CLAUDE.md records
+that llama.cpp's own f16-KV config fails its own f32 reference at 5 of 7
+lengths, which is exactly why identity gates are teacher-forced agreement
+"never greedy 64-token equality past ~256 ids". Gate 2 asked for the thing
+the rule says not to ask for.
+
+Corollary, learned the same day: before calling any per-layer divergence a
+defect, check whether the model CANCELS there. Layer 31's residual read 10x
+worse than its neighbours and was localised as the break. It is not: that
+layer subtracts two vectors of RMS 0.85 into a result of RMS 0.095, and
+llama does the same, 8.9x, with our magnitudes matching to three decimals.
+The relative error is amplified cancellation of a constant input error.
