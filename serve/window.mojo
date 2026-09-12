@@ -20,7 +20,7 @@ from moe import (
     MOE_WAVES, MOE_THREADS, N_EXP, TOPK, E_FFN, SH_FFN,
 )
 from matmul_skinny import amar_matmul_skinny_m1_row
-from ssm import amar_cast_bf16, amar_ssm_gated_out_bf16
+from ssm import amar_cast_bf16, amar_widen_bf16, amar_ssm_gated_out_bf16
 from dattn import dattn_nsplit
 from mega import DATT_NLD
 
@@ -577,6 +577,7 @@ struct WindowCfg(Copyable, Movable):
     var pf3: Bool
     var pf4: Bool
     var dump: Bool
+    var dump4: Bool
     var mega: Bool
     var att_split: Int
     var mega_win: Bool
@@ -647,16 +648,19 @@ comptime moe_inner_layout = row_major[NH_V * SSTATE]()
 comptime moe_inner_m_layout = row_major[1, NH_V * SSTATE]()
 comptime moe_om_layout = row_major[1, NH_V, SSTATE]()
 def moe_ffn(ctx: DeviceContext, mut b: WindowBufs, Xm: TileTensor[f32, type_of(xm_layout), MutAnyOrigin], CurBm: TileTensor[bf16, type_of(xm_layout), MutAnyOrigin], w: Int, layer: Int, routed_base: Int, extra_base: Int) raises:
-    var X = row_f32(ctx, b.x_d, 0, H, moe_vec_layout)
+    var Xres = row_f32(ctx, b.x_d, 0, H, moe_vec_layout)
+    var X = row_f32(ctx, b.p_h_d, 0, H, moe_vec_layout)
+    var X2 = row_f32(ctx, b.p_h_d, 0, H, h2_layout)
+    ctx.enqueue_function[amar_widen_bf16[type_of(moe_vec_layout), type_of(moe_vec_layout)]](row_bf16(ctx, b.curb_d, 0, H, moe_vec_layout), X, Int32(H), grid_dim=ceildiv(H, 256), block_dim=256)
     var Router = tens_f32(ctx, b.wbuf, b.off[extra_base], N_EXP * H, moe_router_layout)
     var Logits = row_f32(ctx, b.logits_d, 0, N_EXP, moe_logits_layout)
     var Idx = TileTensor[DType.int32, type_of(moe_idx_layout), MutAnyOrigin](b.hidx_d, moe_idx_layout)
     var Wt = TileTensor[f32, type_of(moe_idx_layout), MutAnyOrigin](b.hmax_d, moe_idx_layout)
-    comptime k_router = amar_matmul_skinny_m1_row[f32, 2, type_of(xm_layout), type_of(moe_router_layout), type_of(moe_logits_layout)]
-    ctx.enqueue_function[k_router](Xm, Router, Logits, Int32(N_EXP), Int32(H), grid_dim=ceildiv(N_EXP, ROW_WAVES), block_dim=ROW_THREADS)
+    comptime k_router = amar_matmul_skinny_m1_row[f32, 2, type_of(h2_layout), type_of(moe_router_layout), type_of(moe_logits_layout)]
+    ctx.enqueue_function[k_router](X2, Router, Logits, Int32(N_EXP), Int32(H), grid_dim=ceildiv(N_EXP, ROW_WAVES), block_dim=ROW_THREADS)
     ctx.enqueue_function[amar_moe_router_top8[type_of(moe_logits_layout), type_of(moe_idx_layout), type_of(moe_idx_layout)]](Logits, Idx, Wt, grid_dim=1, block_dim=N_EXP)
-    var routed = row_f32(ctx, b.p_h_d, 0, H, moe_vec_layout)
-    var shared = row_f32(ctx, b.p_qf_d, 0, H, moe_vec_layout)
+    var routed = row_f32(ctx, b.p_qf_d, 0, H, moe_vec_layout)
+    var shared = row_f32(ctx, b.p_h_d, 0, H, moe_vec_layout)
     var routed_f = row_f32(ctx, b.p_ffn_d, 0, TOPK * E_FFN, moe_expert_f_layout)
     var routed_h_flat = TileTensor[bf16, type_of(moe_expert_flat_layout), MutAnyOrigin](b.fgb_d, moe_expert_flat_layout)
     ctx.enqueue_function[moe_gate_up_q4k_pack[TOPK, E_FFN, type_of(xm_layout), type_of(moe_idx_layout), type_of(moe_expert_f_layout)]](
@@ -687,7 +691,7 @@ def moe_ffn(ctx: DeviceContext, mut b: WindowBufs, Xm: TileTensor[f32, type_of(x
     var shared_h = TileTensor[bf16, type_of(moe_shared_layout), MutAnyOrigin](b.fgbp_d, moe_shared_layout)
     ctx.enqueue_function[moe_down_q8_0[1, SH_FFN, type_of(moe_shared_layout), type_of(moe_one_layout), type_of(moe_one_layout), type_of(moe_vec_layout)]](
         shared_h, b.wbuf.unsafe_ptr() + b.off[extra_base + 3], idx0, sigmoid, shared, Int32(H), Int32((SH_FFN // 32) * 34), grid_dim=ceildiv(H, MOE_WAVES), block_dim=MOE_THREADS)
-    ctx.enqueue_function[moe_add3[type_of(moe_vec_layout), type_of(moe_vec_layout), type_of(moe_vec_layout)]](routed, shared, X, Int32(H), grid_dim=ceildiv(H, 256), block_dim=256)
+    ctx.enqueue_function[moe_add3[type_of(moe_vec_layout), type_of(moe_vec_layout), type_of(moe_vec_layout)]](routed, shared, Xres, Int32(H), grid_dim=ceildiv(H, 256), block_dim=256)
 
 
 def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: WindowState) raises:
@@ -1044,7 +1048,10 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                 st.tp = now
                 st.tq = now
             if cfg.dump and m == 1 and st.pos + 1 >= cfg.n_prompt:
-                ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr() + (2 * layer) * H, H, owning=False), src_buf=DeviceBuffer[f32](ctx, b.x_d.unsafe_ptr(), H, owning=False))
+                if not cfg.dump4:
+                    ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr() + (2 * layer) * H, H, owning=False), src_buf=DeviceBuffer[f32](ctx, b.x_d.unsafe_ptr(), H, owning=False))
+                if cfg.dump4 and layer == 0:
+                    ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr(), H, owning=False), src_buf=DeviceBuffer[f32](ctx, b.x_d.unsafe_ptr(), H, owning=False))
             # -- ffn sub-block --
             if cfg.pf4:
                 ctx.synchronize()
@@ -1056,6 +1063,10 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                 Xm, tens_f32(ctx, b.wbuf, b.off[ffn_norm_base], H, h_layout), CurBm,
                 Int32(H), Float32(1e-6), grid_dim=m, block_dim=256,
             )
+            if cfg.dump4 and cfg.dump and m == 1 and st.pos + 1 >= cfg.n_prompt and layer == 0:
+                var DbgNorm = row_f32(ctx, b.p_h_d, 0, H, moe_vec_layout)
+                ctx.enqueue_function[amar_widen_bf16[type_of(moe_vec_layout), type_of(moe_vec_layout)]](row_bf16(ctx, b.curb_d, 0, H, moe_vec_layout), DbgNorm, Int32(H), grid_dim=ceildiv(H, 256), block_dim=256)
+                ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr() + H, H, owning=False), src_buf=DeviceBuffer[f32](ctx, b.p_h_d.unsafe_ptr(), H, owning=False))
             if cfg.pf4:
                 ctx.synchronize()
                 var nw = perf_counter_ns()
@@ -1130,7 +1141,10 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
             else:
                 moe_w += 19
             if cfg.dump and m == 1 and st.pos + 1 >= cfg.n_prompt:
-                ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr() + (2 * layer + 1) * H, H, owning=False), src_buf=DeviceBuffer[f32](ctx, b.x_d.unsafe_ptr(), H, owning=False))
+                if not cfg.dump4:
+                    ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr() + (2 * layer + 1) * H, H, owning=False), src_buf=DeviceBuffer[f32](ctx, b.x_d.unsafe_ptr(), H, owning=False))
+                if cfg.dump4 and layer == 0:
+                    ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr() + 2 * H, H, owning=False), src_buf=DeviceBuffer[f32](ctx, b.x_d.unsafe_ptr(), H, owning=False))
             if cfg.prof:
                 ctx.synchronize()
                 var now = perf_counter_ns()
@@ -1141,9 +1155,6 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
             w = moe_w
         if use_mega or use_mega_win:
             w = 1 + N_SSM * 10 + N_ATT * 7 + N_LAYERS * 4
-        if cfg.dump and m == 1 and st.pos + 1 >= cfg.n_prompt and st.n_dumped < GEN_N:
-            ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dump_h.unsafe_ptr() + st.n_dumped * 2 * N_LAYERS * H, 2 * N_LAYERS * H, owning=False), src_buf=b.dbg_d)
-            st.n_dumped += 1
         # -- head --
         if cfg.prof:
             ctx.synchronize()
@@ -1156,6 +1167,11 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                 Xm, tens_f32(ctx, b.wbuf, b.off[w], H, h_layout), Hnm,
                 Int32(H), Float32(1e-6), grid_dim=m, block_dim=256,
             )
+        if cfg.dump4 and cfg.dump and m == 1 and st.pos + 1 >= cfg.n_prompt:
+            ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr() + 3 * H, H, owning=False), src_buf=DeviceBuffer[f32](ctx, b.hn_d.unsafe_ptr(), H, owning=False))
+        if cfg.dump and m == 1 and st.pos + 1 >= cfg.n_prompt and st.n_dumped < GEN_N:
+            ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dump_h.unsafe_ptr() + st.n_dumped * 2 * N_LAYERS * H, 2 * N_LAYERS * H, owning=False), src_buf=b.dbg_d)
+            st.n_dumped += 1
         if st.pos + m >= cfg.n_prompt:
             if not use_mega:
                 ctx.enqueue_function[rmsc_k](

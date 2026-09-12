@@ -432,6 +432,7 @@ def main() raises:
     var pf5 = getenv("BARO_PROFILE", "0") == "5"
     var dump_path = getenv("BARO_DUMP", "")
     var dump = dump_path != ""
+    var dump4 = getenv("BARO_DUMP4", "0") == "1"
 
     var serve = getenv("BARO_SERVE", "0") == "1"
     print("BARO_SERVE:", serve)
@@ -706,7 +707,7 @@ def main() raises:
         # stage sum exceeds the unsynchronized sub-block time; compare stages
         # within an arm and the same stage across m, never add these into a budget.
         var pf4 = getenv("BARO_PROFILE", "0") == "4"
-        var cfg = WindowCfg(pack_q4=pack_q4, draft_q4=draft_q4, q4_off=q4_off, e=e, kcfg=kcfg, spec=spec, spec_dbg=spec_dbg, serve=serve, req_id=req_id, prof=prof, pf2=pf2, pf3=pf3, pf4=pf4, dump=dump, mega=mega, att_split=att_split, mega_win=mega_win, dot3=dot3, pf_chunk=pf_chunk, pf_rows=pf_rows, pf_tail=pf_tail, n_total=n_total, fr_k=fr_k, fr_off=fr_off, fr_ids_off=fr_ids_off, n_prompt=len(prompt))
+        var cfg = WindowCfg(pack_q4=pack_q4, draft_q4=draft_q4, q4_off=q4_off, e=e, kcfg=kcfg, spec=spec, spec_dbg=spec_dbg, serve=serve, req_id=req_id, prof=prof, pf2=pf2, pf3=pf3, pf4=pf4, dump=dump, dump4=dump4, mega=mega, att_split=att_split, mega_win=mega_win, dot3=dot3, pf_chunk=pf_chunk, pf_rows=pf_rows, pf_tail=pf_tail, n_total=n_total, fr_k=fr_k, fr_off=fr_off, fr_ids_off=fr_ids_off, n_prompt=len(prompt))
         if len(force) > 0 and cfg.spec:
             raise Error("BARO_FORCE requires BARO_SPEC=0 (teacher forcing is a no-spec identity gate)")
         wst.reset(t0)

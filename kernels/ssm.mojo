@@ -31,6 +31,19 @@ def amar_cast_bf16[
         )
 
 
+def amar_widen_bf16[
+    XLayout: TensorLayout, OLayout: TensorLayout
+](
+    X: TileTensor[DType.bfloat16, XLayout, MutAnyOrigin],
+    O: TileTensor[f32, OLayout, MutAnyOrigin],
+    n: Int32,
+):
+    comptime assert X.flat_rank == 1 and O.flat_rank == 1
+    var i = global_idx.x
+    if i < Int(n):
+        O[i] = rebind[Scalar[f32]](X[i].cast[f32]())
+
+
 def amar_residual_add[
     XLayout: TensorLayout, YLayout: TensorLayout
 ](
