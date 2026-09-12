@@ -84,7 +84,7 @@ def yarn_rope(x, pos):
     j = np.arange(NROT // 2, dtype=np.float32)
     te = pos * FREQ_BASE ** (-2.0 * j / NROT)
     ti = FREQ_SCALE * te
-    ramp = np.clip((j - low) / max(high - low, 0.001), 0, 1)
+    ramp = 1 - np.clip((j - low) / max(high - low, 0.001), 0, 1)
     th = ti * (1 - ramp) + te * ramp
     m = 1 + 0.1 * np.log(1 / FREQ_SCALE)
     c, s = np.cos(th) * m, np.sin(th) * m

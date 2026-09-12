@@ -254,7 +254,7 @@ def amar_rope_yarn[
     )
     var theta_in = FREQ_SCALE * theta_ex
     var ramp = (Float32(j) - YARN_LOW) / max(YARN_HIGH - YARN_LOW, 0.001)
-    ramp = min(max(ramp, 0), 1)
+    ramp = 1 - min(max(ramp, 0), 1)
     var theta = theta_in * (1 - ramp) + theta_ex * ramp
     var c = cos(theta) * MSCALE
     var s = sin(theta) * MSCALE
