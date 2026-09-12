@@ -25,6 +25,8 @@ from window import *
 from harness import *
 from prefix import *
 from moe_pack import parse_moe_index, resolve_plain
+from latent import EngineLatentClient
+from latentos.ipc import connect_unix_socket
 
 
 def read_line(fd: Int) raises -> Optional[String]:
@@ -579,6 +581,18 @@ def main() raises:
         ckpt_cap = 1
     var chain = Chain(ctx, ckpt_cap, packdir)
     print("checkpoints: cap", ckpt_cap, ", bytes", Float64(CKPT_BYTES) / 1e6, "MB each, period", CKPT_PERIOD)
+    # L1 (bench/chat-protocol.md): hand prefix checkpoints to an out-of-process
+    # latentos-agent as sealed memfds. Unset, nothing here runs. Set and
+    # unreachable, this RAISES: a handoff that silently does not happen is the
+    # failure this sidecar exists to make visible.
+    var latent_sock = getenv("BARO_LATENT_SOCK", "")
+    var latent_fd = Int32(-1)
+    var latent_gen = 0
+    if latent_sock != "":
+        latent_fd = connect_unix_socket(latent_sock)
+        if latent_fd < 0:
+            raise Error("BARO_LATENT_SOCK set but cannot connect: " + latent_sock)
+        print("latent: exporting checkpoints to", latent_sock)
     if state_load != "":
         var t_ld = perf_counter_ns()
         var lpos = load_state(ctx, chain, bufs.kc_d, bufs.vc_d, state_load, tmax)
@@ -851,6 +865,16 @@ def main() raises:
         var t_host = Float64(perf_counter_ns() - t0) / 1e9
         ctx.synchronize()
         chain.commit()
+        if latent_fd >= 0:
+            var client = EngineLatentClient(latent_fd)
+            var exported = 0
+            for i in range(len(chain.items)):
+                if chain.items[i].valid and chain.items[i].gen > latent_gen:
+                    if not client.export_chain_slot(chain, i):
+                        raise Error("latent export failed at slot " + String(i))
+                    exported += 1
+            latent_gen = chain.gen
+            print("latent: exported", exported, "checkpoints, chain gen", latent_gen)
         if state_save != "":
             save_state(ctx, chain, bufs.kc_d, bufs.vc_d, state_save, prompt, len(prompt) - 1)
         var dt = Float64(perf_counter_ns() - t0) / 1e9

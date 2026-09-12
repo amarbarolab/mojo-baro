@@ -15,6 +15,15 @@ from prefix import Checkpoint, Chain, CKPT_BYTES, f32
 
 comptime BytePtr = Pointer[UInt8, MutUntrackedOrigin]
 
+
+def hash64(h: List[UInt8]) -> UInt64:
+    """First 8 bytes of a sha256 prefix key, little-endian, as the wire
+    header's 64-bit cache key. A shortened key, not the key itself."""
+    var v: UInt64 = 0
+    for i in range(min(8, len(h))):
+        v |= UInt64(h[i]) << UInt64(8 * i)
+    return v
+
 # KV cache geometry constants (03 §2)
 # 8 layers × 4 heads × (128 tokens * 256 dim) = 1,048,576 floats per page
 comptime PGSTR = N_ATT * NKVH * KVHSTR
@@ -64,7 +73,7 @@ def mint_checkpoint_latent(
     header.kind = UInt8(proto.KIND_SSM_CKPT)
     header.dtype = UInt8(proto.DTYPE_F32)
     header.pos_hi = UInt32(ckpt.pos)
-    header.prefix_hash = ckpt.hash
+    header.prefix_hash = hash64(ckpt.hash)
     header.payload_len = UInt64(CKPT_BYTES)
     header.weights_uuid = weights_uuid.copy()
     header.role_sha = role_sha.copy()
@@ -110,7 +119,14 @@ def ingest_checkpoint_latent(
 
     # Update checkpoint metadata
     ckpt.pos = Int(header.pos_hi)
-    ckpt.hash = header.prefix_hash
+    # The wire header carries a 64-bit prefix_hash; Checkpoint.hash is the full
+    # 32-byte sha256 the prefix cache matches on (b3b4244). 64 bits cannot
+    # reconstruct it, so the hash is left EMPTY rather than filled with a
+    # truncation that would compare equal to nothing and look like a real key.
+    # Consequence, recorded rather than hidden: an ingested checkpoint restores
+    # its payload exactly but is NOT reachable by Chain.lookup, whose bytes_eq
+    # never matches an empty hash. Carrying the full sha needs a wire change.
+    ckpt.hash = List[UInt8]()
     ckpt.valid = True
     ckpt.pending = False
 
