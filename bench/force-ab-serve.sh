@@ -73,4 +73,10 @@ void = [r[0] for r in rows if r[3].startswith("VOID")]
 ok = [r for r in rows if not r[3].startswith("VOID")]
 pct = [float(r[3]) for r in ok]
 print(f"prompts {len(ok)}/{len(rows)}  min {min(pct) if pct else 'nan'}%  mean {sum(pct)/len(pct) if pct else float('nan'):.1f}%  void: {void or 'none'}")
+# A void is a FAILED arm, not a skipped row. Averaging over the survivors
+# printed "prompts 1/20 min 100.0% mean 100.0%" on this script's first ever
+# run, which reads as a pass while 19 of 20 requests had been eaten.
+if void:
+    print(f"FAIL: {len(void)} void arm(s) -- this is not a pass")
+    sys.exit(1)
 PY

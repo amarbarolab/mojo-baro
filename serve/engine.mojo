@@ -42,7 +42,7 @@ def read_line(fd: Int) raises -> Optional[String]:
     return String(from_utf8=Span[UInt8](buf))
 
 
-def cancel_pending(fd: Int, req_id: Int) raises -> Bool:
+def cancel_pending(fd: Int, req_id: Int, mut pending: List[String]) raises -> Bool:
     # Non-blocking check for a "{"cancel":ID}" line on fd, once per
     # step_window call. poll(fd, POLLIN, 0) never blocks; a hit means the
     # writer's single write() of a short line is already in the pipe, so the
@@ -62,6 +62,11 @@ def cancel_pending(fd: Int, req_id: Int) raises -> Bool:
     var i = json_key(line, "cancel")
     var cid = 0
     if i < 0 or not json_int(line, i, cid):
+        # Not a cancel: this is the NEXT REQUEST, already in the pipe because
+        # the client queued it while this one was still decoding. Hand it back
+        # to the request loop. Dropping it here silently ate 19 of 20 requests
+        # the first time bench/force-ab-serve.sh was ever run (2026-09-12).
+        pending.append(line)
         return False
     return cid == req_id
 
@@ -527,6 +532,9 @@ def main() raises:
         var lpos = load_state(ctx, chain, bufs.kc_d, bufs.vc_d, state_load, tmax)
         print("state loaded:", state_load, " pos", lpos, " in", Float64(perf_counter_ns() - t_ld) / 1e9, "s")
     var req_id = 0
+    # Requests read off fd 0 by the cancel probe mid-generation, in arrival
+    # order; the request loop drains these before touching fd 0 again.
+    var pending = List[String]()
     if serve:
         print("{\"ready\":true,\"tmax\":" + String(tmax) + ",\"mrows\":" + String(MROWS) + ",\"kmax\":" + String(KMAX) + ",\"spec_k\":" + String(kcfg) + ",\"kv\":\"" + String(KVT) + "\",\"pack\":\"" + packdir + "\"}")
 
@@ -543,7 +551,11 @@ def main() raises:
         var ckpt_hints = List[Int]()
         var sample = default_sample_params()
         if serve:
-            var line_in = read_line(0)
+            var line_in = Optional[String](None)
+            if len(pending) > 0:
+                line_in = Optional(pending.pop(0))
+            else:
+                line_in = read_line(0)
             if not line_in:
                 break
             var req_n = 0
@@ -736,7 +748,7 @@ def main() raises:
                 ctx.synchronize()
                 t_prefill_end = perf_counter_ns()
                 prefill_done = True
-            if serve and cancel_pending(0, req_id):
+            if serve and cancel_pending(0, req_id, pending):
                 cancelled = True
                 break
             if len(stop_seqs) > 0 and wst.pos >= len(prompt):
