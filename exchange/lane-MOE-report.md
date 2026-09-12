@@ -122,11 +122,23 @@ named terminal norm/head offsets, preserves dense positional offsets, and
 exits the non-mega request path before the no-head NextN receipt. The qwen
 build exits 0. `./run-tests.sh` reaches `92 kernels, 42 in registry, 0
 orphans` but has one unrelated pre-existing host sampler failure (`real decode
-row`). The corrected llama reference extractor strips `timings.prompt_n` and
-requests 128 combined tokens for a 64-token continuation. Gate 2 then fails at
-p01 `1/64`; the candidate is non-zero and the reference is not being mistaken
-for a clean run. Receipt: `.work/moe-w3/gate2-force-final2/`; candidate build:
+row`). After removing the stale MoE-written draft fixtures, `test_sample_ref`
+passes all five checks (`PASS: host reference sampler`) and `./run-tests.sh`
+reaches `92 kernels, 42 in registry, 0 orphans`. The corrected llama reference
+extractor strips `timings.prompt_n` and requests 128 combined tokens for a
+64-token continuation. Gate 2 then fails at p01 `1/64`; the candidate is
+non-zero and the reference is not being mistaken for a clean run. Receipt:
+`.work/moe-w3/gate2-force-final2/`; candidate build:
 `.work/moe-engine-positional-fix3`.
+
+Layer-0 diagnostic remains open. An opt-in four-slot capture was built from
+the working tree (post-SSM residual, post-FFN norm, post-MoE residual,
+post-final norm) as `.work/moe-w3/diag-layer0.f32`; the fresh diagnostic binary
+hash is `7cc046c841c9b7c462580ef59cf08de515b334171f1229062fdb84fa222859f5`.
+A candidate correction that fed normalized `CurBm` to the router/shared gate
+also built and produced a fresh p01 receipt, but remained `0/64`; it is not
+committed. No first-divergence claim is recorded until the four points are
+compared against a correctly matched real-pack reference.
 
 ## W4
 
