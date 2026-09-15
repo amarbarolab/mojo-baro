@@ -144,3 +144,28 @@ The 40 copies were `moe_ffn` creating a host buffer and copying a zero into
 now one int32 buffer allocated and zeroed once. It also removes a fragile
 aliasing: the old copy clobbered the router's own `idx[0]` after the routed
 path had consumed it, which was harmless only by ordering.
+
+### R6a, MoE projections in the dense q8 layout (preregistered 2026-09-15, before any run)
+
+Why: `ssm_phases` / `attn_phases` (the persistent kernel's phase bodies)
+read int8 rows plus f16 per-32 scales (`wq`/`ws`); the MoE pack keeps its
+projections as raw 34-byte q8_0 blocks. Converting those tensors at pack
+time (attn_q, attn_k, attn_v, attn_output, attn_qkv, attn_gate, ssm_out:
+130 tensors, 1.36 GB) into the dense layout is a byte split, not a
+requantisation: q = the block's 32 int8 values, d = the block's f16 scale,
+so every dequantised value is bit-equal. Shared-expert q8_0 tensors and the
+embedding stay raw (their kernels read raw blocks). Pack amendment stated
+here; round 1's "no pack change" froze only that round.
+Change: `tools/engine-pack.py --arch qwen35moe` writes those seven classes
+as `q8`; new pack dir `.work/moe-w1/pack-q8d` (the old pack stays for the
+A/B); `serve/window.mojo`'s eight `moe_matmul_q8_0_m1` dispatch sites use
+the dense q8 row kernel (`gemm_q8`) through the `tens_q8q`/`tens_q8s` views
+that already exist there.
+Predictions, frozen: GENERATED bit-identical on 20/20 prompts between the
+old-pack engine and the new-pack engine (values bit-equal, the row kernel's
+accumulation order is the same lane-strided sum of per-block dots; if not
+identical, the agreement band decides and the difference is explained by
+order); tok/s within -1% to +3% (the big matrix is already near bandwidth;
+the 8.9 MB ones at 635 GB/s may gain). No kill line: R6a is an enabling
+step; it lands on identity, or on agreement in band with the order
+difference explained. GPU: parity, identity A/B, minutes.
