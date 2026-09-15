@@ -13,6 +13,7 @@ from std.time import perf_counter_ns
 from max.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
 from layout import TileTensor, TensorLayout, row_major
 from registry import *
+from expert_tier import ExpertTier
 from serve_proto import SampleParams
 from moe import (
     moe_embed_q8_0_pos, moe_matmul_q8_0_m1,
@@ -570,6 +571,9 @@ struct WindowBufs(Copyable, Movable):
     # every layer, 40 host buffers and 40 copies per token, and that copy also
     # clobbered the router's own idx[0] after the routed path had consumed it.
     # B4 stage 2: TRACE_TOK tokens x N_LAYERS x TOPK expert ids, device side.
+    # B4 stage 2b (bench/moe-tier-protocol.md): routed experts in host RAM,
+    # an LRU of resident experts in this cache. Empty when BARO_TIER is unset.
+    var tier: ExpertTier
     var etrace_d: DeviceBuffer[DType.int32]
     var etrace_h: HostBuffer[DType.int32]
     var zidx_d: DeviceBuffer[DType.int32]
@@ -701,15 +705,24 @@ def moe_ffn(ctx: DeviceContext, mut b: WindowBufs, Xm: TileTensor[f32, type_of(x
         )
     var routed = row_f32(ctx, b.p_qf_d, 0, H, moe_vec_layout)
     var routed_h_flat = TileTensor[bf16, type_of(moe_expert_flat_layout), MutAnyOrigin](b.fgb_d, moe_expert_flat_layout)
-    ctx.enqueue_function[moe_gate_up_q4k_pack[TOPK, E_FFN, type_of(xm_layout), type_of(moe_idx_layout), type_of(moe_expert_flat_layout), bf16]](
-        CurBm, b.wbuf.unsafe_ptr().unsafe_offset(b.off[routed_base]), Idx, routed_h_flat, Int32(H), Int32(b.off[routed_base + 1] - b.off[routed_base]), grid_dim=ceildiv(TOPK * E_FFN, MOE_WAVES), block_dim=MOE_THREADS)
+    # B4 stage 2b: with the tier on, the gather reads the VRAM expert cache
+    # instead of the pack, and Idx holds cache SLOTS instead of expert ids
+    # (prepare rewrites it in place, after fetching any miss). The kernels are
+    # untouched: their expert stride is a runtime argument.
+    if b.tier.active:
+        b.tier.prepare(ctx, layer, b.hidx_d)
+        ctx.enqueue_function[moe_gate_up_q4k_pack[TOPK, E_FFN, type_of(xm_layout), type_of(moe_idx_layout), type_of(moe_expert_flat_layout), bf16]](
+            CurBm, b.tier.cache.unsafe_ptr().unsafe_offset(b.tier.gate_base(layer)), Idx, routed_h_flat, Int32(H), Int32(b.tier.up_offset(layer)), grid_dim=ceildiv(TOPK * E_FFN, MOE_WAVES), block_dim=MOE_THREADS)
+    else:
+        ctx.enqueue_function[moe_gate_up_q4k_pack[TOPK, E_FFN, type_of(xm_layout), type_of(moe_idx_layout), type_of(moe_expert_flat_layout), bf16]](
+            CurBm, b.wbuf.unsafe_ptr().unsafe_offset(b.off[routed_base]), Idx, routed_h_flat, Int32(H), Int32(b.off[routed_base + 1] - b.off[routed_base]), grid_dim=ceildiv(TOPK * E_FFN, MOE_WAVES), block_dim=MOE_THREADS)
     var routed_h = TileTensor[bf16, type_of(moe_expert_layout), MutAnyOrigin](b.fgb_d, moe_expert_layout)
     if layer == 34 or layer == 38 or layer == 39:
         ctx.enqueue_function[amar_moe_down_q6k[TOPK, E_FFN, type_of(moe_expert_layout), type_of(moe_idx_layout), type_of(moe_idx_layout), type_of(moe_vec_layout)]](
-            routed_h, b.wbuf.unsafe_ptr().unsafe_offset(b.off[routed_base + 2]), Idx, Wt, routed, Int32(H), grid_dim=ceildiv(H, MOE_WAVES), block_dim=MOE_THREADS)
+            routed_h, (b.tier.cache.unsafe_ptr().unsafe_offset(b.tier.down_base(layer)) if b.tier.active else b.wbuf.unsafe_ptr().unsafe_offset(b.off[routed_base + 2])), Idx, Wt, routed, Int32(H), grid_dim=ceildiv(H, MOE_WAVES), block_dim=MOE_THREADS)
     else:
         ctx.enqueue_function[amar_moe_down_q4k[TOPK, E_FFN, type_of(moe_expert_layout), type_of(moe_idx_layout), type_of(moe_idx_layout), type_of(moe_vec_layout)]](
-            routed_h, b.wbuf.unsafe_ptr().unsafe_offset(b.off[routed_base + 2]), Idx, Wt, routed, Int32(H), grid_dim=ceildiv(H, MOE_WAVES), block_dim=MOE_THREADS)
+            routed_h, (b.tier.cache.unsafe_ptr().unsafe_offset(b.tier.down_base(layer)) if b.tier.active else b.wbuf.unsafe_ptr().unsafe_offset(b.off[routed_base + 2])), Idx, Wt, routed, Int32(H), grid_dim=ceildiv(H, MOE_WAVES), block_dim=MOE_THREADS)
     var idx0 = TileTensor[DType.int32, type_of(moe_one_layout), MutAnyOrigin](b.zidx_d, moe_one_layout)
     var shared_h_flat = TileTensor[bf16, type_of(moe_shared_flat_layout), MutAnyOrigin](b.fgbp_d, moe_shared_flat_layout)
     var shared_gate = b.wbuf.unsafe_ptr().unsafe_offset(b.off[extra_base + 1])

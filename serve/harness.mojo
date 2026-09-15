@@ -3,6 +3,7 @@ and kernels/test_prefix.mojo. Moved verbatim out of engine.mojo main (M1a);
 no decode-path code lives here.
 """
 from std.os import getenv
+from expert_tier import ExpertTier
 from std.collections import Dict
 from std.ffi import c_ssize_t, external_call
 from std.math import ceildiv
@@ -331,6 +332,14 @@ def alloc_bufs(ctx: DeviceContext, pack: Pack, tmax: Int) raises -> WindowBufs:
     # sampling on mid-session does not have to allocate.
     var pt_d = ctx.enqueue_create_buffer[f32](MROWS * VOCAB)
     var pd_d = ctx.enqueue_create_buffer[f32](MROWS * VOCAB)
+    # B4 stage 2b: BARO_TIER=<capacity> puts the routed experts in host RAM
+    # behind a per-layer LRU. Unset, the tier is inert and the pack is read as
+    # before, so this allocation is the only cost of carrying it.
+    var tier_cap = getenv("BARO_TIER", "")
+    var tier = (
+        ExpertTier(ctx, pack.packdir, Int(tier_cap), N_LAYERS) if tier_cap != ""
+        else ExpertTier(ctx)
+    )
     var etrace_d = ctx.enqueue_create_buffer[DType.int32](TRACE_TOK * N_LAYERS * TOPK_TRACE)
     var etrace_h = ctx.enqueue_create_host_buffer[DType.int32](TRACE_TOK * N_LAYERS * TOPK_TRACE)
     var zidx_d = ctx.enqueue_create_buffer[DType.int32](1)
@@ -347,4 +356,4 @@ def alloc_bufs(ctx: DeviceContext, pack: Pack, tmax: Int) raises -> WindowBufs:
     var sacc_d = ctx.enqueue_create_buffer[DType.int32](KMAX + 1)
     var sout_h = ctx.enqueue_create_host_buffer[DType.int32](KMAX + 1)
     var sacc_h = ctx.enqueue_create_host_buffer[DType.int32](KMAX + 1)
-    return WindowBufs(wbuf=wbuf.copy(), off=off.copy(), dtok_h=dtok_h.copy(), win_h=win_h.copy(), x_d=x_d.copy(), curb_d=curb_d.copy(), qkv_d=qkv_d.copy(), z_d=z_d.copy(), eg_d=eg_d.copy(), beta_d=beta_d.copy(), conv_d=conv_d.copy(), so_d=so_d.copy(), resb_d=resb_d.copy(), qf_d=qf_d.copy(), q_d=q_d.copy(), gate_d=gate_d.copy(), k_d=k_d.copy(), v_d=v_d.copy(), ao_d=ao_d.copy(), fgb_d=fgb_d.copy(), aq_d=aq_d.copy(), asc_d=asc_d.copy(), logits_d=logits_d.copy(), toks_d=toks_d.copy(), hn_d=hn_d.copy(), de_d=de_d.copy(), hd_d=hd_d.copy(), cc_d=cc_d.copy(), dtok_d=dtok_d.copy(), p_qf_d=p_qf_d.copy(), p_h_d=p_h_d.copy(), p_kv_d=p_kv_d.copy(), p_32_d=p_32_d.copy(), p_32b_d=p_32b_d.copy(), p_ffn_d=p_ffn_d.copy(), p_ffn2_d=p_ffn2_d.copy(), p_v_d=p_v_d.copy(), xp_d=xp_d.copy(), curbp_d=curbp_d.copy(), qkvp_d=qkvp_d.copy(), zp_d=zp_d.copy(), arp_d=arp_d.copy(), brp_d=brp_d.copy(), egp_d=egp_d.copy(), betap_d=betap_d.copy(), convp_d=convp_d.copy(), sop_d=sop_d.copy(), resbp_d=resbp_d.copy(), qfp_d=qfp_d.copy(), qp_d=qp_d.copy(), gatep_d=gatep_d.copy(), kp_d=kp_d.copy(), vp_d=vp_d.copy(), aop_d=aop_d.copy(), gp_d=gp_d.copy(), up_d=up_d.copy(), fgbp_d=fgbp_d.copy(), convstate_d=convstate_d.copy(), sstate_d=sstate_d.copy(), kvpool=kvpool, kc_d=kc_d.copy(), vc_d=vc_d.copy(), kc32_d=kc32_d.copy(), vc32_d=vc32_d.copy(), off_d=off_d.copy(), araw_d=araw_d.copy(), braw_d=braw_d.copy(), ctr_d=ctr_d.copy(), prof_d=prof_d.copy(), dbg_d=dbg_d.copy(), hmax_d=hmax_d.copy(), hidx_d=hidx_d.copy(), dump_h=dump_h.copy(), stream_h=stream_h.copy(), pt_d=pt_d.copy(), pd_d=pd_d.copy(), etrace_d=etrace_d.copy(), etrace_h=etrace_h.copy(), zidx_d=zidx_d.copy(), dids_d=dids_d.copy(), sout_d=sout_d.copy(), sacc_d=sacc_d.copy(), sout_h=sout_h.copy(), sacc_h=sacc_h.copy())
+    return WindowBufs(wbuf=wbuf.copy(), off=off.copy(), dtok_h=dtok_h.copy(), win_h=win_h.copy(), x_d=x_d.copy(), curb_d=curb_d.copy(), qkv_d=qkv_d.copy(), z_d=z_d.copy(), eg_d=eg_d.copy(), beta_d=beta_d.copy(), conv_d=conv_d.copy(), so_d=so_d.copy(), resb_d=resb_d.copy(), qf_d=qf_d.copy(), q_d=q_d.copy(), gate_d=gate_d.copy(), k_d=k_d.copy(), v_d=v_d.copy(), ao_d=ao_d.copy(), fgb_d=fgb_d.copy(), aq_d=aq_d.copy(), asc_d=asc_d.copy(), logits_d=logits_d.copy(), toks_d=toks_d.copy(), hn_d=hn_d.copy(), de_d=de_d.copy(), hd_d=hd_d.copy(), cc_d=cc_d.copy(), dtok_d=dtok_d.copy(), p_qf_d=p_qf_d.copy(), p_h_d=p_h_d.copy(), p_kv_d=p_kv_d.copy(), p_32_d=p_32_d.copy(), p_32b_d=p_32b_d.copy(), p_ffn_d=p_ffn_d.copy(), p_ffn2_d=p_ffn2_d.copy(), p_v_d=p_v_d.copy(), xp_d=xp_d.copy(), curbp_d=curbp_d.copy(), qkvp_d=qkvp_d.copy(), zp_d=zp_d.copy(), arp_d=arp_d.copy(), brp_d=brp_d.copy(), egp_d=egp_d.copy(), betap_d=betap_d.copy(), convp_d=convp_d.copy(), sop_d=sop_d.copy(), resbp_d=resbp_d.copy(), qfp_d=qfp_d.copy(), qp_d=qp_d.copy(), gatep_d=gatep_d.copy(), kp_d=kp_d.copy(), vp_d=vp_d.copy(), aop_d=aop_d.copy(), gp_d=gp_d.copy(), up_d=up_d.copy(), fgbp_d=fgbp_d.copy(), convstate_d=convstate_d.copy(), sstate_d=sstate_d.copy(), kvpool=kvpool, kc_d=kc_d.copy(), vc_d=vc_d.copy(), kc32_d=kc32_d.copy(), vc32_d=vc32_d.copy(), off_d=off_d.copy(), araw_d=araw_d.copy(), braw_d=braw_d.copy(), ctr_d=ctr_d.copy(), prof_d=prof_d.copy(), dbg_d=dbg_d.copy(), hmax_d=hmax_d.copy(), hidx_d=hidx_d.copy(), dump_h=dump_h.copy(), stream_h=stream_h.copy(), pt_d=pt_d.copy(), pd_d=pd_d.copy(), tier=tier^, etrace_d=etrace_d.copy(), etrace_h=etrace_h.copy(), zidx_d=zidx_d.copy(), dids_d=dids_d.copy(), sout_d=sout_d.copy(), sacc_d=sacc_d.copy(), sout_h=sout_h.copy(), sacc_h=sacc_h.copy())
