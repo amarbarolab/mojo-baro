@@ -182,7 +182,7 @@ def amar_ssm_qk_l2norm[
 def amar_ssm_delta_step[
     MR: Int,
     S0Layout: TensorLayout, CLayout: TensorLayout, GLayout: TensorLayout,
-    OLayout: TensorLayout, JSPLIT: Int = 1
+    OLayout: TensorLayout
 ](
     SAll: TileTensor[f32, S0Layout, MutAnyOrigin],
     ConvOut: TileTensor[f32, CLayout, MutAnyOrigin],
@@ -193,85 +193,43 @@ def amar_ssm_delta_step[
 ):
     comptime assert SAll.flat_rank == 5 and ConvOut.flat_rank == 2
     comptime assert Eg.flat_rank == 2 and O.flat_rank == 3
-    comptime if JSPLIT == 1:
-        var h = block_idx.x
-        var j = thread_idx.x
-        var kh = h % NH_K
-        var si = Int(ssm_i)
-        var sl = Int(slots)
-        var rg = Int(ring)
+    var h = block_idx.x
+    var j = thread_idx.x
+    var kh = h % NH_K
+    var si = Int(ssm_i)
+    var sl = Int(slots)
+    var rg = Int(ring)
 
-        var kq = stack_allocation[f32, address_space = AddressSpace.SHARED](
-            row_major[2, SSTATE]()
-        )
-        comptime for r in range(MR):
-            var rs = (rg + r) % sl
-            var ws = (rg + r + 1) % sl
-            kq[0, j] = rebind[kq.ElementType](ConvOut[r, kh * SSTATE + j])
-            kq[1, j] = rebind[kq.ElementType](ConvOut[r, KDIM + kh * SSTATE + j])
-            barrier()
+    var kq = stack_allocation[f32, address_space = AddressSpace.SHARED](
+        row_major[2, SSTATE]()
+    )
+    comptime for r in range(MR):
+        var rs = (rg + r) % sl
+        var ws = (rg + r + 1) % sl
+        kq[0, j] = rebind[kq.ElementType](ConvOut[r, kh * SSTATE + j])
+        kq[1, j] = rebind[kq.ElementType](ConvOut[r, KDIM + kh * SSTATE + j])
+        barrier()
 
-            var eg = rebind[Scalar[f32]](Eg[r, h])
-            var beta = rebind[Scalar[f32]](Beta[r, h])
-            var vj = rebind[Scalar[f32]](ConvOut[r, 2 * KDIM + h * SSTATE + j])
+        var eg = rebind[Scalar[f32]](Eg[r, h])
+        var beta = rebind[Scalar[f32]](Beta[r, h])
+        var vj = rebind[Scalar[f32]](ConvOut[r, 2 * KDIM + h * SSTATE + j])
 
-            var col = SIMD[f32, SSTATE]()
-            comptime for i in range(SSTATE):
-                col[i] = rebind[Scalar[f32]](SAll[rs, si, h, i, j])
+        var col = SIMD[f32, SSTATE]()
+        comptime for i in range(SSTATE):
+            col[i] = rebind[Scalar[f32]](SAll[rs, si, h, i, j])
 
-            var sk: Float32 = 0
-            comptime for i in range(SSTATE):
-                sk += col[i] * eg * rebind[Scalar[f32]](kq[1, i])
-            var d = (vj - sk) * beta
+        var sk: Float32 = 0
+        comptime for i in range(SSTATE):
+            sk += col[i] * eg * rebind[Scalar[f32]](kq[1, i])
+        var d = (vj - sk) * beta
 
-            var o: Float32 = 0
-            comptime for i in range(SSTATE):
-                var s = col[i] * eg + rebind[Scalar[f32]](kq[1, i]) * d
-                SAll[ws, si, h, i, j] = rebind[SAll.ElementType](s)
-                o += s * rebind[Scalar[f32]](kq[0, i])
-            O[r, h, j] = rebind[O.ElementType](o)
-            barrier()
-    else:
-        comptime JW = SSTATE // JSPLIT
-        var h = block_idx.x
-        var j = (block_idx.y & (JSPLIT - 1)) * JW + thread_idx.x
-        var kh = h % NH_K
-        var si = Int(ssm_i)
-        var sl = Int(slots)
-        var rg = Int(ring)
-
-        var kq = stack_allocation[f32, address_space = AddressSpace.SHARED](
-            row_major[2, SSTATE]()
-        )
-        comptime for r in range(MR):
-            var rs = (rg + r) % sl
-            var ws = (rg + r + 1) % sl
-            comptime for g in range(JSPLIT):
-                var idx = thread_idx.x + g * JW
-                kq[0, idx] = rebind[kq.ElementType](ConvOut[r, kh * SSTATE + idx])
-                kq[1, idx] = rebind[kq.ElementType](ConvOut[r, KDIM + kh * SSTATE + idx])
-            barrier()
-
-            var eg = rebind[Scalar[f32]](Eg[r, h])
-            var beta = rebind[Scalar[f32]](Beta[r, h])
-            var vj = rebind[Scalar[f32]](ConvOut[r, 2 * KDIM + h * SSTATE + j])
-
-            var col = SIMD[f32, SSTATE]()
-            comptime for i in range(SSTATE):
-                col[i] = rebind[Scalar[f32]](SAll[rs, si, h, i, j])
-
-            var sk: Float32 = 0
-            comptime for i in range(SSTATE):
-                sk += col[i] * eg * rebind[Scalar[f32]](kq[1, i])
-            var d = (vj - sk) * beta
-
-            var o: Float32 = 0
-            comptime for i in range(SSTATE):
-                var s = col[i] * eg + rebind[Scalar[f32]](kq[1, i]) * d
-                SAll[ws, si, h, i, j] = rebind[SAll.ElementType](s)
-                o += s * rebind[Scalar[f32]](kq[0, i])
-            O[r, h, j] = rebind[O.ElementType](o)
-            barrier()
+        var o: Float32 = 0
+        comptime for i in range(SSTATE):
+            var s = col[i] * eg + rebind[Scalar[f32]](kq[1, i]) * d
+            SAll[ws, si, h, i, j] = rebind[SAll.ElementType](s)
+            o += s * rebind[Scalar[f32]](kq[0, i])
+        O[r, h, j] = rebind[O.ElementType](o)
+        barrier()
 
 
 def amar_ssm_gated_out[
