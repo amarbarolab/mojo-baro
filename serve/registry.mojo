@@ -33,6 +33,7 @@ from model import H, FFN, VOCAB, QF, KV, N_LAYERS, N_SSM, N_ATT, MEGA_ALLOWED, I
 from moe import amar_moe_down_q6k
 
 comptime TMAX = 1088
+comptime SSM_JSPLIT = 1
 comptime GEN_N = 64
 comptime CP = 1024
 comptime PF_LDS_MIN = 128
@@ -301,29 +302,29 @@ def delta_dispatch(
     comptime GL = type_of(g32m_layout)
     comptime OL = type_of(om_layout)
     if m == 1:
-        ctx.enqueue_function[amar_ssm_delta_step[1, DL, CL, GL, OL]](
-            SAll, ConvOut, Eg, Beta, O, ring, ssm_i, slots, grid_dim=NH_V, block_dim=SSTATE)
+        ctx.enqueue_function[amar_ssm_delta_step[1, DL, CL, GL, OL, SSM_JSPLIT]](
+            SAll, ConvOut, Eg, Beta, O, ring, ssm_i, slots, grid_dim=(NH_V, SSM_JSPLIT), block_dim=SSTATE // SSM_JSPLIT)
     elif m == 2:
-        ctx.enqueue_function[amar_ssm_delta_step[2, DL, CL, GL, OL]](
-            SAll, ConvOut, Eg, Beta, O, ring, ssm_i, slots, grid_dim=NH_V, block_dim=SSTATE)
+        ctx.enqueue_function[amar_ssm_delta_step[2, DL, CL, GL, OL, SSM_JSPLIT]](
+            SAll, ConvOut, Eg, Beta, O, ring, ssm_i, slots, grid_dim=(NH_V, SSM_JSPLIT), block_dim=SSTATE // SSM_JSPLIT)
     elif m == 3:
-        ctx.enqueue_function[amar_ssm_delta_step[3, DL, CL, GL, OL]](
-            SAll, ConvOut, Eg, Beta, O, ring, ssm_i, slots, grid_dim=NH_V, block_dim=SSTATE)
+        ctx.enqueue_function[amar_ssm_delta_step[3, DL, CL, GL, OL, SSM_JSPLIT]](
+            SAll, ConvOut, Eg, Beta, O, ring, ssm_i, slots, grid_dim=(NH_V, SSM_JSPLIT), block_dim=SSTATE // SSM_JSPLIT)
     elif m == 4:
-        ctx.enqueue_function[amar_ssm_delta_step[4, DL, CL, GL, OL]](
-            SAll, ConvOut, Eg, Beta, O, ring, ssm_i, slots, grid_dim=NH_V, block_dim=SSTATE)
+        ctx.enqueue_function[amar_ssm_delta_step[4, DL, CL, GL, OL, SSM_JSPLIT]](
+            SAll, ConvOut, Eg, Beta, O, ring, ssm_i, slots, grid_dim=(NH_V, SSM_JSPLIT), block_dim=SSTATE // SSM_JSPLIT)
     elif m == 5:
-        ctx.enqueue_function[amar_ssm_delta_step[5, DL, CL, GL, OL]](
-            SAll, ConvOut, Eg, Beta, O, ring, ssm_i, slots, grid_dim=NH_V, block_dim=SSTATE)
+        ctx.enqueue_function[amar_ssm_delta_step[5, DL, CL, GL, OL, SSM_JSPLIT]](
+            SAll, ConvOut, Eg, Beta, O, ring, ssm_i, slots, grid_dim=(NH_V, SSM_JSPLIT), block_dim=SSTATE // SSM_JSPLIT)
     elif m == 6:
-        ctx.enqueue_function[amar_ssm_delta_step[6, DL, CL, GL, OL]](
-            SAll, ConvOut, Eg, Beta, O, ring, ssm_i, slots, grid_dim=NH_V, block_dim=SSTATE)
+        ctx.enqueue_function[amar_ssm_delta_step[6, DL, CL, GL, OL, SSM_JSPLIT]](
+            SAll, ConvOut, Eg, Beta, O, ring, ssm_i, slots, grid_dim=(NH_V, SSM_JSPLIT), block_dim=SSTATE // SSM_JSPLIT)
     elif m == 7:
-        ctx.enqueue_function[amar_ssm_delta_step[7, DL, CL, GL, OL]](
-            SAll, ConvOut, Eg, Beta, O, ring, ssm_i, slots, grid_dim=NH_V, block_dim=SSTATE)
+        ctx.enqueue_function[amar_ssm_delta_step[7, DL, CL, GL, OL, SSM_JSPLIT]](
+            SAll, ConvOut, Eg, Beta, O, ring, ssm_i, slots, grid_dim=(NH_V, SSM_JSPLIT), block_dim=SSTATE // SSM_JSPLIT)
     else:
-        ctx.enqueue_function[amar_ssm_delta_step[SM, DL, CL, GL, OL]](
-            SAll, ConvOut, Eg, Beta, O, ring, ssm_i, slots, grid_dim=NH_V, block_dim=SSTATE)
+        ctx.enqueue_function[amar_ssm_delta_step[SM, DL, CL, GL, OL, SSM_JSPLIT]](
+            SAll, ConvOut, Eg, Beta, O, ring, ssm_i, slots, grid_dim=(NH_V, SSM_JSPLIT), block_dim=SSTATE // SSM_JSPLIT)
 
 
 def gemm_q8[
