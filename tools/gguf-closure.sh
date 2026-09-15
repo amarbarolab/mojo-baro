@@ -46,7 +46,7 @@ if [ "$kmodel" = "qwen35moe" ]; then
   # The reference holds bare ids. A file still carrying the engine's own
   # "GENERATED:" prefix compares that word against a token id and reports a
   # mismatch at position 1 on a run that is actually identical.
-  sed 's/^GENERATED: *//' "$moeref" > "$out/ref-ids.txt"
+  sed 's/^GENERATED: *//' "$moeref" | tr -s ' ' '\n' | grep -v '^$' > "$out/ref-ids.txt"
   moeref="$out/ref-ids.txt"
   env BARO_MEGA=0 BARO_PREFILL=1 BARO_PACK=${BARO_PACK:-.work/moe-w1/pack} \
       BARO_PROMPT=${BARO_PROMPT:-.work/moe-w3/one.tokens} ./.work/moe-engine-closure > "$out/run.log" 2>&1 \
@@ -55,8 +55,8 @@ if [ "$kmodel" = "qwen35moe" ]; then
   tools/check-tokens.sh "$moeref" "$out/run.log"
   exit
 fi
-if grep -qx moe.mojo "$out/FILES"; then
-  # qwen35moe: no engine yet; the closure rebuilds the parity test from the embedded
+if grep -qx moe.mojo "$out/FILES" && ! grep -qx window.mojo "$out/FILES"; then
+  # qwen35moe kernels-only bake (no engine closure in the file); the closure rebuilds the parity test from the embedded
   # kernels and checks blk.0 of THIS gguf against the numpy oracle (tools/moe-ref.py).
   kcommit=$(jq -r '.["baro.kernel.commit"]' "$out/meta.json")
   git show "$kcommit:kernels/test_moe_block.mojo" > "$out/harness.mojo" || { echo "no kernels/test_moe_block.mojo at gguf commit $kcommit"; exit 1; }
