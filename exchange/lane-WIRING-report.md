@@ -489,3 +489,94 @@ for by `tools/ci-checks.sh`'s bench-compile step alongside its existing
 **B3 is closed (KILL, both HIP calls confirmed reproducible, root cause
 named as an open question rather than resolved).** C3 and B3 both land this
 leg; reporting DONE to `w82:p1`.
+
+## Vendor latentos (brief `briefs/2026-09-15-vendor-latentos.md`), DONE `8184f7d`
+
+Same shape as M1 (`d7b3237`, uregex/minja), same precedent followed
+exactly. `serve/engine.mojo` has imported `latentos` (through
+`serve/latent.mojo` and the `serve/latentos -> ~/AMDHQ/src/latentos`
+symlink) since the sidecar landed 2026-09-12; a clone had no way to build
+the engine, and `tools/gguf-closure.sh`'s self-describing rebuild printed
+"external (NOT in the file): latentos" (the coordinator's same-night stopgap,
+`aa3f147`) instead of reconstructing it from the gguf's own metadata.
+
+**Vendored** `latentos/` at the repo root as real files (`__init__.mojo`,
+`agent.mojo`, `ipc.mojo`, `proto.mojo`, `sys.mojo`), each carrying the M1
+banner naming its upstream. `boot/` is not imported by anything in either
+repo and was left out, per the brief's own "check the imports" instruction.
+`serve/latentos` symlink removed.
+
+**Build lines fixed** (every one that resolved `latentos` through the
+removed symlink's implicit same-directory lookup, now explicit `-I .`):
+`run-tests.sh` (`kernels/test_latent.mojo`), `tools/test_server.sh`,
+`tools/test_pool.sh`, `bench/ornith-run.sh`, `tools/mega-gate.sh`,
+`bench/run-all.sh`, `tools/merge-gate.sh`, `tools/latent-gate.sh` (both its
+engine and `tools/latent-recv.mojo` builds). The carry-over probe's own
+stamped-tree builder (`bench/carryover-stamp.py`) symlinked
+`serve/latentos` into each stamped tree; repointed at the vendored
+`latentos/` and its build line (`bench/carryover-run.sh`) gained the
+stamped tree's own root as an `-I`.
+
+**`tools/ci-checks.sh`**: `latentos` added as a third package in the
+uregex/minja drift-check loop, banner-stripped diff against
+`~/AMDHQ/src/latentos`. Verified both ways: in sync passes; appending one
+line to the vendored `latentos/sys.mojo` and rerunning the loop standalone
+failed with `sys.mojo` named, then restored.
+
+**`tools/embed-files.py`**: `latentos` added to `EXT`. Neither arch's roots
+(`window.mojo`/`registry.mojo`) reach `latentos` themselves -- only the
+harness (`serve/engine.mojo`) imports it directly, and the harness is
+deliberately excluded from the closure walk (fetched from git at rebuild
+time, never embedded, same as `harness.mojo`/`prefix.mojo`). Added a
+second, narrower scan (`harness_ext_files()`) over the harness's own
+top-level imports for `EXT`-registered packages only -- `gguf-closure.sh`'s
+git-fetch rebuild path can reconstruct a single flat module from git but
+has no way to reconstruct a whole vendored package that way. Verified:
+`tools/embed-files.py -1` now lists the five `latentos` files for both
+`qwythos` and `qwen35moe` (harness `serve/engine.mojo` for both); `--arch
+spark` (harness `serve/spark.mojo`, never imports `latentos`) is
+unaffected, still lists only `uregex`/`minja`. Eyeballed: no harness, test
+or `.work` file in any of the three lists.
+
+**`tools/gguf-closure.sh`**: removed the `EXTI` external-include block
+`aa3f147` added, since `latentos` now comes from the gguf's own
+`baro.kernel.src.latentos/*` KVs via the existing generic FILES-list
+extraction (`mkdir -p "$out/$(dirname "$f")"` already recreates subdirectory
+keys correctly), same as every `kernels/` or `serve/` file.
+
+**Gates:**
+- `./run-tests.sh` exit 0, including `kernels/test_latent.mojo`'s
+  mint/ingest round trip (built with the new `-I .`).
+- `tools/ci-checks.sh` green end to end, including the new three-package
+  drift step.
+- Fresh `git clone . .work/clone-check` from the vendoring commit, then
+  `mojo build serve/engine.mojo -I kernels -I .` from inside the clone with
+  no path outside it: binary produced clean (only pre-existing, unrelated
+  deprecation warnings).
+- `tools/latent-gate.sh`: first run (default `LATENT_REF_ENGINE=.work/engine`)
+  hit a tooling false positive, not a content defect -- `.work/engine` from
+  an earlier build this session happened to be byte-identical to the
+  freshly-built candidate (same commit, deterministic build), and
+  `bench/force-ab.sh` refuses an A/B where ref and cand are the same binary.
+  P-L1b/c (the actual export/ingest round trip) passed in that same run,
+  52690944 bytes byte-identical. Built a genuine pre-vendoring reference
+  (`git worktree add` at `4024b05`, the commit before this one, engine built
+  there under the old symlink) and reran with `LATENT_REF_ENGINE` pointing
+  at it: **L1 GATE PASS**, P-L1a 20/20 prompts 100% identity against the
+  pre-vendoring engine, P-L1b/c unchanged. 65 s wall time, inside the
+  brief's 10-minute allowance.
+
+**`docs/BASELINE.md`**: LatentOS caveat updated -- vendoring landed, a
+fresh clone can build the engine now; the two already-baked `aa3f147`
+ggufs still carry the old external-dependency marker and need a re-bake
+before their own closure is self-contained (coordinator's call, not done
+by this lane, per the brief). Note: the coordinator's own baton entry
+(2026-09-15 09:30) shows this already happened -- both models re-baked at
+`8184f7d` and verified self-describing by `tools/gguf-verify.sh` from the
+file alone, ahead of this report landing.
+
+**CLAUDE.md**: build-command note extended to name `serve/engine.mojo` /
+`serve/latent.mojo` alongside `serve/tokenizer.mojo` / `serve/spark.mojo`
+and list `latentos/` alongside `uregex/`/`minja/`.
+
+Whiteboard ticked, reporting DONE to `w82:p1`.
