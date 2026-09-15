@@ -30,6 +30,10 @@ struct Meta {
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+    /// A5: assistant tool calls, already in the shape the chat template
+    /// expects (`arguments` as a parsed object, not an OpenAI-style JSON
+    /// string) -- `main.rs` converts on the way in.
+    pub tool_calls: Option<Value>,
 }
 
 pub struct Text {
@@ -80,12 +84,22 @@ impl Text {
     }
 
     /// Render the chat template (the pack's, else ChatML which is what Qwen
-    /// ships) with the generation prompt appended.
-    pub fn apply_chat_template(&self, messages: &[ChatMessage]) -> Result<String, String> {
-        self.render(messages, true)
+    /// ships) with the generation prompt appended. `tools`: the OpenAI
+    /// `tools` array, passed to the template verbatim (A5, `tools on
+    /// /v1/chat/completions` -- the template decides how to render them,
+    /// same as vLLM and llama.cpp). `template_kwargs`: extra top-level
+    /// template variables (A5 `chat_template_kwargs`, e.g. Qwen/Qwythos's
+    /// `enable_thinking`), merged into the render context so the caller
+    /// never needs to know the template's own variable names.
+    pub fn apply_chat_template(
+        &self, messages: &[ChatMessage], tools: Option<&Value>, template_kwargs: Option<&Value>,
+    ) -> Result<String, String> {
+        self.render(messages, true, tools, template_kwargs)
     }
 
-    fn render(&self, messages: &[ChatMessage], add_generation_prompt: bool) -> Result<String, String> {
+    fn render(
+        &self, messages: &[ChatMessage], add_generation_prompt: bool, tools: Option<&Value>, template_kwargs: Option<&Value>,
+    ) -> Result<String, String> {
         let Some(tpl) = &self.meta.chat_template else {
             let mut s = String::new();
             for m in messages {
@@ -106,14 +120,28 @@ impl Text {
         env.add_template("chat", tpl).map_err(|e| format!("chat_template: {e}"))?;
         let msgs: Vec<Value> = messages
             .iter()
-            .map(|m| serde_json::json!({"role": m.role, "content": m.content}))
+            .map(|m| {
+                let mut v = serde_json::json!({"role": m.role, "content": m.content});
+                if let Some(tc) = &m.tool_calls {
+                    v["tool_calls"] = tc.clone();
+                }
+                v
+            })
             .collect();
-        let ctx = serde_json::json!({
+        let mut ctx = serde_json::json!({
             "messages": msgs,
             "add_generation_prompt": add_generation_prompt,
             "bos_token": self.meta.bos_token.clone().unwrap_or_default(),
             "eos_token": self.meta.eos_token.clone().unwrap_or_default(),
         });
+        if let Some(t) = tools {
+            ctx["tools"] = t.clone();
+        }
+        if let Some(Value::Object(kwargs)) = template_kwargs {
+            for (k, v) in kwargs {
+                ctx[k] = v.clone();
+            }
+        }
         env.get_template("chat")
             .and_then(|t| t.render(minijinja::Value::from_serialize(&ctx)))
             .map_err(|e| format!("chat_template: {e}"))
@@ -138,7 +166,7 @@ impl Text {
     pub fn role_boundaries(&self, messages: &[ChatMessage]) -> Vec<u32> {
         let mut out = Vec::with_capacity(messages.len());
         for k in 1..=messages.len() {
-            let Ok(rendered) = self.render(&messages[..k], false) else { continue };
+            let Ok(rendered) = self.render(&messages[..k], false, None, None) else { continue };
             let Ok(ids) = self.encode(&rendered, true) else { continue };
             out.push(ids.len() as u32);
         }
@@ -202,16 +230,14 @@ mod tests {
             stop_ids: vec![],
         };
         let s = t
-            .apply_chat_template(&[
-                ChatMessage {
-                    role: "system".into(),
-                    content: "be brief".into(),
-                },
-                ChatMessage {
-                    role: "user".into(),
-                    content: "hi".into(),
-                },
-            ])
+            .apply_chat_template(
+                &[
+                    ChatMessage { role: "system".into(), content: "be brief".into(), tool_calls: None },
+                    ChatMessage { role: "user".into(), content: "hi".into(), tool_calls: None },
+                ],
+                None,
+                None,
+            )
             .unwrap();
         assert_eq!(
             s,
@@ -233,12 +259,12 @@ mod tests {
             stop_ids: vec![],
         };
         let msgs = [
-            ChatMessage { role: "system".into(), content: "be brief".into() },
-            ChatMessage { role: "user".into(), content: "hi".into() },
+            ChatMessage { role: "system".into(), content: "be brief".into(), tool_calls: None },
+            ChatMessage { role: "user".into(), content: "hi".into(), tool_calls: None },
         ];
-        let full = t.render(&msgs, false).unwrap();
+        let full = t.render(&msgs, false, None, None).unwrap();
         for k in 1..=msgs.len() {
-            let prefix = t.render(&msgs[..k], false).unwrap();
+            let prefix = t.render(&msgs[..k], false, None, None).unwrap();
             assert!(full.starts_with(&prefix), "message {k} render is not a prefix: {prefix:?} vs {full:?}");
         }
         assert!(t.role_boundaries(&msgs).len() <= msgs.len());
@@ -260,15 +286,15 @@ mod tests {
             stop_ids: vec![],
         };
         let msgs = [
-            ChatMessage { role: "system".into(), content: "be brief".into() },
-            ChatMessage { role: "user".into(), content: "hi".into() },
+            ChatMessage { role: "system".into(), content: "be brief".into(), tool_calls: None },
+            ChatMessage { role: "user".into(), content: "hi".into(), tool_calls: None },
         ];
         // Doesn't panic or return an Err; k=1 (renders fine, but as an
         // empty-BPE encode -> filtered by the same empty-encode behaviour
         // as any other prefix) contributes nothing, k=2 does not error.
         let _ = t.role_boundaries(&msgs);
-        assert!(t.render(&msgs, false).is_ok(), "the full render (k=2, what a real request sends) must succeed");
-        assert!(t.render(&msgs[..1], false).is_err(), "k=1 must actually fail to render, or this test proves nothing");
+        assert!(t.render(&msgs, false, None, None).is_ok(), "the full render (k=2, what a real request sends) must succeed");
+        assert!(t.render(&msgs[..1], false, None, None).is_err(), "k=1 must actually fail to render, or this test proves nothing");
     }
 
     #[test]
@@ -284,11 +310,53 @@ mod tests {
             stop_ids: vec![],
         };
         let s = t
-            .apply_chat_template(&[ChatMessage {
-                role: "user".into(),
-                content: "  hi  ".into(),
-            }])
+            .apply_chat_template(
+                &[ChatMessage { role: "user".into(), content: "  hi  ".into(), tool_calls: None }],
+                None,
+                None,
+            )
             .unwrap();
         assert_eq!(s, "<user>hi</><assistant>");
+    }
+
+    #[test]
+    fn chat_template_kwargs_reach_the_render_context() {
+        // A5: chat_template_kwargs is a bag of extra top-level template
+        // variables, merged in verbatim -- this template reads one back
+        // that isn't part of the fixed ctx (messages/add_generation_prompt/
+        // bos_token/eos_token), the same shape Qwen/Qwythos's real template
+        // reads `enable_thinking` from.
+        let t = Text {
+            tok: Tokenizer::new(tokenizers::models::bpe::BPE::default()),
+            meta: Meta {
+                chat_template: Some("{% if enable_thinking is defined and enable_thinking is false %}off{% else %}on{% endif %}".into()),
+                ..Meta::default()
+            },
+            stop_ids: vec![],
+        };
+        let msgs = [ChatMessage { role: "user".into(), content: "hi".into(), tool_calls: None }];
+        let without = t.render(&msgs, false, None, None).unwrap();
+        let with_false = t.render(&msgs, false, None, Some(&serde_json::json!({"enable_thinking": false}))).unwrap();
+        assert_eq!(without, "on");
+        assert_eq!(with_false, "off");
+        assert_ne!(without, with_false, "chat_template_kwargs must actually change the render");
+    }
+
+    #[test]
+    fn tools_array_reaches_the_template() {
+        let t = Text {
+            tok: Tokenizer::new(tokenizers::models::bpe::BPE::default()),
+            meta: Meta {
+                chat_template: Some("{% if tools %}{{ tools|length }} tools{% else %}no tools{% endif %}".into()),
+                ..Meta::default()
+            },
+            stop_ids: vec![],
+        };
+        let msgs = [ChatMessage { role: "user".into(), content: "hi".into(), tool_calls: None }];
+        let without = t.render(&msgs, false, None, None).unwrap();
+        let tools = serde_json::json!([{"type": "function", "function": {"name": "get_weather"}}]);
+        let with = t.render(&msgs, false, Some(&tools), None).unwrap();
+        assert_eq!(without, "no tools");
+        assert_eq!(with, "1 tools");
     }
 }

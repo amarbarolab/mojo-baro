@@ -581,6 +581,21 @@ struct ChatReq {
     spec: Option<bool>,
     #[serde(default)]
     stop: Option<StopParam>,
+    /// A5: the OpenAI `tools` array, handed to the chat template verbatim
+    /// (the template decides how to render function definitions, same as
+    /// vLLM and llama.cpp).
+    #[serde(default)]
+    tools: Option<Value>,
+    /// A5: extra top-level chat-template variables. Same field name as
+    /// vLLM and llama.cpp; Qwen/Qwythos's own template reads
+    /// `enable_thinking` from here.
+    #[serde(default)]
+    chat_template_kwargs: Option<Value>,
+    /// A5: `{"type":"json_schema","json_schema":{...}}`. Parsed and
+    /// validated, never silently ignored (bench/PROTOCOL-RULES.md P1) --
+    /// see `check_response_format`.
+    #[serde(default)]
+    response_format: Option<Value>,
     #[serde(flatten)]
     sampler: SamplerFields,
 }
@@ -588,7 +603,55 @@ struct ChatReq {
 #[derive(Deserialize)]
 struct ChatMsgIn {
     role: String,
+    #[serde(default)]
     content: Value,
+    /// A5: an assistant turn's own prior tool calls, echoed back by the
+    /// client on a follow-up request so the template can reconstruct
+    /// multi-turn tool-use history.
+    #[serde(default)]
+    tool_calls: Option<Vec<ToolCallIn>>,
+    /// A5: OpenAI's tool-result linkage id. Accepted and not silently
+    /// dropped from the request shape, but unused: Qwythos's chat template
+    /// keys a tool result off message order and `role == "tool"`, not this
+    /// id (checked directly in the template text).
+    #[serde(default)]
+    #[allow(dead_code)]
+    tool_call_id: Option<String>,
+}
+
+/// A5: one entry of an incoming `tool_calls` array (OpenAI shape:
+/// `arguments` is a JSON-encoded string, not an object).
+#[derive(Deserialize)]
+struct ToolCallIn {
+    function: ToolCallFunctionIn,
+}
+
+#[derive(Deserialize)]
+struct ToolCallFunctionIn {
+    name: String,
+    #[serde(default)]
+    arguments: Option<String>,
+}
+
+/// Converts an incoming OpenAI-shape `tool_calls` array (`arguments` as a
+/// JSON string) into the shape Qwythos's chat template expects
+/// (`tool_call.arguments|items`, i.e. a real object): parsed once here so
+/// `text.rs` never has to know the wire format.
+fn tool_calls_for_template(calls: &[ToolCallIn]) -> Value {
+    Value::Array(
+        calls
+            .iter()
+            .map(|c| {
+                let args: Value = c
+                    .function
+                    .arguments
+                    .as_deref()
+                    .and_then(|s| serde_json::from_str(s).ok())
+                    .unwrap_or_else(|| json!({}));
+                json!({"function": {"name": c.function.name, "arguments": args}})
+            })
+            .collect(),
+    )
 }
 
 fn content_text(v: &Value) -> Result<String, ApiError> {
@@ -604,17 +667,144 @@ fn content_text(v: &Value) -> Result<String, ApiError> {
     }
 }
 
+/// A5: response_format is accepted and validated, never silently ignored
+/// (bench/PROTOCOL-RULES.md P1's silently-inert parameter), but not
+/// enforced. Evidence, not a placeholder: the engine's decode loop has no
+/// point where the host sees a step's logits or can steer which token gets
+/// chosen before it is written -- `serve/engine.mojo`'s only per-step host
+/// visibility is the already-generated token id (used for stop-sequence
+/// matching), after the device has committed to it. True enforcement needs
+/// either the device mask (kernels/sample.mojo, mask before Gumbel -- the
+/// device half of A5, never edited by this lane) or a synchronous
+/// per-token host round trip that would itself be a decode-loop
+/// architecture change, out of an API-wiring lane's scope. `grammar/
+/// json_schema.mojo` compiling a `response_format`-shaped schema is proven
+/// offline (see the report), which is as far as "enforce it on the host"
+/// goes without one of those two.
+fn check_response_format(rf: &Value) -> Result<(), ApiError> {
+    let obj = rf.as_object().ok_or_else(|| bad("response_format must be an object"))?;
+    let kind = obj.get("type").and_then(Value::as_str).ok_or_else(|| bad("response_format.type is required"))?;
+    if kind != "json_schema" {
+        return Err(bad(format!("response_format.type {kind:?} is not supported (only \"json_schema\")")));
+    }
+    let schema_obj = obj
+        .get("json_schema")
+        .and_then(Value::as_object)
+        .ok_or_else(|| bad("response_format.json_schema is required for type \"json_schema\""))?;
+    if !schema_obj.contains_key("schema") {
+        return Err(bad("response_format.json_schema.schema is required"));
+    }
+    Err(bad(
+        "response_format is not enforced yet: no host-side point exists to apply a token mask \
+         without either kernels/sample.mojo (mask before Gumbel, the device half of A5) or a \
+         per-token host round trip that is itself a decode-loop architecture change; both are out \
+         of this lane's scope (briefs/2026-09-15-p2-a5-grammar-api.md). grammar/json_schema.mojo \
+         compiling this shape of schema is proven offline, see exchange/2026-09-15-p2-a5-report.md",
+    ))
+}
+
+/// A5: Qwythos's own tool-call wire format (from its `tokenizer.chat_template`,
+/// not an OpenAI convention):
+///   <tool_call>
+///   <function=NAME>
+///   <parameter=P1>
+///   V1
+///   </parameter>
+///   </function>
+///   </tool_call>
+/// one or more, back to back. Returns (content before the first tool_call,
+/// parsed calls); content is the full trimmed text when there are none.
+/// A parameter value that parses as JSON (number, bool, object, array)
+/// keeps that type; anything else is kept as a plain string.
+type ToolCall = (String, serde_json::Map<String, Value>);
+
+fn parse_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
+    let mut calls = Vec::new();
+    let mut rest = text;
+    let mut first_start: Option<usize> = None;
+    while let Some(start) = rest.find("<tool_call>") {
+        if first_start.is_none() {
+            first_start = Some(text.len() - rest.len() + start);
+        }
+        let after_open = &rest[start + "<tool_call>".len()..];
+        let Some(end) = after_open.find("</tool_call>") else { break };
+        let body = &after_open[..end];
+        if let Some(call) = parse_one_tool_call(body) {
+            calls.push(call);
+        }
+        rest = &after_open[end + "</tool_call>".len()..];
+    }
+    let content = match first_start {
+        Some(i) => text[..i].trim().to_string(),
+        None => text.trim().to_string(),
+    };
+    (content, calls)
+}
+
+fn parse_one_tool_call(body: &str) -> Option<ToolCall> {
+    let body = body.trim().strip_prefix("<function=")?;
+    let (name, after_name) = body.split_once('>')?;
+    let inner = after_name.strip_suffix("</function>").unwrap_or(after_name);
+    let mut args = serde_json::Map::new();
+    let mut r = inner;
+    while let Some(pstart) = r.find("<parameter=") {
+        let after = &r[pstart + "<parameter=".len()..];
+        let Some((pname, after_pname)) = after.split_once('>') else { break };
+        let Some(pend) = after_pname.find("</parameter>") else { break };
+        let pval = after_pname[..pend].trim();
+        let value: Value = serde_json::from_str(pval).unwrap_or_else(|_| Value::String(pval.to_string()));
+        args.insert(pname.to_string(), value);
+        r = &after_pname[pend + "</parameter>".len()..];
+    }
+    Some((name.to_string(), args))
+}
+
+/// `tool_calls` in the OpenAI response shape: `arguments` is a JSON-encoded
+/// string (not an object -- that shape is only for what the template reads,
+/// see `tool_calls_for_template`).
+fn tool_calls_response_json(calls: &[ToolCall]) -> Value {
+    Value::Array(
+        calls
+            .iter()
+            .enumerate()
+            .map(|(i, (name, args))| {
+                json!({
+                    "id": format!("call_{i}"),
+                    "type": "function",
+                    "function": {"name": name, "arguments": Value::Object(args.clone()).to_string()},
+                })
+            })
+            .collect(),
+    )
+}
+
 async fn chat_completions(State(app): State<Shared>, Json(r): Json<ChatReq>) -> Result<Response, ApiError> {
     let t = need_text(&app)?;
     if r.messages.is_empty() {
         return Err(bad("messages is empty"));
     }
+    if let Some(rf) = &r.response_format {
+        check_response_format(rf)?;
+    }
     let msgs = r
         .messages
         .iter()
-        .map(|m| Ok(ChatMessage { role: m.role.clone(), content: content_text(&m.content)? }))
+        .map(|m| {
+            Ok(ChatMessage {
+                role: m.role.clone(),
+                content: content_text(&m.content)?,
+                tool_calls: m.tool_calls.as_deref().map(tool_calls_for_template),
+            })
+        })
         .collect::<Result<Vec<_>, ApiError>>()?;
-    let rendered = t.apply_chat_template(&msgs).map_err(|e| ApiError::Plain(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let rendered = t
+        .apply_chat_template(&msgs, r.tools.as_ref(), r.chat_template_kwargs.as_ref())
+        .map_err(|e| ApiError::Plain(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    // A5: the rendered prompt is otherwise invisible to a caller (no
+    // endpoint returns it directly); a debug print is the brief's own
+    // suggested check for chat_template_kwargs actually changing the
+    // render (briefs/2026-09-15-p2-a5-grammar-api.md item 1).
+    eprintln!("chat_template render ({} chars): {rendered:?}", rendered.len());
     let ckpt = t.role_boundaries(&msgs);
     let g = Gen {
         prompt: t.encode(&rendered, true).map_err(bad)?,
@@ -652,11 +842,103 @@ async fn chat_completions(State(app): State<Shared>, Json(r): Json<ChatReq>) -> 
     }
     let (acc, text_out, stats) = collect(&app, rx).await?;
     let reason = acc.finish_reason(stats.get("finish").and_then(Value::as_str));
+    // A5: tool_calls parsed out of the generated text, non-streaming path
+    // only -- OpenAI's real streaming tool-call protocol is incremental
+    // per-argument-byte deltas, a separate, larger piece of work than this
+    // lane's round-trip check needs (out of scope, named here rather than
+    // half-built).
+    let (content, calls) = parse_tool_calls(&text_out);
+    let mut message = json!({"role": "assistant", "content": content});
+    if !calls.is_empty() {
+        message["tool_calls"] = tool_calls_response_json(&calls);
+    }
     Ok(Json(json!({
         "id": id, "object": "chat.completion", "created": now(), "model": model,
-        "choices": [{"index": 0, "message": {"role": "assistant", "content": text_out}, "tokens": acc.tokens, "finish_reason": reason}],
+        "choices": [{"index": 0, "message": message, "tokens": acc.tokens, "finish_reason": reason}],
         "usage": usage_json(n_prompt, acc.tokens.len(), &stats),
         "timings": stats,
     }))
     .into_response())
+}
+
+#[cfg(test)]
+mod a5_tests {
+    use super::*;
+
+    #[test]
+    fn parses_one_tool_call_with_typed_and_string_parameters() {
+        let text = "Let me check that.\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>";
+        let (content, calls) = parse_tool_calls(text);
+        assert_eq!(content, "Let me check that.");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "get_weather");
+        assert_eq!(calls[0].1.get("city"), Some(&json!("Paris")));
+        assert_eq!(calls[0].1.get("days"), Some(&json!(3)));
+    }
+
+    #[test]
+    fn parses_multiple_back_to_back_tool_calls() {
+        let text = "<tool_call>\n<function=a>\n</function>\n</tool_call>\n<tool_call>\n<function=b>\n<parameter=x>\ny\n</parameter>\n</function>\n</tool_call>";
+        let (content, calls) = parse_tool_calls(text);
+        assert_eq!(content, "");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, "a");
+        assert_eq!(calls[1].0, "b");
+        assert_eq!(calls[1].1.get("x"), Some(&json!("y")));
+    }
+
+    #[test]
+    fn plain_text_has_no_tool_calls() {
+        let (content, calls) = parse_tool_calls("just an answer, no calls here");
+        assert_eq!(content, "just an answer, no calls here");
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn tool_calls_response_json_encodes_arguments_as_a_string() {
+        let mut args = serde_json::Map::new();
+        args.insert("city".into(), json!("Paris"));
+        let v = tool_calls_response_json(&[("get_weather".to_string(), args)]);
+        let arr = v.as_array().unwrap();
+        assert_eq!(arr[0]["id"], json!("call_0"));
+        assert_eq!(arr[0]["type"], json!("function"));
+        assert_eq!(arr[0]["function"]["name"], json!("get_weather"));
+        // arguments must be a JSON-encoded STRING, the OpenAI wire shape,
+        // not the object shape the template itself reads.
+        assert!(arr[0]["function"]["arguments"].is_string());
+        let parsed: Value = serde_json::from_str(arr[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(parsed["city"], json!("Paris"));
+    }
+
+    #[test]
+    fn tool_calls_for_template_parses_the_openai_string_back_to_an_object() {
+        let calls = vec![ToolCallIn { function: ToolCallFunctionIn { name: "f".into(), arguments: Some(r#"{"x":1}"#.into()) } }];
+        let v = tool_calls_for_template(&calls);
+        assert_eq!(v[0]["function"]["name"], json!("f"));
+        assert_eq!(v[0]["function"]["arguments"]["x"], json!(1));
+    }
+
+    #[test]
+    fn response_format_rejects_unsupported_type() {
+        let err = check_response_format(&json!({"type": "json_object"})).unwrap_err();
+        match err {
+            ApiError::Plain(code, msg) => {
+                assert_eq!(code, StatusCode::BAD_REQUEST);
+                assert!(msg.contains("json_object"), "{msg}");
+            }
+            _ => panic!("expected ApiError::Plain"),
+        }
+    }
+
+    #[test]
+    fn response_format_400s_a_well_formed_json_schema_shape_as_not_enforced() {
+        let err = check_response_format(&json!({"type": "json_schema", "json_schema": {"name": "x", "schema": {"type": "object"}}})).unwrap_err();
+        match err {
+            ApiError::Plain(code, msg) => {
+                assert_eq!(code, StatusCode::BAD_REQUEST);
+                assert!(msg.contains("not enforced"), "{msg}");
+            }
+            _ => panic!("expected ApiError::Plain"),
+        }
+    }
 }
