@@ -87,3 +87,17 @@ the +-0.5 band; per prompt 53 58 56 49 57 45 58 57 40 56 48 59 55 53 50 44
 equal on 15/20 prompts (accumulation order, as allowed). `BARO_PROFILE=1`
 p09: ffn 19.5 -> 12.7 ms per token. Predicted "token 22 -> about 15 ms":
 measured 23.3 -> 17.9 ms, the expert kernels alone landed at prediction.
+
+### R2 result (2026-09-15): landed
+
+`q8_0_row_dot` rewritten: two lanes per 34-byte block, one 16-byte quant
+load per lane (2-byte aligned, the compiler emits `global_load_b128`, 92
+VGPRs, 0 spills), scale read once per block, per-element `(d*q)` bf16
+round-trip unchanged; all five callers (ssm/attn projections, shared
+expert, sigmoid gate input) inherit it. Gate 1: `test_moe_block` PASS.
+Gate 2: 20-prompt mean **53.00/64** (band 52.70..53.70); per prompt 53 58
+56 49 57 45 57 57 39 56 48 59 55 53 50 47 45 57 60 59. Gate 4: 20-prompt
+tok/s_gen median **55.97 -> 71.89 (1.284x)** against R1, ranges
+55.86..56.06 vs 71.67..72.14, sclk med 3277 MHz, 290 W / -100 mV, GENERATED
+equal 17/20. `BARO_PROFILE=1` p09: ssm 9.0 -> 5.7 ms per token, ffn
+12.7 -> 11.3 (shared expert), profile-mode 50.6 -> 64.5 tok/s.

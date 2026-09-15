@@ -402,12 +402,21 @@ def q8_0_row_dot[
 ) -> Scalar[f32]:
     comptime assert X.flat_rank == 2
     var lane = Int(lane_id())
-    var acc = Scalar[f32](0)
-    var k = lane
-    while k < k_dim:
-        acc += rebind[Scalar[bf16]](X[x_row, k]).cast[f32]() * q8_0_value(W, row_base, k)
-        k += WARP_SIZE
-    return warp.sum(acc)
+    var Xv = X.vectorize[1, 16]()
+    var nb = k_dim // 32
+    var acc = SIMD[f32, 16](0)
+    var b = lane // 2
+    var h = lane % 2
+    while b < nb:
+        var base = row_base + b * 34
+        var raw = W.unsafe_offset(base).unsafe_bitcast[Scalar[u16]]()[]
+        var d = bitcast[f16, 1](SIMD[u16, 1](raw)).cast[f32]()[0]
+        var q = W.unsafe_offset(base + 2 + h * 16).unsafe_bitcast[Scalar[i8]]().load[width=16]()
+        var v = (SIMD[f32, 16](d) * q.cast[f32]()).cast[bf16]().cast[f32]()
+        var a = rebind[SIMD[bf16, 16]](Xv[x_row, 2 * b + h]).cast[f32]()
+        acc = fma(v, a, acc)
+        b += 16
+    return warp.sum(acc.reduce_add())
 
 
 def moe_embed_q8_0_pos[
