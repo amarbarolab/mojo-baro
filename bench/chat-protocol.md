@@ -1612,3 +1612,38 @@ wired at all, whatever the socket does.
 NOT IN THIS ROUND. KV page export (`export_kv_pages` stays uncalled), the
 hidden-state latents, ingest-on-startup, and any agent-side policy. This
 round proves one direction of one payload type over a real socket.
+
+## C3 fix round: host top-p mass target (preregistered 2026-09-15, not run)
+
+Finding: `exchange/2026-09-15-m5-sampler-diagnosis.md`. `serve/sample_ref.mojo`
+applies `ceil` to a float64 top-p mass target whose unit is `exp(lmax)`; the
+device's `pmass_target` applies it to fixed-point mass (2^-40 units) where it is
+exact. On the real row the host keeps 20 and 56 tokens where top-p means 4.
+
+Arms, frozen before any code:
+- H0: `serve/sample_ref.mojo` as committed (`8ddd477`).
+- H1: host target `w = top_p * zc` (no ceil; clamp to [smallest single mass, zc]),
+  everything else unchanged. Device untouched.
+- Oracle: numpy float64, sorted exact nucleus (`.work/m5/oracle.py` shape),
+  independent of both.
+
+Gates, all at real vocab (248320, `.work/draft-logits.bin` plus at least two more
+real rows dumped from different prompts, named in the run record):
+1. `kernels/test_sample_device.mojo`: device == H1 per token on 64 draws for
+   every config shape: p-only, k-only, k+p, k+p+min_p, T=1 no truncation.
+2. Distribution: 20000 draws per config on device, chi-square against the
+   oracle's tempered nucleus distribution, critical value at p = 0.001, the same
+   test `kernels/test_sample.mojo` runs at VS=64, now at real vocab.
+3. `kernels/test_sample_ref.mojo` still green; H1 == oracle on every fixture it
+   already carries (the VS=64 ones must not change, since ceil is a no-op there
+   only when `top_p * zc` is already integral; any fixture that changes is
+   reported, not silently updated).
+4. Gate 1 of M5 (temperature 0 byte-identical) rerun after the change.
+
+Predictions: H1 passes 1 to 4; H0 fails 1 on the p-only and k+p shapes exactly
+as recorded. Falsifier of the diagnosis: the device fails gate 2 at real vocab on
+any shape; then the device is also wrong and the round widens to
+`kernels/sample.mojo` (fable, kernel work).
+
+On PASS: lift the M5 refusal of `top_p < 1` without `min_p`, in the same commit
+as the fix, with the gate named. Until then the refusal stands.

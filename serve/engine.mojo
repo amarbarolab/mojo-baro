@@ -378,6 +378,19 @@ def main() raises:
                 perr = "n must be >= 1"
             if perr == "" and len(prompt) + req_n > tmax:
                 perr = "prompt+n exceeds TMAX " + String(tmax)
+            # M5 gate-2 finding (exchange/2026-09-15-m5-sampler-diagnosis.md):
+            # serve/sample_ref.mojo's top-p cutoff is wrong at real vocab
+            # width when min_p is not also set (the ceil() in its pmass_target
+            # port rounds the mass target up to most or all of the top-k set
+            # on a peaked row); kernels/sample.mojo's device cutoff is the
+            # correct side, but gate 2 cannot yet confirm the device's own
+            # shape independently, so a request that would exercise the
+            # unverified cutoff is refused rather than served from a set the
+            # gate cannot confirm. Fix round preregistered in
+            # bench/chat-protocol.md ("C3 fix round"); neither sampler file
+            # changes until that round lands.
+            if perr == "" and sample.temperature > 0 and sample.top_p < 1 and sample.min_p <= 0:
+                perr = "top_p without min_p is unverified at real vocab (exchange/2026-09-15-m5-sampler-diagnosis.md, bench/chat-protocol.md C3 fix round); use min_p > 0 or top_p = 1"
             if perr != "":
                 print(err_line(req_id, perr))
                 continue
