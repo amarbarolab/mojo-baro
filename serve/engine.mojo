@@ -244,6 +244,13 @@ def main() raises:
     var spec_env = MEGA_ALLOWED and getenv("BARO_SPEC", "1") == "1"
     print("BARO_SPEC:", spec_env)
     var spec_dbg = getenv("BARO_SPEC_DBG", "0") == "1"
+    # B4 stage 2 (bench/moe-locality-protocol.md): BARO_EXPERTS=<path> writes
+    # the router's top-8 per layer per decoded token after each request. A
+    # traced run is an instrumentation run: it adds a device-to-device copy per
+    # layer, so its tok/s is not a receipt for anything.
+    var expert_trace_path = getenv("BARO_EXPERTS", "")
+    var expert_trace = expert_trace_path != ""
+    print("BARO_EXPERTS:", expert_trace_path if expert_trace else "off")
     # Teacher-forced agreement (identity gate, CLAUDE.md: never greedy equality
     # past ~256 ids). Off by default (empty path -> empty list, decode
     # unchanged): the model's own no-spec argmax is recorded as "predicted"
@@ -535,7 +542,7 @@ def main() raises:
         # the launch path for the window too, exactly as it already does for
         # the single-token megakernel above.
         var mega_win_req = mega_win and sample.temperature <= 0
-        var cfg = WindowCfg(pack_q4=pack_q4, draft_q4=draft_q4, q4_off=q4_off, e=e, kcfg=kcfg, spec=spec, spec_dbg=spec_dbg, serve=serve, req_id=req_id, prof=prof, pf2=pf2, pf3=pf3, pf4=pf4, dump=dump, dump4=dump4, dump_layer=dump_layer, mega=mega_req, att_split=att_split, mega_win=mega_win_req, dot3=dot3, pf_chunk=pf_chunk, pf_rows=pf_rows, pf_tail=pf_tail, n_total=n_total, fr_k=fr_k, fr_off=fr_off, fr_ids_off=fr_ids_off, n_prompt=len(prompt), sample=sample.copy())
+        var cfg = WindowCfg(pack_q4=pack_q4, draft_q4=draft_q4, q4_off=q4_off, e=e, kcfg=kcfg, spec=spec, spec_dbg=spec_dbg, expert_trace=expert_trace, serve=serve, req_id=req_id, prof=prof, pf2=pf2, pf3=pf3, pf4=pf4, dump=dump, dump4=dump4, dump_layer=dump_layer, mega=mega_req, att_split=att_split, mega_win=mega_win_req, dot3=dot3, pf_chunk=pf_chunk, pf_rows=pf_rows, pf_tail=pf_tail, n_total=n_total, fr_k=fr_k, fr_off=fr_off, fr_ids_off=fr_ids_off, n_prompt=len(prompt), sample=sample.copy())
         if len(force) > 0 and cfg.spec:
             raise Error("BARO_FORCE requires BARO_SPEC=0 (teacher forcing is a no-spec identity gate)")
         wst.reset(t0)
@@ -840,6 +847,30 @@ def main() raises:
         for i in range(len(generated)):
             line += String(generated[i]) + " "
         print("GENERATED:", line)
+        # B4 stage 2: one copy out, after the request, not per layer. The file
+        # is appended so a 20-prompt sweep is one trace; each block names the
+        # prompt's own token count so the replay can refuse a truncated trace.
+        if expert_trace:
+            ctx.enqueue_copy(dst_buf=bufs.etrace_h, src_buf=bufs.etrace_d)
+            ctx.synchronize()
+            var tl = String("# trace n_gen=") + String(n_gen) + " layers=" + String(N_LAYERS) + " topk=" + String(TOPK_TRACE) + " prompt_tokens=" + String(len(prompt)) + "\n"
+            var rows = min(n_gen, TRACE_TOK)
+            for tk in range(rows):
+                for ly in range(N_LAYERS):
+                    var base = (tk * N_LAYERS + ly) * TOPK_TRACE
+                    var any_set = False
+                    for e in range(TOPK_TRACE):
+                        if bufs.etrace_h[base + e] >= 0:
+                            any_set = True
+                    if not any_set:
+                        continue
+                    tl += String(tk) + " " + String(ly)
+                    for e in range(TOPK_TRACE):
+                        tl += " " + String(bufs.etrace_h[base + e])
+                    tl += "\n"
+            with open(expert_trace_path, "a") as tf:
+                tf.write(tl)
+            print("expert trace appended:", expert_trace_path, " rows", rows, "x", N_LAYERS)
         if len(force) > 0:
             var ps = String("")
             var agree = 0

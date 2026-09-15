@@ -566,6 +566,9 @@ struct WindowBufs(Copyable, Movable):
     # once. moe_ffn used to make a host buffer and copy a 0 into hidx_d[0] on
     # every layer, 40 host buffers and 40 copies per token, and that copy also
     # clobbered the router's own idx[0] after the routed path had consumed it.
+    # B4 stage 2: TRACE_TOK tokens x N_LAYERS x TOPK expert ids, device side.
+    var etrace_d: DeviceBuffer[DType.int32]
+    var etrace_h: HostBuffer[DType.int32]
     var zidx_d: DeviceBuffer[DType.int32]
     var dids_d: DeviceBuffer[DType.int32]
     var sout_d: DeviceBuffer[DType.int32]
@@ -586,6 +589,10 @@ struct WindowCfg(Copyable, Movable):
     var kcfg: Int
     var spec: Bool
     var spec_dbg: Bool
+    # B4 stage 2 (bench/moe-locality-protocol.md): capture the router's top-8
+    # per layer per token into a device plane, copied out once per request.
+    # Off by default; a traced run is an instrumentation run, never a timed one.
+    var expert_trace: Bool
     var serve: Bool
     var req_id: Int
     var prof: Bool
@@ -670,7 +677,7 @@ comptime moe_shared_flat_layout = row_major[SH_FFN]()
 comptime moe_inner_layout = row_major[NH_V * SSTATE]()
 comptime moe_inner_m_layout = row_major[1, NH_V * SSTATE]()
 comptime moe_om_layout = row_major[1, NH_V, SSTATE]()
-def moe_ffn(ctx: DeviceContext, mut b: WindowBufs, Xm: TileTensor[f32, type_of(xm_layout), MutAnyOrigin], CurBm: TileTensor[bf16, type_of(xm_layout), MutAnyOrigin], w: Int, layer: Int, routed_base: Int, extra_base: Int) raises:
+def moe_ffn(ctx: DeviceContext, mut b: WindowBufs, Xm: TileTensor[f32, type_of(xm_layout), MutAnyOrigin], CurBm: TileTensor[bf16, type_of(xm_layout), MutAnyOrigin], w: Int, layer: Int, routed_base: Int, extra_base: Int, trace_slot: Int = -1) raises:
     var Xres = row_f32(ctx, b.x_d, 0, H, moe_vec_layout)
     var X = row_f32(ctx, b.p_h_d, 0, H, moe_vec_layout)
     var X2 = row_f32(ctx, b.p_h_d, 0, H, h2_layout)
@@ -682,6 +689,12 @@ def moe_ffn(ctx: DeviceContext, mut b: WindowBufs, Xm: TileTensor[f32, type_of(x
     comptime k_router = amar_matmul_skinny_m1_row[f32, 2, type_of(h2_layout), type_of(moe_router_layout), type_of(moe_logits_layout)]
     ctx.enqueue_function[k_router](X2, Router, Logits, Int32(N_EXP), Int32(H), grid_dim=ceildiv(N_EXP, ROW_WAVES), block_dim=ROW_THREADS)
     ctx.enqueue_function[amar_moe_router_top8[type_of(moe_logits_layout), type_of(moe_idx_layout), type_of(moe_idx_layout)]](Logits, Idx, Wt, grid_dim=1, block_dim=MOE_THREADS // MOE_WAVES)
+    if trace_slot >= 0 and trace_slot < TRACE_TOK:
+        # Device to device, no sync: the ids are read out once per request.
+        ctx.enqueue_copy(
+            dst_buf=DeviceBuffer[DType.int32](ctx, b.etrace_d.unsafe_ptr().unsafe_offset((trace_slot * N_LAYERS + layer) * TOPK), TOPK, owning=False),
+            src_buf=DeviceBuffer[DType.int32](ctx, b.hidx_d.unsafe_ptr(), TOPK, owning=False),
+        )
     var routed = row_f32(ctx, b.p_qf_d, 0, H, moe_vec_layout)
     var shared = row_f32(ctx, b.p_h_d, 0, H, moe_vec_layout)
     var routed_f = row_f32(ctx, b.p_ffn_d, 0, TOPK * E_FFN, moe_expert_f_layout)
@@ -1196,7 +1209,8 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                 st.fc[0] += Int(nw - st.tq)
                 st.tq = nw
             comptime if not MEGA_ALLOWED:
-                moe_ffn(ctx, b, Xm, CurBm, moe_base, layer, moe_base + (8 if is_attn(layer) else 11), moe_base + (11 if is_attn(layer) else 14))
+                moe_ffn(ctx, b, Xm, CurBm, moe_base, layer, moe_base + (8 if is_attn(layer) else 11), moe_base + (11 if is_attn(layer) else 14),
+                        st.pos if cfg.expert_trace else -1)
             var Wfgq = tens_q8q(ctx, b.wbuf, b.off[w + 1], H * FFN, q_h_ffn)
             var Wfgs = tens_q8s(ctx, b.wbuf, b.off[w + 1], H * FFN, s_h_ffn)
             var Wfuq = tens_q8q(ctx, b.wbuf, b.off[w + 2], H * FFN, q_h_ffn)

@@ -35,6 +35,14 @@ from moe import amar_moe_down_q6k
 
 comptime TMAX = 1088
 comptime GEN_N = 64
+# B4 stage 2 (bench/moe-locality-protocol.md): how many decoded tokens the
+# expert-id trace plane holds. One GEN_N-length request fills it exactly; a
+# longer request stops tracing rather than wrapping, so a trace is never a
+# mixture of two positions.
+comptime TRACE_TOK = 64
+# The trace plane's width is a literal 8 rather than the MoE profile's TOPK,
+# because registry is shared with the dense profiles, which have no experts.
+comptime TOPK_TRACE = 8
 comptime CP = 1024
 comptime PF_LDS_MIN = 128
 comptime PF_MIN = 16
