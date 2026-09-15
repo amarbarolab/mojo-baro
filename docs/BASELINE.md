@@ -393,6 +393,21 @@ used to dequantize one element per lane per load; the bytes-per-token floor
 is about 3.2 ms (2.7 GB), so the remaining gap is launch-bound small kernels
 in the SSM sub-block and expert time, not bytes.
 
+**Served path (2026-09-15, `bench/moe-served-protocol.md`).** The same binary
+behind `baro-serve`, one `POST /v1/completions` per prompt, prompts as token
+ids, 64 tokens: **92.89 tok/s_gen 20-prompt median (range 90.56 to 93.07),
+0.993x the one-shot 93.52 (range 86.97 to 94.11) measured in the same stint,
+and 74.74 tok/s over the whole HTTP round trip** (range 49.81 to 83.92).
+Served tokens are identical to the one-shot tokens on 20/20 prompts. Per
+request the medians are prefill 159.3 ms, decode 0.678 s, wall 0.843 s, so
+serving costs 5.5 ms (HTTP, JSON, the line protocol, queueing) and the rest
+of the gap to the decode-only number is prefill. Quote 92.89 against another
+engine's decode rate and 74.74 against another server's end-to-end latency;
+they are not the same measurement. Falsifier, runnable on any RDNA3 card with
+this pack: `bench/served-prompts.sh .work/moe-served/engine .work/moe-w1/pack
+OUT "BARO_SPEC=0 BARO_MEGA=0"`; a served/one-shot ratio outside 0.98 to 1.02,
+or any identity failure, refutes this row.
+
 ## Self-describing bakes 2026-09-15 (`8184f7d`, closure PASS from the file, nothing external)
 
 - `Qwythos-9B-Claude-Mythos-5-1M-MTP-BF16-BARO-8184f7d.gguf` sha256
