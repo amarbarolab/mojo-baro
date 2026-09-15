@@ -12,6 +12,17 @@ every block's wave-0 cycles / sum of their wall spans; a block lifetime over
 Site names default to gate/up/down (bench/carryover-stamp.py's SITES, site
 index 0/1/2); pass --site-names to match a different SITES list.
 
+The per-site sums (sum_<name>_ms) and the window sum (sum_win_ms) are exact
+regardless of dispatch order -- each STAMP line carries its own site index,
+so these are a straight group-by. The pairwise gap breakdown (sum_<a>-><b>_ms)
+assumes real dispatches visit the sites in index order 0,1,2,...,cyclically;
+that holds for an always-sequential SITES list (e.g. gate->up->down) but not
+for one with mutually-exclusive branches (e.g. this repo's attn-only vs
+ssm-only sites, M3 2026-09-15) -- there most real inter-kernel gaps do not
+match any labeled pair and go uncounted in the breakdown. Trust the per-site
+and window sums always; trust the pairwise breakdown only when the SITES
+list is a single sequential chain.
+
 Promoted from .work/carryover/analyze.py (2026-09-15 carry-over probe).
 """
 import argparse
@@ -70,7 +81,11 @@ def parse_runs(runs_dir, pattern):
 
 def aggregate(runs, site_names):
     nsites = len(site_names)
-    gap_names = [f"{site_names[i][0]}2{site_names[(i + 1) % nsites][0]}" for i in range(nsites)]
+    # Full names, not first letters: a heterogeneous site set (this repo's
+    # SITES has "att_*" and "ssm_*" siblings) collides on first letter, e.g.
+    # "att_qf"->"att_k" and "att_v"->"att_out" would both read "a2a". Full
+    # names keep every (site[i], site[i+1]) pair a distinct key.
+    gap_names = [f"{site_names[i]}->{site_names[(i + 1) % nsites]}" for i in range(nsites)]
     agg = {}
     for tag, r in runs.items():
         st = r["st"]
@@ -163,7 +178,8 @@ def report(agg, site_names, gap_names):
             rc = [a["sums"][k] for a in C]
             rd = [a["sums"][k] for a in D]
             disj = "disjoint" if (min(rd) > max(rc) or max(rd) < min(rc)) else "overlap"
-            print(f"   {k}: {vd - vc:+.2f} ms ({(vd / vc - 1) * 100:+.2f}%) {disj}")
+            pct = f"{(vd / vc - 1) * 100:+.2f}%" if vc else "n/a (zero)"
+            print(f"   {k}: {vd - vc:+.2f} ms ({pct}) {disj}")
         print(f"   decode_s: {med([a['decode_s'] for a in D]) - med([a['decode_s'] for a in C]):+.4f} s")
         for k in site_names:
             ec = med([a["med_eff"][k] for a in C])

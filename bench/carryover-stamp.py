@@ -39,7 +39,13 @@ import sys
 
 ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 OUT = os.path.join(ROOT, ".work/carryover")
-NSLOT = 8192
+# 8192 was enough for the 3-site FFN-only probe (3360 stamps observed on a
+# 64-token k=2 decode, ~35 windows). M3's 13-site SITES list fires ~249
+# stamps/window (3 FFN + 4 attn + 5 ssm, N_LAYERS/N_ATT/N_SSM = 32/8/24, +1
+# head), so the same run would need ~8715 slots -- over capacity, and
+# stamp_slot() has no bounds check, so overflow would silently write past
+# St's allocation. 32768 gives about 4x headroom over that.
+NSLOT = 32768
 
 
 def git_show(rev, path):
@@ -139,12 +145,26 @@ def patch_kernel_file(d, kernel_key):
 
 
 # --- SITES: which dispatch points route through a stamped kernel ----------
-# One entry per FFN GEMV call in serve/window.mojo's gemm_w_st (site index is
-# what lands in the STAMP line and in analyze.py's --site-names). Extending
-# this probe to a fourth call site, or a different kernel, means adding a
-# KERNELS entry (if it is a new kernel) and a SITES entry naming the call to
-# replace with its stamped form; patch_window() below loops the list, it does
-# not special-case each one.
+# One entry per gemm_w[...] call in serve/window.mojo's decode-loop window
+# (site index is what lands in the STAMP line and in analyze.py's
+# --site-names). Extending this probe to a different call site, or a
+# different kernel, means adding a KERNELS entry (if it is a new kernel) and
+# a SITES entry naming the call to replace with its stamped form;
+# patch_window() below loops the list, it does not special-case each one.
+#
+# The first three (gate/up/down, the shared FFN sub-block, site 0-2) are the
+# 2026-09-15 carry-over probe's original set. Sites 3-12 (M3, MSPEC
+# precondition 2026-09-15) add every other gemm_w call reached by ONE decode
+# window: 4 in the attn sub-block, 5 in the ssm sub-block (mutually
+# exclusive per layer -- is_attn(layer) picks one), 1 head/logits GEMV once
+# per window. Everything else dispatched in the window (rmsc_k, split_k,
+# hrms_q/kv, rope_q/k, append_k, datt_k/att_k, gmul_k, r_add, rgates_k,
+# conv_k, l2_k, delta_dispatch, gated_k, r_swiglu, argmax_d/k, tokcp_k,
+# embed_k, ~25 kernels total) is NOT stamped and is charged to "gap" by
+# carryover-analyze.py -- gap share computed from this SITES set is an UPPER
+# BOUND on the true gap share, never a lower one (fewer measured kernels ->
+# smaller measured sum_kernel_spans -> larger apparent gap), per the maintainer's
+# 2026-09-15 MSPEC decision rule.
 SITES = [
     dict(name="gate", kernel="q4rowb", site=0,
          call="gemm_w[FFN, H](ctx, CurBm, b.wbuf, b.off[w + 1], cfg.pack_q4, Pg, m)"),
@@ -152,6 +172,27 @@ SITES = [
          call="gemm_w[FFN, H](ctx, CurBm, b.wbuf, b.off[w + 2], cfg.pack_q4, Pu, m)"),
     dict(name="down", kernel="q4rowb", site=2,
          call="gemm_w[H, FFN](ctx, FgBm, b.wbuf, b.off[w + 3], cfg.pack_q4, Ph2, m)"),
+    dict(name="att_qf", kernel="q4rowb", site=3,
+         call="gemm_w[QF, H](ctx, CurBm, b.wbuf, b.off[w + 1], cfg.pack_q4, Pqf, m)"),
+    dict(name="att_k", kernel="q4rowb", site=4,
+         call="gemm_w[KV, H](ctx, CurBm, b.wbuf, b.off[w + 2], cfg.pack_q4, Pkv, m)"),
+    dict(name="att_v", kernel="q4rowb", site=5,
+         call="gemm_w[KV, H](ctx, CurBm, b.wbuf, b.off[w + 3], cfg.pack_q4, Pkv, m)"),
+    dict(name="att_out", kernel="q4rowb", site=6,
+         call="gemm_w[H, ATT](ctx, AoBm, b.wbuf, b.off[w + 6], cfg.pack_q4, Ph, m)"),
+    dict(name="ssm_qkv", kernel="q4rowb", site=7,
+         call="gemm_w[CONV, H](ctx, CurBm, b.wbuf, b.off[w + 1], cfg.pack_q4, Pq, m)"),
+    dict(name="ssm_z", kernel="q4rowb", site=8,
+         call="gemm_w[H, H](ctx, CurBm, b.wbuf, b.off[w + 2], cfg.pack_q4, Ph, m)"),
+    dict(name="ssm_a", kernel="q4rowb", site=9,
+         call="gemm_w[NH_V, H](ctx, CurBm, b.wbuf, b.off[w + 3], cfg.pack_q4, Pab, m)"),
+    dict(name="ssm_b", kernel="q4rowb", site=10,
+         call="gemm_w[NH_V, H](ctx, CurBm, b.wbuf, b.off[w + 4], cfg.pack_q4, Pab2, m)"),
+    dict(name="ssm_out", kernel="q4rowb", site=11,
+         call="gemm_w[H, H](ctx, ResBmOld, b.wbuf, b.off[w + 9], cfg.pack_q4, Ph, m)"),
+    dict(name="head", kernel="q4rowb", site=12,
+         call="gemm_w[VOCAB, H](ctx, CurBm, b.wbuf, b.off[w + 1], cfg.pack_q4, Pv, m)",
+         indent=16, layer_expr="N_LAYERS"),
 ]
 
 
@@ -204,9 +245,12 @@ def patch_window(d, sites):
         "        for layer in range(0 if (use_mega or use_mega_win) else N_LAYERS):\n",
     )
     for s in sites:
-        dims = "H, FFN" if s["call"].startswith("gemm_w[H, FFN]") else "FFN, H"
-        stamped_call = f"gemm_w_st[{dims}]({s['call'].split('(', 1)[1][:-1]}, b.st_d, st.stamp_slot(layer, {s['site']}, m))"
-        t = rep(t, f"                    {s['call']}\n", f"                    {stamped_call}\n")
+        dims = s["call"][len("gemm_w["):s["call"].index("]")]
+        args = s["call"].split("(", 1)[1][:-1]
+        layer_expr = s.get("layer_expr", "layer")
+        stamped_call = f"gemm_w_st[{dims}]({args}, b.st_d, st.stamp_slot({layer_expr}, {s['site']}, m))"
+        indent = " " * s.get("indent", 20)
+        t = rep(t, f"{indent}{s['call']}\n", f"{indent}{stamped_call}\n")
     open(p, "w").write(t)
 
 

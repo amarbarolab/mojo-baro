@@ -610,3 +610,96 @@ the 290 W cap. **H1 falsified; H2-class cost (more cycles at equal clock in
 untouched kernels), mechanism not identified. Gate-2 per-kernel timing cannot
 judge a geometry change; the untraced tok/s and the in-stream device timeline
 can.** Report: `exchange/2026-09-15-carryover-probe.md`.
+
+## MSPEC precondition check (M3, wiring lane, 2026-09-15, preregistered before the first timed run)
+
+Question (brief `briefs/2026-09-15-wiring-lane.md` M3): does an untraced
+in-stream gap-share measurement of the MSPEC spec-verify window fall inside
+the 8.4-9.2% corrected bound (`bench/mtp-protocol.md`, MSPEC step 1 traced
+15.65% at T/B tracer cost 0.93, corrected two ways: 8.35% charging all extra
+decode time to gaps, 9.21% charging only the windows' dispatch share)? Kill
+line for MSPEC step 2: g < 10%.
+
+**Instrument.** `bench/carryover-stamp.py`'s `SITES` list, extended from the
+carry-over probe's 3 FFN GEMVs (gate/up/down) to all 13 `gemm_w[...]` call
+sites reached by one decode-loop window on the qwen35 `MEGA_ALLOWED` profile
+(`serve/window.mojo:842-1290`): the 3 FFN sites plus 4 attn-subblock GEMVs
+(qf, k, v, output) and 5 ssm-subblock GEMVs (qkv, z, a, b, out), mutually
+exclusive per layer on `is_attn(layer)` (`N_LAYERS`/`N_ATT`/`N_SSM` =
+32/8/24), plus the once-per-window head/logits GEMV. `NSLOT` raised
+8192 -> 32768 (13-site stamps/window ~249 vs the 3-site ~21; a 64-token k=2
+decode needs ~8715 slots at 13 sites, over the old cap with no bounds check
+in `stamp_slot()`).
+
+**Decision rule (the maintainer, 2026-09-15, verbatim):** gap_share = (window -
+sum_kernel_spans) / window. Stamping a SUBSET of the window's kernels
+underestimates sum_kernel_spans and therefore OVERESTIMATES gap -- every
+unstamped kernel's real execution time is charged to "gap". So the SITES
+subset above (gemm_w-class only; everything else -- `rmsc_k`, `split_k`,
+`hrms_q`/`hrms_kv`, `rope_q`/`rope_k`, `append_k`, `datt_k`/`att_k`,
+`dcomb_k`, `gmul_k`, `r_add`, `rgates_k`, `conv_k`, `l2_k`,
+`delta_dispatch`, `gated_k`, `r_swiglu`, `argmax_d`/`argmax_k`, `tokcp_k`,
+`embed_k`, ~25 kernels total -- charged to gap) yields an UPPER BOUND on the
+true untraced gap share, never a lower one. The GEMVs carry the weight
+streaming and should dominate the window, so the bound has a real chance of
+landing under 10%; if it does not, that is information too, not a failure.
+
+**Verdict rule:** measured upper bound < 10% -> MSPEC's correction is
+validated on measured (untraced) ground, the kill line is cleared, step 2
+may proceed (starting it is still not this lane's to do). Measured upper
+bound >= 10% -> **INCONCLUSIVE**, not a refutation: report which of the ~25
+unstamped kernel types would need stamping next to tighten the bound, and
+stop.
+
+**Run.** `bench/carryover-run.sh S` (arms Cs/D2s, 5 rounds each, prompt
+`bench/mtp-prompts/p09-explain-gpu.tokens`, `BARO_SPEC=1 BARO_SPEC_K=2`,
+`GEN_N=64` default); `bench/carryover-analyze.py --site-names
+gate,up,down,att_qf,att_k,att_v,att_out,ssm_qkv,ssm_z,ssm_a,ssm_b,ssm_out,head`.
+Gap share per run = 1 - sum(all 13 sites' spans) / window span, read from the
+`sum_win_ms` and the 13 `sum_<site>_ms` fields already reported per arm.
+Identity gate unchanged from the carry-over probe (every run's `GENERATED`
+hash must match). Only the **Cs** arm (plain checkout) is read for the gap
+share verdict; D2s is carried along for free (same run) but is not part of
+this question.
+
+### Result 2026-09-15 (Cs arm, 5 runs, working tree)
+
+Identity PASS 10/10 (both arms), 0 WARN, `fail=0` every run, `STAMPS 8715`
+every run (matches the predicted ~249 stamps/window x ~35 windows). Median
+over 5 runs, Cs arm: `sum_win_ms` 479.08 (478.30..532.33, one run's tail
+outlier in `sum_up_ms` -- 100.51 vs a 56.5x median on that one run, median is
+robust to it). Per-site medians (ms): ffn (gate+up+down) 184.59, attn
+(qf+k+v+out) 24.77, ssm (qkv+z+a+b+out) 89.65, head 31.66 -- sum of all 13
+sites **330.67 ms**.
+
+**gap_share_upper_bound = 1 - 330.67/479.08 = 0.310 (31.0%).**
+
+**Verdict: INCONCLUSIVE per the decision rule (upper bound >= 10%).** This
+does not refute the 8.4-9.2% corrected bound -- an upper bound above the kill
+line says nothing about where the true value sits, only that this
+measurement cannot clear the line. It also does not surprise: the 13
+`gemm_w`-class sites cover 249 of ~678 dispatches per window (~37% by
+count), and 31% > MSPEC's own traced 15.65% (tracer overhead included) >
+its corrected 8.4-9.2%, which is the expected direction -- fewer measured
+kernels, higher apparent gap, monotonically.
+
+**Next kernels to add, ranked by expected contribution (not measured, judged
+by what each kernel actually does over how much state):** `delta_dispatch`
+(the SSM scan itself, i.e. the one truly serial per-token recurrence in
+the SSM sub-block, run on all 24 ssm layers -- the single largest suspect,
+since the already-stamped `ssm_*` GEMVs are only the projections around it,
+89.65 ms, not the scan); `datt_k`/`att_k` (the attention kernel proper, on
+all 8 attn layers, analogous gap to `delta_dispatch`); `rope_q`/`rope_k`,
+`hrms_q`/`hrms_kv`, `append_k` (attn-branch per-head ops, smaller but
+numerous); `conv_k`, `l2_k`, `gated_k`, `rgates_k` (ssm-branch elementwise,
+smaller); `rmsc_k` (rmsnorm, runs every sub-block boundary, many small
+launches); `r_swiglu`, `r_add`, `gmul_k`, `split_k` (cheap elementwise,
+lowest priority); `argmax_d`/`argmax_k`, `tokcp_k`, `embed_k` (once or twice
+per window, small). Stamping `delta_dispatch` and `datt_k`/`att_k` next is
+the highest-yield single addition, since between them they are the only
+unstamped kernels that scale with sequence/state length rather than being
+O(1) elementwise.
+
+**Stopping here per the decision rule.** Not this lane's call whether to
+extend SITES further or scope a smaller round for it; report:
+`exchange/lane-WIRING-report.md`.
