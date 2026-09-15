@@ -66,6 +66,12 @@ def gumbel(w: UInt32) -> Float32:
 
 
 @always_inline
+def gumbel2(w1: UInt32, w2: UInt32) -> Float32:
+    var u = ((w1 >> 5).cast[DType.float64]() * 67108864.0 + (w2 >> 6).cast[DType.float64]() + 0.5) * 1.1102230246251565e-16
+    return (-log(-log(u))).cast[f32]()
+
+
+@always_inline
 def okey(v: Float32) -> UInt32:
     var b = bitcast[u32, 1](v)
     if (b >> 31) != 0:
@@ -814,11 +820,12 @@ def amar_sample_row[
                 hit = True
         if hit:
             var w = rng4(seed, counter, row, 0, g)
+            var w2 = rng4(seed, counter, row, 4, g)
             comptime for e in range(4):
                 var v = a[e]
                 if member(v, g + e, lmax, vcut, ck, ci, mpe):
                     var ev = (v - lmax) / temperature
-                    var s = ev + gumbel(w[e])
+                    var s = ev + gumbel2(w[e], w2[e])
                     if s > bs:
                         bs = s
                         bi = Int32(g + e)
@@ -938,9 +945,10 @@ def amar_spec_accept[
         var r = at - ad
         if r.gt(SIMD[f32, 4](0)).reduce_or():
             var w = rng4(seed, counter, row, 2, g)
+            var w2 = rng4(seed, counter, row, 6, g)
             comptime for e in range(4):
                 if r[e] > 0:
-                    var s = log(r[e]) + gumbel(w[e])
+                    var s = log(r[e]) + gumbel2(w[e], w2[e])
                     if s > bs:
                         bs = s
                         bi = Int32(g + e)
@@ -954,9 +962,10 @@ def amar_spec_accept[
             var at = load4(Pt, base, g, N)
             if at.gt(SIMD[f32, 4](0)).reduce_or():
                 var w = rng4(seed, counter, row, 3, g)
+                var w2 = rng4(seed, counter, row, 7, g)
                 comptime for e in range(4):
                     if at[e] > 0:
-                        var s = log(at[e]) + gumbel(w[e])
+                        var s = log(at[e]) + gumbel2(w[e], w2[e])
                         if s > bs:
                             bs = s
                             bi = Int32(g + e)

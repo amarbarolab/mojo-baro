@@ -1770,3 +1770,21 @@ the same commit as the fix, gate named. Until then the refusal stands.
 lifted, untruncated shape newly refused) landed ahead of this round per the
 coordinator's decision, since the refusal's job is to gate what the engine
 serves, not to gate when this round runs.
+
+### C3 tail round result (2026-09-15): H1 PASS, landed, refusal lifted
+
+H1 = `gumbel2(w1, w2)`: a 53-bit float64 uniform from two Philox words
+(second word from stream + 4, streams 0..3 were taken), `-ln(-ln(u))` in
+float64 then float32, at all six Gumbel sites (row sampler, residual and
+fallback in spec accept) on both `kernels/sample.mojo` and
+`serve/sample_ref.mojo`. Gate 1 (20000-draw chi-square, real vocab, three
+rows): `T1_k0_p1` p02 chi2 136 -> 55.4 (crit 77.5), p03 555.7 -> 44.2
+(crit 86.7), p01 clean; the four already-passing shapes stay clean on all
+rows; per-token host == device 64/64 on every row and shape (device test
+`.work/m5/tail-device.log`). `kernels/test_sample_ref.mojo` and
+`kernels/test_sample.mojo` (VS=64) green. Gate 2 (temperature 0
+byte-identical): 20/20 prompts GENERATED equal, base vs H1 engine at
+defaults (`.work/m5/ab-tail/results.txt`). Refusal for the untruncated shape
+lifted in `serve/engine.mojo`; live `POST /v1/chat/completions` at
+`temperature 1.0` returns a completion, nucleus and greedy unchanged
+(`.work/m5/verify-tail.sh`). Prediction held; falsifier did not fire.

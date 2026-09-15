@@ -63,6 +63,13 @@ def gumbel(w: UInt32) -> Float32:
     return -log(-log(unif(w)))
 
 
+def gumbel2(w1: UInt32, w2: UInt32) -> Float32:
+    # 53-bit uniform in float64 from two Philox words (C3 tail round): the
+    # 24-bit float32 uniform floors every token at 2^-24 per draw.
+    var u = (Float64(w1 >> 5) * 67108864.0 + Float64(w2 >> 6) + 0.5) * 1.1102230246251565e-16
+    return Float32(-log(-log(u)))
+
+
 # ---- stable sort (value desc, ties by ascending original index) ----------
 
 def sort_desc_stable(mut order: List[Int], values: List[Float32]):
@@ -185,7 +192,7 @@ def sample_row_ref(
         var i = order[j]
         var ev = (logits[i] - lmax) / temperature
         var wd = rng_word(seed, counter, row, 0, i)
-        var s = ev + gumbel(wd)
+        var s = ev + gumbel2(wd, rng_word(seed, counter, row, 4, i))
         if s > bs:
             bs = s
             bi = i
@@ -299,7 +306,7 @@ def spec_accept_ref(
         var r = pt[i] - pd[i]
         if r > 0:
             var wd = rng_word(seed, counter, row, 2, i)
-            var s = log(r) + gumbel(wd)
+            var s = log(r) + gumbel2(wd, rng_word(seed, counter, row, 6, i))
             if s > bs:
                 bs = s
                 bi = i
@@ -307,7 +314,7 @@ def spec_accept_ref(
         for i in range(n):
             if pt[i] > 0:
                 var wd = rng_word(seed, counter, row, 3, i)
-                var s = log(pt[i]) + gumbel(wd)
+                var s = log(pt[i]) + gumbel2(wd, rng_word(seed, counter, row, 7, i))
                 if s > bs:
                     bs = s
                     bi = i

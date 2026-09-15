@@ -387,13 +387,6 @@ def main() raises:
             #
             # C3 tail round (bench/chat-protocol.md): the untruncated shape
             # (top_p=1, top_k=0, min_p<=0) is a separate, still-open defect —
-            # unif()'s 24-bit float32 uniform caps the Gumbel key at ~17.3
-            # nats, giving every one of the vocab's tokens a ~2^-24 floor
-            # chance per draw regardless of true probability, inflating the
-            # observed deep tail (1.48% of draws affected). Refused until the
-            # C3 tail round's 53-bit uniform fix lands.
-            if perr == "" and sample.temperature > 0 and sample.top_p >= 1 and sample.top_k == 0 and sample.min_p <= 0:
-                perr = "untruncated sampling has a 2^-24 uniform tail floor (bench/chat-protocol.md C3 tail round); use top_p<1, top_k>0 or min_p>0"
             if perr != "":
                 print(err_line(req_id, perr))
                 continue
