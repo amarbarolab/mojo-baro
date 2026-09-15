@@ -2,6 +2,7 @@
 and kernels/test_prefix.mojo. Moved verbatim out of engine.mojo main (M1a);
 no decode-path code lives here.
 """
+from std.os import getenv
 from std.collections import Dict
 from std.ffi import c_ssize_t, external_call
 from std.math import ceildiv
@@ -15,6 +16,9 @@ from window import *
 
 
 struct Pack(Movable):
+    # B4 stage 2b: the tier needs the pack directory to read index.txt and
+    # experts.bin, and alloc_bufs only ever sees the Pack.
+    var packdir: String
     var wbuf: DeviceBuffer[DType.uint8]
     var off: List[Int]
     var total: Int
@@ -26,7 +30,8 @@ struct Pack(Movable):
     var fr_ids_off: Int
     var fr_k: Int
 
-    def __init__(out self, var wbuf: DeviceBuffer[DType.uint8], var off: List[Int], total: Int, q4_off: Int, have_q4_draft: Bool, pack_q4: Bool, fr_off: Int = 0, fr_ids_off: Int = 0, fr_k: Int = 0):
+    def __init__(out self, packdir: String, var wbuf: DeviceBuffer[DType.uint8], var off: List[Int], total: Int, q4_off: Int, have_q4_draft: Bool, pack_q4: Bool, fr_off: Int = 0, fr_ids_off: Int = 0, fr_k: Int = 0):
+        self.packdir = packdir
         self.wbuf = wbuf^
         self.off = off^
         self.total = total
@@ -63,6 +68,7 @@ def load_pack(ctx: DeviceContext, packdir: String) raises -> Pack:
     # not enough to tell a real layer from the draft head -- only "does this
     # blk.N group contain a nextn.* tensor at all" is.
     var h_implied = 0
+    var n_tier = 0
     var layer_has_nextn = Dict[Int, Bool]()
     with open(packdir + "/index.txt", "r") as f:
         for line in f.read().splitlines():
@@ -73,6 +79,17 @@ def load_pack(ctx: DeviceContext, packdir: String) raises -> Pack:
             var dt = String(parts[1])
             var name = String(parts[0])
             off.append(Int(parts[2]))
+            # B4 stage 2b (bench/moe-tier-protocol.md): a fifth column
+            # ("expert", as tools/pack-split-experts.py writes it) marks a
+            # tensor that lives in experts.bin rather than in pack.bin.
+            # Its entry keeps its position, name, dtype and element count, so
+            # window.mojo's positional addressing is unchanged, but it
+            # contributes no bytes to the device pack and its offset is an
+            # offset into the expert store. serve/expert_tier.mojo resolves
+            # those by name; nothing else may dereference them.
+            if len(parts) >= 5 and (String(parts[4]) == "expert" or String(parts[4]) == "tier"):
+                n_tier += 1
+                continue
             if name == "token_embd.weight":
                 h_implied = n // VOCAB
             var dotparts = name.split(".")
@@ -137,8 +154,24 @@ def load_pack(ctx: DeviceContext, packdir: String) raises -> Pack:
             + " real transformer layers (blk.N groups with no nextn.* tensor)"
         )
 
+    # A tier pack read without the tier would hand the expert kernels an
+    # offset into a file that is not loaded, and they would gather whatever
+    # happens to live there. Refuse instead: this is the failure mode that
+    # produces plausible tokens from the wrong weights.
+    if n_tier > 0 and getenv("BARO_TIER", "") == "":
+        raise Error(
+            "pack " + packdir + " has " + String(n_tier)
+            + " tier-resident tensors (experts.bin) but BARO_TIER is unset;"
+            + " set BARO_TIER=<capacity> or use a full pack"
+        )
+    if n_tier == 0 and getenv("BARO_TIER", "") != "":
+        raise Error(
+            "BARO_TIER is set but pack " + packdir + " carries no tier tensors;"
+            + " split it first with tools/pack-split-experts.py"
+        )
+
     # --- load pack into one device buffer -----------------------------------
-    print("loading pack:", total, "bytes")
+    print("loading pack:", total, "bytes", " tier tensors:", n_tier)
     var wbuf = ctx.enqueue_create_buffer[DType.uint8](total)
     comptime CHUNK = 1 << 28
     comptime RSPLIT = 4
@@ -185,7 +218,7 @@ def load_pack(ctx: DeviceContext, packdir: String) raises -> Pack:
             flip = not flip
     ctx.synchronize()
     print("pack loaded in", Float64(perf_counter_ns() - t_load) / 1e9, "s")
-    return Pack(wbuf^, off^, total, q4_off, have_q4_draft, pack_q4, fr_off, fr_ids_off, fr_k)
+    return Pack(packdir, wbuf^, off^, total, q4_off, have_q4_draft, pack_q4, fr_off, fr_ids_off, fr_k)
 
 
 def alloc_bufs(ctx: DeviceContext, pack: Pack, tmax: Int) raises -> WindowBufs:

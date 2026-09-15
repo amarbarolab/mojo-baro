@@ -847,6 +847,10 @@ def main() raises:
         for i in range(len(generated)):
             line += String(generated[i]) + " "
         print("GENERATED:", line)
+        # B4 stage 2b gate 3: the tier's own counters, per request. Printed
+        # here rather than in window.mojo so the wiring patch stays small.
+        if bufs.tier.active:
+            bufs.tier.report(n_gen)
         # B4 stage 2: one copy out, after the request, not per layer. The file
         # is appended so a 20-prompt sweep is one trace; each block names the
         # prompt's own token count so the replay can refuse a truncated trace.
