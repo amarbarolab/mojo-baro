@@ -218,7 +218,7 @@ def main() raises:
     comptime k_top8 = amar_moe_router_top8[
         type_of(lg_1), type_of(idx_1), type_of(wt_1)
     ]
-    ctx.enqueue_function[k_top8](lg, idx, wt, grid_dim=1, block_dim=N_EXP)
+    ctx.enqueue_function[k_top8](lg, idx, wt, grid_dim=1, block_dim=32)
 
     comptime k_sig = amar_moe_sig_gate[
         type_of(x_1), type_of(x_1), type_of(one_1)

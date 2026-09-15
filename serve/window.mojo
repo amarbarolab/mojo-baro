@@ -666,7 +666,7 @@ def moe_ffn(ctx: DeviceContext, mut b: WindowBufs, Xm: TileTensor[f32, type_of(x
     var Wt = TileTensor[f32, type_of(moe_idx_layout), MutAnyOrigin](b.hmax_d, moe_idx_layout)
     comptime k_router = amar_matmul_skinny_m1_row[f32, 2, type_of(h2_layout), type_of(moe_router_layout), type_of(moe_logits_layout)]
     ctx.enqueue_function[k_router](X2, Router, Logits, Int32(N_EXP), Int32(H), grid_dim=ceildiv(N_EXP, ROW_WAVES), block_dim=ROW_THREADS)
-    ctx.enqueue_function[amar_moe_router_top8[type_of(moe_logits_layout), type_of(moe_idx_layout), type_of(moe_idx_layout)]](Logits, Idx, Wt, grid_dim=1, block_dim=N_EXP)
+    ctx.enqueue_function[amar_moe_router_top8[type_of(moe_logits_layout), type_of(moe_idx_layout), type_of(moe_idx_layout)]](Logits, Idx, Wt, grid_dim=1, block_dim=MOE_THREADS // MOE_WAVES)
     var routed = row_f32(ctx, b.p_qf_d, 0, H, moe_vec_layout)
     var shared = row_f32(ctx, b.p_h_d, 0, H, moe_vec_layout)
     var routed_f = row_f32(ctx, b.p_ffn_d, 0, TOPK * E_FFN, moe_expert_f_layout)

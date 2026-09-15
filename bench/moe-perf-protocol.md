@@ -101,3 +101,27 @@ tok/s_gen median **55.97 -> 71.89 (1.284x)** against R1, ranges
 55.86..56.06 vs 71.67..72.14, sclk med 3277 MHz, 290 W / -100 mV, GENERATED
 equal 17/20. `BARO_PROFILE=1` p09: ssm 9.0 -> 5.7 ms per token, ffn
 12.7 -> 11.3 (shared expert), profile-mode 50.6 -> 64.5 tok/s.
+
+### R3 result (2026-09-15): landed
+
+Router top-8 as one wave (each lane owns 8 experts in registers; softmax
+max and sum by warp reductions; eight rounds of warp argmax with
+strict-greater, lowest-index tie-break, the same selection order as the
+serial scan it replaces; renormalisation unchanged), dispatched at
+`block_dim = 32`; sigmoid gate reads 8 f32 per lane. Gate 1: `test_moe_block`
+PASS (its launch adapted to the one-wave router). Gate 2: 20-prompt mean
+**53.15/64**; per prompt 55 58 56 50 57 45 57 57 40 56 50 59 54 53 50 46 44
+56 60 60. Gate 4: 20-prompt tok/s_gen median **71.82 -> 93.46 (1.301x)**
+against R2, ranges 71.52..72.19 vs 92.12..93.80, sclk med 3276 MHz, 290 W /
+-100 mV, GENERATED equal 16/20. `BARO_PROFILE=1` p09 per token: attn 1.6,
+ssm 5.8, ffn 7.0, head 0.8 ms; profile-mode 64.5 -> 81.7 tok/s.
+
+### Round summary
+
+42.88 -> 55.98 -> 71.89 -> 93.46 tok/s_gen (20-prompt medians, each arm A/B
+against its predecessor in one stint), 2.18x, agreement 53.20 -> 52.85 ->
+53.00 -> 53.15 within the band throughout. llama.cpp's bar 109.4: 0.39x ->
+0.85x. Next levers, from the R3 profile: the ssm sub-block's per-layer small
+kernels (conv, gates, l2, delta, about eight launches per layer) and the
+remaining expert time; a fresh rocprofv3 trace is the first step of any
+follow-up round, not this file's numbers.

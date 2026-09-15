@@ -69,63 +69,42 @@ def amar_moe_router_top8[
     W: TileTensor[f32, WLayout, MutAnyOrigin],
 ):
     comptime assert L.flat_rank == 1 and IDX.flat_rank == 1 and W.flat_rank == 1
-
-    var p = stack_allocation[f32, address_space=AddressSpace.SHARED](
-        row_major[N_EXP]()
-    )
-    var red = stack_allocation[f32, address_space=AddressSpace.SHARED](
-        row_major[N_EXP]()
-    )
-
-    var tid = Int(thread_idx.x)
-    var v = rebind[Scalar[f32]](L[tid])
-    red[tid] = rebind[red.ElementType](v)
-    barrier()
-
-    var s = N_EXP // 2
-    while s > 0:
-        if tid < s:
-            var a = rebind[Scalar[f32]](red[tid])
-            var b = rebind[Scalar[f32]](red[tid + s])
-            red[tid] = rebind[red.ElementType](a if a > b else b)
-        barrier()
-        s //= 2
-    var mx = rebind[Scalar[f32]](red[0])
-    barrier()
-
-    var ev = exp(v - mx)
-    p[tid] = rebind[p.ElementType](ev)
-    red[tid] = rebind[red.ElementType](ev)
-    barrier()
-
-    s = N_EXP // 2
-    while s > 0:
-        if tid < s:
-            red[tid] = rebind[red.ElementType](
-                rebind[Scalar[f32]](red[tid]) + rebind[Scalar[f32]](red[tid + s])
-            )
-        barrier()
-        s //= 2
-    var tot = rebind[Scalar[f32]](red[0])
-    barrier()
-
-    p[tid] = rebind[p.ElementType](rebind[Scalar[f32]](p[tid]) / tot)
-    barrier()
-
-    if tid == 0:
-        var wsum = Scalar[f32](0)
-        for j in range(TOPK):
-            var best = Scalar[f32](-1)
-            var bi = 0
-            for i in range(N_EXP):
-                var pv = rebind[Scalar[f32]](p[i])
-                if pv > best:
-                    best = pv
-                    bi = i
-            IDX[j] = rebind[IDX.ElementType](Int32(bi))
-            W[j] = rebind[W.ElementType](best)
-            wsum += best
-            p[bi] = rebind[p.ElementType](Scalar[f32](-1))
+    comptime PER = N_EXP // WARP_SIZE
+    var lane = Int(lane_id())
+    var v = InlineArray[Scalar[f32], PER](uninitialized=True)
+    var lm = Scalar[f32](-3.4028234663852886e38)
+    comptime for m in range(PER):
+        v[m] = rebind[Scalar[f32]](L[lane + m * WARP_SIZE])
+        if v[m] > lm:
+            lm = v[m]
+    var mx = warp.max(lm)
+    var ls = Scalar[f32](0)
+    comptime for m in range(PER):
+        v[m] = exp(v[m] - mx)
+        ls += v[m]
+    var tot = warp.sum(ls)
+    comptime for m in range(PER):
+        v[m] = v[m] / tot
+    var wsum = Scalar[f32](0)
+    for j in range(TOPK):
+        var best = Scalar[f32](-1)
+        var bi = N_EXP
+        comptime for m in range(PER):
+            if v[m] > best:
+                best = v[m]
+                bi = lane + m * WARP_SIZE
+        var gbest = warp.max(best)
+        var cand = bi if best == gbest else N_EXP
+        var gi = -warp.max(-cand)
+        if gi == bi and best == gbest:
+            comptime for m in range(PER):
+                if lane + m * WARP_SIZE == gi:
+                    v[m] = Scalar[f32](-1)
+        if lane == 0:
+            IDX[j] = rebind[IDX.ElementType](Int32(gi))
+            W[j] = rebind[W.ElementType](gbest)
+        wsum += gbest
+    if lane == 0:
         for j in range(TOPK):
             W[j] = rebind[W.ElementType](rebind[Scalar[f32]](W[j]) / wsum)
 
@@ -142,12 +121,14 @@ def amar_moe_sig_gate[
 
     var lane = Int(lane_id())
     var K = Int(k_dim)
-    var acc = Scalar[f32](0)
+    var Xv = X.vectorize[8]()
+    var Gv = G.vectorize[8]()
+    var acc = SIMD[f32, 8](0)
     var i = lane
-    while i < K:
-        acc += rebind[Scalar[f32]](X[i]) * rebind[Scalar[f32]](G[i])
+    while i < K // 8:
+        acc = fma(rebind[SIMD[f32, 8]](Xv[i]), rebind[SIMD[f32, 8]](Gv[i]), acc)
         i += WARP_SIZE
-    var t = warp.sum(acc)
+    var t = warp.sum(acc.reduce_add())
     if lane == 0:
         O[0] = rebind[O.ElementType](Scalar[f32](1) / (Scalar[f32](1) + exp(-t)))
 
