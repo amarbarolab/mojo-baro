@@ -758,8 +758,9 @@ def member(v: Float32, i: Int, lmax: Float32, vcut: Float32, ck: UInt32, ci: Int
     return mpe <= 0 or exp(v - lmax) >= mpe
 
 
-def amar_sample_row[
-    XLayout: TensorLayout, OLayout: TensorLayout, PLayout: TensorLayout, CAP: Int = SAMP_CAP
+@always_inline
+def sample_row_body[
+    MASK: Bool, XLayout: TensorLayout, OLayout: TensorLayout, PLayout: TensorLayout, CAP: Int
 ](
     X: TileTensor[f32, XLayout, MutAnyOrigin],
     Out: TileTensor[i32, OLayout, MutAnyOrigin],
@@ -771,6 +772,8 @@ def amar_sample_row[
     min_p: Float32,
     seed: UInt64,
     counter: UInt64,
+    mask: MutPointer[Scalar[u64], MutAnyOrigin],
+    mask_stride: Int,
 ):
     comptime assert X.flat_rank == 2 and Out.flat_rank == 1 and Prob.flat_rank == 1
     var N = Int(n)
@@ -814,16 +817,19 @@ def amar_sample_row[
     var g = tid * 4
     while g < N:
         var a = load4(X, base, g, N)
+        var mb = UInt64(15)
+        comptime if MASK:
+            mb = (mask[unsafe_offset=row * mask_stride + (g >> 6)] >> UInt64(g & 63)) & UInt64(15)
         var hit = False
         comptime for e in range(4):
-            if member(a[e], g + e, lmax, vcut, ck, ci, mpe):
+            if ((mb >> UInt64(e)) & 1) != 0 and member(a[e], g + e, lmax, vcut, ck, ci, mpe):
                 hit = True
         if hit:
             var w = rng4(seed, counter, row, 0, g)
             var w2 = rng4(seed, counter, row, 4, g)
             comptime for e in range(4):
                 var v = a[e]
-                if member(v, g + e, lmax, vcut, ck, ci, mpe):
+                if ((mb >> UInt64(e)) & 1) != 0 and member(v, g + e, lmax, vcut, ck, ci, mpe):
                     var ev = (v - lmax) / temperature
                     var s = ev + gumbel2(w[e], w2[e])
                     if s > bs:
@@ -837,6 +843,42 @@ def amar_sample_row[
         var lt = rebind[Scalar[f32]](X[row, Int(tok)])
         Out[row] = rebind[Out.ElementType](tok)
         Prob[row] = rebind[Prob.ElementType](exp((lt - lmax) / temperature) / z)
+
+
+def amar_sample_row[
+    XLayout: TensorLayout, OLayout: TensorLayout, PLayout: TensorLayout, CAP: Int = SAMP_CAP
+](
+    X: TileTensor[f32, XLayout, MutAnyOrigin],
+    Out: TileTensor[i32, OLayout, MutAnyOrigin],
+    Prob: TileTensor[f32, PLayout, MutAnyOrigin],
+    n: Int32,
+    temperature: Float32,
+    top_k: Int32,
+    top_p: Float32,
+    min_p: Float32,
+    seed: UInt64,
+    counter: UInt64,
+):
+    sample_row_body[False, XLayout, OLayout, PLayout, CAP](X, Out, Prob, n, temperature, top_k, top_p, min_p, seed, counter, X.ptr.unsafe_bitcast[Scalar[u64]](), 0)
+
+
+def amar_sample_row_masked[
+    XLayout: TensorLayout, OLayout: TensorLayout, PLayout: TensorLayout, CAP: Int = SAMP_CAP
+](
+    X: TileTensor[f32, XLayout, MutAnyOrigin],
+    Out: TileTensor[i32, OLayout, MutAnyOrigin],
+    Prob: TileTensor[f32, PLayout, MutAnyOrigin],
+    n: Int32,
+    temperature: Float32,
+    top_k: Int32,
+    top_p: Float32,
+    min_p: Float32,
+    seed: UInt64,
+    counter: UInt64,
+    mask: MutPointer[Scalar[u64], MutAnyOrigin],
+    mask_stride: Int32,
+):
+    sample_row_body[True, XLayout, OLayout, PLayout, CAP](X, Out, Prob, n, temperature, top_k, top_p, min_p, seed, counter, mask, Int(mask_stride))
 
 
 def amar_sample_probs[
