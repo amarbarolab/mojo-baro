@@ -216,8 +216,43 @@ hardware receipt, not a property of the file. Anyone comparing two cards'
 numbers is comparing two separate receipts, not auditing one claim against
 itself.
 
-## Running the file itself (B1, not yet built)
+## 6. Running the file itself, and the two modes that keep it honest
 
-A `baro run MODEL.gguf` command and a `baro.hw.receipts` ledger key that
-extends with each verified card's result are planned (B1) but not built as
-of this document; this section is a placeholder for whoever lands them.
+`tools/baro` is the entry point, and it has two modes because verification and
+convenience pull in opposite directions.
+
+```
+tools/baro run      MODEL.gguf [--port N] [--pack DIR] [--no-serve]
+tools/baro verify   MODEL.gguf [--append]
+tools/baro receipts MODEL.gguf
+```
+
+**run** extracts the sources from the file, builds the engine using the
+harness the file carries (`baro.run.src.engine.mojo` plus the serve modules it
+imports), builds the weight pack from the file's own tensors with the
+`engine-pack.py` the file carries, applies the env the file says the model
+needs (`baro.run.env`), and serves it over HTTP. Every number it prints is
+labelled **self-reported**, because the file supplied the stopwatch. That
+label is the whole reason run mode is a separate mode.
+
+**verify** does the opposite and needs the checkout. It takes
+`serve/engine.mojo` from git at the file's own `baro.kernel.commit`, compares
+it byte for byte with the copy inside the file, and refuses to go on if they
+differ: that is how a tampered clock is caught. Then it rebuilds from the
+embedded kernel sources, decodes the file's own prompt
+(`baro.run.prompt.tokens`) and gates the result against the file's own
+reference ids (`baro.run.ref.tokens`), so nothing outside the file is
+consulted except the harness, which is exactly the thing that must come from
+outside.
+
+**receipts** prints the ledger. Only verify mode may write to it, every record
+carries `mode: verified` and the commit its harness was checked against, and
+`tools/gguf-receipt.py` refuses a record that carries neither. The ledger
+lives in a sidecar JSONL beside the model by default; `--in-file` puts it in
+the file's own `baro.hw.receipts` key, which means rewriting the whole
+container (21 GB for the MoE bake), so it is opt-in.
+
+What this does not do yet: a pack has no `tokenizer.json` unless one was built
+beside it, so a served model whose pack lacks one accepts token ids on
+`/v1/completions` and refuses the text and chat endpoints. Converting the
+gguf's own tokenizer into that file is not built.

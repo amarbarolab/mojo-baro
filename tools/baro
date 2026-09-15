@@ -98,7 +98,10 @@ verify)
   if [ $append = 1 ]; then
     tps=$(grep -oE 'tok/s_gen: [0-9.]+' "$out/run.log" 2>/dev/null | tail -1 | cut -d' ' -f2)
     card=$(rocminfo 2>/dev/null | grep -m1 -oE 'gfx[0-9a-f]+')
+    # product_name is empty on this driver, so the GPU's marketing name comes
+    # from rocminfo (the second one: the first is the CPU agent).
     name=$(cat /sys/class/drm/card*/device/product_name 2>/dev/null | grep -v '^$' | head -1)
+    [ -n "$name" ] || name=$(rocminfo 2>/dev/null | awk '/Marketing Name/ {sub(/^ *Marketing Name: */, ""); sub(/ *$/, ""); print}' | sed -n 2p)
     cap=$(cat /sys/class/drm/card1/device/hwmon/hwmon*/power1_cap 2>/dev/null | head -1)
     "$py" "$here/tools/gguf-receipt.py" "$model" --append "$(jq -nc \
       --arg mode verified --arg commit "$commit" --arg gfx "${card:-unknown}" \
