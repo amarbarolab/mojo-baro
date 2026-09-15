@@ -169,3 +169,22 @@ order); tok/s within -1% to +3% (the big matrix is already near bandwidth;
 the 8.9 MB ones at 635 GB/s may gain). No kill line: R6a is an enabling
 step; it lands on identity, or on agreement in band with the order
 difference explained. GPU: parity, identity A/B, minutes.
+
+### R6a result (2026-09-15): pack lands, launch-path switch does not
+
+The pack change landed (`72eeb72`, `.work/moe-w1/pack-q8d`, 131 tensors in the
+dense q8 layout, byte total unchanged, three tensors checked value-for-value
+bit-equal against the raw blocks). The launch-path switch of the eight
+projection dispatches to the dense q8 row kernel (`gemm_q8` /
+`amar_matmul_skinny_q8row`) is REVERTED: 20-prompt tok/s **99.54 -> 91.50
+(0.919x)**, GENERATED identical 18/20 (the dense kernel's accumulation
+order differs from the R2 raw-block dot). The prediction (-1 to +3%) was
+wrong: at these shapes (N = 8192 / 512 / 2048 / 4096, K = 2048) the dense
+skinny kernel is slower than the R2 dot, which reads 16 bytes per lane per
+34-byte block and runs the 17.8 MB matrix at about 950 GB/s. Cause not
+chased (the persistent kernel is the consumer, not the launch path). Patch
+kept at `.work/moe-perf/r6a-window-switch.patch`. Consequence for R6: its
+projection phases must use the raw-block dot (`q8_0_row_dot` on the old
+pack) or prove the dense-layout dot inside the persistent kernel is not
+slower; the pack-q8d file stays as the enabling artifact for the second
+option and the parity gate will decide which pack R6 ships with.
