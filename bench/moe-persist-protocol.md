@@ -188,3 +188,47 @@ projection phases must use the raw-block dot (`q8_0_row_dot` on the old
 pack) or prove the dense-layout dot inside the persistent kernel is not
 slower; the pack-q8d file stays as the enabling artifact for the second
 option and the parity gate will decide which pack R6 ships with.
+
+## R6.0: launch folds on the MoE launch path (preregistered 2026-09-15)
+
+R6 (the persistent token kernel) re-estimated XL after the MoE SSM block was
+read in full (`docs/design/moe-persistent-kernel.md`, 14798df); its
+decision is the maintainer's. R6.0 is the host-side stage that the design note stages
+first. It is the dense profile's launch-fusion question asked again in a
+different regime: the dense body runs about 200 launches per token and the
+fusion ceiling was 6.9% (memory `launch-fusion-closed`); the MoE launch path
+runs 1117 (R4 receipt) and the HEAD timeline (`.work/moe-perf/timeline-head.txt`,
+pre-R4, 1216 launches) measures the inter-dispatch gap at 3.12 us median and
+3999 us of a 12523 us token, 32% of wall. Every fold below removes a launch
+whose kernel is a pure elementwise pass over a vector that the producer
+already holds in registers.
+
+Folds (launch counts per token, 30 SSM + 10 attention layers = 40 FFNs):
+1. `amar_rmsnorm_cast` writes an f32 copy next to the bf16 one
+   (`amar_rmsnorm_cast2`), removing the `amar_widen_bf16` before the router
+   GEMV (40) and before the SSM f32 gate GEMVs (30): 70 launches.
+2. `moe_gate_up_q4k_pack` and `moe_gate_up_q8_0` write bf16 directly, removing
+   the two `amar_cast_bf16` per FFN: 80 launches.
+3. `amar_moe_sig_gate` (one wave, dot over H) folds into
+   `amar_moe_router_top8` (already one wave): 40 launches.
+4. `moe_add3` folds into the shared `moe_down_q8_0` epilogue (the routed
+   vector is complete before the shared down starts): 40 launches.
+5. The two f32 `amar_matmul_skinny_m1_row` SSM gate GEMVs become one launch
+   over both weight tensors (grid doubled): 30 launches.
+Total 260 launches: 1117 -> 857.
+
+Predictions, frozen: launch count 857 +- 5 per token by
+`bench/moe-launch-count.sh` (the receipt that judges the fold, tok/s cannot);
+time removed = 260 gaps x 3.1 us = 0.81 ms plus the removed kernels' own
+spans (widen 155 us, casts 126 us, sig_gate 154 us, add3 63 us, one skinny
+GEMV 85 us: about 0.58 ms), 1.39 ms of the 10.0 ms token: **99.92 -> 115
+tok/s (+15%)**, kill line +5% (104.9). Identity: GENERATED bit-identical on
+20/20 prompts against `.work/moe-perf/engine-head` (every fold reorders no
+floating-point sum: the same values are written by a different launch), so
+any difference is a bug, not an order effect. Gates: `test_moe_block` (the
+kernel signatures change, its calls are updated), `run-tests`, BARO_DUMP
+per-layer X parity on p09, 20-prompt A/B through `bench/ab-prompts.sh`
+(`AB_ENGINE_B` inside the gpu-wait job), fail word read, launch count.
+Fold order = the order above; each fold is one commit with its own build,
+so a lost fold is found by bisection, not by diagnosis. GPU: gates only,
+minutes each.
