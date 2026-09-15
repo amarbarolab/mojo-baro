@@ -392,3 +392,18 @@ top-8 (R3). llama.cpp 109.4 on the same GGUF. Teacher-forced agreement
 used to dequantize one element per lane per load; the bytes-per-token floor
 is about 3.2 ms (2.7 GB), so the remaining gap is launch-bound small kernels
 in the SSM sub-block and expert time, not bytes.
+
+## Self-describing bakes 2026-09-15 (`aa3f147`, closure PASS from the file)
+
+- `Qwythos-9B-Claude-Mythos-5-1M-MTP-BF16-BARO-aa3f147.gguf` sha256
+  `7eba194adb94986dd...` (`.work/bake/shas.txt`): `tools/gguf-verify.sh` PASS
+  64/64, rebuilt engine 116.3 tok/s_gen on p09 (spec on, one prompt).
+- `RegesCore-1.0-35B-UD-Q4_K_S-BARO-aa3f147.gguf` sha256 `b2a6f176be1b2a0db...`:
+  PASS 64/64, rebuilt engine 93.7 tok/s_gen on p09.
+- Both carry `baro.hw.*` (card, driver, ROCm, power cap, 20-prompt median,
+  config, protocol) and `baro.kernel.model`; `tools/gguf-verify.sh MODEL.gguf`
+  is the contributor's one-command check (`docs/amd-family.md`).
+- **Caveat until LatentOS is vendored:** the harness `serve/engine.mojo`
+  imports `latentos` from `~/AMDHQ/src` (not in the repo); the closure states
+  it as an external dependency. A clone cannot build the engine until the
+  vendoring lane lands (`briefs/2026-09-15-vendor-latentos.md`).
