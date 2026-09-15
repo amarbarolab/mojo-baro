@@ -300,3 +300,20 @@ ours head 94.40 (spread 4.1%), r60 **106.95** (spread 3.1%), ratio 1.133
 (identity 20/20, fail word 0 on 40 runs). So R6.0 stands at **0.973x of
 llama.cpp** in the same stint; the bar is not yet passed, and R6.0b's +7.5%
 prediction would put it at about 115, above it, if it holds.
+
+### R6.0b result (2026-09-15): 727 launches, +4.2%, below the +5% line, KILLED
+
+Receipts (`.work/moe-perf/lc-r60b.log`, `ab-r60b.log`, `ab-r60b/`): launches
+per token **727.0** (predicted 727); 20-prompt A/B r60 (sha cfbb664e) vs
+r60b (sha 27093555), same stint, 290 W: **107.25 -> 111.70 tok/s_gen, ratio
+1.042**, identity 20/20, fail word 0 on 40 runs, run-tests 104 PASS, census
+0 orphans. Predicted +7.5%, measured +4.2%: the launch count held and the
+time did not, so the removed launches were cheaper than 3.1 us each on
+this path (the reduce copies and the small attention kernels overlap with
+neighbouring dispatches more than the timeline's median gap suggests).
+Below the preregistered +5% kill line: not landed, tree reverted, patch at
+`.work/moe-perf/r60b-folds.patch` (368 lines, applies on `708488a`,
+engine at `.work/moe-perf/engine-r60b`). the maintainer's call whether the line
+stands for a bit-identical fold that reads 111.70 against llama.cpp's
+109.92 (different stints: r60 measured 106.95 in the llama stint and 107.25
+here, so the r60b arm is about 1.6% above the bar, not 2%).
