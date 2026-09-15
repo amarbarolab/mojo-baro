@@ -98,3 +98,49 @@ What is known: one row per wave, 4096 waves, 28 to 30 us for 9.4 MB. The
 lever is left to R6, where the expert phases are written fresh inside the
 persistent kernel and may use the pair dot (17.7 us receipt) by design.
 Patch kept at `.work/moe-perf/r5b-dual.patch`.
+
+### R4 result (2026-09-15, opus lane): LANDED, +5.5% and exactly 100 launches
+
+Both arms built from a clean `git archive` of HEAD plus only
+`serve/window.mojo` and `serve/harness.mojo`, so no other lane's uncommitted
+work is in either binary. `engine-r4base` sha `70f9913a0f87db7c`,
+`engine-r4cand` sha `12ca6cfc12beb48f`.
+
+**Launch count, the receipt the prediction was actually stated in**
+(`bench/moe-launch-count.sh`, rocprofv3 `--kernel-trace`, difference between a
+16-token and a 32-token run so load and prefill cancel):
+
+| arm | dispatches at 16 tok | at 32 tok | per token |
+|---|---|---|---|
+| base | 34,036 | 53,508 | **1217.0** |
+| R4 | 31,239 | 49,111 | **1117.0** |
+
+Exactly 100 launches per token removed, against the predicted 1216 to about
+1116.
+
+**Throughput** (`bench/ab-prompts.sh`, 20 prompts, one stint, clock probe):
+base median **94.68** tok/s_gen (spread 5.7%), R4 median **99.92** (spread
+0.7%), **ratio 1.055**, inside the predicted +5 to +6% and above the +5% kill
+line. sclk med 3266 MHz, 290 W cap, -100 mV, junction max 70 C.
+
+**Identity: 20/20 PASS.** Every prompt's `GENERATED` line is identical between
+the two arms, which is what makes the agreement gate unnecessary here rather
+than skipped: the teacher-forced agreement number cannot move when the emitted
+ids are bit-identical to the arm it was measured on. `test_moe_block` parity is
+likewise unaffected by construction (no kernel body changed).
+
+**What was removed and why it was safe.** The 60 memsets were two per layer
+zeroing `p_32_d` and `p_32b_d` before the two skinny f32 matmuls.
+`amar_ssm_reduce_gates` sums `SPLITK` partials, so the unwritten partial has to
+be zero; but `amar_matmul_skinny_m1_row` **writes** its output row
+(`O[row] = total`, not an accumulate), and on this profile only partial 0 row 0
+is ever written, because the dense `gemm_w` partial writer is not compiled into
+the MoE build (`MEGA_ALLOWED` is False). So the rest of those planes has to be
+zero and never stops being zero: they are zeroed once at allocation. The code
+carries the condition that would invalidate that reasoning.
+
+The 40 copies were `moe_ffn` creating a host buffer and copying a zero into
+`hidx_d[0]` once per layer, to give the shared expert an index of 0. That is
+now one int32 buffer allocated and zeroed once. It also removes a fragile
+aliasing: the old copy clobbered the router's own `idx[0]` after the routed
+path had consumed it, which was harmless only by ordering.

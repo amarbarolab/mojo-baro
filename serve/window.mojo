@@ -562,6 +562,11 @@ struct WindowBufs(Copyable, Movable):
     # rows for this window, pd_d the draft's, one row per drafted position.
     var pt_d: DeviceBuffer[f32]
     var pd_d: DeviceBuffer[f32]
+    # R4 (bench/moe-persist-protocol.md): one int32 zero, allocated and zeroed
+    # once. moe_ffn used to make a host buffer and copy a 0 into hidx_d[0] on
+    # every layer, 40 host buffers and 40 copies per token, and that copy also
+    # clobbered the router's own idx[0] after the routed path had consumed it.
+    var zidx_d: DeviceBuffer[DType.int32]
     var dids_d: DeviceBuffer[DType.int32]
     var sout_d: DeviceBuffer[DType.int32]
     var sacc_d: DeviceBuffer[DType.int32]
@@ -691,11 +696,7 @@ def moe_ffn(ctx: DeviceContext, mut b: WindowBufs, Xm: TileTensor[f32, type_of(x
     else:
         ctx.enqueue_function[amar_moe_down_q4k[TOPK, E_FFN, type_of(moe_expert_layout), type_of(moe_idx_layout), type_of(moe_idx_layout), type_of(moe_vec_layout)]](
             routed_h, b.wbuf.unsafe_ptr().unsafe_offset(b.off[routed_base + 2]), Idx, Wt, routed, Int32(H), grid_dim=ceildiv(H, MOE_WAVES), block_dim=MOE_THREADS)
-    var idx0b = DeviceBuffer[DType.int32](ctx, b.hidx_d.unsafe_ptr(), 1, owning=False)
-    var idx0 = TileTensor[DType.int32, type_of(moe_one_layout), MutAnyOrigin](idx0b, moe_one_layout)
-    var idx0_h = ctx.enqueue_create_host_buffer[DType.int32](1)
-    idx0_h[0] = 0
-    ctx.enqueue_copy(dst_buf=idx0b, src_buf=idx0_h)
+    var idx0 = TileTensor[DType.int32, type_of(moe_one_layout), MutAnyOrigin](b.zidx_d, moe_one_layout)
     var shared_f = row_f32(ctx, b.p_ffn2_d, 0, SH_FFN, moe_shared_f_layout)
     var shared_h_flat = TileTensor[bf16, type_of(moe_shared_flat_layout), MutAnyOrigin](b.fgbp_d, moe_shared_flat_layout)
     var sigmoid = row_f32(ctx, b.p_v_d, 0, 1, moe_one_layout)
@@ -1063,8 +1064,17 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                     # kernel made every beta sigmoid saturate to exactly
                     # 0.0/1.0 (W3 gate 2 bug 4, 2026-09-12). f32 weights need
                     # the skinny f32 matmul and an f32 copy of the activation.
-                    ctx.enqueue_memset(b.p_32_d, 0)
-                    ctx.enqueue_memset(b.p_32b_d, 0)
+                    # R4: these two used to be zeroed here, 60 memsets per
+                    # token. amar_ssm_reduce_gates sums SPLITK partials, and on
+                    # this profile only partial 0 row 0 is ever written (by the
+                    # two skinny f32 matmuls below, which WRITE their output
+                    # rather than accumulate into it), so the rest of the plane
+                    # has to be zero but never stops being zero. It is zeroed
+                    # once at allocation instead. The dense profile's gemm_w
+                    # partial writer is not compiled into this build
+                    # (MEGA_ALLOWED is False for the MoE), which is what makes
+                    # that safe; if a future path writes these planes per
+                    # layer, the zeroing has to come back with it.
                     ctx.enqueue_function[amar_widen_bf16[type_of(moe_vec_layout), type_of(moe_vec_layout)]](
                         row_bf16(ctx, b.curb_d, 0, H, moe_vec_layout), row_f32(ctx, b.logits_d, 0, H, moe_vec_layout),
                         Int32(H), grid_dim=ceildiv(H, 256), block_dim=256)
