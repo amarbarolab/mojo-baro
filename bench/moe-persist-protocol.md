@@ -256,3 +256,36 @@ head norms on the 10 attention layers (about 60). Those are R6.0b if
 the maintainer wants a second fold round before R6 proper; the gap per launch is
 unchanged at about 3.1 us, so the ceiling of a full second round is
 about 300 launches, 0.9 ms, +9%.
+
+## R6.0b: second fold round on the MoE launch path (preregistered 2026-09-15)
+
+the maintainer's call after R6.0: same-stint llama.cpp arm first, then R6.0b. Same
+rule as R6.0: every fold removes a launch whose work moves into the
+producer, no floating-point sum changes order, so the gate is bit-identical
+GENERATED on 20/20 prompts and the receipt is the launch count.
+
+Folds (per token, 10 attention + 30 SSM layers):
+1. The MoE projections write their destination directly. On this profile
+   `moe_matmul_q8_0_m1` writes partial 0 and `amar_skinny_reduce` then
+   sums SPLITK partials of which only partial 0 is ever non-zero (R4's
+   note), so the reduce is a copy: 0 + x = x exactly. q, k, v on the
+   attention layers (30) and qkv on the SSM layers (30): 60 launches.
+2. `moe_matmul_q8_0_m1_add`: the o projection and the ssm_out projection
+   add into the residual themselves (`amar_skinny_reduce_add` was
+   Y + (0 + x)); the projection result is still written to its old buffer
+   so the BARO_DUMP slots 6 and 7 keep their meaning: 40 launches.
+3. `amar_head_rmsnorm_rope`: the per-head norm and the YaRN rope on q and
+   on k in one launch each (norm, barrier, rope on the same rows in the
+   same order): 20 launches.
+4. `amar_kv_append2`: k and v appended by one launch (grid z = 2): 10.
+Total 130: 857 -> 727.
+
+Predictions, frozen: launches per token 727 +- 5 by
+`bench/moe-launch-count.sh`; time removed = 130 gaps x 3.1 us = 0.40 ms
+plus the removed kernels' own spans (reduce copies 191 us, half of the
+norm/rope/append pairs about 50 us): 0.64 ms of the 9.32 ms token, **107.27
+-> 115 tok/s (+7.5%)**, kill line +5%. Identity 20/20 bit-identical against
+`.work/moe-perf/engine-r60`, fail word read on every run, run-tests,
+ci-checks, census. Not folded: the SSM small chain (reduce_gates, conv,
+l2norm, delta, gated_out: 150 launches) and qgate_split/gate_mul (20);
+those change the kernels' work partition and belong to R6 proper.
