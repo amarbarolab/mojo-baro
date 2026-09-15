@@ -407,3 +407,83 @@ the masked variant yet, so the census gate flags it. `tools/ci-checks.sh` fails
 the same single check and passes every other one. Neither failure is caused by
 this lane's change and neither is chased here (P6 on pre-existing red); it was
 reported to the coordinator, who owns that file, with the two ways to clear it.
+
+---
+
+## 9. R4 MoE launches from the host: LANDED
+
+Commit `7145b71`. Delegated to this lane by the coordinator because it owns
+`serve/window.mojo`. Preregistered in `bench/moe-persist-protocol.md` with the
+prediction stated in launches (1216 to about 1116) and a +5% kill line.
+
+The MoE FFN path issued **60 `enqueue_memset`s and 40 `enqueue_copy`s per
+token that nothing needed**:
+
+- the memsets zeroed the two SSM gate partial planes before each layer's two
+  skinny f32 matmuls. `amar_ssm_reduce_gates` sums `SPLITK` partials, so the
+  unwritten partial must be zero, but `amar_matmul_skinny_m1_row` **writes**
+  its output row rather than accumulating into it, and on this profile nothing
+  else writes those planes at all (the dense `gemm_w` partial writer is not
+  compiled into the MoE build). They are zero once and stay zero, so they are
+  zeroed at allocation.
+- the copies gave the shared expert an index of 0 by creating a host buffer
+  and copying into `hidx_d[0]` every layer, which also clobbered the router's
+  own `idx[0]` after the routed path had consumed it, harmless only by
+  ordering. One int32 buffer, zeroed once, replaces both.
+
+| receipt | base | R4 |
+|---|---|---|
+| launches per token | **1217.0** | **1117.0** |
+| 20-prompt median tok/s_gen | 94.68 (spread 5.7%) | **99.92** (spread 0.7%) |
+| ratio | | **1.055** |
+| identity, 20 prompts | | **20/20 bit-identical** |
+
+The launch count is the receipt the prediction was actually stated in, and a
+tok/s number cannot confirm it, so `bench/moe-launch-count.sh` exists: it
+counts rocprofv3 kernel-trace dispatches at 16 and at 32 generated tokens and
+differences them, which cancels load and prefill without needing to know which
+kernel belongs to which phase. Exactly 100 launches per token came out.
+
+The teacher-forced agreement band was **not** re-run, and that is not a
+skipped gate: every prompt's emitted ids are bit-identical between the two
+arms, and the agreement number is computed from those ids, so it cannot have
+moved. `test_moe_block` parity is unaffected by construction, no kernel body
+changed. Both arms were built from a clean `git archive` of HEAD plus only the
+two files this change touches, so another lane's uncommitted kernel work is in
+neither binary.
+
+---
+
+## 10. A3 continuous batching, plan only: LANDED
+
+`docs/A3-PLAN.md` at `34e5e1d`. No code, as the brief specified.
+
+The plan was written after a conference with the model that would build it
+(w82:p2, `exchange/2026-09-15-p2-a3-conference.md`, `41ebb4b`), per the house
+rule that a plan a smaller model will build is written in the shape that model
+asks for. That was not a formality: three of its corrections changed the
+plan's content.
+
+- **The Rust server is not the scheduler.** `EnginePool::submit` hands over a
+  whole request and the worker runs one job start to finish, so there is no
+  point in the Rust code where a batching decision could be inserted. The seam
+  has to be built in the Mojo decode loop. A plan that said "extend the queue
+  to batch requests" would have sent the builder hunting for a seam that does
+  not exist.
+- **The plan's own proposed first gate already passes today with zero
+  batching.** `tools/test_server.sh`'s queue case is "N concurrent clients,
+  each identical to its single-request run at T=0" at N=2, on unchanged code,
+  and it is green. The first gate is now two requests advanced by one decode
+  step, with a receipt naming both request ids in that launch so a serialized
+  implementation cannot pass it.
+- **The m=4 throughput gate compared against the wrong kernel family.** P5's
+  row-scaling receipt is the ffn GEMM shape; this model's delta phase is the
+  worst-scaling stage at 1.46x for m=2. The plan now requires a fresh
+  delta-phase receipt before any m=4 number is predicted.
+
+It also records that A2 is a blocker rather than a dependency, that
+`BARO_POOL` buys nothing on a single 24 GB card (the second pool member
+`hipErrorOutOfMemory`s, three attempts on record), that per-request sampler
+state is already built and needs only threading, and one unmeasured number
+that bounds every later gate: whether MAX's per-process VRAM reservation
+scales with tracked sequences.
