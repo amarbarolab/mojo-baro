@@ -219,6 +219,90 @@ this one. Said plainly rather than claimed done.
 `README.md` and `docs/ENGINE-ROADMAP.md` updated: the four dense targets are
 no longer described as CLI-only.
 
-## M5
+## M5 -- greedy/sampling toggle (WIRING DONE `8ddd477`, gate 2 open, question sent)
+
+`kernels/sample.mojo` (device, distribution-tested) and `serve/sample_ref.mojo`
+(host oracle) both already existed; `grep -n sample serve/registry.mojo
+serve/window.mojo` was zero hits, confirming the brief. Wired
+`temperature == 0` as the toggle at `serve/window.mojo`'s non-spec
+token-selection call site: `<= 0` keeps `argmax_k` unchanged (byte-for-byte),
+`> 0` calls `amar_sample_row` (new `registry.mojo` alias `sample_row_k`) into
+`b.dtok_d`/`b.hmax_d` (both free scratch once spec and the megakernel are
+off), then the same `tokcp_k` the spec path already uses places the sampled
+token at the real position -- no new buffers. Scope limit as specified:
+`temperature > 0` forces `spec = False` (`engine.mojo`) and forces the
+megakernel off (`mega_token_*` kernels bake greedy argmax into their own
+launch, no sampler params, so a sampling request always takes the launch
+path where the sampler is wired).
+
+**Gate 1 (byte-identical at temperature = 0): PASS.** Same before/after A/B
+methodology as M4's `serve_proto` extraction -- built `engine.mojo` before
+and after, ran both one-shot on the q4 pack, same prompt, through one
+`gpu-wait` job. `GENERATED` output byte-identical, `BARO_SPEC`/`BARO_MEGA`
+readback and mega fail word identical, mega still engages by default (the
+new `mega_req = mega and sample.temperature <= 0` local only affects a
+per-request WindowCfg field, never the session-level `mega` var other
+requests see).
+
+**Gate 2 (device sampler matches `serve/sample_ref.mojo` per token, fixed
+seed and logits): OPEN, with a real finding.** Wrote
+`kernels/test_sample_device.mojo`: the first check that runs
+`amar_sample_row` (device) and `sample_row_ref` (host) on the *same* inputs
+and compares tokens directly, rather than each against its own target
+(`kernels/test_sample.mojo` already device-tests the kernel's own
+distribution via chi-square on a 64-token synthetic vocab, and
+`kernels/test_sample_ref.mojo` already host-tests the reference, but neither
+compares the two implementations to each other). Used `.work/draft-logits.bin`
+(a real 248320-wide decode row, a side effect of `run-tests.sh`) at a fixed
+seed across 64 `counter` values, 4 configs.
+
+Result: greedy (T=0), `T=1 k=0 p=1` (no truncation), and one config with
+`min_p` set all match exactly on every draw. Two configs that combine
+`top_k`/`top_p` **without** `min_p` disagree on every one of 64 draws:
+device returns the same token regardless of `counter` (its reported
+probability is identical across draws too, e.g. `0.7913294` every time),
+while host varies (e.g. a ~0.16%-probability tail token wins one draw, a
+~76%-probability token wins the next two). Checked the RNG derivation
+(`rng4`/`rng_word`) by inspection -- identical on both sides, same
+`(seed, counter, row, stream, g)` construction, same `philox4x32` call. So
+this is not a noise/seed mismatch; the two implementations are settling on a
+**different candidate set** before the noise is even applied. Likely
+explanation, not confirmed: `kernels/sample.mojo`'s `sample_cut` is a
+histogram-bucketed, GPU-parallel approximate top-p/top-k selector, against
+`sample_ref.mojo`'s exact sorted-and-cumulative-summed selector --
+plausible to diverge right at a probability-mass threshold on a real,
+heavily peaked 248320-token distribution in a way a 64-token synthetic
+vocab never exercises.
+
+Diagnosing or fixing which side is right (or whether the device
+approximation's disagreement is within an acceptable, previously
+unspecified tolerance) is kernel-algorithm work in `kernels/sample.mojo` or
+`serve/sample_ref.mojo` -- past this lane's stop condition. Sent the finding
+to the coordinator with full evidence (`herd tell`) rather than guessing;
+not touching either file without a steer.
+
+**Gates 3 (seed reproducibility) and 4 (T=1 distribution within a
+preregistered tolerance): PASS**, both already covered by
+`kernels/test_sample.mojo` and rerun fresh this session rather than cited
+from memory: P-K3/P-K4 (same `(seed, counter)` -> identical tokens, 10000/10000;
+a different seed changes the draws) and its chi-square check at
+`"T1 k- p-"` (temperature 1, no truncation) against a preregistered p=0.001
+critical value.
+
+**Committed the wiring and the new test** (`8ddd477`): `run-tests.sh` and
+`tools/ci-checks.sh` both green with the wiring in place (fixed three other
+`WindowCfg` construction sites the new `sample` field broke --
+`kernels/test_prefix.mojo`, `bench/bench_hidden_dtype.mojo` x2 -- all in the
+gates this lane owns keeping green). `kernels/test_sample_device.mojo` is
+deliberately **not** wired into `run-tests.sh` or `ci-checks.sh`: it
+currently fails (correctly, reporting the real finding above), and adding a
+known-failing check to a standing gate would turn that gate red for a
+finding, not a regression, which CLAUDE.md's "never commit red" is about
+protecting against. Also noted, not fixed: `kernels/test_realign.mojo` and
+`bench/bench_latent_handoff.mojo` have their own older `WindowCfg` calls
+already missing `dump4`/`dump_layer` from a change that predates this
+session; neither is in `run-tests.sh`, and `ci-checks.sh` already skips
+`bench_latent_handoff.mojo` for its external `grammar` import, so both are
+out of this lane's gates and left as a separate, pre-existing finding.
 
 Not started.
