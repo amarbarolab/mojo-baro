@@ -219,7 +219,7 @@ this one. Said plainly rather than claimed done.
 `README.md` and `docs/ENGINE-ROADMAP.md` updated: the four dense targets are
 no longer described as CLI-only.
 
-## M5 -- greedy/sampling toggle (WIRING DONE `8ddd477`, gate 2 open, question sent)
+## M5 -- greedy/sampling toggle (SHIPPED WITH A NAMED OPEN DEFECT, not done)
 
 `kernels/sample.mojo` (device, distribution-tested) and `serve/sample_ref.mojo`
 (host oracle) both already existed; `grep -n sample serve/registry.mojo
@@ -244,65 +244,80 @@ new `mega_req = mega and sample.temperature <= 0` local only affects a
 per-request WindowCfg field, never the session-level `mega` var other
 requests see).
 
-**Gate 2 (device sampler matches `serve/sample_ref.mojo` per token, fixed
-seed and logits): OPEN, with a real finding.** Wrote
+**Gate 2 finding, and the coordinator's diagnosis.** Wrote
 `kernels/test_sample_device.mojo`: the first check that runs
 `amar_sample_row` (device) and `sample_row_ref` (host) on the *same* inputs
 and compares tokens directly, rather than each against its own target
 (`kernels/test_sample.mojo` already device-tests the kernel's own
 distribution via chi-square on a 64-token synthetic vocab, and
 `kernels/test_sample_ref.mojo` already host-tests the reference, but neither
-compares the two implementations to each other). Used `.work/draft-logits.bin`
-(a real 248320-wide decode row, a side effect of `run-tests.sh`) at a fixed
-seed across 64 `counter` values, 4 configs.
+compares the two implementations to each other). Two of four configs
+disagreed on every draw checked; sent the raw finding up rather than
+guessing which side was wrong. The coordinator's diagnosis
+(`exchange/2026-09-15-m5-sampler-diagnosis.md`) resolved it: **the host
+reference is the defective side, not the device kernel.**
+`serve/sample_ref.mojo` ports the device's `pmass_target` formula
+(`W = ceil(top_p * Z)`) from the device's fixed-point mass (unit `2^-40`,
+where `ceil` is exact) onto a float64 mass whose unit is `exp(lmax) = 1`; on
+a peaked real row, `ceil` rounds the target up to most or all of the top-k
+set. The device was never collapsing to one candidate -- it was returning
+the correct, small nucleus, while the host's inflated set kept low-mass tail
+tokens live. `min_p` masked this in the one config that had it set, on both
+sides, which is why that config alone matched.
 
-Result: greedy (T=0), `T=1 k=0 p=1` (no truncation), and one config with
-`min_p` set all match exactly on every draw. Two configs that combine
-`top_k`/`top_p` **without** `min_p` disagree on every one of 64 draws:
-device returns the same token regardless of `counter` (its reported
-probability is identical across draws too, e.g. `0.7913294` every time),
-while host varies (e.g. a ~0.16%-probability tail token wins one draw, a
-~76%-probability token wins the next two). Checked the RNG derivation
-(`rng4`/`rng_word`) by inspection -- identical on both sides, same
-`(seed, counter, row, stream, g)` construction, same `philox4x32` call. So
-this is not a noise/seed mismatch; the two implementations are settling on a
-**different candidate set** before the noise is even applied. Likely
-explanation, not confirmed: `kernels/sample.mojo`'s `sample_cut` is a
-histogram-bucketed, GPU-parallel approximate top-p/top-k selector, against
-`sample_ref.mojo`'s exact sorted-and-cumulative-summed selector --
-plausible to diverge right at a probability-mass threshold on a real,
-heavily peaked 248320-token distribution in a way a 64-token synthetic
-vocab never exercises.
+**Corrected gate status** (per the diagnosis and the coordinator's steer,
+`briefs/2026-09-15-m5-steer.md`):
+- Gate 1 (temperature 0 byte-identical): **PASS**, real engine A/B, rerun
+  again after the refusal below and still byte-identical.
+- Gate 2 (device == host per token, real row): **FAIL for `top_p < 1`
+  without `min_p`, failing side is the host**, not a device defect --
+  `exchange/2026-09-15-m5-sampler-diagnosis.md`.
+- Gates 3 (seed reproducibility) and 4 (T=1 chi-square): **PASS at VS=64,
+  UNVERIFIED at real vocab.** Both ran only in `kernels/test_sample.mojo`'s
+  64-token synthetic vocab at `T1 k- p-`; they say nothing about the top-p,
+  top-k, or top-k+top-p shapes at 248320. The missing check is preregistered
+  in `bench/chat-protocol.md` ("C3 fix round").
+- Also UNVERIFIED at real vocab: `top_k > 0` alone (never in gate 2's
+  config list).
 
-Diagnosing or fixing which side is right (or whether the device
-approximation's disagreement is within an acceptable, previously
-unspecified tolerance) is kernel-algorithm work in `kernels/sample.mojo` or
-`serve/sample_ref.mojo` -- past this lane's stop condition. Sent the finding
-to the coordinator with full evidence (`herd tell`) rather than guessing;
-not touching either file without a steer.
+**M5 ships as wiring plus a loud refusal, not a fix.** `serve/engine.mojo`'s
+`BARO_SERVE` request validation now rejects any request with
+`temperature > 0`, `top_p < 1` and `min_p <= 0` before any GPU work, with:
+`top_p without min_p is unverified at real vocab
+(exchange/2026-09-15-m5-sampler-diagnosis.md, bench/chat-protocol.md C3 fix
+round); use min_p > 0 or top_p = 1`. `temperature = 0` is unaffected (gate 1
+above). `min_p > 0` and `top_p = 1` configs still sample normally. Verified
+with a real `POST /v1/chat/completions` against a running `baro-serve`
+(qwen35, `.work/engine-pack-q4`), all three required cases:
 
-**Gates 3 (seed reproducibility) and 4 (T=1 distribution within a
-preregistered tolerance): PASS**, both already covered by
-`kernels/test_sample.mojo` and rerun fresh this session rather than cited
-from memory: P-K3/P-K4 (same `(seed, counter)` -> identical tokens, 10000/10000;
-a different seed changes the draws) and its chi-square check at
-`"T1 k- p-"` (temperature 1, no truncation) against a preregistered p=0.001
-critical value.
+- `{"temperature":0.7,"top_p":0.8}` (no `min_p`) -> `502`,
+  `{"error":{"code":502,"message":"engine: top_p without min_p is
+  unverified at real vocab (exchange/2026-09-15-m5-sampler-diagnosis.md,
+  bench/chat-protocol.md C3 fix round); use min_p > 0 or top_p = 1",
+  "type":"invalid_request_error"}}`. (502, not 400: every engine-level
+  request rejection in `serve/src/main.rs` maps to `BAD_GATEWAY` today,
+  including the pre-existing `prompt+n exceeds TMAX` case -- pre-existing
+  behavior, not introduced here, and out of this steer's scope to change.)
+- `{"temperature":0.7,"top_p":0.8,"min_p":0.05}` -> a real completion
+  (`"<think>\n1.  **Identify the core question:** ..."`, `finish_reason:
+  "length"`, server log confirms `spec: False`).
+- `{"temperature":1,"top_p":1}` -> a real completion (same content, cache
+  hit on the identical prompt), `spec: False` confirmed in the server log.
 
-**Committed the wiring and the new test** (`8ddd477`): `run-tests.sh` and
-`tools/ci-checks.sh` both green with the wiring in place (fixed three other
-`WindowCfg` construction sites the new `sample` field broke --
-`kernels/test_prefix.mojo`, `bench/bench_hidden_dtype.mojo` x2 -- all in the
-gates this lane owns keeping green). `kernels/test_sample_device.mojo` is
-deliberately **not** wired into `run-tests.sh` or `ci-checks.sh`: it
-currently fails (correctly, reporting the real finding above), and adding a
-known-failing check to a standing gate would turn that gate red for a
-finding, not a regression, which CLAUDE.md's "never commit red" is about
-protecting against. Also noted, not fixed: `kernels/test_realign.mojo` and
-`bench/bench_latent_handoff.mojo` have their own older `WindowCfg` calls
+Committed as its own commit, why-body citing the diagnosis file; no
+attribution lines. `run-tests.sh` and `tools/ci-checks.sh` both green
+(also regenerated `docs/KERNELS.md`, stale from the prior M5 commit missing
+`kernels/test_sample_device.mojo` as a caller of `amar_sample_row`).
+
+**Not touched:** `kernels/sample.mojo`, `serve/sample_ref.mojo`. The fix
+round (host top-p mass target, arms H0/H1 against a numpy oracle, real-vocab
+gate 2 and a real-vocab chi-square) is preregistered in
+`bench/chat-protocol.md` ("C3 fix round: host top-p mass target") and waits
+for a session with room for it.
+
+Also noted, not fixed (unrelated to this steer): `kernels/test_realign.mojo`
+and `bench/bench_latent_handoff.mojo` have their own older `WindowCfg` calls
 already missing `dump4`/`dump_layer` from a change that predates this
 session; neither is in `run-tests.sh`, and `ci-checks.sh` already skips
 `bench_latent_handoff.mojo` for its external `grammar` import, so both are
 out of this lane's gates and left as a separate, pre-existing finding.
-
-Not started.
