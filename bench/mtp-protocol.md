@@ -458,3 +458,31 @@ general corpus ranks this model's own tokens worse than the small one did. The
 larger tok/s gain is partly run-to-run noise (round 1's full-head arms read 150.80
 and 129.37). Next: rank by the model's own output (a generated corpus,
 option B) rather than by general text. FR-Spec stays off by default.
+
+## A1 speculative-sampling gates at real vocab (preregistered 2026-09-15, before the first run)
+
+`kernels/test_sample_device.mojo` gains two gates beside its sampler pair.
+Full round: `bench/spec-sample-protocol.md`. Thresholds frozen here before
+the gates ran, per P2:
+
+- **gate3, per draw, exact.** For each of the three real logits rows and each
+  of two shapes (`T1_k0_p1`, `T0.7_k20_p0.8`), 64 draws: the token and the
+  accept flag from `amar_spec_accept` equal `spec_accept_ref` on the same
+  `(seed, counter)`. **Threshold: 0 mismatches of 64.** Not a rate, not a
+  distribution: one disagreeing draw fails the gate. The draft distribution is
+  the NEXT row's logits (wrapping), so `q` is far from `p` and most draws take
+  the residual branch rather than the accept branch. The device and host
+  probability rows are compared too (`max |device - host|` is printed as a
+  receipt, not a threshold, since both gates run on the device rows).
+- **gate4, distribution, 20,000 draws.** Draw `x ~ q` on device, run the
+  accept rule on device, bin the EMITTED token against the independent numpy
+  oracle for `p` (`tools/sample-nucleus-oracle.py`, the same oracle file gate2
+  uses), chi-square with expected counts under 5 pooled, **critical value at
+  p = 0.001**. This is the theorem's own claim: tokens emitted by accept plus
+  residual are distributed as `p`, so the same oracle that gates direct
+  sampling gates this.
+
+Why these two and not one: aggregate agreement with a per-draw disagreement is
+exactly the sampler defect this repo shipped once already
+(`exchange/2026-09-15-m5-sampler-diagnosis.md`). gate4 passing while gate3
+fails is a failure.
