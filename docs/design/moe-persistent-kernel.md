@@ -79,3 +79,35 @@ NOT-RESIDENT fail word read on every run. Kill line +5%; the prediction is
 L: `mega_body_moe` about 250 lines reusing `ssm_phases`/`attn_phases`/
 `stage_rms` and the R1/R2/R5 dots; registry dispatch and `window.mojo`
 switch about 40 lines (the lane's files, by request); GPU minutes per gate.
+
+## Correction after reading the MoE launch path in full (2026-09-15, later)
+
+The MoE SSM block is not the dense one and `ssm_phases` cannot be reused:
+- inner width `NH_V * SSTATE = 4096` against `H = 2048` (the 2026-09-12 W3
+  fix), so qkv is `CONV x H` with CONV sized for the 4096 inner, gate is
+  `4096 x H`, and `ssm_out` is `H x 4096` (`decode_base + 9`);
+- the A and B gates are f32 tensors (`moe_base + 3`, `+ 4`, `ssm_gate_w_layout`)
+  consumed by their own GEMV kernel, not q8 rows as in the dense body;
+- conv, l2, reduce_gates, delta (`NH_V = 32`, `SSTATE = 128`) and gated_out
+  keep the dense shapes and can be reused;
+- the launch path also switched to the dense q8 row kernel for the
+  projections ran 8% slower than the raw-block dot (R6a), so the
+  projection phase must carry the raw-block dot or prove the dense one is
+  not slower inside the persistent kernel.
+
+Revised effort: **XL** (own `ssm_phases_moe`, own projection phases with the
+raw-block dot, FFN expert phases, MoE offset walk, dump parity per layer).
+Staging that keeps every step a short experiment:
+1. R6.0 (M, host side, no grid barrier): fuse the per-layer elementwise
+   chains on the launch path (norm + cast, casts, add3, the small SSM
+   kernels) into 2 to 3 launches per layer; measured by the launch counter
+   (`bench/moe-launch-count.sh`) and the 20-prompt A/B. Prediction from the
+   timeline: about 400 launches removed, 1.3 ms, +12%.
+2. R6.1 (L): persistent kernel for the attention layers' sub-blocks only is
+   not possible (one launch per token or nothing), so the first kernel
+   milestone is the full body at parity on one prompt with `BARO_DUMP`
+   layer compares, speed not gated.
+3. R6.2 (M): speed gates as preregistered.
+Decision on opening the XL lane is the maintainer's (`docs/NEXT-PLAN.md` GPU rule:
+each gate under 10 minutes still holds; the cost is engineering sessions,
+not GPU).
