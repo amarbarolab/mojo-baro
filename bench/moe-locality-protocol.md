@@ -73,6 +73,56 @@ If the hit rate at a resident half is below 30%, the host-resident tier is not
 built: the streaming claim then depends on prefetch alone and B4's build order
 is rewritten around prediction 2 rather than around a cache.
 
-## Result
+## Result (2026-09-15): two of three predictions falsified, the tier pays
 
-Filled in when the trace and the replay run. Nothing here is a claim yet.
+Trace: `.work/b1/experts.txt`, engine `.work/b1/engine-trace` built from HEAD
+plus the trace mode, 20 prompts x 64 tokens x 40 layers x top-8 =
+**51,200 rows, none missing** (the replay refuses a short trace). Replay:
+`bench/moe-locality.py`, bytes per expert 1.77 MB (gate + up + down, q4_k),
+bandwidth 28.5 GB/s from stage 1.
+
+**Cross-check first: the traced run emits exactly what the untraced run
+emits, on all 20 prompts.** So the trace describes this engine and not an
+instrumented variant of it.
+
+**Sequential repeat: 39.3%** of 403,200 picks (same expert, same layer, two
+consecutive tokens). A uniform-random router of 256 experts choosing 8 would
+give 3.1%, so the routing is strongly structured, and MoE-Infinity's "under 5%
+of experts repeat within a request" for a roughly 100-expert model does not
+describe this model. Prediction 2 (5% to 40%) held, at the top of its band.
+
+| resident per layer | resident VRAM | hit rate | GB/token | ms/token at 28.5 GB/s |
+|---|---|---|---|---|
+| 8 | 0.6 GB | 28.1% | 0.407 | 14.3 |
+| 16 | 1.1 GB | 49.8% | 0.285 | 10.0 |
+| 32 | 2.3 GB | 65.1% | 0.197 | 6.9 |
+| **64** | **4.5 GB** | **76.7%** | **0.132** | **4.6** |
+| 96 | 6.8 GB | 79.8% | 0.115 | 4.0 |
+| 128 | 9.1 GB | **80.4%** | 0.111 | 3.9 |
+| 256 (all) | 18.1 GB | 80.5% | 0.110 | 3.9 |
+
+**Prediction 1 is falsified.** A resident half gives **80.4%**, not under 70%.
+The ceiling is 80.5% and it is reached at 128; a quarter-cache (64 per layer,
+4.5 GB, which fits beside the 5.2 GB trunk) already gets 76.7%. The reason is
+visible in the same table: with an unlimited cache the hit rate is still
+80.5%, so **only about 100 of the 256 experts per layer are ever touched in a
+64-token request**, and they are touched repeatedly.
+
+**Prediction 3 is falsified too, with a caveat that matters more than the
+prediction.** At 80% hit rate the 100B-class arithmetic from stage 1 (1.64 GB
+routed per token) drops to about 0.32 GB and 11 ms, which fits a 30 tok/s
+budget on transfer time. But that applies OUR router's locality to a model we
+have not traced. The honest statement is: **on this 35B, a 4.5 GB expert cache
+covers three quarters of expert traffic**; whether a 100B-class model routes as
+repetitively is an assumption until one is traced.
+
+**Kill line: not reached.** It was "below 30% at a resident half"; measured
+80.4%. The host-resident tier is worth building, and stage 3's prefetch has a
+concrete target: the 19.5% that a perfect within-request cache still misses
+are cold first-touches, which is exactly what a router-driven prefetch of the
+next layer can hide.
+
+Caveats, stated rather than buried: the cache is reset per prompt, so this is
+within-request locality over 64 tokens and a longer request would score higher;
+and the bytes-per-expert figure averages q4_k, ignoring the three layers whose
+`down` is q6_k, which biases bytes slightly low.
