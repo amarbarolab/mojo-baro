@@ -94,10 +94,11 @@ behaviour and B4's build order is rewritten around prefetch instead.
 
 ## Result (2026-09-15): the tier works, and every prediction held
 
-Engine `.work/b4/engine-tier-wired` (the wiring applied to a scratch copy of
-the tree, since `serve/window.mojo` was fable's), reference
-`.work/b1/engine-r4base`, pack `.work/moe-tier` (trunk 2.68 GB, experts.bin
-18.33 GB). Receipts in `.work/b4/`.
+Engine `.work/b4/engine-main`, sha256 `af50a7357db6a3f2`, built from a clean
+`git archive` of `f798ed4` (the wiring as it landed on main, not the scratch
+copy it was developed in). Reference `.work/b1/engine-r4base`, pack
+`.work/moe-tier` (trunk 2.68 GB, experts.bin 18.33 GB). Receipts in
+`.work/b4/g23main/`.
 
 **The pack load is the first read-back and it is the one that could have
 voided everything:** `loading pack: 2678180352 bytes  tier tensors: 120`. The
@@ -106,8 +107,8 @@ weights left VRAM.
 
 | capacity | cache VRAM | identity | hit rate | bytes/token | ms/token at 28.5 GB/s | median tok/s_gen |
 |---|---|---|---|---|---|---|
-| 64 | 5.22 GB | **20/20** | **0.7743** | 0.1656 GB | 5.81 | 41.66 |
-| 128 | 10.4 GB | **20/20** | 0.8274 | 0.1266 GB | 4.44 | 47.36 |
+| 64 | 5.22 GB | **20/20** | **0.7743** | 0.1656 GB | 5.81 | 39.06 |
+| 128 | 10.4 GB | **20/20** | 0.8274 | 0.1266 GB | 4.44 | 46.75 |
 | 256 | 20.9 GB | does not fit: `hipErrorOutOfMemory`, `oom log request=19.45GB` | | | | |
 
 - **Prediction 1 held.** Live hit rate at capacity 64 is 0.7743 against the
@@ -118,10 +119,9 @@ weights left VRAM.
   of transfer against the frozen 4.7 to 6.4 ms.
 - **Prediction 3, stated and not gated, was pessimistic in one direction and
   optimistic in the other.** It predicted 62 to 71 tok/s from transfer cost
-  alone; measured 41.66. The missing term is the one the protocol named as
+  alone; measured 39.06. The missing term is the one the protocol named as
   inherent: 40 host round trips per token to read the router's top-8 back
-  before the fetches can be issued. `fetch_s` is 1.60 s of a 1.68 s decode on
-  p01, so the tier's own path, not the kernels, is what the engine now waits
+  before the fetches can be issued. `fetch_s` is 1.74 s of a 1.75 s decode on p01, so the tier's own path, not the kernels, is what the engine now waits
   on.
 - **Kill line not reached.** It was below 70% live at capacity 64; measured
   77.4%.
@@ -137,3 +137,8 @@ Deviation: the brief's second capacity was 256, which does not fit on this
 card. 128 replaces it as the no-eviction arm, and its hit rate (0.8274) sits
 just above the offline ceiling for an unlimited cache (0.805), which is the
 consistency check that it really evicted nothing.
+
+
+Gate 4 on `f798ed4`: `tools/ci-checks.sh` all non-GPU checks passed;
+`./run-tests.sh` exit 0, 104 PASS, census `97 kernels, 52 in registry, 0
+orphans`.
