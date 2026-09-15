@@ -41,7 +41,7 @@ def main():
     for a in sys.argv[1:]:
         if a.startswith("--kv="):
             k, v = a[5:].split("=", 1)
-            assert k.startswith("baro.") and not k.startswith("baro.kernel."), f"--kv key must be baro.<ns>.<name>, not kernel: {k}"
+            assert k.startswith("baro.") and (not k.startswith("baro.kernel.") or k == "baro.kernel.model"), f"--kv key must be baro.<ns>.<name> (or baro.kernel.model): {k}"
             extra.append((k, v))
         else:
             args.append(a)

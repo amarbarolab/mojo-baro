@@ -22,7 +22,13 @@ fi
 # Split layout (2026-09-08): no main() in the embedded sources; the harness is
 # serve/engine.mojo at the gguf's commit, from git, never from the gguf.
 entry="$out/engine.mojo"
-if grep -qx moe.mojo "$out/FILES" && grep -qx window.mojo "$out/FILES"; then
+# External harness dependency (2026-09-15 finding): serve/engine.mojo imports
+# latentos (the LatentOS sidecar, ~/AMDHQ/src, deliberately not in this repo),
+# so the harness only builds where that tree exists. Stated in the receipt;
+# a clone cannot rebuild the engine until the sidecar is vendored or stubbed.
+EXTI=""; if [ -d "$HOME/AMDHQ/src/latentos" ]; then EXTI="-I $HOME/AMDHQ/src"; echo "external (NOT in the file): latentos from $HOME/AMDHQ/src"; else echo "WARNING: latentos not found; the harness will not build (serve/engine.mojo imports it)"; fi
+kmodel=$(jq -r '.["baro.kernel.model"] // empty' "$out/meta.json")
+if [ "$kmodel" = "qwen35moe" ]; then
   # qwen35moe FULL ENGINE closure (2026-09-12): the file carries the whole
   # engine closure, not just the expert kernels, so rebuild the engine from it
   # exactly as the qwythos path does and gate on reference tokens. The harness
@@ -33,7 +39,8 @@ if grep -qx moe.mojo "$out/FILES" && grep -qx window.mojo "$out/FILES"; then
   for m in $(sed -n 's/^from \([a-z_]*\) import.*/\1/p' "$out/closure_main.mojo"); do
     [ -f "$out/$m.mojo" ] || ! git cat-file -e "$kcommit:serve/$m.mojo" 2>/dev/null || git show "$kcommit:serve/$m.mojo" > "$out/$m.mojo"
   done
-  ./.venv/bin/mojo build "$out/closure_main.mojo" -I "$out" -D BARO_MODEL=qwen35moe -o .work/moe-engine-closure 2>&1 | grep -E "error" -A3 && exit 1 || true
+  ./.venv/bin/mojo build "$out/closure_main.mojo" -I "$out" $EXTI -D BARO_MODEL=qwen35moe -o .work/moe-engine-closure 2>&1 | grep -E "error" -A3 && exit 1 || true
+  [ -x .work/moe-engine-closure ] || { echo "closure build FAILED (no binary)"; exit 1; }
   moeref=${ref:-.work/moe-closure-ref.txt}
   [ -f "$moeref" ] || { echo "no reference token file $moeref -- make one with the repo-built engine first"; exit 1; }
   # The reference holds bare ids. A file still carrying the engine's own
@@ -77,7 +84,8 @@ if [ -f "$out/window.mojo" ] && ! grep -q '^def main' "$out/engine.mojo" 2>/dev/
   done
   entry="$out/closure_main.mojo"; echo "split layout: harness serve/engine.mojo@$kcommit"
 fi
-./.venv/bin/mojo build "$entry" -I "$out" -o .work/engine-closure 2>&1 | grep -E "error" -A3 && exit 1 || true
+./.venv/bin/mojo build "$entry" -I "$out" $EXTI -o .work/engine-closure 2>&1 | grep -E "error" -A3 && exit 1 || true
+[ -x .work/engine-closure ] || { echo "closure build FAILED (no binary)"; exit 1; }
 ./.work/engine-closure > "$out/run.log"
 grep -E "tok/s|host_enqueue" "$out/run.log"
 tools/check-tokens.sh "$ref" "$out/run.log"
