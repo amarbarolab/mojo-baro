@@ -487,3 +487,50 @@ It also records that A2 is a blocker rather than a dependency, that
 state is already built and needs only threading, and one unmeasured number
 that bounds every later gate: whether MAX's per-process VRAM reservation
 scales with tracked sequences.
+
+---
+
+## 11. B4 stage 2 expert locality: LANDED, and the tier is worth building
+
+Trace mode `dfd65cd`, result `1aa06d5`, protocol
+`bench/moe-locality-protocol.md` (frozen before the trace mode was written).
+
+The coordinator asked for a host-resident expert tier with an LRU and a hit
+rate on the 20 prompts. **The hit rate was measured without building the
+tier**, because the number stage 2 has to produce is a property of the
+router's choices, not of a tier, and a tier built first would be an engine
+change resting on an assumption. `BARO_EXPERTS=<path>` accumulates the top-8
+ids the MoE FFN already computes into one device plane and writes it out once
+per request; `bench/moe-locality.py` replays an LRU offline over a capacity
+sweep.
+
+Cross-check before any number: **the traced run emits exactly what the
+untraced run emits on all 20 prompts**, so the trace describes this engine.
+51,200 rows, none missing (the replay refuses a short trace).
+
+| resident per layer | resident VRAM | hit rate | GB/token | ms/token at 28.5 GB/s |
+|---|---|---|---|---|
+| 8 | 0.6 GB | 28.1% | 0.407 | 14.3 |
+| 32 | 2.3 GB | 65.1% | 0.197 | 6.9 |
+| **64** | **4.5 GB** | **76.7%** | **0.132** | **4.6** |
+| 128 | 9.1 GB | 80.4% | 0.111 | 3.9 |
+| 256 (all) | 18.1 GB | 80.5% | 0.110 | 3.9 |
+
+**Two of three frozen predictions are falsified, both favourably, and the
+protocol records it that way.** A resident half gives 80.4%, not the under-70%
+predicted. The ceiling is 80.5% and it is reached at 128, which says something
+sharper than the hit rate itself: **only about 100 of the 256 experts per
+layer are touched at all in a 64-token request**, and they are touched
+repeatedly. Sequential repeat is **39.3%** of 403,200 picks against **3.1%**
+for a uniform-random router of the same shape, so MoE-Infinity's "under 5% of
+experts repeat within a request" does not describe this model.
+
+The kill line (below 30% at a resident half) is not reached, so the tier is
+worth building, and stage 3's prefetch has a concrete target: the 19.5% a
+perfect within-request cache still misses are cold first touches, which is
+exactly what a router-driven prefetch of the next layer can hide.
+
+Two caveats kept in the open rather than buried: the LRU resets per prompt, so
+this is within-request locality over 64 tokens and a longer request would
+score higher; and applying this hit rate to a 100B-class model, which is what
+B4's claim needs, is an assumption until such a model is traced.
