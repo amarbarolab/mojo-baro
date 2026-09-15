@@ -1,7 +1,7 @@
 from std.gpu import block_idx, global_idx, lane_id, thread_idx, WARP_SIZE
 from std.gpu.primitives import warp
 from std.memory import bitcast
-from std.math import exp
+from std.math import exp, fma
 from max.gpu.memory import AddressSpace
 from max.gpu.sync import barrier
 from layout import TileTensor, TensorLayout, row_major, stack_allocation
@@ -271,6 +271,61 @@ def q4k_row_dot[
     return warp.sum(acc)
 
 
+@always_inline
+def q4k_dot_blocks[
+    XLayout: TensorLayout,
+](
+    X: TileTensor[bf16, XLayout, MutAnyOrigin],
+    W: MutPointer[Scalar[u8], MutAnyOrigin],
+    x_row: Int,
+    row_base: Int,
+    k_dim: Int,
+) -> Scalar[f32]:
+    comptime assert X.flat_rank == 2
+    var lane = Int(lane_id())
+    var Xv = X.vectorize[1, 16]()
+    var nb = k_dim // Q4K
+    var acc = SIMD[f32, 16](0)
+    var b = lane // 8
+    var s = lane % 8
+    var pair = s // 2
+    var half = (s % 2) * 16
+    while b < nb:
+        var base = row_base + b * Q4K_BYTES
+        var hdr = W.unsafe_offset(base).load[width=16]()
+        var d = bitcast[f16, 1](SIMD[u16, 1](UInt16(Int(hdr[0]) | (Int(hdr[1]) << 8))))[0].cast[f32]()
+        var dm = bitcast[f16, 1](SIMD[u16, 1](UInt16(Int(hdr[2]) | (Int(hdr[3]) << 8))))[0].cast[f32]()
+        var g0 = 2 * pair
+        var g1 = g0 + 1
+        var sc0: Int
+        var mn0: Int
+        var sc1: Int
+        var mn1: Int
+        if g0 < 4:
+            sc0 = Int(hdr[4 + g0]) & 0x3F
+            mn0 = Int(hdr[8 + g0]) & 0x3F
+            sc1 = Int(hdr[4 + g1]) & 0x3F
+            mn1 = Int(hdr[8 + g1]) & 0x3F
+        else:
+            var md0 = Int(hdr[12 + g0 - 4])
+            var md1 = Int(hdr[12 + g1 - 4])
+            sc0 = (md0 & 0x0F) | ((Int(hdr[4 + g0 % 4]) >> 2) & 0x30)
+            mn0 = (md0 >> 4) | ((Int(hdr[8 + g0 % 4]) >> 2) & 0x30)
+            sc1 = (md1 & 0x0F) | ((Int(hdr[4 + g1 % 4]) >> 2) & 0x30)
+            mn1 = (md1 >> 4) | ((Int(hdr[8 + g1 % 4]) >> 2) & 0x30)
+        var qb = W.unsafe_offset(base + 16 + pair * 32 + half).load[width=16]()
+        var lo = (qb & 0x0F).cast[f32]()
+        var hi = (qb >> 4).cast[f32]()
+        var v0 = (SIMD[f32, 16](d * Scalar[f32](sc0)) * lo - SIMD[f32, 16](dm * Scalar[f32](mn0))).cast[bf16]().cast[f32]()
+        var v1 = (SIMD[f32, 16](d * Scalar[f32](sc1)) * hi - SIMD[f32, 16](dm * Scalar[f32](mn1))).cast[bf16]().cast[f32]()
+        var k0 = b * Q4K + g0 * 32 + half
+        var a0 = rebind[SIMD[bf16, 16]](Xv[x_row, k0 // 16]).cast[f32]()
+        var a1 = rebind[SIMD[bf16, 16]](Xv[x_row, (k0 + 32) // 16]).cast[f32]()
+        acc = fma(v0, a0, fma(v1, a1, acc))
+        b += 4
+    return warp.sum(acc.reduce_add())
+
+
 def q4k_decode_vector[
     OLayout: TensorLayout,
 ](
@@ -523,8 +578,8 @@ def moe_gate_up_q4k_pack[
     var e = Int(rebind[Scalar[i32]](IDX[j]))
     var row_bytes = (Int(k_dim) // Q4K) * Q4K_BYTES
     var row_base = e * FFN * row_bytes + r * row_bytes
-    var g = q4k_row_dot(Xb, W, 0, row_base, Int(k_dim))
-    var u = q4k_row_dot(Xb, W, 0, row_base + Int(up_offset), Int(k_dim))
+    var g = q4k_dot_blocks(Xb, W, 0, row_base, Int(k_dim))
+    var u = q4k_dot_blocks(Xb, W, 0, row_base + Int(up_offset), Int(k_dim))
     if lane_id() == 0:
         HO[wid] = rebind[HO.ElementType](g / (Scalar[f32](1) + exp(-g)) * u)
 
@@ -552,7 +607,7 @@ def amar_moe_down_q4k[
     for j in range(NSEL):
         var e = Int(rebind[Scalar[i32]](IDX[j]))
         var row_base = e * N * row_bytes + c * row_bytes
-        var dot = q4k_row_dot(Hb, WD, j, row_base, FFN)
+        var dot = q4k_dot_blocks(Hb, WD, j, row_base, FFN)
         out += rebind[Scalar[f32]](WT[j]) * dot
     if lane == 0:
         O[c] = rebind[O.ElementType](out)

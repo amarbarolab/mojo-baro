@@ -71,3 +71,19 @@ doing a serial selection; the sigmoid gate is a single wave.
 Fixed for the round: no change to the router math, the top-8 renormalisation,
 the shared-expert gate formula, or the pack format. Prefill (m>1) keeps its
 path; only m=1 decode kernels change.
+
+### R1 result (2026-09-15): landed
+
+`q4k_dot_blocks` (16 quant bytes per lane, super-block header once per block,
+per-element `d*sc*q - dm*mn` with the bf16 round-trip unchanged) in
+`moe_gate_up_q4k_pack` and `amar_moe_down_q4k`; `amar_moe_down_q6k` (3
+layers) left as is. Gate 1: `test_moe_block` PASS (routed rel 9.6e-8, y
+1.3e-4, ids 8/8). Gate 2: 20-prompt mean **52.85/64** against the 53.20
+baseline reproduced in the same stint (`.work/moe-perf/base/gate2`), inside
+the +-0.5 band; per prompt 53 58 56 49 57 45 58 57 40 56 48 59 55 53 50 44
+44 56 60 59. Gate 3: run-tests and ci-checks green at commit. Gate 4:
+20-prompt tok/s_gen median **42.88 -> 55.98 (1.306x)**, ranges
+42.77..42.95 vs 55.22..56.09, sclk med 3268 MHz, 290 W / -100 mV, GENERATED
+equal on 15/20 prompts (accumulation order, as allowed). `BARO_PROFILE=1`
+p09: ffn 19.5 -> 12.7 ms per token. Predicted "token 22 -> about 15 ms":
+measured 23.3 -> 17.9 ms, the expert kernels alone landed at prediction.
