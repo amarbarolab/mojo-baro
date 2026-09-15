@@ -13,6 +13,17 @@ rm -rf "$out"; mkdir -p "$out"
 jq -r '.["baro.kernel.files"]' "$out/meta.json" | tr ',' '\n' > "$out/FILES"
 while read -r f; do mkdir -p "$out/$(dirname "$f")"; jq -r --arg k "baro.kernel.src.$f" '.[$k]' "$out/meta.json" > "$out/$f"; done < "$out/FILES"
 jq -r '"commit: " + .["baro.kernel.commit"] + "  arch: " + .["baro.kernel.arch"] + "  files: " + .["baro.kernel.files"]' "$out/meta.json"
+# The file's own prompt and reference ids (baro.run.*, B1). A bake that carries
+# them verifies with nothing outside itself; before they existed the qwen35moe
+# branch defaulted to .work/moe-w3/one.tokens, a local path the gguf never
+# carried and which no longer exists, so tools/gguf-verify.sh exited 1 on every
+# MoE bake.
+jq -er '.["baro.run.prompt.tokens"]' "$out/meta.json" > "$out/prompt.tokens" 2>/dev/null \
+  && echo "prompt: from the file ($(wc -w < "$out/prompt.tokens") ids)" || rm -f "$out/prompt.tokens"
+jq -er '.["baro.run.ref.tokens"]' "$out/meta.json" > "$out/ref-embedded.txt" 2>/dev/null \
+  && echo "reference: from the file ($(wc -w < "$out/ref-embedded.txt") ids)" || rm -f "$out/ref-embedded.txt"
+[ -n "$ref" ] || { [ -s "$out/ref-embedded.txt" ] && ref="$out/ref-embedded.txt"; } || true
+[ -n "${BARO_PROMPT:-}" ] || { [ -s "$out/prompt.tokens" ] && export BARO_PROMPT="$out/prompt.tokens"; } || true
 export MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_SIZE_PERCENT=10
 # vendor arm: if the gguf carries the hipBLASLt shim sources, build them too
 if [ -f "$out/shim/CMakeLists.txt" ]; then
@@ -42,14 +53,16 @@ if [ "$kmodel" = "qwen35moe" ]; then
   ./.venv/bin/mojo build "$out/closure_main.mojo" -I "$out" -D BARO_MODEL=qwen35moe -o .work/moe-engine-closure 2>&1 | grep -E "error" -A3 && exit 1 || true
   [ -x .work/moe-engine-closure ] || { echo "closure build FAILED (no binary)"; exit 1; }
   moeref=${ref:-.work/moe-closure-ref.txt}
-  [ -f "$moeref" ] || { echo "no reference token file $moeref -- make one with the repo-built engine first"; exit 1; }
+  [ -f "$moeref" ] || { echo "no reference token file $moeref: the gguf carries no baro.run.ref.tokens and no file was given"; exit 1; }
   # The reference holds bare ids. A file still carrying the engine's own
   # "GENERATED:" prefix compares that word against a token id and reports a
   # mismatch at position 1 on a run that is actually identical.
   sed 's/^GENERATED: *//' "$moeref" | tr -s ' ' '\n' | grep -v '^$' > "$out/ref-ids.txt"
   moeref="$out/ref-ids.txt"
+  moeprompt=${BARO_PROMPT:-.work/moe-w3/one.tokens}
+  [ -f "$moeprompt" ] || { echo "no prompt token file $moeprompt: the gguf carries no baro.run.prompt.tokens and BARO_PROMPT is unset"; exit 1; }
   env BARO_MEGA=0 BARO_PREFILL=1 BARO_PACK=${BARO_PACK:-.work/moe-w1/pack} \
-      BARO_PROMPT=${BARO_PROMPT:-.work/moe-w3/one.tokens} ./.work/moe-engine-closure > "$out/run.log" 2>&1 \
+      BARO_PROMPT="$moeprompt" ./.work/moe-engine-closure > "$out/run.log" 2>&1 \
       || { echo "closure engine FAILED"; tail -20 "$out/run.log"; exit 1; }
   grep -E "tok/s_gen|mega fail word" "$out/run.log"
   tools/check-tokens.sh "$moeref" "$out/run.log"

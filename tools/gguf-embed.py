@@ -9,7 +9,16 @@ region so only the header padding changes.
 
 Usage: tools/gguf-embed.py SRC.gguf DST.gguf $(tools/embed-files.py)
        (split layout, 2026-09-08: window.mojo + registry.mojo + kernel closure; never serve/engine.mojo)
+
+Optional, for B1 (`tools/baro`), all in the separate baro.run.* namespace so
+the closure walk above stays harness-free:
+  --run-harness=serve/engine.mojo  the RUN-mode harness plus its sha256
+  --run-prompt=FILE                token ids the closure decodes
+  --run-ref=FILE                   the ids it must produce (GENERATED: line or bare)
+  --run-pack-flags='--q4 ...'      how tools/engine-pack.py builds this model's pack
+  --run-pack-tool=tools/engine-pack.py  the pack builder itself, so run mode needs no checkout
 """
+import hashlib
 import os
 import struct
 import subprocess
@@ -35,49 +44,19 @@ def src_key(k):
     return k.name if rel.startswith(("kernels/", "serve/")) else rel
 
 
-def main():
-    extra = []
-    args = []
-    for a in sys.argv[1:]:
-        if a.startswith("--kv="):
-            k, v = a[5:].split("=", 1)
-            assert k.startswith("baro.") and (not k.startswith("baro.kernel.") or k == "baro.kernel.model"), f"--kv key must be baro.<ns>.<name> (or baro.kernel.model): {k}"
-            extra.append((k, v))
-        else:
-            args.append(a)
-    src, dst = Path(args[0]), Path(args[1])
-    kfiles = [Path(p) for p in args[2:]]
-    assert src.exists() and not dst.exists(), "dst must not exist"
+def rewrite(src, dst, new_kv, drop=("baro.kernel.", "baro.hw.", "baro.run.")):
+    """Write dst = src with every KV whose key starts with one of `drop`
+    replaced by `new_kv` (a list of (key, string value) pairs), tensor infos
+    and tensor data copied byte for byte.
 
+    Factored out of main() so tools/gguf-receipt.py can extend one KV without
+    a second copy of the container format. Returns (added, dropped).
+    """
     f = open(src, "rb")
     magic, version = struct.unpack("<4sI", f.read(8))
     assert magic == b"GGUF" and version == 3
     n_tensors, n_kv = struct.unpack("<QQ", f.read(16))
 
-    commit = subprocess.run(
-        ["git", "-C", str(Path(__file__).resolve().parent.parent),
-         "rev-parse", "--short", "HEAD"],
-        capture_output=True, text=True).stdout.strip()
-    new_kv = [("baro.kernel.arch", "gfx1100"),
-              ("baro.kernel.commit", commit),
-              ("baro.kernel.files", ",".join(src_key(k) for k in kfiles))]
-    for pkg in sorted({k.resolve().parent for k in kfiles if not k.resolve().is_relative_to(Path(__file__).resolve().parent.parent)}):
-        c = subprocess.run(["git", "-C", str(pkg), "rev-parse", "--short", "HEAD"], capture_output=True, text=True).stdout.strip()
-        dirty = subprocess.run(["git", "-C", str(pkg), "status", "--short"], capture_output=True, text=True).stdout.strip()
-        assert not dirty, f"{pkg} dirty"
-        new_kv.append((f"baro.kernel.ext.{pkg.name}.commit", c))
-    if os.environ.get("BARO_KERNEL_PARENT"):
-        new_kv.append(("baro.kernel.parent", os.environ["BARO_KERNEL_PARENT"]))
-    # --kv=baro.hw.<name>=<value> (repeatable): the receipts a verifier on another
-    # card compares against (card, driver, power cap, the 20-prompt number and the
-    # protocol that produced it). Earlier baro.hw.* keys are replaced like the
-    # kernel set, so a re-bake never carries two scoreboards.
-    new_kv.extend(extra)
-    for k in kfiles:
-        new_kv.append((f"baro.kernel.src.{src_key(k)}", k.read_text()))
-
-    # copy the existing KV entries except any earlier baro.kernel.* set (re-embedding from a
-    # BARO file must replace its sources, not append a second set), then the tensor infos
     kv_start = f.tell()
     from importlib.util import spec_from_file_location, module_from_spec
     spec = spec_from_file_location("ge", Path(__file__).parent / "gguf-extract.py")
@@ -92,7 +71,7 @@ def main():
         key = key.decode("utf-8") if isinstance(key, bytes) else key
         (vtype,) = struct.unpack("<I", f.read(4))
         ge.read_value(f, vtype, want=False)
-        if not key.startswith("baro.kernel.") and not key.startswith("baro.hw."):
+        if not any(key.startswith(p) for p in drop):
             keep.append((a, f.tell()))
     kv_end = f.tell()
     for _ in range(n_tensors):
@@ -123,7 +102,96 @@ def main():
             break
         out.write(chunk)
     out.close()
-    print(f"wrote {dst} (+{len(new_kv)} kv, dropped {n_kv - len(keep)} earlier baro.kernel.* kv)")
+    return len(new_kv), n_kv - len(keep)
+
+
+def main():
+    extra = []
+    args = []
+    run_harness = None
+    run_prompt = None
+    run_ref = None
+    run_pack_flags = None
+    run_pack_tool = None
+    for a in sys.argv[1:]:
+        if a.startswith("--kv="):
+            k, v = a[5:].split("=", 1)
+            assert k.startswith("baro.") and (not k.startswith("baro.kernel.") or k == "baro.kernel.model"), f"--kv key must be baro.<ns>.<name> (or baro.kernel.model): {k}"
+            extra.append((k, v))
+        elif a.startswith("--run-harness="):
+            run_harness = Path(a.split("=", 1)[1])
+        elif a.startswith("--run-prompt="):
+            run_prompt = Path(a.split("=", 1)[1])
+        elif a.startswith("--run-ref="):
+            run_ref = Path(a.split("=", 1)[1])
+        elif a.startswith("--run-pack-flags="):
+            run_pack_flags = a.split("=", 1)[1]
+        elif a.startswith("--run-pack-tool="):
+            run_pack_tool = Path(a.split("=", 1)[1])
+        else:
+            args.append(a)
+    src, dst = Path(args[0]), Path(args[1])
+    kfiles = [Path(p) for p in args[2:]]
+    assert src.exists() and not dst.exists(), "dst must not exist"
+
+    commit = subprocess.run(
+        ["git", "-C", str(Path(__file__).resolve().parent.parent),
+         "rev-parse", "--short", "HEAD"],
+        capture_output=True, text=True).stdout.strip()
+    new_kv = [("baro.kernel.arch", "gfx1100"),
+              ("baro.kernel.commit", commit),
+              ("baro.kernel.files", ",".join(src_key(k) for k in kfiles))]
+    for pkg in sorted({k.resolve().parent for k in kfiles if not k.resolve().is_relative_to(Path(__file__).resolve().parent.parent)}):
+        c = subprocess.run(["git", "-C", str(pkg), "rev-parse", "--short", "HEAD"], capture_output=True, text=True).stdout.strip()
+        dirty = subprocess.run(["git", "-C", str(pkg), "status", "--short"], capture_output=True, text=True).stdout.strip()
+        assert not dirty, f"{pkg} dirty"
+        new_kv.append((f"baro.kernel.ext.{pkg.name}.commit", c))
+    if os.environ.get("BARO_KERNEL_PARENT"):
+        new_kv.append(("baro.kernel.parent", os.environ["BARO_KERNEL_PARENT"]))
+    # --kv=baro.hw.<name>=<value> (repeatable): the receipts a verifier on another
+    # card compares against (card, driver, power cap, the 20-prompt number and the
+    # protocol that produced it). Earlier baro.hw.* keys are replaced like the
+    # kernel set, so a re-bake never carries two scoreboards.
+    new_kv.extend(extra)
+    for k in kfiles:
+        new_kv.append((f"baro.kernel.src.{src_key(k)}", k.read_text()))
+
+    # --run-harness=serve/engine.mojo: the RUN-mode harness (B1). The closure
+    # walk stays harness-free -- baro.kernel.src.* never carries engine.mojo,
+    # because a file that carries its own stopwatch cannot be timed by it
+    # (exchange/scorer-integrity-report.md P-A). This is a separate namespace
+    # for a separate job: `baro run` serves the model with no checkout and
+    # labels every number it prints self-reported, while `baro verify` takes
+    # the harness from git and first checks this copy is byte-identical to it,
+    # which is how a tampered clock is caught.
+    if run_harness is not None:
+        text = run_harness.read_text()
+        new_kv.append((f"baro.run.src.{run_harness.name}", text))
+        new_kv.append(("baro.run.harness.sha", hashlib.sha256(text.encode()).hexdigest()))
+        new_kv.append(("baro.run.harness.path", "serve/" + run_harness.name))
+
+    # The closure used to reach for .work/ paths that the file never carried
+    # (the qwen35moe branch defaulted BARO_PROMPT to .work/moe-w3/one.tokens,
+    # which no longer exists on this box, so tools/gguf-verify.sh exited 1 on
+    # the MoE bake). A file that verifies itself carries its own prompt and its
+    # own reference ids.
+    if run_prompt is not None:
+        new_kv.append(("baro.run.prompt.tokens", " ".join(run_prompt.read_text().split())))
+    if run_ref is not None:
+        ids = run_ref.read_text().replace("GENERATED:", " ").split()
+        new_kv.append(("baro.run.ref.tokens", " ".join(ids)))
+    if run_pack_flags is not None:
+        new_kv.append(("baro.run.pack.flags", run_pack_flags))
+    if run_pack_tool is not None:
+        # The pack builder too, so run mode needs no checkout to turn the file's
+        # own weights into the engine's pack.
+        new_kv.append((f"baro.run.src.{run_pack_tool.name}", run_pack_tool.read_text()))
+
+    # Existing KVs are copied except any earlier baro.kernel.*/baro.hw.*/baro.run.*
+    # set: re-embedding from a BARO file replaces its sources and its scoreboard,
+    # it never appends a second one.
+    added, dropped = rewrite(src, dst, new_kv)
+    print(f"wrote {dst} (+{added} kv, dropped {dropped} earlier baro.kernel.*/baro.hw.*/baro.run.* kv)")
 
 
 if __name__ == "__main__":

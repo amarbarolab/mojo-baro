@@ -1,0 +1,172 @@
+#!/usr/bin/env bash
+# baro: run or verify a self-describing BARO gguf (B1, docs/NEXT-PLAN.md).
+#
+#   tools/baro run     MODEL.gguf [--port N] [--pack DIR] [--work DIR] [--no-serve]
+#   tools/baro verify  MODEL.gguf [--append] [--work DIR]
+#   tools/baro receipts MODEL.gguf
+#
+# TWO MODES, and the difference between them is the whole point.
+#
+# run mode extracts the sources the file carries, builds the engine with the
+# harness the file carries (baro.run.src.engine.mojo), builds the weight pack
+# from the file itself, and serves it. It needs no reference tokens and no
+# checkout of this repo beyond this script. Every number it prints is labelled
+# "self-reported": the file supplied the stopwatch, so the file cannot be timed
+# by it (exchange/scorer-integrity-report.md P-A).
+#
+# verify mode does the opposite. It takes serve/engine.mojo from git at the
+# file's own baro.kernel.commit, refuses to continue if the harness the file
+# carries differs from it by one byte, then runs tools/gguf-verify.sh (rebuild
+# from the embedded kernel sources, gate the tokens, print the hardware
+# receipt). Only verify mode may append to the receipt ledger, and every
+# receipt it writes carries mode=verified and the commit it was checked
+# against. It needs the checkout, by design.
+#
+# The ledger lives in tools/gguf-receipt.py: a sidecar JSONL next to the model
+# by default, or inside the file's baro.hw.receipts key with --in-file (which
+# rewrites the whole gguf, so it is opt-in).
+set -uo pipefail
+here=$(cd "$(dirname "$0")/.." && pwd)
+
+die() { echo "baro: $*" >&2; exit 1; }
+kvget() { jq -r --arg k "$1" '.[$k] // empty' "$meta"; }
+
+cmd=${1:-}; shift || true
+[ -n "$cmd" ] || die "usage: baro {run|verify|receipts} MODEL.gguf [options]"
+model=${1:-}; shift || true
+[ -n "$model" ] && [ -f "$model" ] || die "no such model file: ${model:-<none>}"
+model=$(readlink -f "$model")
+
+port=8080; pack=""; work=""; append=0; serve=1
+while [ $# -gt 0 ]; do
+  case $1 in
+    --port) port=$2; shift 2;;
+    --pack) pack=$(readlink -f "$2"); shift 2;;
+    --work) work=$2; shift 2;;
+    --append) append=1; shift;;
+    --no-serve) serve=0; shift;;
+    *) die "unknown option $1";;
+  esac
+done
+work=${work:-$here/.work/baro-$(basename "${model%.gguf}")}
+mkdir -p "$work"
+meta=$work/meta.json
+
+# The metadata read is the same for every mode. gguf-extract.py is this repo's
+# reader; ~/iTools/bin/gguf-kv is the one-line alternative but does not emit
+# the source KVs as JSON.
+py=$here/.venv/bin/python3
+[ -x "$py" ] || py=python3
+"$py" "$here/tools/gguf-extract.py" "$model" --meta > "$meta" || die "cannot read $model"
+commit=$(kvget baro.kernel.commit)
+kmodel=$(kvget baro.kernel.model)
+[ -n "$commit" ] || die "not a BARO file: no baro.kernel.commit"
+
+case $cmd in
+
+receipts)
+  exec "$py" "$here/tools/gguf-receipt.py" "$model" --list
+  ;;
+
+verify)
+  # 1. the harness check. A file whose embedded harness differs from git at its
+  #    own commit has either been tampered with or was baked from a dirty tree;
+  #    either way its numbers describe an engine nobody can review.
+  esha=$(kvget baro.run.harness.sha)
+  if [ -n "$esha" ]; then
+    git -C "$here" cat-file -e "$commit:serve/engine.mojo" 2>/dev/null \
+      || die "commit $commit is not in this checkout, so the harness cannot be checked"
+    gsha=$(git -C "$here" show "$commit:serve/engine.mojo" | sha256sum | cut -d' ' -f1)
+    if [ "$esha" != "$gsha" ]; then
+      echo "HARNESS MISMATCH" >&2
+      echo "  embedded baro.run.harness.sha: $esha" >&2
+      echo "  git $commit:serve/engine.mojo:  $gsha" >&2
+      die "the file carries a harness that is not the one at its own commit; its numbers are not verifiable"
+    fi
+    echo "harness: embedded copy is byte-identical to serve/engine.mojo at $commit ($gsha)"
+  else
+    echo "harness: file carries no baro.run.src.engine.mojo (pre-B1 bake); verify uses git only"
+  fi
+
+  # 2. the real check: rebuild from the file's kernel sources and gate tokens.
+  out=$work/verify
+  "$here/tools/gguf-verify.sh" "$model" "$out" 2>&1 | tee "$work/verify.log"
+  rc=${PIPESTATUS[0]}
+  echo "verify exit: $rc"
+  [ $rc = 0 ] || die "verification FAILED (exit $rc); no receipt written"
+
+  if [ $append = 1 ]; then
+    tps=$(grep -oE 'tok/s_gen: [0-9.]+' "$out/run.log" 2>/dev/null | tail -1 | cut -d' ' -f2)
+    card=$(rocminfo 2>/dev/null | grep -m1 -oE 'gfx[0-9a-f]+')
+    name=$(cat /sys/class/drm/card*/device/product_name 2>/dev/null | grep -v '^$' | head -1)
+    cap=$(cat /sys/class/drm/card1/device/hwmon/hwmon*/power1_cap 2>/dev/null | head -1)
+    "$py" "$here/tools/gguf-receipt.py" "$model" --append "$(jq -nc \
+      --arg mode verified --arg commit "$commit" --arg gfx "${card:-unknown}" \
+      --arg card "${name:-unknown}" --arg rocm "$(cat /opt/rocm/.info/version 2>/dev/null)" \
+      --arg driver "$(cat /sys/module/amdgpu/version 2>/dev/null || uname -r)" \
+      --arg cap_w "$(( ${cap:-0} / 1000000 ))" --arg tok_s_gen "${tps:-}" \
+      --arg date "$(date -Is)" --arg host "$(hostname)" \
+      '{mode:$mode, checked_against_commit:$commit, gfx:$gfx, card:$card, rocm:$rocm,
+        driver:$driver, power_cap_w:($cap_w|tonumber), tok_s_gen_one_prompt:$tok_s_gen,
+        date:$date, host:$host}')"
+  fi
+  ;;
+
+run)
+  # Run mode needs the harness FROM THE FILE. Without it there is nothing to
+  # build a runnable engine from, and taking it from git would make this mode
+  # need the checkout, which is exactly what it exists to avoid.
+  src=$work/src
+  rm -rf "$src"; mkdir -p "$src"
+  harness=$(jq -r '.["baro.run.src.engine.mojo"] // empty' "$meta")
+  [ -n "$harness" ] || die "this file carries no baro.run.src.engine.mojo, so it cannot run itself; use: baro verify $model"
+  printf '%s' "$harness" > "$src/engine.mojo"
+  jq -r '.["baro.kernel.files"]' "$meta" | tr ',' '\n' > "$src/FILES"
+  while read -r f; do
+    [ -n "$f" ] || continue
+    mkdir -p "$src/$(dirname "$f")"
+    jq -r --arg k "baro.kernel.src.$f" '.[$k]' "$meta" > "$src/$f"
+  done < "$src/FILES"
+  echo "sources: $(wc -l < "$src/FILES") files plus the run harness, all from $model"
+
+  mojo=$here/.venv/bin/mojo
+  [ -x "$mojo" ] || die "no $mojo; run 'uv sync' in the checkout first (the pinned toolchain is max[all]==26.5.0)"
+  dflag=""; [ -n "$kmodel" ] && dflag="-D BARO_MODEL=$kmodel"
+  echo "building engine (model ${kmodel:-qwen35}) ..."
+  # shellcheck disable=SC2086
+  "$mojo" build "$src/engine.mojo" -I "$src" $dflag -o "$work/engine" > "$work/build.log" 2>&1
+  [ -x "$work/engine" ] || { grep -m3 error "$work/build.log"; die "engine build FAILED, see $work/build.log"; }
+  echo "engine: $work/engine  sha256 $(sha256sum "$work/engine" | cut -c1-16)"
+
+  if [ -z "$pack" ]; then
+    pack=$work/pack
+    if [ ! -s "$pack/index.txt" ]; then
+      flags=$(kvget baro.run.pack.flags)
+      packer=$work/engine-pack.py
+      jq -er '.["baro.run.src.engine-pack.py"]' "$meta" > "$packer" 2>/dev/null \
+        || { packer=$here/tools/engine-pack.py; echo "pack tool: from the checkout (the file carries none)"; }
+      echo "building pack from $model with flags '${flags:-none}' (minutes, CPU) ..."
+      # shellcheck disable=SC2086
+      "$py" "$packer" "$model" "$pack" $flags > "$work/pack.log" 2>&1 \
+        || { tail -5 "$work/pack.log"; die "pack build FAILED, see $work/pack.log"; }
+    fi
+  fi
+  echo "pack: $pack ($(wc -l < "$pack/index.txt") tensors)"
+
+  [ $serve = 1 ] || { echo "--no-serve: stopping after build"; exit 0; }
+  bs=$here/serve/target/release/baro-serve
+  if [ ! -x "$bs" ]; then
+    echo "baro-serve is not built; building it (needs cargo) ..."
+    cargo build --release --manifest-path "$here/serve/Cargo.toml" > "$work/cargo.log" 2>&1 \
+      || die "cargo build FAILED, see $work/cargo.log"
+  fi
+  echo "self-reported: every tok/s this server prints came from the harness the"
+  echo "self-reported: model file carries, not from a harness a verifier chose."
+  echo "self-reported: to produce a citable number run: tools/baro verify $model --append"
+  exec "$bs" --engine "$work/engine" --pack "$pack" --port "$port"
+  ;;
+
+*)
+  die "unknown command $cmd (run, verify, receipts)"
+  ;;
+esac
