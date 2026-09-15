@@ -557,6 +557,16 @@ struct WindowBufs(Copyable, Movable):
     var hidx_d: DeviceBuffer[DType.int32]
     var dump_h: HostBuffer[f32]
     var stream_h: HostBuffer[DType.int32]
+    # A1: truncated probability rows for the speculative rule, plus the
+    # per-row emitted token and accept flag it writes. pt_d holds the target's
+    # rows for this window, pd_d the draft's, one row per drafted position.
+    var pt_d: DeviceBuffer[f32]
+    var pd_d: DeviceBuffer[f32]
+    var dids_d: DeviceBuffer[DType.int32]
+    var sout_d: DeviceBuffer[DType.int32]
+    var sacc_d: DeviceBuffer[DType.int32]
+    var sout_h: HostBuffer[DType.int32]
+    var sacc_h: HostBuffer[DType.int32]
 
 
 @fieldwise_init
@@ -702,6 +712,37 @@ def moe_ffn(ctx: DeviceContext, mut b: WindowBufs, Xm: TileTensor[f32, type_of(x
     ctx.enqueue_function[moe_add3[type_of(moe_vec_layout), type_of(moe_vec_layout), type_of(moe_vec_layout)]](routed, shared, Xres, Int32(H), grid_dim=ceildiv(H, 256), block_dim=256)
 
 
+# A1 (bench/spec-sample-protocol.md): the draft head's own draw, under
+# sampling. Two launches on one logits row: the truncated q row into the draft
+# plane's row j, and one token drawn from that same truncated distribution.
+#
+# The draft's seed is mixed, because amar_sample_row uses the same Philox
+# streams for every caller: an unmixed draft at (seed, counter = pos + j) would
+# share a Gumbel key with the target row drawn at the same counter, which
+# correlates q and p exactly where the accept rule assumes they are
+# independent. The constant is the golden-ratio mix, no significance beyond
+# being a fixed odd word.
+comptime DRAFT_SEED_MIX = UInt64(0x9E3779B97F4A7C15)
+
+
+def draft_draw(
+    ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, pos: Int, j: Int, logits_row: Int
+) raises:
+    var Xrow = row_f32(ctx, b.logits_d, logits_row * VOCAB, VOCAB, vrow_layout)
+    var Qrow = row_f32(ctx, b.pd_d, j * VOCAB, VOCAB, vrow_layout)
+    var Dtok = TileTensor(b.dtok_d, dtok_layout)
+    var Prob = TileTensor(b.hmax_d, dtok_layout)
+    ctx.enqueue_function[sample_probs_1](
+        Xrow, Qrow, Int32(VOCAB), Float32(cfg.sample.temperature), Int32(cfg.sample.top_k),
+        Float32(cfg.sample.top_p), Float32(cfg.sample.min_p), grid_dim=1, block_dim=SAMP_THREADS,
+    )
+    ctx.enqueue_function[sample_row_1](
+        Xrow, Dtok, Prob, Int32(VOCAB), Float32(cfg.sample.temperature), Int32(cfg.sample.top_k),
+        Float32(cfg.sample.top_p), Float32(cfg.sample.min_p),
+        cfg.sample.seed ^ DRAFT_SEED_MIX, UInt64(pos + j), grid_dim=1, block_dim=SAMP_THREADS,
+    )
+
+
 def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: WindowState) raises:
     var Xm = TileTensor(b.x_d, xm_layout)
     var CurBm = TileTensor(b.curb_d, xm_layout)
@@ -754,7 +795,18 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                 b.p_ffn_d, b.p_ffn2_d, b.p_v_d, b.logits_d, b.cc_d, b.de_d, b.hd_d, b.kc32_d, b.vc32_d, b.toks_d, b.dtok_d,
                 cfg.pf3, st.p3, cfg.draft_q4, cfg.q4_off, cfg.pack_q4, cfg.fr_k, cfg.fr_off, cfg.fr_ids_off)
             var Dtok = TileTensor(b.dtok_d, dtok_layout)
-            ctx.enqueue_function[tokcp_k](Dtok, Toks, Int32(nproc - 1), Int32(st.pos + 1), Int32(1), grid_dim=1, block_dim=32)
+            # A1 (bench/spec-sample-protocol.md). Under sampling the draft is a
+            # DRAW from q, not q's argmax, and the whole q row has to survive to
+            # verify time: the residual norm(max(0, p - q)) needs every entry,
+            # not just q(x). blk32_forward's own argmax is ignored on this path.
+            # The draft stream uses a different seed from the target's so the
+            # two never share a Gumbel key at the same (counter, row).
+            var samp_spec = cfg.sample.temperature > 0
+            if samp_spec:
+                draft_draw(ctx, b, cfg, st.pos, 0, nproc - 1)
+                ctx.enqueue_function[tokcp_k](Dtok, Toks, Int32(0), Int32(st.pos + 1), Int32(1), grid_dim=1, block_dim=32)
+            else:
+                ctx.enqueue_function[tokcp_k](Dtok, Toks, Int32(nproc - 1), Int32(st.pos + 1), Int32(1), grid_dim=1, block_dim=32)
             m = min(cfg.kcfg + 1, cfg.n_total - 1 - st.pos)
             if cfg.prof:
                 ctx.synchronize()
@@ -767,6 +819,8 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                     b.x_d, b.curb_d, b.qf_d, b.q_d, b.k_d, b.v_d, b.gate_d, b.ao_d, b.resb_d, b.fgb_d, b.p_qf_d, b.p_kv_d, b.p_h_d,
                     b.p_ffn_d, b.p_ffn2_d, b.p_v_d, b.logits_d, b.cc_d, b.de_d, b.hd_d, b.kc32_d, b.vc32_d, b.toks_d, b.dtok_d,
                     cfg.pf3, st.p3, cfg.draft_q4, cfg.q4_off, cfg.pack_q4, cfg.fr_k, cfg.fr_off, cfg.fr_ids_off)
+                if samp_spec:
+                    draft_draw(ctx, b, cfg, st.pos, j, 0)
                 ctx.enqueue_function[tokcp_k](Dtok, Toks, Int32(0), Int32(st.pos + j + 1), Int32(1), grid_dim=1, block_dim=32)
                 hrow = 0
             st.n_drafted += m - 1
@@ -1243,6 +1297,64 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                 ctx.enqueue_function[r_head](Pv, Logitsm, Int32(m), Int32(VOCAB), grid_dim=ceildiv(m * VOCAB, 256), block_dim=256)
             if use_mega:
                 pass
+            elif win_spec and cfg.sample.temperature > 0:
+                # A1: speculative SAMPLING. Truncate the target's rows into p,
+                # draw one token per row from p (row m-1 is the bonus token if
+                # every draft is accepted), and run the accept plus residual
+                # rule against the drafts already sitting in toks_d.
+                var Pt = TileTensor(b.pt_d, vm_layout)
+                var Pd = TileTensor(b.pd_d, vm_layout)
+                var SampTok = TileTensor(b.dtok_d, dtok_layout)
+                var SampProb = TileTensor(b.hmax_d, dtok_layout)
+                ctx.enqueue_function[sample_probs_k](
+                    Logitsm, Pt, Int32(VOCAB), Float32(cfg.sample.temperature), Int32(cfg.sample.top_k),
+                    Float32(cfg.sample.top_p), Float32(cfg.sample.min_p), grid_dim=m, block_dim=SAMP_THREADS,
+                )
+                ctx.enqueue_function[sample_row_k](
+                    Logitsm, SampTok, SampProb, Int32(VOCAB),
+                    Float32(cfg.sample.temperature), Int32(cfg.sample.top_k),
+                    Float32(cfg.sample.top_p), Float32(cfg.sample.min_p),
+                    cfg.sample.seed, UInt64(st.pos), grid_dim=m, block_dim=SAMP_THREADS,
+                )
+                if m == 1:
+                    # No draft to verify: the window collapsed to one row (the
+                    # generation limit, or k = 0). The target's own draw is the
+                    # token, which is what the greedy path does here too.
+                    ctx.enqueue_function[tokcp_k](SampTok, Toks, Int32(0), Int32(st.pos + 1), Int32(1), grid_dim=1, block_dim=32)
+                else:
+                  # The drafted ids are already in toks_d; they are copied into
+                  # their own plane because a view over toks_d is immutable here
+                  # and a kernel argument has to be mutable.
+                  ctx.enqueue_copy(
+                      dst_buf=b.dids_d,
+                      src_buf=DeviceBuffer[DType.int32](ctx, b.toks_d.unsafe_ptr().unsafe_offset(st.pos + 1), KMAX + 1, owning=False),
+                  )
+                  var DraftIds = TileTensor(b.dids_d, dtok_layout)
+                  var Sout = TileTensor(b.sout_d, dtok_layout)
+                  var Sacc = TileTensor(b.sacc_d, dtok_layout)
+                  ctx.enqueue_function[spec_accept_k](
+                      Pt, Pd, DraftIds, Sout, Sacc, Int32(VOCAB),
+                      cfg.sample.seed, UInt64(st.pos), grid_dim=m - 1, block_dim=SAMP_THREADS,
+                  )
+                  ctx.enqueue_copy(dst_buf=b.sout_h, src_buf=b.sout_d)
+                  ctx.enqueue_copy(dst_buf=b.sacc_h, src_buf=b.sacc_d)
+                  ctx.synchronize()
+                  var n_acc = 0
+                  while n_acc < m - 1 and b.sacc_h[n_acc] == 1:
+                      n_acc += 1
+                  st.n_accepted += n_acc
+                  if n_acc < m - 1:
+                      # First rejection: the residual draw replaces that draft.
+                      ctx.enqueue_function[tokcp_k](Sout, Toks, Int32(n_acc), Int32(st.pos + n_acc + 1), Int32(1), grid_dim=1, block_dim=32)
+                  else:
+                      # Every draft accepted: the bonus token comes from p.
+                      ctx.enqueue_function[tokcp_k](SampTok, Toks, Int32(m - 1), Int32(st.pos + m), Int32(1), grid_dim=1, block_dim=32)
+                  if cfg.spec_dbg:
+                      var sline = String("specsample pos=") + String(st.pos) + " m=" + String(m) + " n_acc=" + String(n_acc) + " acc:"
+                      for i in range(m - 1):
+                          sline += " " + String(b.sacc_h[i]) + "/" + String(b.sout_h[i])
+                      print(sline)
+                  m = n_acc + 1
             elif win_spec:
                 var Dtok = TileTensor(b.dtok_d, dtok_layout)
                 ctx.enqueue_function[argmax_d](Logitsm, Dtok, Int32(VOCAB), Int32(0), grid_dim=m, block_dim=256)
@@ -1285,7 +1397,15 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                 )
                 ctx.enqueue_function[tokcp_k](SampTok, Toks, Int32(0), Int32(st.pos + 1), Int32(m), grid_dim=1, block_dim=32)
             if cfg.serve:
-                if win_spec:
+                if win_spec and cfg.sample.temperature > 0:
+                    # Sampled spec writes every emitted token into toks_d (the
+                    # accepted drafts were written at draft time, the last one
+                    # just now), so the plain read-back path is the right one.
+                    ctx.enqueue_copy(dst_buf=b.stream_h.create_sub_buffer[DType.int32](0, m), src_buf=DeviceBuffer[DType.int32](ctx, b.toks_d.unsafe_ptr().unsafe_offset(st.pos + 1), m, owning=False))
+                    ctx.synchronize()
+                    for i in range(m):
+                        print(tok_line(cfg.req_id, Int(b.stream_h[i])))
+                elif win_spec:
                     for i in range(m - 1):
                         print(tok_line(cfg.req_id, Int(b.win_h[i])))
                     print(tok_line(cfg.req_id, Int(b.dtok_h[m - 1])))

@@ -24,7 +24,7 @@ from matmul_prefill import (
 )
 from matmul_prefill_lds import amar_matmul_prefill_lds, LDS_THREADS
 from mega import amar_mega_token, amar_mega_window, MEGA_G, MEGA_G_WIN, DATT_NLD
-from sample import amar_sample_row, SAMP_THREADS
+from sample import amar_sample_row, amar_sample_probs, amar_spec_accept, SAMP_THREADS
 from dattn import amar_dattn_split, amar_dattn_combine, dattn_nsplit
 from attn import (
     amar_head_rmsnorm, amar_attn_decode, amar_gate_mul_cast, amar_qgate_split, amar_rope_yarn, amar_kv_append,
@@ -189,6 +189,17 @@ comptime argmax_d = amar_argmax_pos[type_of(vm_layout), type_of(dtok_layout)]
 # temperature > 0 forces) -- reusing scratch rather than allocating new
 # buffers, same as reusing hmax_d for Prob.
 comptime sample_row_k = amar_sample_row[type_of(vm_layout), type_of(dtok_layout), type_of(dtok_layout)]
+# A1 (bench/spec-sample-protocol.md): sampled speculation needs the truncated
+# probability row of the target and of the draft, and the accept plus residual
+# draw. Both kernels already exist and are not touched by this round; these are
+# the instantiations the window uses. MROWS == KMAX == SM, so one window's rows
+# fit vm_layout on both sides.
+comptime sample_probs_k = amar_sample_probs[type_of(vm_layout), type_of(vm_layout)]
+# One-row views, for the draft head: it produces a single logits row per draft
+# step, and its q row has to land in the draft plane's row j rather than row 0.
+comptime sample_probs_1 = amar_sample_probs[type_of(vrow_layout), type_of(vrow_layout)]
+comptime sample_row_1 = amar_sample_row[type_of(vrow_layout), type_of(dtok_layout), type_of(dtok_layout)]
+comptime spec_accept_k = amar_spec_accept[type_of(vm_layout), type_of(dtok_layout)]
 comptime embed1_k = amar_embed_lookup_pos[type_of(emb_layout), type_of(h2_layout), type_of(dtok_layout)]
 comptime rms_m = amar_rmsnorm[type_of(xm_layout), type_of(h_layout), type_of(xm_layout)]
 comptime rms_h2 = amar_rmsnorm[type_of(h2_layout), type_of(h_layout), type_of(h2_layout)]

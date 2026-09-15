@@ -393,16 +393,12 @@ def main() raises:
             gen_n = req_n
             if req_has_spec:
                 spec = req_spec
-            # M5 scope limit (briefs/2026-09-15-wiring-lane.md): accepting a
-            # draft token on argmax equality under sampling would silently
-            # change the output distribution (the verify step compares ids,
-            # not probabilities), so temperature > 0 forces k=0 this round.
-            # Correct speculative sampling (accept with min(1, p/q), resample
-            # from the residual) is its own preregistered round --
-            # spec_accept_ref exists for exactly that, which is why this is a
-            # deferral and not an oversight.
-            if sample.temperature > 0:
-                spec = False
+            # A1 (bench/spec-sample-protocol.md): temperature > 0 used to force
+            # spec off, because accepting a draft on argmax equality under
+            # sampling silently changes the output distribution. The window now
+            # runs the real rule instead (accept with min(1, p/q) on the
+            # truncated distributions, residual draw on the first rejection,
+            # bonus token from p), so sampling and speculation compose.
             print("prompt tokens:", len(prompt), " n:", gen_n, " spec:", spec, " temperature:", sample.temperature)
             # Per-request teacher forcing. BARO_FORCE is read once at startup,
             # so a forced run used to need one process per prompt: 20 pack
@@ -533,7 +529,13 @@ def main() raises:
         # kernels take no sampler params); a sampling request always runs the
         # launch path, which is where the sampler is wired below.
         var mega_req = mega and sample.temperature <= 0
-        var cfg = WindowCfg(pack_q4=pack_q4, draft_q4=draft_q4, q4_off=q4_off, e=e, kcfg=kcfg, spec=spec, spec_dbg=spec_dbg, serve=serve, req_id=req_id, prof=prof, pf2=pf2, pf3=pf3, pf4=pf4, dump=dump, dump4=dump4, dump_layer=dump_layer, mega=mega_req, att_split=att_split, mega_win=mega_win, dot3=dot3, pf_chunk=pf_chunk, pf_rows=pf_rows, pf_tail=pf_tail, n_total=n_total, fr_k=fr_k, fr_off=fr_off, fr_ids_off=fr_ids_off, n_prompt=len(prompt), sample=sample.copy())
+        # A1: the megakernel WINDOW writes the window's tokens itself, so it
+        # cannot host the speculative sampling rule (which needs the target's
+        # full probability rows, not its argmax). Sampling therefore stays on
+        # the launch path for the window too, exactly as it already does for
+        # the single-token megakernel above.
+        var mega_win_req = mega_win and sample.temperature <= 0
+        var cfg = WindowCfg(pack_q4=pack_q4, draft_q4=draft_q4, q4_off=q4_off, e=e, kcfg=kcfg, spec=spec, spec_dbg=spec_dbg, serve=serve, req_id=req_id, prof=prof, pf2=pf2, pf3=pf3, pf4=pf4, dump=dump, dump4=dump4, dump_layer=dump_layer, mega=mega_req, att_split=att_split, mega_win=mega_win_req, dot3=dot3, pf_chunk=pf_chunk, pf_rows=pf_rows, pf_tail=pf_tail, n_total=n_total, fr_k=fr_k, fr_off=fr_off, fr_ids_off=fr_ids_off, n_prompt=len(prompt), sample=sample.copy())
         if len(force) > 0 and cfg.spec:
             raise Error("BARO_FORCE requires BARO_SPEC=0 (teacher forcing is a no-spec identity gate)")
         wst.reset(t0)

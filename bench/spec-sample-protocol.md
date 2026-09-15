@@ -89,6 +89,76 @@ each draft row to an argmax in `dtok_d`.
   under argmax equality; report the acceptance numbers and stop, rather than
   tuning k until the number looks better.
 
-## Result
+## Result (2026-09-15)
 
-Filled in when the gates run. Nothing here is a claim until then.
+Engine `.work/b1/engine-a1` sha `51bc35656338e92f`, built from the working tree
+at `9b755e4` plus this round's uncommitted changes (the dirty list is in each
+arm file). Dense q4 pack, `spec_k` 2.
+
+### Gate 1, T=0 byte identity: PASS
+
+`bench/force-ab.sh` against an engine built from a clean `git archive` of HEAD:
+**20/20, min 100.0%, mean 100.0%, no voids** on the first build
+(`shaCand 2dc924a29937d252`), re-run on the final build after the `m == 1` fix.
+
+### Gates 2 and 3, real vocab: PASS, 24 of 24
+
+`kernels/test_sample_device.mojo` (`f56206d`), results recorded in
+`bench/mtp-protocol.md`. 0 mismatches of 64 per row, shape and draft arm;
+every 20,000-draw chi-square under its p=0.001 critical value.
+
+### Gate 4, throughput: the frozen prediction is FALSIFIED, and the round is not
+
+`bench/spec-sample-ab.sh`, four arms in one resident process, one stint,
+20 prompts each, `.work/b1/g4b/`. sclk med 2985 MHz, 290 W cap, -100 mV,
+junction max 77 C.
+
+| arm | median tok/s | min | max | drafted | accepted | acceptance |
+|---|---|---|---|---|---|---|
+| T=0.7 top_p 0.9, spec on | **147.15** | 125.47 | 182.33 | 1061 | 733 | **0.691** |
+| T=0.7 top_p 0.9, spec off | 109.19 | 108.84 | 109.36 | 0 | 0 | |
+| T=0, spec on | 150.24 | 118.30 | 171.70 | 1093 | 721 | 0.660 |
+| T=0, spec off | 134.97 | 123.58 | 135.60 | 0 | 0 | |
+
+The frozen prediction was that the T>0 speculative gain lands within 5% of the
+T=0 gain, and that acceptance at T=0.7 falls to 0.7x to 1.0x of the T=0
+acceptance. **Both are wrong.** The gains are 1.348x at T=0.7 against 1.113x
+at T=0, a ratio of 1.211, and acceptance is slightly HIGHER under sampling
+(0.691 against 0.660, a ratio of 1.047).
+
+The prediction was wrong because its premise was: it treated the two no-spec
+baselines as comparable. They are not. **Sampling itself costs 19% of decode
+on this vocab** (109.19 against 134.97 tok/s with no speculation, the only
+difference being the device sampler scanning 248,320 logits per row instead of
+an argmax). Speculation amortises that scan over the accepted drafts, so it
+buys more at T>0 than at T=0 by construction. The acceptance result has its
+own cause: at top_p 0.9 the draft and the target are both truncated to the
+same small candidate set, so the draft draws from a distribution closer to the
+target's than greedy argmax equality is.
+
+The falsifier that would have made this a defect ("a gain below half the T=0
+gain") did not fire, and the absolute number is what a user gets: **sampled
+speculation at T=0.7 decodes at 147.15 tok/s, faster than greedy decoding
+without speculation at 134.97**, on the same binary in the same stint.
+
+A better gate 4 for the next round, since this one's threshold measured the
+wrong thing: compare acceptance rates (which are directly comparable) and the
+absolute medians, not the ratio of two gains whose baselines differ by a fixed
+sampler cost.
+
+### Gate 5, the untruncated shape: PASS
+
+Three requests through the resident engine (`.work/b1/g5`), all served, none
+refused:
+
+```
+PASS T=1 untruncated, spec on: n=32 drafted=29 accepted=17 k=2 tok_s=112.89
+PASS T=0.7 top_p 0.9, spec on: n=32 drafted=27 accepted=18 k=2 tok_s=145.48
+PASS T=0 greedy, spec on:      n=32 drafted=28 accepted=17 k=2 tok_s=142.20
+```
+
+`drafted` and `accepted` on every row are the P1 read-back that the window
+really speculated rather than falling back to a plain sampled decode. The
+untruncated shape (top_p 1, top_k 0, min_p 0) is the one C3 had to refuse
+until the 53-bit Gumbel key landed; it is served here with speculation on,
+which is what gate 5 asked for.
