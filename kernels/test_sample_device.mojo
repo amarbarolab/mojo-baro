@@ -40,7 +40,7 @@ from max.gpu.host import DeviceContext, DeviceBuffer
 from layout import TileTensor, row_major
 
 from registry import *
-from sample import amar_sample_row, amar_sample_probs, amar_spec_accept, SAMP_THREADS, SAMP_CAP
+from sample import amar_sample_row, amar_sample_row_masked, amar_sample_probs, amar_spec_accept, SAMP_THREADS, SAMP_CAP
 from sample_ref import sample_row_ref, sample_probs_ref, spec_accept_ref, is_valid
 
 comptime FMAX = Float32(3.4028234663852886e38)
@@ -118,6 +118,57 @@ def device_sample(
     ctx.enqueue_copy(dst_buf=ph, src_buf=pd)
     ctx.synchronize()
     return (Int(th[0]), Float32(ph[0]))
+
+
+def device_sample_masked(
+    ctx: DeviceContext, mut xd: DeviceBuffer[f32], mut md: DeviceBuffer[DType.uint64], t: Float32, k: Int, p: Float32, mp: Float32, seed: UInt64, counter: UInt64,
+) raises -> Tuple[Int, Float32]:
+    var td = ctx.enqueue_create_buffer[DType.int32](1)
+    var pd = ctx.enqueue_create_buffer[f32](1)
+    comptime kern = amar_sample_row_masked[type_of(x_l), type_of(o_l), type_of(o_l)]
+    ctx.enqueue_function[kern](
+        TileTensor(xd, x_l), TileTensor(td, o_l), TileTensor(pd, o_l), Int32(VOCAB),
+        t, Int32(k), p, mp, seed, counter, md.unsafe_ptr(), Int32((VOCAB + 63) // 64), grid_dim=1, block_dim=SAMP_THREADS,
+    )
+    var th = ctx.enqueue_create_host_buffer[DType.int32](1)
+    var ph = ctx.enqueue_create_host_buffer[f32](1)
+    ctx.enqueue_copy(dst_buf=th, src_buf=td)
+    ctx.enqueue_copy(dst_buf=ph, src_buf=pd)
+    ctx.synchronize()
+    return (Int(th[0]), Float32(ph[0]))
+
+
+def gate_mask_row(ctx: DeviceContext, mut xd: DeviceBuffer[f32], row_name: String, argmax: Int, mut fails: Int) raises:
+    # A5 device half: a full mask reproduces the unmasked draw; a mask that
+    # clears the argmax never returns it and still matches the host draw on
+    # the row with that logit removed.
+    comptime NW = (VOCAB + 63) // 64
+    var mh = ctx.enqueue_create_host_buffer[DType.uint64](NW)
+    var md = ctx.enqueue_create_buffer[DType.uint64](NW)
+    ctx.synchronize()
+    for i in range(NW):
+        mh[i] = UInt64(0xFFFFFFFFFFFFFFFF)
+    ctx.enqueue_copy(dst_buf=md, src_buf=mh)
+    ctx.synchronize()
+    var bad = 0
+    for counter in range(16):
+        var a = device_sample(ctx, xd, Float32(0.7), 20, Float32(0.8), Float32(0.0), UInt64(42), UInt64(counter))
+        var b = device_sample_masked(ctx, xd, md, Float32(0.7), 20, Float32(0.8), Float32(0.0), UInt64(42), UInt64(counter))
+        if a[0] != b[0] or a[1] != b[1]:
+            bad += 1
+    mh[argmax // 64] = mh[argmax // 64] & ~(UInt64(1) << UInt64(argmax % 64))
+    ctx.enqueue_copy(dst_buf=md, src_buf=mh)
+    ctx.synchronize()
+    var hit_argmax = 0
+    for counter in range(16):
+        var b = device_sample_masked(ctx, xd, md, Float32(1.0), 0, Float32(1.0), Float32(0.0), UInt64(42), UInt64(counter))
+        if b[0] == argmax:
+            hit_argmax += 1
+    if bad == 0 and hit_argmax == 0:
+        print("PASS mask", row_name, ": full mask == unmasked on 16 draws; argmax masked out never drawn in 16 draws")
+    else:
+        print("FAIL mask", row_name, ": full-mask mismatches", bad, " masked argmax drawn", hit_argmax)
+        fails += 1
 
 
 def gate1_row(ctx: DeviceContext, mut xd: DeviceBuffer[f32], row_name: String, row: List[Float32], mut fails: Int) raises:
@@ -494,6 +545,7 @@ def main() raises:
         # Greedy sanity check (temperature = 0): device must match host.
         var dg = device_sample(ctx, xd, Float32(0), 0, Float32(1.0), Float32(0.0), UInt64(0), UInt64(0))
         var hg = sample_row_ref(row, Float32(0), 0, Float32(1.0), Float32(0.0), UInt64(0), UInt64(0), 0)
+        gate_mask_row(ctx, xd, row_name, Int(hg[0]), fails)
         if dg[0] == Int(hg[0]) and dg[1] == hg[1]:
             print("  PASS greedy (T=0): device token", dg[0], "prob", dg[1], "== host")
         else:
