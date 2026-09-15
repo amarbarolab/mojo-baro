@@ -332,3 +332,77 @@ rejected), so the scheduler's occupancy target stays out of reach.
 the branch lacked the `AB_ENGINE_B` runner commit and ran the champion
 against itself; `arm.txt` names both binaries since, and it is read before
 the ratio (ledger 2026-09-08).
+
+## Round: warm the next phase's first weight rows before the grid barrier (preregistered 2026-09-15, before any run)
+
+**Why.** Fresh `BARO_PROFILE=5` on the champion (`083ad17`, p09, 137.5 tok/s_gen,
+identity sha `c00468774758`, `.work/m5/prof5.log`): per token 7149 us; ffn
+gate+up 2414 us = 750 GB/s, ffn down 1299 us = 697 GB/s, ssm out-proj 570 us
+= 707 GB/s, head 626 us = 914 GB/s. Same picture as the 2026-09-06
+phase-efficiency receipt above: the layer GEMVs pay a ramp at every phase
+start (768 waves issue their first loads into a cold pipeline at once) and the
+head, one huge phase, does not. That receipt bounded the whole effect at about
++5% of the token and named "fewer, larger phases" as the lever; the data
+dependencies forbid that. This round tries the other way to hide the ramp: a
+wave that has finished its rows of the current phase issues the loads of its
+first weight tiles of the NEXT phase before entering the grid barrier, so
+those lines are in L2 when the phase starts. Loads only; nothing is computed
+from them, so the arithmetic and its order are untouched.
+
+**Change** (`kernels/mega.mojo`, m=1 q4 token kernel only; the window kernel
+and the launch path untouched): a `touch_row` helper (16 B per lane x UNROLL
+per wave, the same addresses the first `q4_dot_lds` iteration reads) called
+at three sites: (1) end of the ffn gate/up loop, touching the wave's first
+`down` row; (2) end of the ffn down loop in `mega_body`, touching the wave's
+first row of the next layer's first GEMM (`o1`: CONV x H for an ssm layer,
+QF x H for an attn layer); (3) after the last layer, the wave's first head
+row. The touched bytes are folded into a register sink stored only under a
+value-dependent condition that the compiler cannot fold, so the loads stay.
+
+**Arms.** A = `.work/engine-base` built from `083ad17` untouched; B = same
+tree plus the change. Both built in the same stint; sha256 of both recorded;
+`isa-loops` fingerprint of `amar_mega_token` q4 recorded for both (A today:
+dual 124/79/79/59, delay 644/420/312, scratch 0, `.work/m5/isa/co79.s`).
+
+**Predictions (frozen).**
+1. Bit-identical: `tools/mega-gate.sh` identity stages PASS, `test_mega_block`
+   PASS, A/B identity 20/20. Loads only; no bit may move.
+2. `BARO_PROFILE=5`, p09, median of 5 alternating runs: ffn down slot
+   1299 -> 1240..1270 us; the next-layer first slots (ssm in-proj 1031, attn
+   qkv 300) shrink by 20..50 us summed; head 626 within noise. Token
+   7149 -> 7020..7090 us.
+3. Real pack, q4, no-spec, 20-prompt median (P4), `bench/ab-prompts.sh` with
+   `AB_ENGINE_B`, A then B per prompt in one stint, clock read back
+   (`bench/clock-probe.sh`), power cap read back: **+1.0 to +3.0 %
+   tok/s_gen**. Kill line (the 2026-09-08 rule): median below +1.0 %, or any
+   untouched phase slower by more than its noise, is a no-op; the change is
+   reverted with the numbers in this file and the fingerprint diff named.
+4. Failure mode to watch: the touch changes register allocation and re-rolls
+   the dot loop (the 09-06 and 09-08 rounds both lost an untouched phase this
+   way; `3824e20` gained one). The fingerprint diff is read BEFORE the tok/s
+   number is interpreted; a loop that changed with unchanged source is the
+   allocator, and only the real-pack A/B settles it.
+
+**Result (2026-09-15, same stint): no-op by the kill line, reverted; patch kept
+at `.work/m5/touch.patch`.** Prediction 1 held: `test_mega_block` PASS, A/B
+identity 20/20 (the mega-gate identity stage itself aborted on
+`engine-pack-q8: no index.txt`, the q8 pack is no longer on disk; tool rot,
+not the kernel, noted for `tools/mega-gate.sh`). Prediction 4 fired first:
+with the dot-loop source untouched the q4 token kernel's fingerprint moved,
+`isa-loops` dual 124/79/79/59 -> 115/118/84/84, delay 644 -> 533, first-loop
+wide loads 29 -> 21, VGPR/scratch census unchanged (256, 0 scratch). Read
+before the number, as required. Prediction 3 failed: 20-prompt q4 no-spec,
+A then B per prompt in one stint (`bench/ab-prompts.sh`, base `e5804d99` vs
+touch `eaf20e9a`, sclk med 2930 MHz, 290 W / -100 mV):
+
+| arm | median tok/s_gen | min..max | spread |
+|---|---|---|---|
+| base (`083ad17`) | 137.54 | 136.96..137.95 | 0.7% |
+| touch | 138.11 | 137.74..138.45 | 0.5% |
+
+ratio 1.0042; per-prompt ratio 1.0016..1.0072, every prompt above 1. A real
+but sub-threshold gain, confounded with the re-rolled schedule; under the
+frozen rule it does not land. The 2026-09-06 ceiling stands: phase ramp is
+worth a few percent at most and no single-site change reaches +1%. Not to be
+re-proposed as a warm-touch; a next attempt at the ramp needs a different
+mechanism (fewer phases), which the data dependencies forbid at m=1.
