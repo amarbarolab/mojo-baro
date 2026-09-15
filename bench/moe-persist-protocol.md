@@ -66,3 +66,21 @@ land; patch kept at `.work/moe-perf/r5-down-pair.patch`. It re-enters only
 as one combined arm with a gate+up change (28 us at 335 GB/s, K = 2048, one
 row per wave) under a new frozen prediction stated in kernel microseconds
 and in token percent from the launch counts, not a guessed range.
+
+### R5b, combined expert arm (preregistered 2026-09-15, before any run)
+
+Change: (1) the R5 down pair (`.work/moe-perf/r5-down-pair.patch`, down
+30.5 -> 17.7 us measured); (2) gate+up: one wave computes its gate row and
+its up row in a single loop with all four 16-byte loads per lane (gate block
+b, up block b, gate b+4, up b+4) issued before any arithmetic, instead of two
+sequential dots each with dependent iterations. Same per-element arithmetic
+and bf16 rounding; accumulation order within a row unchanged (blocks still
+summed in lane order).
+Predictions, frozen: gate+up **29.8 -> under 20 us per call** (40 calls:
+at least 0.39 ms per token), down 17.7 us (37 calls: 0.47 ms); token 10.7 ->
+under 9.85 ms, **+8 to +10%** on the 20-prompt median against
+`.work/moe-perf/engine-head`. Kill line +5% as for the round. Gates as for
+the round (parity, agreement band, tok/s A/B with clocks, run-tests,
+ci-checks). Falsifier: gate+up not under 22 us in the trace means the loads
+were already overlapped and the cause is elsewhere (the receipt decides,
+not the tok/s).
