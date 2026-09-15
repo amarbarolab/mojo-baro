@@ -15,7 +15,7 @@ out=${1:-.work/mega-gate}; mkdir -p "$out"; : > "$out/SUMMARY.txt"
 ok() { echo "PASS $1: $2" | tee -a "$out/SUMMARY.txt"; }
 die() { echo "FAIL $1: $2" | tee -a "$out/SUMMARY.txt"; exit 1; }
 ./.venv/bin/mojo build serve/engine.mojo -I kernels -o .work/engine > "$out/build-engine.log" 2>&1 || die build "$(grep -m1 error: "$out/build-engine.log" | cut -c1-160)"
-./.venv/bin/mojo build kernels/test_mega_block.mojo -o .work/test_mega_block -I kernels > "$out/build-test.log" 2>&1 || die build "$(grep -m1 error: "$out/build-test.log" | cut -c1-160)"
+./.venv/bin/mojo build kernels/test_mega_block.mojo -o .work/test_mega_block -I kernels -I serve > "$out/build-test.log" 2>&1 || die build "$(grep -m1 error: "$out/build-test.log" | cut -c1-160)"
 ok build "engine + test_mega_block"
 ./.work/test_mega_block > "$out/kernel.log" 2>&1; grep -q '^PASS' "$out/kernel.log" || die kernel "$(grep -E 'FAIL|mismatches' "$out/kernel.log" | head -1)"
 ok kernel "$(grep -oE 'ratio= [0-9.]+' "$out/kernel.log")"
