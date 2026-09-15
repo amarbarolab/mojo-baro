@@ -101,6 +101,25 @@ sys.exit(bad)
 PY
 then ok "$(ls results/*.json 2>/dev/null | wc -l) receipts consistent"; else bad "malformed receipt"; fi
 
+step "bench sources compile (no GPU needed to build)"
+# Every bench/*.mojo with a main() must build against the current kernel and
+# serve signatures. bench/bench_launch_floor.mojo drifted silently for a week
+# because nothing built bench/. Files importing the external `grammar` package
+# (a sibling repo, not on this repo's include path) are listed, not built.
+benchbad=0; benchn=0; benchskip=""
+for f in bench/*.mojo; do
+  grep -q '^def main' "$f" || continue
+  if grep -q '^from grammar' "$f"; then benchskip="$benchskip $(basename "$f")"; continue; fi
+  benchn=$((benchn + 1))
+  "$MOJO" build "$f" -o .work/ci-bench-bin -I kernels -I serve \
+    -I "$HOME/Projects/mojo/mojo-uregex/src" -I "$HOME/Projects/mojo/mojo-minja/src" \
+    -Xlinker -L.work/shim-build -Xlinker -lamarbaro_shim -Xlinker -rpath -Xlinker "$PWD/.work/shim-build" \
+    > .work/ci-bench-build.log 2>&1 || { bad "$f: $(grep -m1 'error:' .work/ci-bench-build.log | cut -c1-140)"; benchbad=1; }
+done
+rm -f .work/ci-bench-bin
+[ "$benchbad" = 0 ] && ok "$benchn bench sources build"
+[ -n "$benchskip" ] && echo "  skip (external grammar package):$benchskip"
+
 printf '\n'
 if [ "$fails" = 0 ]; then echo "all non-GPU checks passed"; else echo "$fails check(s) failed"; fi
 exit $((fails > 0))
