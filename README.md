@@ -23,6 +23,31 @@ minutes, no model weights needed.
 | Spark-X2.5-4B | `spark2_5` (gated sliding-window attention) | its own engine, `serve/spark.mojo` |
 | RegesCore-35B | `qwen35moe` (256 experts, top 8) | decodes and serves; 53.20/64 mean teacher-forced agreement with llama.cpp over 20 prompts, above the dense path's own 51.90 on a quant-matched arm. No performance round yet. |
 
+### Dense families on the Spark path
+
+`serve/spark.mojo` is profile-driven: `tools/gen-profile.mojo` reads a GGUF's
+recipe (dims, rope type and base, norm eps, QKV bias, activation, SWA window,
+scale multipliers, tied embeddings) into a comptime module the engine imports,
+so a new dense model is a generated profile rather than a new engine. Four
+targets are verified end to end against llama.cpp on the same GGUF
+(`bench/dense-protocol.md`, preregistered; 20 prompts, teacher-forced):
+
+| model | arch | forced agreement | tok/s_gen |
+|---|---|---|---|
+| Llama-3.2-1B-Instruct Q4_K_M | `llama` | 20/20 prompts, 95.3-100% | 451-458 |
+| Qwen2.5-7B-Instruct Q4_K_M | `qwen2` | 20/20 prompts, 96.9-100% | 96.8-97.8 |
+| granite-4.2-3b BF16 | `granite` | 20/20 prompts, 98.4-100% | 164.5-169.0 |
+| lily-cybersecurity-7b Q6_K | `llama` (Mistral-arch, SPM) | 20/20 prompts, 96.9-100% | 94.1-95.0 |
+
+**These four decode; they do not serve.** `serve/spark.mojo` is a one-shot CLI
+and does not implement the request/response protocol the Rust front speaks, so
+there is no `/v1/chat/completions` path to them today. Only the `qwen35` and
+`qwen35moe` models above are reachable through `baro-serve`.
+
+Two gaps the four checkpoints did not exercise: Granite's embedding/residual
+scale folding at pack time (both multipliers are 1.0 in the only Granite
+checkpoint available), and any chat-template path through the HTTP front.
+
 Model weights are not distributed with this repo.
 
 ## Results
