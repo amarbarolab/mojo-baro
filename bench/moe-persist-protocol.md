@@ -84,3 +84,17 @@ the round (parity, agreement band, tok/s A/B with clocks, run-tests,
 ci-checks). Falsifier: gate+up not under 22 us in the trace means the loads
 were already overlapped and the cause is elsewhere (the receipt decides,
 not the tok/s).
+
+### R5b result (2026-09-15): falsifier fired, reverted
+
+Parity PASS, agreement 53.35, 20-prompt tok/s 94.99 -> 97.10 (1.022x, below
+the +5% line). Trace (`.work/moe-perf/trace-r5b`): down 18.4 us (the R5
+pair, as measured before), **gate+up 29.8 -> 33.5 us**, not under 22: the
+falsifier fired. Issuing both matrices' loads together did not help; the
+dual dot needed 237 VGPRs (the 192 cap was lifted with
+`rocdl.flat_work_group_size` to remove 64 spills) and the occupancy loss
+outweighed any overlap, so the gate+up cost is not load latency per wave.
+What is known: one row per wave, 4096 waves, 28 to 30 us for 9.4 MB. The
+lever is left to R6, where the expert phases are written fresh inside the
+persistent kernel and may use the pair dot (17.7 us receipt) by design.
+Patch kept at `.work/moe-perf/r5b-dual.patch`.
