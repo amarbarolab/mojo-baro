@@ -145,6 +145,80 @@ with sequence/state length rather than being O(1) elementwise; the rest
 here per the rule; full writeup and the decision rule's exact wording are in
 `bench/ssm-occupancy-protocol.md` ("MSPEC precondition check").
 
-## M4-M5
+## M4 -- make the dense families servable (DONE, `44a1742`)
+
+`serve/spark.mojo` decoded llama/qwen2/granite/spark2_5 at 95.3-100%
+teacher-forced agreement but was a one-shot CLI (`grep -rn spark
+serve/src/*.rs` = nothing). Extracted the generic byte-scanner protocol out
+of `serve/engine.mojo` into `serve/serve_proto.mojo` (`read_line`,
+`cancel_pending`, `json_key`/`json_int`/`json_float`, `SampleParams`,
+`parse_request`) -- a verbatim move. Verified behavior-preserving with a
+same-tree A/B: `git stash` the M4 changes, build `engine.mojo` before and
+after on the q4 pack, run both one-shot on the same prompt through one
+gpu-wait job. `GENERATED` output byte-identical, `BARO_SPEC`/`BARO_MEGA`
+readback and mega fail word identical, only wall-clock timings differ
+(run-to-run noise); qwen35moe profile also confirmed still building clean
+with the extraction in place.
+
+Wired the same `BARO_SERVE=1` request loop into `spark.mojo`: ready line,
+per-token streaming, done line, clean exit on stdin EOF. No explicit
+per-request KV cache reset needed -- the cache is position-addressed and
+every kernel only reads a position the current request just wrote, so
+position 0 always overwrites the previous request's data there.
+`BARO_SERVE=0` (every existing dense-protocol.md gate) is untouched: same
+range, same final prints, verified by inspection and by the one-shot smoke
+runs below reproducing the exact greedy output the CLI path already gave.
+No cancel support this round (spark has no draft head, so nothing runs long
+enough to need it). Stop-sequence checking IS wired, and turned out to
+matter immediately: the first smoke test without it showed granite looping
+past EOS to `max_tokens` with `finish_reason: "length"`; added a per-token
+check against every `stop` sequence in the request (spark always decodes
+m=1, so this is simpler than engine.mojo's per-window check), reran, got
+`"finish_reason": "stop"` and a clean two-sentence answer.
+
+**`serve/src/engine.rs` and `main.rs` needed zero changes.** `Engine::spawn`
+already takes an arbitrary `--engine` binary and `--pack` dir and speaks
+exactly this line protocol -- "make the Rust front able to select the
+engine" was already true at the CLI level, just undiscovered because
+nothing had ever pointed `--engine` at spark before.
+
+**Gate, verified end to end for 2 of 4 targets** (built profiles + packs via
+`tools/gen-profile.mojo` + `tools/engine-pack.py --dense`, fetched
+`tokenizer.json` from HF for the open/ungated targets, built `baro-serve`
+release, launched it through `gpu-wait run` and hit it with `curl`):
+
+- Qwen2.5-7B-Instruct: `POST /v1/chat/completions` -> `"The capital of
+  France is Paris."`, `finish_reason: "stop"`, 94.6 tok/s_gen.
+- granite-4.2-3b: `POST /v1/chat/completions` -> `"<think></think>Paris."`,
+  `finish_reason: "stop"`, 164.4 tok/s_gen (the empty think-tag is the
+  model's own behavior, not a serving defect).
+
+Llama-3.2-1B and lily-cybersecurity-7b are wired through the identical code
+path (same `serve_proto`, same spark.mojo request loop) but not verified
+through HTTP this round: no `tokenizer.json` fetched for them, and
+Llama-3.2-1B-Instruct is gated on HF (needs an accepted-license token this
+session does not have). Reported, not silently skipped.
+
+**Also landed the two M1-class leftovers the maintainer caught in review**
+(`tools/embed-files.py:17-18`, `bench/ruler/tok.py:31` -- both still pointed
+at `$HOME/Projects/mojo/mojo-uregex`/`mojo-minja`, one layer deeper than
+M1's fix: the self-describing GGUF closure was still pulling from outside
+the repo). `EXT` now points at `ROOT/uregex`/`ROOT/minja`; verified by
+re-embedding a fresh spark gguf (`tools/gguf-embed.py` against
+`~/Models/spark-x2.5-4b`'s base gguf) and checking the result: the file list
+includes `uregex/*.mojo`/`minja/*.mojo`, their embedded content is
+byte-identical to the working tree, and the `baro.kernel.ext.*.commit`
+provenance keys these two used to need (external package, tracked outside
+the repo) no longer appear -- they're covered by the repo's own
+`baro.kernel.commit` now, correctly, since they're no longer external.
+`tools/gguf-closure.sh`'s rebuild+run gate on that fresh embed was **not**
+run: it needs a runtime pack and a `ref-tokens-64.txt` for spark2_5 that
+don't exist on this box, its own provisioning round, not a cheap add-on to
+this one. Said plainly rather than claimed done.
+
+`README.md` and `docs/ENGINE-ROADMAP.md` updated: the four dense targets are
+no longer described as CLI-only.
+
+## M5
 
 Not started.
