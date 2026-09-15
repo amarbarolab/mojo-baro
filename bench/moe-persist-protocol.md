@@ -289,3 +289,14 @@ norm/rope/append pairs about 50 us): 0.64 ms of the 9.32 ms token, **107.27
 ci-checks, census. Not folded: the SSM small chain (reduce_gates, conv,
 l2norm, delta, gated_out: 150 launches) and qgate_split/gate_mul (20);
 those change the kernels' work partition and belong to R6 proper.
+
+### Same-stint llama.cpp arm (2026-09-15, after R6.0)
+
+`bench/moe-baseline.sh` (llama-server build 10665, ca3d5a3e1, the same GGUF
+by sha prefix 02d1fa2e, `.work/moe-perf/llama-stint/`) then
+`bench/ab-prompts.sh` head vs r60 back to back, same power cap 290 W:
+llama.cpp **109.92** tok/s decode (20-prompt median, 109.49 to 110.01);
+ours head 94.40 (spread 4.1%), r60 **106.95** (spread 3.1%), ratio 1.133
+(identity 20/20, fail word 0 on 40 runs). So R6.0 stands at **0.973x of
+llama.cpp** in the same stint; the bar is not yet passed, and R6.0b's +7.5%
+prediction would put it at about 115, above it, if it holds.
