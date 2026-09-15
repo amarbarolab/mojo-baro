@@ -75,7 +75,7 @@ than the original probe's, consistent with ordinary thermal/ambient
 variance rather than a tool defect -- the ratio between arms (what the probe
 actually claims) held.
 
-## M3 -- MSPEC precondition (BLOCKED, question sent, moving to M4)
+## M3 -- MSPEC precondition (DONE, `c9298f9`, INCONCLUSIVE by the preregistered rule)
 
 "Stamp every dispatch of one MSPEC verify window" is not a small extension of
 M2's tool. Enumerated the launch-path window's kernel dispatches
@@ -97,8 +97,53 @@ untouched. Sent the scope question to the coordinator
 (`herd tell w7T:p1`) with three options (do the full 25-kernel
 instrumentation / report a partial lower-bound gap share from the
 already-generalized kernels only / skip M3 and report it scoped too large
-for this lane) rather than deciding silently. Moving to M4, not gated on
-this answer.
+for this lane) rather than deciding silently.
+
+**the maintainer's ruling:** confirmed the full 25-kernel instrumentation is the
+stop condition in spirit -- do not do it. Corrected the framing of the
+narrower option: stamping a SUBSET of the window's kernels gives an UPPER
+bound on gap share, not a lower one (gap_share = (window - sum_kernel_spans)
+/ window; fewer measured kernels means a smaller measured sum, which means a
+larger apparent gap). Preregistered decision rule: stamp the already-
+generalized `gemm_w`-class kernels, report the result explicitly as an upper
+bound; under 10% validates MSPEC's correction and clears the kill line,
+at/over 10% is INCONCLUSIVE (not a failure or refutation) -- report which
+kernels would need stamping next to tighten it, and stop.
+
+**Result.** Extended `bench/carryover-stamp.py`'s `SITES` from the 3 FFN
+GEMVs to all 13 `gemm_w[...]` call sites in one decode-loop window
+(`serve/window.mojo:842-1290`): 3 FFN (gate/up/down), 4 attn-subblock (qf,
+k, v, output), 5 ssm-subblock (qkv, z, a, b, out) -- mutually exclusive per
+layer on `is_attn(layer)` -- and 1 head/logits GEMV once per window.
+`NSLOT` raised 8192 -> 32768: the 13-site run needs ~8715 stamp slots
+(3-site needed ~3360), which would have silently overflowed the old cap
+(`stamp_slot()` has no bounds check). Along the way found and fixed a real
+bug in `carryover-analyze.py` that the bigger, branching SITES list exposed:
+the pairwise gap-name scheme collided on first-letter labels
+(`att_qf`/`att_k`/`att_v`/`att_out` all reducing to "a") and divided by zero
+on a gap category that structurally never fires for a branching site list;
+fixed with full names and a zero guard, plus a docstring note that the
+pairwise breakdown (unlike the per-site and window sums, which are
+order-independent) only means what it says for a single sequential chain.
+
+Preregistered in `bench/ssm-occupancy-protocol.md` before the run (hash
+stamped to `.work/carryover/prereg.sha256`, same convention as the carry-over
+probe). 5 runs, Cs arm: identity PASS 10/10 across both arms, 0 WARN,
+`STAMPS 8715` every run. Sum of the 13 stamped sites' medians 330.67 ms
+against a 479.08 ms window -> **gap_share_upper_bound = 31.0%**, over the
+10% line. **INCONCLUSIVE per the rule.** Consistent with expectation, not a
+surprise: the 13 sites cover ~249 of ~678 dispatches per window (~37% by
+count), and 31% > MSPEC's own traced 15.65% (tracer overhead included) >
+its corrected 8.4-9.2% -- the right direction, since measuring fewer kernels
+should raise the apparent gap monotonically. Named the highest-yield next
+addition: `delta_dispatch` (the SSM scan itself) and `datt_k`/`att_k` (the
+attention kernel), since those are the only unstamped kernels that scale
+with sequence/state length rather than being O(1) elementwise; the rest
+(`rope_q`/`rope_k`, `hrms_q`/`hrms_kv`, `append_k`, `conv_k`, `l2_k`,
+`gated_k`, `rgates_k`, `rmsc_k`, `r_swiglu`, `r_add`, `gmul_k`, `split_k`,
+`argmax_d`/`argmax_k`, `tokcp_k`, `embed_k`) are lower priority. Stopped
+here per the rule; full writeup and the decision rule's exact wording are in
+`bench/ssm-occupancy-protocol.md` ("MSPEC precondition check").
 
 ## M4-M5
 
