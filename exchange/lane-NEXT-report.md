@@ -237,17 +237,22 @@ headline conclusion is backwards:
 |---|---|---|
 | per expert per matrix | 1,048,576 B | 589,824 B |
 | top-8 per layer | 25,165,824 B | 14,155,776 B |
-| routed per token, 40 layers | 1.007 GB | **0.566 GB** |
-| routed + shared + router per token | 1.154 GB | **0.784 GB** |
-| 100B-class scaled (114.3 layers) | 2.876 / 3.296 GB | **1.617 / 2.240 GB** |
-| ms per token at 28.7 GB/s, 100B-class | 100 to 115 ms | **56 to 78 ms** |
-| residency needed, 100B-class at 30 tok/s | 67 to 71% | **41 to 57%** |
+| routed per token, 40 layers | 1.007 GB | **0.573 GB** |
+| routed + shared + router per token | 1.154 GB | **0.791 GB** |
+| 100B-class scaled (114.3 layers) | 2.876 / 3.296 GB | **1.64 / 2.26 GB** |
+| ms per token at 28.7 GB/s, 100B-class | 100 to 115 ms | **57 to 79 ms** |
+| residency needed, 100B-class at 30 tok/s | 67 to 71% | **41 to 58%** |
 
-**`docs/NEXT-PLAN.md`'s 0.78 GB per token reproduces exactly** (0.78413824 GB
-is routed plus shared expert plus router, uncached), and its "1 to 2 GB per
-token, 40 to 80 ms" for a 100B-class model is confirmed by the corrected
-arithmetic rather than refuted. The plan needs no change; the report does, and
-w82:p3 has the correction with the evidence to redo that section.
+**`docs/NEXT-PLAN.md`'s 0.78 GB per token reproduces** (0.7906 GB is routed
+plus shared expert plus router, uncached, 1.4% off the plan's figure), and its
+"1 to 2 GB per token, 40 to 80 ms" for a 100B-class model is confirmed by the
+corrected arithmetic rather than refuted. The plan needs no change.
+
+Fixed by w82:p3 at `b7f7db5`, and their fix is better than the correction I
+sent them: 3 of the 40 layers store `ffn_down_exps` as q6_k rather than q4_k,
+which my own first pass flattened to q4_k everywhere. 0.573 and 0.791 GB are
+the per-layer-dtype figures, confirmed against the index by both of us
+independently.
 
 Their stage 2 question stands and is the right one: does an expert-weight H2D
 transfer overlap with compute on already-resident layers through this API, and
