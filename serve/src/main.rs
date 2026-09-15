@@ -4,8 +4,9 @@
 //!              [--tokenizer <pack>/tokenizer.json] [--host 127.0.0.1] [--port 8080]
 //!
 //! Endpoints: GET /health, GET /v1/models, POST /v1/completions,
-//! POST /v1/chat/completions (stream:true => SSE), POST /tokenize,
-//! POST /detokenize. One request runs at a time; the rest queue.
+//! POST /v1/chat/completions (stream:true => SSE), POST /v1/fork
+//! (branches from one shared prompt, B5), POST /tokenize, POST /detokenize.
+//! One request runs at a time; the rest queue.
 
 mod engine;
 mod protocol;
@@ -123,6 +124,7 @@ async fn main() {
         .route("/v1/models", get(models))
         .route("/v1/completions", post(completions))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/fork", post(fork))
         .route("/v1/cancel", post(cancel))
         .route("/tokenize", post(tokenize))
         .route("/detokenize", post(detokenize))
@@ -560,6 +562,77 @@ async fn completions(State(app): State<Shared>, Json(r): Json<CompletionReq>) ->
         "choices": [{"index": 0, "text": text_out, "tokens": acc.tokens, "finish_reason": reason, "logprobs": null}],
         "usage": usage_json(n_prompt, acc.tokens.len(), &stats),
         "timings": stats,
+    }))
+    .into_response())
+}
+
+// ---- /v1/fork -------------------------------------------------------------------
+
+/// B5 (`briefs/2026-09-15-p2-b5-fork.md`, `bench/fork-protocol.md`): fork
+/// one shared prompt into N branches, each a first-class request with its
+/// own sampler state. No new engine plumbing -- `serve/prefix.mojo`'s
+/// checkpoint chain already restores any repeated prompt automatically, on
+/// every request, matched by a hash of the prompt tokens; sending the same
+/// `prompt` to N branches here already gets branches 2..N served from a
+/// restored checkpoint instead of a fresh prefill. This endpoint is a
+/// convenience wrapper around that existing mechanism: branches run
+/// sequentially (the engine already serializes one request at a time), so
+/// branch 1 always prefills and saves the checkpoint that every later
+/// branch restores.
+#[derive(Deserialize)]
+struct ForkReq {
+    #[serde(default)]
+    model: Option<String>,
+    prompt: Value,
+    branches: Vec<ForkBranch>,
+}
+
+#[derive(Deserialize)]
+struct ForkBranch {
+    #[serde(default)]
+    max_tokens: Option<u32>,
+    #[serde(default)]
+    spec: Option<bool>,
+    #[serde(default)]
+    stop: Option<StopParam>,
+    #[serde(flatten)]
+    sampler: SamplerFields,
+}
+
+async fn fork(State(app): State<Shared>, Json(r): Json<ForkReq>) -> Result<Response, ApiError> {
+    if r.branches.is_empty() {
+        return Err(bad("branches must be non-empty"));
+    }
+    let prompt = prompt_ids(&app, &r.prompt)?;
+    let model = r.model.unwrap_or_else(|| app.model.clone());
+    let mut branches = Vec::with_capacity(r.branches.len());
+    for (i, b) in r.branches.into_iter().enumerate() {
+        let g = Gen {
+            prompt: prompt.clone(),
+            n: b.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
+            spec: spec_default(&app, b.spec),
+            stream: false,
+            stop: compute_stop(&app, b.stop),
+            ckpt: vec![],
+            sample: b.sampler.to_sample_params(),
+        };
+        let n_prompt = g.prompt.len();
+        let (req_id, rx) = check_and_submit(&app, &g)?;
+        let (acc, text_out, stats) = collect(&app, rx).await?;
+        let reason = acc.finish_reason(stats.get("finish").and_then(Value::as_str));
+        branches.push(json!({
+            "index": i,
+            "id": format!("fork-{req_id}"),
+            "text": text_out,
+            "tokens": acc.tokens,
+            "finish_reason": reason,
+            "usage": usage_json(n_prompt, acc.tokens.len(), &stats),
+            "timings": stats,
+        }));
+    }
+    Ok(Json(json!({
+        "object": "fork", "model": model, "prompt_tokens": prompt.len(),
+        "branches": branches,
     }))
     .into_response())
 }
