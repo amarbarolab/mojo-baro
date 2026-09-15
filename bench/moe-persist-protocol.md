@@ -51,3 +51,18 @@ GPU per gate under 10 minutes.
 Falsifier for the whole round: if R4 lands and the wall does not move by at
 least the removed launches x 3 us, the gap accounting is wrong and R6 is not
 opened on this evidence.
+
+### R5 result (2026-09-15): below the kill line, reverted; mechanism confirmed, prediction wrong
+
+Two experts per pass on the two lane halves (`q4k_dot_pair`, shared
+`q4k_block_partial`). Gate 1 parity PASS; gate 2 agreement **53.35/64**;
+gate 4: 20-prompt tok/s **94.43 -> 98.55 (1.0436x)**, ranges 92.81..95.00 vs
+98.32..98.86, sclk med 3267 MHz, GENERATED equal 17/20. Kernel receipt
+(rocprofv3, `.work/moe-perf/trace-r5`): **down 30.5 -> 17.7 us per call**,
+exactly the "under 18" predicted; gate+up unchanged 29.0 -> 29.8. The
+token-level prediction (+6 to +9%) was wrong by arithmetic: 12.8 us x 37
+calls = 0.47 ms of 10.7 = 4.4%. Under the frozen +5% line the arm does not
+land; patch kept at `.work/moe-perf/r5-down-pair.patch`. It re-enters only
+as one combined arm with a gate+up change (28 us at 335 GB/s, K = 2048, one
+row per wave) under a new frozen prediction stated in kernel microseconds
+and in token percent from the launch counts, not a guessed range.
