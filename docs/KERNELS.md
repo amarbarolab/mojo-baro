@@ -72,7 +72,7 @@ must be reachable from `serve/registry.mojo`, a bench, or a test.
 | `amar_realign_gather` | `realign_kernels.mojo` | `TLayout: TensorLayout, PLayout: TensorLayout, PartLayout: TensorLayout` |  | kernels/test_realign.mojo |
 | `amar_realign_reduce` | `realign_kernels.mojo` | `PartLayout: TensorLayout, ELayout: TensorLayout` |  | kernels/test_realign.mojo |
 | `amar_sample_probs` | `sample.mojo` | `XLayout: TensorLayout, PLayout: TensorLayout, CAP: Int = SAMP_CAP` |  | kernels/test_sample.mojo |
-| `amar_sample_row` | `sample.mojo` | `XLayout: TensorLayout, OLayout: TensorLayout, PLayout: TensorLayout, CAP: Int = SAMP_CAP` |  | kernels/test_sample.mojo |
+| `amar_sample_row` | `sample.mojo` | `XLayout: TensorLayout, OLayout: TensorLayout, PLayout: TensorLayout, CAP: Int = SAMP_CAP` | sample_row_k | serve/registry.mojo, kernels/test_sample.mojo |
 | `amar_spec_accept` | `sample.mojo` | `PLayout: TensorLayout, TLayout: TensorLayout` |  | kernels/test_sample.mojo |
 | `amar_argmax_final` | `spark_kernels.mojo` | `NB: Int, VLayout: TensorLayout, ILayout: TensorLayout, OLayout: TensorLayout` |  | serve/spark.mojo |
 | `amar_argmax_part` | `spark_kernels.mojo` | `NB: Int, XLayout: TensorLayout, VLayout: TensorLayout, ILayout: TensorLayout` |  | serve/spark.mojo |

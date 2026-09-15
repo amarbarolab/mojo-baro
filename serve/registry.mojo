@@ -24,6 +24,7 @@ from matmul_prefill import (
 )
 from matmul_prefill_lds import amar_matmul_prefill_lds, LDS_THREADS
 from mega import amar_mega_token, amar_mega_window, MEGA_G, MEGA_G_WIN, DATT_NLD
+from sample import amar_sample_row, SAMP_THREADS
 from dattn import amar_dattn_split, amar_dattn_combine, dattn_nsplit
 from attn import (
     amar_head_rmsnorm, amar_attn_decode, amar_gate_mul_cast, amar_qgate_split, amar_rope_yarn, amar_kv_append,
@@ -182,6 +183,12 @@ comptime rmsc_k = amar_rmsnorm_cast[type_of(xm_layout), type_of(h_layout), type_
 comptime embed_k = amar_embed_lookup_pos[type_of(emb_layout), type_of(xm_layout), type_of(toks_layout)]
 comptime argmax_k = amar_argmax_pos[type_of(vm_layout), type_of(toks_layout)]
 comptime argmax_d = amar_argmax_pos[type_of(vm_layout), type_of(dtok_layout)]
+# M5 (briefs/2026-09-15-wiring-lane.md): temperature > 0 replaces argmax_k
+# with this at the same call site (window.mojo). Out/Prob share dtok_layout
+# (KMAX + 1 >= MROWS, and dtok_d is otherwise unused when spec is off, which
+# temperature > 0 forces) -- reusing scratch rather than allocating new
+# buffers, same as reusing hmax_d for Prob.
+comptime sample_row_k = amar_sample_row[type_of(vm_layout), type_of(dtok_layout), type_of(dtok_layout)]
 comptime embed1_k = amar_embed_lookup_pos[type_of(emb_layout), type_of(h2_layout), type_of(dtok_layout)]
 comptime rms_m = amar_rmsnorm[type_of(xm_layout), type_of(h_layout), type_of(xm_layout)]
 comptime rms_h2 = amar_rmsnorm[type_of(h2_layout), type_of(h_layout), type_of(h2_layout)]

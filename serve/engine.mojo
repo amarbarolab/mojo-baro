@@ -384,7 +384,17 @@ def main() raises:
             gen_n = req_n
             if req_has_spec:
                 spec = req_spec
-            print("prompt tokens:", len(prompt), " n:", gen_n, " spec:", spec)
+            # M5 scope limit (briefs/2026-09-15-wiring-lane.md): accepting a
+            # draft token on argmax equality under sampling would silently
+            # change the output distribution (the verify step compares ids,
+            # not probabilities), so temperature > 0 forces k=0 this round.
+            # Correct speculative sampling (accept with min(1, p/q), resample
+            # from the residual) is its own preregistered round --
+            # spec_accept_ref exists for exactly that, which is why this is a
+            # deferral and not an oversight.
+            if sample.temperature > 0:
+                spec = False
+            print("prompt tokens:", len(prompt), " n:", gen_n, " spec:", spec, " temperature:", sample.temperature)
             # Per-request teacher forcing. BARO_FORCE is read once at startup,
             # so a forced run used to need one process per prompt: 20 pack
             # loads for a 20-prompt gate, 1.4 s each on the MoE pack. A
@@ -510,7 +520,11 @@ def main() raises:
         # stage sum exceeds the unsynchronized sub-block time; compare stages
         # within an arm and the same stage across m, never add these into a budget.
         var pf4 = getenv("BARO_PROFILE", "0") == "4"
-        var cfg = WindowCfg(pack_q4=pack_q4, draft_q4=draft_q4, q4_off=q4_off, e=e, kcfg=kcfg, spec=spec, spec_dbg=spec_dbg, serve=serve, req_id=req_id, prof=prof, pf2=pf2, pf3=pf3, pf4=pf4, dump=dump, dump4=dump4, dump_layer=dump_layer, mega=mega, att_split=att_split, mega_win=mega_win, dot3=dot3, pf_chunk=pf_chunk, pf_rows=pf_rows, pf_tail=pf_tail, n_total=n_total, fr_k=fr_k, fr_off=fr_off, fr_ids_off=fr_ids_off, n_prompt=len(prompt))
+        # The megakernel bakes greedy argmax into its own launch (mega_token_*
+        # kernels take no sampler params); a sampling request always runs the
+        # launch path, which is where the sampler is wired below.
+        var mega_req = mega and sample.temperature <= 0
+        var cfg = WindowCfg(pack_q4=pack_q4, draft_q4=draft_q4, q4_off=q4_off, e=e, kcfg=kcfg, spec=spec, spec_dbg=spec_dbg, serve=serve, req_id=req_id, prof=prof, pf2=pf2, pf3=pf3, pf4=pf4, dump=dump, dump4=dump4, dump_layer=dump_layer, mega=mega_req, att_split=att_split, mega_win=mega_win, dot3=dot3, pf_chunk=pf_chunk, pf_rows=pf_rows, pf_tail=pf_tail, n_total=n_total, fr_k=fr_k, fr_off=fr_off, fr_ids_off=fr_ids_off, n_prompt=len(prompt), sample=sample.copy())
         if len(force) > 0 and cfg.spec:
             raise Error("BARO_FORCE requires BARO_SPEC=0 (teacher forcing is a no-spec identity gate)")
         wst.reset(t0)

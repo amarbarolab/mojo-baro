@@ -13,6 +13,7 @@ from std.time import perf_counter_ns
 from max.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
 from layout import TileTensor, TensorLayout, row_major
 from registry import *
+from serve_proto import SampleParams
 from moe import (
     moe_embed_q8_0_pos, moe_matmul_q8_0_m1, moe_add3,
     amar_moe_router_top8, amar_moe_sig_gate, moe_gate_up_q4k_pack,
@@ -591,6 +592,7 @@ struct WindowCfg(Copyable, Movable):
     var pf_tail: Int
     var n_total: Int
     var n_prompt: Int
+    var sample: SampleParams
 
 
 @fieldwise_init
@@ -1265,8 +1267,23 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                     ctx.synchronize()
                     st.p3[3] += Int(perf_counter_ns() - t_acc)
                 m = n_acc + 1
-            else:
+            elif cfg.sample.temperature <= 0:
                 ctx.enqueue_function[argmax_k](Logitsm, Toks, Int32(VOCAB), Int32(st.pos + 1), grid_dim=m, block_dim=256)
+            else:
+                # Sampling (M5): spec and the megakernel are both forced off
+                # whenever temperature > 0 (engine.mojo), so dtok_d and
+                # hmax_d are free scratch here -- sample into them, 0-based,
+                # then reuse the same tokcp_k the spec path already uses to
+                # place the result at the real position.
+                var SampTok = TileTensor(b.dtok_d, dtok_layout)
+                var SampProb = TileTensor(b.hmax_d, dtok_layout)
+                ctx.enqueue_function[sample_row_k](
+                    Logitsm, SampTok, SampProb, Int32(VOCAB),
+                    Float32(cfg.sample.temperature), Int32(cfg.sample.top_k),
+                    Float32(cfg.sample.top_p), Float32(cfg.sample.min_p),
+                    cfg.sample.seed, UInt64(st.pos), grid_dim=m, block_dim=SAMP_THREADS,
+                )
+                ctx.enqueue_function[tokcp_k](SampTok, Toks, Int32(0), Int32(st.pos + 1), Int32(m), grid_dim=1, block_dim=32)
             if cfg.serve:
                 if win_spec:
                     for i in range(m - 1):

@@ -12,6 +12,7 @@ from registry import *
 from window import *
 from harness import load_pack, alloc_bufs, Pack
 from realign import final_norm_hidden
+from serve_proto import default_sample_params
 
 def step_latent_raw(
     ctx: DeviceContext,
@@ -163,7 +164,8 @@ def main() raises:
             pack_q4=pack.pack_q4, draft_q4=False, q4_off=pack.q4_off, e=pack.e, kcfg=2,
             spec=False, spec_dbg=False, serve=False, req_id=0, prof=False, pf2=False, pf3=False, pf4=False,
             dump=False, dump4=False, dump_layer=0, mega=True, att_split=1088, mega_win=False, dot3=False, pf_chunk=1024,
-            pf_rows=pf_rows, pf_tail=pf_tail, n_total=plen + 1, fr_k=0, fr_off=0, fr_ids_off=0, n_prompt=plen
+            pf_rows=pf_rows, pf_tail=pf_tail, n_total=plen + 1, fr_k=0, fr_off=0, fr_ids_off=0, n_prompt=plen,
+            sample=default_sample_params(),
         )
         wst.reset(perf_counter_ns())
         while wst.pos < plen:
@@ -204,7 +206,8 @@ def main() raises:
             pack_q4=pack.pack_q4, draft_q4=False, q4_off=pack.q4_off, e=pack.e, kcfg=2,
             spec=False, spec_dbg=False, serve=False, req_id=0, prof=False, pf2=False, pf3=False, pf4=False,
             dump=False, dump4=False, dump_layer=0, mega=True, att_split=1088, mega_win=False, dot3=False, pf_chunk=1024,
-            pf_rows=0, pf_tail=0, n_total=total_target, fr_k=0, fr_off=0, fr_ids_off=0, n_prompt=plen + K_LATENT
+            pf_rows=0, pf_tail=0, n_total=total_target, fr_k=0, fr_off=0, fr_ids_off=0, n_prompt=plen + K_LATENT,
+            sample=default_sample_params(),
         )
         while wst.pos < total_target - 1:
             step_window(ctx, bufs, cfg_gen, wst)
