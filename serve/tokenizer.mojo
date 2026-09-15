@@ -3,7 +3,7 @@
 Mirrors tools/gguf-tokenizer.py: gpt2-model vocab + merges + token_type from the
 tokenizer.ggml.* keys, pre-tokenizer regexes per tokenizer.ggml.pre (llama.cpp's
 tables), control/user_defined tokens matched in the text before BPE. Regexes run
-on mojo-uregex (~/Projects/mojo/mojo-uregex/src, build with -I).
+on the vendored uregex/ (repo root, -I ., upstream ~/Projects/mojo/mojo-uregex).
 """
 from std.collections import Dict
 from std.memory import bitcast

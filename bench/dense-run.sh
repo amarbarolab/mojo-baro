@@ -12,8 +12,7 @@ ok() { echo "PASS $1: $2" | tee -a "$OUT/SUMMARY.txt"; }
 die() { echo "FAIL $1: $2" | tee -a "$OUT/SUMMARY.txt"; exit 1; }
 
 echo "== build =="
-./.venv/bin/mojo build serve/spark.mojo -I kernels -I serve -I ~/Projects/mojo/mojo-uregex/src \
-  -I ~/Projects/mojo/mojo-minja/src -I "$PROFILE" -o "$BIN" > "$OUT/build.log" 2>&1 \
+./.venv/bin/mojo build serve/spark.mojo -I . -I kernels -I serve -I "$PROFILE" -o "$BIN" > "$OUT/build.log" 2>&1 \
   || die build "$(grep -m1 error: "$OUT/build.log" | cut -c1-200)"
 ok build "$BIN"
 

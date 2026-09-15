@@ -17,7 +17,7 @@
 #      properties, and validate_specs() fails the build on any future drift.
 #
 # usage:
-#   mojo run tools/generate_e8_tasks.mojo -I . -I serve -I ~/Projects/mojo/mojo-uregex/src
+#   mojo run tools/generate_e8_tasks.mojo -I . -I serve
 #   mojo run tools/generate_e8_tasks.mojo --check-tokenizer .work/e8_tasks.round3.json
 #
 # The GSM8K jsonl comes from tools/gsm8k-parquet-to-jsonl.py (parquet needs

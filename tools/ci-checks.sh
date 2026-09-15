@@ -63,6 +63,30 @@ if [ ! -f "$UP" ]; then ok "upstream not on this machine, nothing to compare"
 elif diff -q <(tail -n +6 tools/gguf_reader.mojo) "$UP" >/dev/null; then ok "vendored copy is in sync"
 else bad "tools/gguf_reader.mojo has drifted from $UP"; diff -u <(tail -n +6 tools/gguf_reader.mojo) "$UP" | head -20; fi
 
+step "vendored uregex/ and minja/ match their upstream"
+# serve/tokenizer.mojo imports uregex, serve/spark.mojo imports minja; both are
+# vendored as real files (repo root uregex/, minja/, -I .), not a symlink or a
+# build flag pointing outside the tree, so a clone builds without either sibling
+# repo checked out.
+vendor_drift=0
+for pkg_up in "uregex:$HOME/Projects/mojo/mojo-uregex/src/uregex" "minja:$HOME/Projects/mojo/mojo-minja/src/minja"; do
+  pkg=${pkg_up%%:*}; up=${pkg_up#*:}
+  if [ ! -d "$up" ]; then ok "$pkg: upstream not on this machine, nothing to compare"; continue
+  fi
+  drift=""
+  for f in "$pkg"/*.mojo; do
+    base=$(basename "$f")
+    if [ ! -f "$up/$base" ]; then drift="$drift $base(missing-upstream)"
+    elif ! diff -q <(tail -n +7 "$f") "$up/$base" >/dev/null; then drift="$drift $base"; fi
+  done
+  for f in "$up"/*.mojo; do
+    base=$(basename "$f")
+    [ -f "$pkg/$base" ] || drift="$drift $base(missing-vendored)"
+  done
+  if [ -z "$drift" ]; then ok "$pkg: vendored copy is in sync"
+  else bad "$pkg: drifted from $up:$drift"; fi
+done
+
 step "referenced protocol and doc files exist"
 if python3 - <<'PY'
 import pathlib, re, sys
@@ -111,8 +135,7 @@ for f in bench/*.mojo; do
   grep -q '^def main' "$f" || continue
   if grep -q '^from grammar' "$f"; then benchskip="$benchskip $(basename "$f")"; continue; fi
   benchn=$((benchn + 1))
-  "$MOJO" build "$f" -o .work/ci-bench-bin -I kernels -I serve \
-    -I "$HOME/Projects/mojo/mojo-uregex/src" -I "$HOME/Projects/mojo/mojo-minja/src" \
+  "$MOJO" build "$f" -o .work/ci-bench-bin -I . -I kernels -I serve \
     -Xlinker -L.work/shim-build -Xlinker -lamarbaro_shim -Xlinker -rpath -Xlinker "$PWD/.work/shim-build" \
     > .work/ci-bench-build.log 2>&1 || { bad "$f: $(grep -m1 'error:' .work/ci-bench-build.log | cut -c1-140)"; benchbad=1; }
 done

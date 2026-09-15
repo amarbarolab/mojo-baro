@@ -27,7 +27,7 @@ done
 mkdir -p .work/e13
 echo "building e13_engine_dump..."
 ./.venv/bin/mojo build bench/e13_engine_dump.mojo -o .work/e13/e13_engine_dump \
-  -I . -I kernels -I serve -I bench -I ~/Projects/mojo/mojo-uregex/src
+  -I . -I kernels -I serve -I bench
 
 fwd_env=()
 for v in BARO_PACK BARO_E8_GGUF BARO_E8_TMAX E13_DUMP_LIMIT E13_MIN_STEPS E8_GSM8K_TRAIN E13_DUMP_DIR E13_WORK_DIR; do

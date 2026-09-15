@@ -37,7 +37,7 @@ rm -f .work/e8-vram-ready.marker
 
 echo "building bench_latent_handoff..."
 ./.venv/bin/mojo build bench/bench_latent_handoff.mojo -o .work/bench_latent_handoff \
-  -I . -I kernels -I serve -I bench -I ~/Projects/mojo/mojo-uregex/src
+  -I . -I kernels -I serve -I bench
 
 read_vram() { gpu-wait gpu --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["vram_used"])'; }
 

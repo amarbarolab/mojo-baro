@@ -7,7 +7,7 @@
 # "Give only the answer" turn, so the prefix is cut off and the rest becomes the user
 # message. Scoring is RULER's string_match_all (bench/e8_score.py, type "ruler").
 #
-# build: ./.venv/bin/mojo build bench/ruler/to_e8.mojo -I . -I serve -I ~/Projects/mojo/mojo-uregex/src -o .work/to_e8
+# build: ./.venv/bin/mojo build bench/ruler/to_e8.mojo -I . -I serve -o .work/to_e8
 # usage: .work/to_e8 OUT.json IN1.jsonl [IN2.jsonl ...]
 
 from std.os import getenv
