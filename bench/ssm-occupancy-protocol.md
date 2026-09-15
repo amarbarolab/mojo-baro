@@ -216,3 +216,246 @@ inventing code). Item 2 is measured and falsified (arm D 85% slower, not
 faster). `amar_ssm_delta_step` stays exactly as `main` has it. No code
 change in this stint; this file's Results section and
 `.work/briefs/status-mrowC.md` are the deliverable.
+
+## Re-run 2026-09-15: fair arm D, preregistered before the first timed run
+
+Why: `exchange/2026-09-15-jsplit-review.md` shows by compile receipt that the
+2026-09-04 arm D carried the same ~2000-spill codegen penalty the control was
+repaired away from (the penalty follows the column-index expression, not the
+value of JSPLIT: 2029 at JSPLIT=1 vs 2009 at JSPLIT=4; a masked index gives
+599 at JSPLIT=4). The recorded 85% therefore measured the refactor. This
+section re-runs item 2 with a treatment that pays no penalty the control
+escaped. Working tree only, nothing committed; freeze receipt = sha256 of this
+file recorded in the exchange report before the first run.
+
+### Arms
+
+- **C (control):** `serve/engine.mojo` built from `main` `a9c0106` with
+  `kernels/` and `serve/` untouched, binary `.work/jsplit-review/engine-C`.
+  Receipt required: `tools/isa-receipt.py` shows `amar_ssm_delta_step`
+  vgpr_spill_count 603 at MR=8 and 81 at MR=1, vgpr_count 192.
+- **D (treatment):** same tree plus `JSPLIT: Int = 1` on
+  `amar_ssm_delta_step` with `comptime if JSPLIT == 1` reproducing the
+  original body verbatim and the split path forming the column index as
+  `(block_idx.y & (JSPLIT - 1)) * (SSTATE // JSPLIT) + thread_idx.x`, with
+  the full-width `kq` fill; `serve/registry.mojo` dispatches with
+  `grid_dim=(NH_V, 4), block_dim=32`. Binary `.work/jsplit-review/engine-D`.
+  Receipt required BEFORE timing: spill count within 3% of arm C's at every
+  MR in 1..8 (expected 599 at MR=8, 78 at MR=1 from the standalone
+  receipts). If D spills more than that, D is not the fair arm and nothing
+  downstream may be read.
+
+### Configurations (both arms, each)
+
+- **P (primary, champion path):** `BARO_PROFILE=2 BARO_SPEC=1 BARO_SPEC_K=2
+  BARO_PROMPT=bench/mtp-prompts/p09-explain-gpu.tokens`. With the megakernel
+  on (default `BARO_MEGA=1`) the per-kernel SSM path, and so
+  `amar_ssm_delta_step`, runs only in the spec verify windows (MR = k+1 = 3),
+  which is exactly where the champion pays for this kernel today.
+- **S (secondary, the 2026-09-04 shape):** `BARO_PROFILE=2 BARO_MEGA=0
+  BARO_SPEC=0 BARO_PROMPT=...p09...`. Per-kernel MR=1 decode for all 64
+  tokens, the shape item 2 was originally written against.
+
+Instrument: `gpu-wait run --` on every launch, GPU otherwise idle (`gpu-wait
+list` empty, checked before each launch). 5 runs per arm per configuration,
+alternating C, D, C, D, ... so drift lands on both arms equally. Number read:
+the `ssm-kernel: delta <seconds>` line. Reported: median of 5 and median of
+the last 4. Spread (max/min - 1) of the control must be under 1.5% (this
+file's per-kernel gate) for a difference to be read; if wider, only disjoint
+ranges may be read as a direction.
+
+### Read-back (P1), per run
+
+`BARO_SPEC:`, `BARO_MEGA:`, `spec k:` lines from the run log; `GENERATED:`
+line byte-identical across all runs of a configuration (JSPLIT changes no
+per-column arithmetic order, so a token difference means a wrong kernel and
+voids the run); `mega fail word:` must be 0 wherever it is printed; sha256 of
+both binaries; the isa-receipt rows above.
+
+### The 0.0478 s reference is not expected to reproduce
+
+136 commits touch `serve/` or `kernels/` between `af30ac9` and `a9c0106`
+(megakernel decode, q4 champion, dattn, MTP changes). The per-kernel delta
+total is a sum over whichever windows take the per-kernel path, and that set
+changed. The arm-A style self-check for this re-run is therefore: control
+spread under 1.5%, identity across all runs, receipts above. Arm C's absolute
+number is recorded and compared to 0.0478 for the record only.
+
+### Predictions, frozen
+
+1. **Confound thesis:** with spills equalized, D's delta time lands within
+   10% of C's in both configurations; the 85% gap does not reappear.
+   Falsifier: D at or above 1.5x C in either configuration, which would mean
+   the j-split geometry itself is the loss and the 2026-09-04 verdict stands
+   for a different reason than recorded.
+2. **Item 2 as originally written** (per-kernel time drops): D below C by
+   more than the control spread in configuration S, the MR=1 shape it was
+   argued for. Direction only; no magnitude predicted. Falsifier: D not
+   below C. In configuration P (MR=3, three rows per launch, 3x the work per
+   block) no direction is predicted.
+3. `tok/s_gen` moves under 1% in either arm (SSM state traffic is ~0.6% of
+   per-token bytes, see the scale check at the top of this file). A flat
+   end-to-end number is expected and is not evidence either way.
+
+### Outcomes and what each means
+
+- D within spread of C: item 2 is a **confirmed null** (not just suspected)
+  and the confound thesis is confirmed at the same time.
+- D below C beyond spread: item 2 is **confirmed at kernel level**; still no
+  end-to-end claim without the 20-prompt median (P4).
+- D above 1.5x C: prediction 1 falsified; the geometry loses on its own.
+
+### Amendment 2026-09-15, before the first timed run: per-MR receipts
+
+The 3% spill gate above was set from the MR=8 and MR=1 receipts. Reading
+arm D's engine binary at every MR (all still before any timed run):
+
+| MR | C spills | D (JSPLIT=4, masked) | 1-D form, JSPLIT=4 | JSPLIT=2, masked |
+|---|---|---|---|---|
+| 8 | 603 | 599 | 612 | read back below |
+| 7 | 526 | 530 | | |
+| 6 | 458 | 461 | | |
+| 5 | 380 | 405 | 405 | 366 |
+| 4 | 312 | 336 | 336 | 297 |
+| 3 | 235 | 267 | 267 | 227 |
+| 2 | 167 | 181 | 181 | 155 |
+| 1 | 81 | 78 | 78 | read back below |
+
+At MR=2..5 both fair JSPLIT=4 forms land on the same count, +32 spills over
+C at MR=3 (+13.6%), so that residue belongs to the 4-way split itself (four
+fill iterations per row) and not to the index expression. The gate as
+written fails for JSPLIT=4 at MR=3, which is configuration P's shape.
+Decision, recorded before running:
+
+- Configuration S (MR=1: 78 vs 81) is gated PASS for JSPLIT=4 and is the
+  fully interpretable comparison for the original item 2.
+- Configuration P keeps JSPLIT=4 as an **exploratory** arm carrying a stated
+  13.6% spill handicap: a D win or tie there is interpretable, a D loss is
+  confounded and may only be reported as such.
+- A third arm **D2 = JSPLIT=2 (masked form, `grid_dim=(NH_V, 2),
+  block_dim=64`)** is added. It spills less than C at every MR read so far
+  and so passes the gate in both configurations. Receipt for its engine
+  binary at MR=8 and MR=1 is read back before timing, same 3% rule.
+
+Run order becomes C, D, D2 alternating, 5 rounds per configuration.
+Predictions 1..3 apply to D2 unchanged. Prediction 2 (per-kernel time drops)
+now has two chances in configuration S; if neither D nor D2 beats C beyond
+the spread, item 2 is a confirmed null for both split widths.
+
+### Amendment 3, 2026-09-15, before the tok/s runs
+
+Under `BARO_PROFILE=2` the engine synchronizes after every SSM sub-block, so
+its `tok/s_gen` is not the tok/s instrument. Prediction 3 (tok/s moves under
+1%) is read from a separate pass with no `BARO_PROFILE`, same prompt, same
+`BARO_SPEC=1 BARO_SPEC_K=2`, arms C, D, D2 alternating, 5 rounds. One prompt
+only, so this is a receipt on prediction 3 and never an end-to-end claim
+(P4 needs the 20-prompt median). Identity and `mega fail word` read on every
+run as before.
+
+### Amendment 4, 2026-09-15, before the launch-path run
+
+Non-profiled pass (Amendment 3) read D and D2 both 3.3% below C on
+`tok/s_gen` with disjoint ranges, the same amount for both split widths,
+while the profiled per-kernel delta time was flat (D) or 2.3% better (D2).
+`host_enqueue_s` equals `gpu_total_s` to within 30 us in every run, so the
+decode is host-enqueue-bound on this path and a fixed per-launch host cost
+would show up exactly like this. The one change D and D2 share that is not
+the kernel body is the launch form: `grid_dim=(NH_V, SSM_JSPLIT)` (a 2-D
+tuple) where C passes the scalar `NH_V`.
+
+Arm **J1**: the working tree with `SSM_JSPLIT = 1`, i.e. the original kernel
+body (comptime branch, receipt must read 603 / 81 spills at MR=8 / MR=1)
+launched with the tuple `grid_dim=(NH_V, 1)`. Same non-profiled pass, C and
+J1 alternating, 5 rounds. Prediction: if the launch form is the cost, J1 lands
+with D and D2 (about 3% below C, disjoint from C); if the kernel is the cost,
+J1 lands on C. Either way the result names where the 3.3% lives before any
+JSPLIT arm can be judged end-to-end.
+
+### Amendment 5, 2026-09-15, before the sub-block attribution run
+
+J1 (first three rounds read while the pass was still running) lands on C, so
+the launch form is not the 3.3%. The loss then lives in GPU work that the
+profiled delta segment does not see: something around the split kernel gets
+slower only when it runs unsynchronized in the stream. `BARO_PROFILE=1`
+attributes GPU time per sub-block (attn / ssm / ffn / head) with a sync at
+each sub-block boundary. Arms C, D, D2, 3 rounds alternating, same prompt and
+spec settings. Read: which sub-block grows in D and D2 relative to C, and by
+how much of the 18 ms `decode_s` gap. If no sub-block grows under profiling,
+the loss only exists unsynchronized and the candidates left are cross-kernel
+(clock or power state, or dispatch overlap), which this protocol cannot
+separate without a clock probe and is stated as such.
+
+### Results 2026-09-15 (working tree, nothing committed)
+
+Binaries (sha256 prefix): C `fc976cd9`, D `501fd19b`, D2 `614968b6`, J1
+`e7ab45bd`. Receipts before timing (`tools/isa-receipt.py`, spills at
+MR=8..1): C and J1 `603 526 458 380 312 235 167 81`; D `599 530 461 405 336
+267 181 78`; D2 `573 504 435 366 297 227 155 78`. vgpr_count 192 everywhere.
+Every run: `GENERATED` sha `c00468774758` (identical across all 64 runs,
+including the 09-04 reference line), `mega fail word: 0`, `BARO_SPEC: True`,
+`spec k: 2` where spec was on, `BARO_MEGA: False` in configuration S. GPU
+queue empty before every launch; all launches through `gpu-wait run`.
+Run logs: `.work/jsplit-review/runs*/`.
+
+**Gate 2 per-kernel time, `ssm-kernel: delta` (s), 5 rounds alternating:**
+
+| cfg | arm | median | min | max | spread | vs C | ranges |
+|---|---|---|---|---|---|---|---|
+| P (spec k=2, MR=3 windows) | C | 0.041477 | 0.041158 | 0.041810 | 1.59% | 1.000 | |
+| P | D (JSPLIT=4) | 0.041045 | 0.040674 | 0.041451 | 1.91% | 0.990 | overlap |
+| P | D2 (JSPLIT=2) | 0.040508 | 0.040127 | 0.040774 | 1.61% | 0.977 | **disjoint** |
+| S (no mega, no spec, MR=1) | C | 0.041784 | 0.041520 | 0.041924 | 0.97% | 1.000 | |
+| S | D (JSPLIT=4) | 0.042405 | 0.041798 | 0.043472 | 4.01% | 1.015 | overlap |
+| S | D2 (JSPLIT=2) | 0.041533 | 0.041223 | 0.042276 | 2.55% | 0.994 | overlap |
+
+The control's P spread (1.59%) is a hair over the 1.5% gate, so in P only
+the disjoint D2 result is read as a direction. The 0.0478 s reference did not
+reproduce (0.0415 today), as predicted: different engine.
+
+**Prediction 1 (confound thesis): CONFIRMED.** With spills equalized the
+split arms land within 2.3% of the control in both configurations. The 85%
+regression recorded on 2026-09-04 was the generalization's codegen, not the
+split.
+
+**Prediction 2 (item 2, per-kernel time drops at MR=1): FALSIFIED for both
+widths.** Configuration S: D +1.5%, D2 -0.6%, both overlapping the control.
+Item 2 is a **confirmed null** at the shape it was written for. At MR=3
+(configuration P) D2 is 2.3% faster with disjoint ranges; a kernel-level
+receipt, one prompt, no end-to-end meaning on its own.
+
+**Prediction 3 (tok/s moves under 1%): FALSIFIED.** Non-profiled pass, same
+prompt, `tok/s_gen` median of 5: C 118.90 (118.12..118.98), D 114.99
+(114.31..115.55), D2 115.00 (114.81..115.71). Both split arms **3.3% slower
+end-to-end with disjoint ranges**; `decode_s` 0.5299 vs 0.5479 / 0.5478.
+
+**Where the 3.3% lives.** J1 (original kernel body, tuple grid) reads 118.33
+vs C 118.98, overlapping: the launch form is not it. `BARO_PROFILE=1`
+sub-block attribution, median of 3 (s):
+
+| sub-block | C | D | D2 |
+|---|---|---|---|
+| attn | 0.0481 | 0.0495 | 0.0495 |
+| ssm | 0.1947 | 0.1993 | 0.1994 |
+| ffn | 0.2218 | 0.2361 | 0.2330 |
+| head | 0.0351 | 0.0350 | 0.0350 |
+| decode_s | 0.5650 | 0.5857 | 0.5824 |
+
+The **FFN sub-block, whose kernels are untouched, carries 11 to 14 ms of the
+20 ms gap** (+5 to +6%); ssm +4.5 ms, attn +1.4 ms, head flat. The delta
+kernel itself is not slower in isolation, so the loss is a carry-over from
+its execution into the kernels that follow. Candidates: clock or power state
+after a kernel that lights all 96 CUs instead of 32, or cache state left by
+the different write order of the 2 MB state. Separating those needs a clock
+probe, which this protocol does not have and which `docs/BASELINE.md` forbids
+inside a timing loop. Stated as unresolved.
+
+### Verdict 2026-09-15
+
+Item 2 stays closed, and for a measured reason this time: the fair split is
+flat at kernel level at MR=1 (null confirmed, both widths), 2.3% better at
+MR=3 for JSPLIT=2, and **3.3% worse end-to-end** because the sub-blocks after
+it slow down. The 2026-09-04 explanation (redundant `kq` fill, spill
+pressure from the split) is withdrawn; its number was the refactor. Nothing
+lands. The working tree keeps the `JSPLIT` machinery at `SSM_JSPLIT = 1`,
+receipt-identical to `main` at every MR and within 0.5% on tok/s (J1), for
+the maintainer to keep or drop.
