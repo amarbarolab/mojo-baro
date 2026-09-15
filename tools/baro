@@ -127,15 +127,36 @@ run)
     mkdir -p "$src/$(dirname "$f")"
     jq -r --arg k "baro.kernel.src.$f" '.[$k]' "$meta" > "$src/$f"
   done < "$src/FILES"
-  echo "sources: $(wc -l < "$src/FILES") files plus the run harness, all from $model"
+  # The harness's own serve-module closure (prefix, harness, moe_pack, latent,
+  # ...) rides in baro.run.src.*.mojo beside it. tools/gguf-closure.sh gets
+  # these from git at the gguf's commit; run mode has no checkout to get them
+  # from, and without them the build stops at "unable to locate module".
+  extra=0
+  for k in $(jq -r 'keys[] | select(startswith("baro.run.src.")) | select(endswith(".mojo"))' "$meta"); do
+    n=${k#baro.run.src.}
+    [ "$n" = "engine.mojo" ] && continue
+    jq -r --arg k "$k" '.[$k]' "$meta" > "$src/$n"
+    extra=$((extra + 1))
+  done
+  echo "sources: $(wc -l < "$src/FILES") kernel files, $extra serve modules, plus the run harness, all from $model"
 
   mojo=$here/.venv/bin/mojo
   [ -x "$mojo" ] || die "no $mojo; run 'uv sync' in the checkout first (the pinned toolchain is max[all]==26.5.0)"
   dflag=""; [ -n "$kmodel" ] && dflag="-D BARO_MODEL=$kmodel"
-  echo "building engine (model ${kmodel:-qwen35}) ..."
-  # shellcheck disable=SC2086
-  "$mojo" build "$src/engine.mojo" -I "$src" $dflag -o "$work/engine" > "$work/build.log" 2>&1
-  [ -x "$work/engine" ] || { grep -m3 error "$work/build.log"; die "engine build FAILED, see $work/build.log"; }
+  # An engine already built from THIS file's harness is reused. Compiling is
+  # minutes of CPU, and the GPU rule (docs/NEXT-PLAN.md) says a gate holds the
+  # card for minutes, not for a build: `baro run --no-serve` does the CPU half
+  # outside any GPU reservation, then the serving call reuses what it made.
+  esha=$(kvget baro.run.harness.sha)
+  if [ -x "$work/engine" ] && [ -n "$esha" ] && [ "$(cat "$work/engine.harness.sha" 2>/dev/null)" = "$esha" ]; then
+    echo "engine: reusing $work/engine (built from this file's harness ${esha:0:16})"
+  else
+    echo "building engine (model ${kmodel:-qwen35}) ..."
+    # shellcheck disable=SC2086
+    "$mojo" build "$src/engine.mojo" -I "$src" $dflag -o "$work/engine" > "$work/build.log" 2>&1
+    [ -x "$work/engine" ] || { grep -m3 error "$work/build.log"; die "engine build FAILED, see $work/build.log"; }
+    printf '%s' "$esha" > "$work/engine.harness.sha"
+  fi
   echo "engine: $work/engine  sha256 $(sha256sum "$work/engine" | cut -c1-16)"
 
   if [ -z "$pack" ]; then

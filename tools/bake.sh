@@ -24,7 +24,10 @@ src=$1; dst=$2; arch=$3; ref=$4; prompt=$5; packflags=$6; shift 6
 [ ! -e "$dst" ] || { echo "destination exists: $dst" >&2; exit 1; }
 [ -s "$ref" ] || { echo "no reference ids $ref (run the repo-built engine on $prompt first)" >&2; exit 1; }
 [ -s "$prompt" ] || { echo "no prompt token file $prompt" >&2; exit 1; }
-dirty=$(git status --porcelain -- kernels serve grammar uregex minja latentos)
+# Only what actually enters the file: the kernel closure, the serve Mojo
+# modules and the vendored packages. serve/src is the Rust front and is not
+# embedded, so another lane editing it must not block a bake.
+dirty=$(git status --porcelain -- kernels 'serve/*.mojo' grammar uregex minja latentos)
 [ -z "$dirty" ] || { echo "refusing to bake from a dirty source tree:"; echo "$dirty"; exit 1; }
 echo "baking $dst from $src at $(git rev-parse --short HEAD), arch $arch"
 ./.venv/bin/python3 tools/gguf-embed.py "$src" "$dst" $(tools/embed-files.py --arch "$arch") \

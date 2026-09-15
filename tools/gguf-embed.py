@@ -20,6 +20,7 @@ the closure walk above stays harness-free:
 """
 import hashlib
 import os
+import re
 import struct
 import subprocess
 import sys
@@ -169,6 +170,25 @@ def main():
         new_kv.append((f"baro.run.src.{run_harness.name}", text))
         new_kv.append(("baro.run.harness.sha", hashlib.sha256(text.encode()).hexdigest()))
         new_kv.append(("baro.run.harness.path", "serve/" + run_harness.name))
+        # The harness's own serve-module closure (prefix, harness, moe_pack,
+        # latent, ...), minus whatever the kernel closure already carries.
+        # tools/gguf-closure.sh pulls these from git at the gguf's commit, which
+        # verify mode can do and run mode cannot: run mode has no checkout, and
+        # without them the build stops at "unable to locate module 'prefix'".
+        serve_dir = run_harness.resolve().parent
+        have = {src_key(k) for k in kfiles}
+        seen, todo = set(), [run_harness]
+        while todo:
+            f = todo.pop(0)
+            for m in re.findall(r"^(?:from|import)\s+([a-z_][a-z0-9_]*)", f.read_text(), re.M):
+                cand = serve_dir / f"{m}.mojo"
+                if m in seen or not cand.exists() or cand.name in have:
+                    continue
+                seen.add(m)
+                todo.append(cand)
+                new_kv.append((f"baro.run.src.{cand.name}", cand.read_text()))
+        if seen:
+            print(f"run closure: {len(seen)} extra serve module(s): {' '.join(sorted(seen))}")
 
     # The closure used to reach for .work/ paths that the file never carried
     # (the qwen35moe branch defaulted BARO_PROMPT to .work/moe-w3/one.tokens,
