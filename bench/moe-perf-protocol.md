@@ -125,3 +125,9 @@ against its predecessor in one stint), 2.18x, agreement 53.20 -> 52.85 ->
 kernels (conv, gates, l2, delta, about eight launches per layer) and the
 remaining expert time; a fresh rocprofv3 trace is the first step of any
 follow-up round, not this file's numbers.
+
+Gate 3 on the committed tree at `bf45322` + `44bf333`: `./run-tests.sh`
+(through gpu-wait) exit 0, 104 PASS lines; `tools/ci-checks.sh` green for every
+tracked source, its one failure being an untracked in-progress LatentOS probe
+(`bench/latentos-ipc-probe.mojo`, link error) belonging to the B3 lane, which
+was told to land it green or excluded.
