@@ -15,6 +15,7 @@ the closure walk above stays harness-free:
   --run-harness=serve/engine.mojo  the RUN-mode harness plus its sha256
   --run-prompt=FILE                token ids the closure decodes
   --run-ref=FILE                   the ids it must produce (GENERATED: line or bare)
+  --run-env='BARO_MEGA=0 ...'      the env this model needs to run at all
   --run-pack-flags='--q4 ...'      how tools/engine-pack.py builds this model's pack
   --run-pack-tool=tools/engine-pack.py  the pack builder itself, so run mode needs no checkout
 """
@@ -114,6 +115,7 @@ def main():
     run_ref = None
     run_pack_flags = None
     run_pack_tool = None
+    run_env = None
     for a in sys.argv[1:]:
         if a.startswith("--kv="):
             k, v = a[5:].split("=", 1)
@@ -127,6 +129,8 @@ def main():
             run_ref = Path(a.split("=", 1)[1])
         elif a.startswith("--run-pack-flags="):
             run_pack_flags = a.split("=", 1)[1]
+        elif a.startswith("--run-env="):
+            run_env = a.split("=", 1)[1]
         elif a.startswith("--run-pack-tool="):
             run_pack_tool = Path(a.split("=", 1)[1])
         else:
@@ -200,12 +204,20 @@ def main():
     if run_ref is not None:
         ids = run_ref.read_text().replace("GENERATED:", " ").split()
         new_kv.append(("baro.run.ref.tokens", " ".join(ids)))
+    if run_env is not None:
+        # How this model must be run, in the file: the MoE profile aborts on
+        # BARO_MEGA=1, which is the engine's own default, so a file that does
+        # not carry its env cannot serve itself.
+        new_kv.append(("baro.run.env", run_env))
     if run_pack_flags is not None:
         new_kv.append(("baro.run.pack.flags", run_pack_flags))
     if run_pack_tool is not None:
         # The pack builder too, so run mode needs no checkout to turn the file's
-        # own weights into the engine's pack.
-        new_kv.append((f"baro.run.src.{run_pack_tool.name}", run_pack_tool.read_text()))
+        # own weights into the engine's pack. It loads gguf-extract.py from its
+        # own directory, so that rides along: without it the pack step dies on
+        # FileNotFoundError for a sibling that only exists in a checkout.
+        for tool in (run_pack_tool, run_pack_tool.parent / "gguf-extract.py"):
+            new_kv.append((f"baro.run.src.{tool.name}", tool.read_text()))
 
     # Existing KVs are copied except any earlier baro.kernel.*/baro.hw.*/baro.run.*
     # set: re-embedding from a BARO file replaces its sources and its scoreboard,

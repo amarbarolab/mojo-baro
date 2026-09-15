@@ -164,8 +164,14 @@ run)
     if [ ! -s "$pack/index.txt" ]; then
       flags=$(kvget baro.run.pack.flags)
       packer=$work/engine-pack.py
-      jq -er '.["baro.run.src.engine-pack.py"]' "$meta" > "$packer" 2>/dev/null \
-        || { packer=$here/tools/engine-pack.py; echo "pack tool: from the checkout (the file carries none)"; }
+      if jq -er '.["baro.run.src.engine-pack.py"]' "$meta" > "$packer" 2>/dev/null; then
+        # engine-pack.py loads gguf-extract.py from its own directory.
+        jq -er '.["baro.run.src.gguf-extract.py"]' "$meta" > "$work/gguf-extract.py" 2>/dev/null \
+          || cp "$here/tools/gguf-extract.py" "$work/gguf-extract.py"
+      else
+        packer=$here/tools/engine-pack.py
+        echo "pack tool: from the checkout (the file carries none)"
+      fi
       echo "building pack from $model with flags '${flags:-none}' (minutes, CPU) ..."
       # shellcheck disable=SC2086
       "$py" "$packer" "$model" "$pack" $flags > "$work/pack.log" 2>&1 \
@@ -181,10 +187,15 @@ run)
     cargo build --release --manifest-path "$here/serve/Cargo.toml" > "$work/cargo.log" 2>&1 \
       || die "cargo build FAILED, see $work/cargo.log"
   fi
+  # The env the file says this model needs (baro.run.env). Without it the MoE
+  # profile dies on the engine's own BARO_MEGA=1 default before its ready line.
+  renv=$(kvget baro.run.env)
+  [ -z "$renv" ] || echo "env from the file: $renv"
   echo "self-reported: every tok/s this server prints came from the harness the"
   echo "self-reported: model file carries, not from a harness a verifier chose."
   echo "self-reported: to produce a citable number run: tools/baro verify $model --append"
-  exec "$bs" --engine "$work/engine" --pack "$pack" --port "$port"
+  # shellcheck disable=SC2086
+  exec env $renv "$bs" --engine "$work/engine" --pack "$pack" --port "$port"
   ;;
 
 *)
