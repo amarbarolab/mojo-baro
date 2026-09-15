@@ -321,3 +321,78 @@ already missing `dump4`/`dump_layer` from a change that predates this
 session; neither is in `run-tests.sh`, and `ci-checks.sh` already skips
 `bench_latent_handoff.mojo` for its external `grammar` import, so both are
 out of this lane's gates and left as a separate, pre-existing finding.
+
+## C3 -- host top-p target fix (SOURCE FIX COMMITTED, refusal NOT lifted, new finding escalated)
+
+Brief `briefs/2026-09-15-c3-b3-lane.md`. Preregistered arms and gates
+(`bench/chat-protocol.md` "C3 fix round: host top-p mass target") run as
+frozen, not redesigned.
+
+**Fix.** `serve/sample_ref.mojo`: dropped `ceil()` from the top-p mass
+target in both `sample_row_ref` and `sample_probs_ref` (the bug was
+duplicated in both functions; fixing only one would have broken gate 3's own
+cross-check between them). `w = top_p * zc`, same clamps as before
+(`[1, zc]`, where `1` is the top-1 token's own mass in these units).
+`kernels/sample.mojo` untouched.
+
+**Three real rows, not one**: `.work/m5/logits-p01.bin` (p01-water, on
+record from M5), `.work/m5/logits-p02.bin` (p02-python-fib),
+`.work/m5/logits-p03.bin` (p03-story), each a one-shot engine run's own MTP
+draft-head logits (regeneration commands in
+`kernels/test_sample_device.mojo`'s docstring). Extended
+`kernels/test_sample_device.mojo` to loop 3 rows x 5 config shapes (added
+the missing standalone top-k-only shape) for gate 1, and added gate 2 (a
+20000-draw chi-square per row/config against a new independent oracle,
+`tools/sample-nucleus-oracle.py`, numpy, computing the correct nucleus set
+and its tempered distribution from scratch -- not derived from either
+sampler file). Real-vocab distributions with more than 60 candidates are
+capped at 60 explicit bins plus one aggregate "rest" bin, a discretionary
+binning choice this round's preregistration did not specify (it froze the
+fix formula, not the real-vocab chi-square's bin scheme).
+
+**Gates 1, 3, 4: clean.** Gate 1: 959/960 per-token draws match (the one
+miss is a deep-tail probability tie, ~1e-11 range, at a scale where
+floating-point noise plausibly flips an argmax between two near-equally
+unlikely candidates on either side, and is not a top-p issue). Gate 3:
+`kernels/test_sample_ref.mojo` stays green; one VS=64 fixture's `df` moved
+10 -> 1 as the preregistration said to expect and report (ceil was not a
+no-op there either -- confirms the bug was never exclusively a real-vocab
+phenomenon, just far more visible there). Gate 4: M5's temperature-0
+byte-identical gate rerun and still PASS -- expected, since
+`serve/sample_ref.mojo` is test-only and never linked into
+`serve/engine.mojo`'s actual decode path, verified rather than assumed.
+
+**Gate 2: mixed, and this is the open item.** The four shapes this round
+actually targets (`T0.8_k30_p1`, `T0.7_k20_p0.8`,
+`T1.3_k12_p0.9_minp0.05`, `T0.5_k0_p0.6`) all PASS cleanly on all three
+rows, chi2 well under the p=0.001 critical value, zero draws landing outside
+the correct candidate set. `T1_k0_p1` (no truncation, `top_p = 1`, the one
+shape the ceil fix cannot touch since `p_on = top_p < 1.0` is false for it)
+**FAILS on 2 of 3 rows**, not marginally (p02: chi2 136.0 vs crit 77.5; p03:
+chi2 555.7 vs crit 86.7; p01 passes, chi2 75.8 vs crit 99.7). In every
+failing case the excess sits almost entirely in the aggregate "rest" bin:
+device draws land in the deep tail more often than the independent oracle
+predicts, and the excess grows as the row's true tail mass shrinks (p01
+true tail 16.3% / observed 17.2%, close; p02 3.8% / 5.2%; p03 0.9% / 2.6%,
+nearly 3x). Not explained by the bug just fixed. Not visible at
+`kernels/test_sample.mojo`'s VS=64 (which already runs the equivalent "T1
+k- p-" case and passes, chi2 11.6 vs crit 40.9 -- a 64-token vocab has no
+deep tail to expose this in).
+
+**Per the round's own frozen falsifier** ("the device fails gate 2 at real
+vocab on any shape; then the device is also wrong and the round widens to
+`kernels/sample.mojo`"), this literally fires. Full numbers in
+`bench/chat-protocol.md`'s "Result 2026-09-15" subsection (append-only,
+under the C3 preregistration). Did not touch `kernels/sample.mojo` and did
+not lift the M5 refusal (which only ever covered `top_p < 1` without
+`min_p` -- `T1_k0_p1` was always allowed and unaffected by the refusal
+either way). Escalated to the coordinator via `herd tell` with the full
+picture and three explicit options (lift for the four covered shapes while
+T1 is tracked separately / hold the whole round / other), rather than
+deciding alone. Committed the source fix and the extended test on their own
+strength regardless of the answer: three of four gates are clean, and the
+fix is correct independent of the T1 finding. `kernels/test_sample_device.mojo`
+is deliberately not wired into `run-tests.sh` (not green yet, per the
+preregistration's own "wire it into run-tests.sh only once green").
+`./run-tests.sh` and `tools/ci-checks.sh` both green (regenerated
+`docs/KERNELS.md` again for the same reason as the M5 commit).
