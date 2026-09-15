@@ -393,21 +393,17 @@ used to dequantize one element per lane per load; the bytes-per-token floor
 is about 3.2 ms (2.7 GB), so the remaining gap is launch-bound small kernels
 in the SSM sub-block and expert time, not bytes.
 
-## Self-describing bakes 2026-09-15 (`aa3f147`, closure PASS from the file)
+## Self-describing bakes 2026-09-15 (`8184f7d`, closure PASS from the file, nothing external)
 
-- `Qwythos-9B-Claude-Mythos-5-1M-MTP-BF16-BARO-aa3f147.gguf` sha256
-  `7eba194adb94986dd...` (`.work/bake/shas.txt`): `tools/gguf-verify.sh` PASS
-  64/64, rebuilt engine 116.3 tok/s_gen on p09 (spec on, one prompt).
-- `RegesCore-1.0-35B-UD-Q4_K_S-BARO-aa3f147.gguf` sha256 `b2a6f176be1b2a0db...`:
+- `Qwythos-9B-Claude-Mythos-5-1M-MTP-BF16-BARO-8184f7d.gguf` sha256
+  `8a0d20fba26b34b0a...` (`.work/bake/shas.txt`): `tools/gguf-verify.sh` PASS
+  64/64, rebuilt engine 118.9 tok/s_gen on p09 (spec on, one prompt).
+- `RegesCore-1.0-35B-UD-Q4_K_S-BARO-8184f7d.gguf` sha256 `a3d719282d1c5aa89...`:
   PASS 64/64, rebuilt engine 93.7 tok/s_gen on p09.
 - Both carry `baro.hw.*` (card, driver, ROCm, power cap, 20-prompt median,
-  config, protocol) and `baro.kernel.model`; `tools/gguf-verify.sh MODEL.gguf`
-  is the contributor's one-command check (`docs/amd-family.md`).
-- **LatentOS vendored** (`briefs/2026-09-15-vendor-latentos.md`): `latentos/`
-  is now a real directory at the repo root (upstream `~/AMDHQ/src/latentos`,
-  same shape as `uregex/`/`minja`/M1), and `tools/embed-files.py` pulls it
-  into the gguf's own `baro.kernel.src.latentos/*` KVs. The two ggufs above
-  (`aa3f147`) predate this and still carry the old external-dependency
-  closure marker; a clone can build the ENGINE from a fresh checkout now, but
-  those two specific files need a re-bake before their own closure is
-  self-contained (coordinator's call, not re-baked by this lane).
+  config, protocol), `baro.kernel.model`, and the vendored `latentos/`
+  package in `baro.kernel.src.latentos/*`, so the closure rebuilds the
+  harness with no path outside the file (`8184f7d` vendored LatentOS; the
+  `aa3f147` bakes needed `~/AMDHQ/src` and are superseded).
+  `tools/gguf-verify.sh MODEL.gguf` is the contributor's one-command check
+  (`docs/amd-family.md`).
