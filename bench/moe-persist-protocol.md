@@ -317,3 +317,13 @@ engine at `.work/moe-perf/engine-r60b`). the maintainer's call whether the line
 stands for a bit-identical fold that reads 111.70 against llama.cpp's
 109.92 (different stints: r60 measured 106.95 in the llama stint and 107.25
 here, so the r60b arm is about 1.6% above the bar, not 2%).
+
+### R6.0b landed on the maintainer's call (2026-09-15)
+
+the maintainer overrode the +5% kill line for this round: the line was set for
+kernel rewrites with regression risk, and R6.0b is a launch fold whose
+output is bit-identical (20/20) with a 1.042 ratio at 1 to 2% spread. The
+override is stated here, not hidden; the line stands for kernel rounds.
+Re-gated on main (the patch re-applied on top of the tier wiring
+`f798ed4`): receipts below.
+Main-tree re-gate (engine sha f52b144e on top of `f798ed4`, `.work/moe-perf/lc-r60b-main.log`, `ab-r60b-main.log`): launches per token 727.0; 20-prompt A/B r60 107.28 (spread 2.0%) -> r60b **111.89** (spread 1.2%), ratio 1.043, identity 20/20, fail word 0 on 40 runs; run-tests 104 PASS, ci-checks 0, census 99 kernels 0 orphans. MoE champion: **111.89 tok/s_gen**, launch path, 727 launches per token; llama.cpp same-box arm 109.92 (different stint, its r60 read 106.95 there).
