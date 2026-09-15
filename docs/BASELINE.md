@@ -76,6 +76,27 @@ engine; its numbers stay in `bench/q8-protocol.md`.
 `spec-k.txt`).** Draft = `blk.32` head; rows verified in one m=k+1 trunk
 window, SSM/conv state in a (k+1)-slot ring so rollback is free.
 
+**Speculation composes with sampling since A1 (2026-09-15, `b3c0d90`,
+`bench/spec-sample-protocol.md`).** The window runs the real rule (accept with
+min(1, p/q) on the truncated distributions, residual draw on the first
+rejection, bonus token from p) instead of refusing to speculate at
+temperature > 0. 20-prompt medians, one stint, dense q4, k=2:
+
+| arm | median tok/s_gen | acceptance |
+|---|---|---|
+| T=0.7 top_p 0.9, spec on | **147.15** | 0.691 |
+| T=0.7 top_p 0.9, spec off | 109.19 | |
+| T=0, spec on | 150.24 | 0.660 |
+| T=0, spec off | 134.97 | |
+
+Two things to read off that table rather than the headline. **Sampling itself
+costs 19% of decode at this vocab** (109.19 against 134.97 with no speculation
+on either side): the device sampler scans 248,320 logits per draw where the
+greedy path does one reduction. And **sampled decoding with speculation is
+faster than greedy decoding without it** (147.15 against 134.97). Falsifier:
+`bench/spec-sample-ab.sh <engine> OUT 0.7 0.9` on this card; a T=0.7 spec
+median below the T=0.7 no-spec median refutes the row.
+
 Headline is the **20-prompt median**, per `bench/PROTOCOL-RULES.md` P4 —
 a single-prompt speculative number is an instrument receipt, never a verdict:
 
