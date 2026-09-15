@@ -109,128 +109,150 @@ Wall clock for the whole sweep: 19.5 s.
 
 ## 2. Expert bytes per token, from the pack index
 
-Source: `.work/moe-w1/pack/index.txt` (733 lines), `.work/moe-w1/pack/pack.bin`
-(21,005,191,680 bytes). Verified directly from the index, not assumed:
+**Correction (this section rewritten after review):** the first version of
+this report read `index.txt` column 4 as a byte count. It is not.
+`tools/engine-pack.py` documents its own index format in its header
+comment: `name dtype offset_bytes n_elem`. Column 4 is the element count,
+not bytes; treating 268,435,456 (the element count of a routed-expert
+tensor, 256 experts x 1024x1024) as if it were a byte count overstated
+every downstream number by roughly 1/0.5625, since q4_k packs 256
+elements into 144 bytes, not one byte per element. The true byte size of
+every tensor is recoverable two ways, and both were checked against each
+other: the block-quant formula (q4_k = 144 B / 256 elem = 0.5625 B/elem,
+q8_0 = 34 B / 32 elem = 1.0625 B/elem, q6_k = 210 B / 256 elem = 0.8203
+B/elem, f32 = 4 B/elem), and directly from the index itself, since tensors
+are laid out contiguously: the byte size of a tensor is the offset gap to
+the next tensor. Both agree exactly, and the sum of every gap across the
+whole index equals `pack.bin`'s size to the byte:
 
 ```
-$ grep -c "ffn_gate_exps.weight" .work/moe-w1/pack/index.txt
-40
-$ grep "ffn_gate_exps.weight\|ffn_up_exps.weight\|ffn_down_exps.weight" \
-    .work/moe-w1/pack/index.txt | awk '{print $4}' | sort -u
-268435456
-$ grep "ffn_gate_inp.weight\b" .work/moe-w1/pack/index.txt | awk '{print $4}' | sort -u
-524288
-$ grep "ffn_gate_inp_shexp" .work/moe-w1/pack/index.txt | awk '{print $4}' | sort -u
-2048
-$ grep -E "ffn_(gate|up|down)_shexp" .work/moe-w1/pack/index.txt | awk '{print $4}' | sort -u
-1048576
+$ python3 - <<'EOF'
+rows = []
+for l in open('.work/moe-w1/pack/index.txt'):
+    name, dt, off, n = l.split()
+    rows.append([name, dt, int(off), int(n)])
+rows.sort(key=lambda r: r[2])
+pack_size = 21005191680
+total = 0
+for i, (name, dt, off, n) in enumerate(rows):
+    nxt = rows[i+1][2] if i+1 < len(rows) else pack_size
+    total += nxt - off
+print(total, pack_size, total == pack_size)
+EOF
+21005191680 21005191680 True
 ```
 
-All 40 blocks carry the routed-expert tensors (`ffn_gate_exps.weight`,
-`ffn_up_exps.weight`, `ffn_down_exps.weight`, q4_k, 268,435,456 bytes each,
-uniform across every block), the shared-expert tensors (q8_0, 1,048,576
-bytes each), and the router (`ffn_gate_inp.weight` f32 524,288 bytes plus
-`ffn_gate_inp_shexp.weight` f32 2,048 bytes). This holds for all 40 blocks
-including the 10 that are classic GQA-only in their attention/SSM trunk;
-the trunk architecture split does not affect the expert tensors.
+Doing this per block also surfaces something the naive uniform read
+missed: **`ffn_down_exps.weight` is not q4_k on every block.** 37 of 40
+blocks are q4_k (150,994,944 bytes for the 256-expert tensor); blocks 34,
+38, and 39 are q6_k (220,200,960 bytes), a higher-precision quant on that
+one matrix only, consistent with this being a "UD" (dynamic-precision)
+GGUF quant that keeps a handful of sensitive tensors wider. `ffn_gate_exps`
+and `ffn_up_exps` are q4_k uniformly across all 40 blocks; the shared
+expert (q8_0, 1,114,112 bytes per matrix) and the router (f32, 2,097,152 +
+8,192 bytes) are uniform too. This affects the total by about 1%, not the
+order of magnitude, but it is the real, non-uniform number, computed per
+block rather than assumed constant.
 
 ### Arithmetic (35B, this pack)
 
 | quantity | bytes | how |
 |---|---|---|
-| bytes per expert per matrix (q4_k) | 1,048,576 (1 MiB) | 268,435,456 / 256 experts |
-| bytes per expert, gate+up+down | 3,145,728 (3 MiB) | 1,048,576 x 3 |
-| top-8 routed experts, per layer, uncached | 25,165,824 (24 MiB) | 3,145,728 x 8 |
-| shared expert, per layer (always active) | 3,145,728 (3 MiB) | 1,048,576 x 3, q8_0 |
-| router, per layer | 526,336 | 524,288 + 2,048 |
-| **per layer, routed only** | 25,165,824 | |
-| **per layer, everything uncached** | 28,837,888 | 25,165,824 + 3,145,728 + 526,336 |
-| **per token, 40 layers, routed only** | **1,006,632,960 (0.9375 GiB, 1.007 GB)** | 25,165,824 x 40 |
-| **per token, 40 layers, everything uncached** | **1,153,515,520 (1.074 GiB, 1.154 GB)** | 28,837,888 x 40 |
+| bytes per expert per matrix, q4_k (37/40 blocks' down, all gate/up) | 589,824 | 150,994,944 / 256 experts |
+| bytes per expert, down matrix only, q6_k (blocks 34, 38, 39) | 860,160 | 220,200,960 / 256 experts |
+| bytes per expert, gate+up+down, q4_k blocks | 1,769,472 | 589,824 x 3 |
+| bytes per expert, gate+up+down, q6_k-down blocks | 2,039,808 | 589,824 x 2 + 860,160 |
+| top-8 routed experts, per layer, q4_k blocks (37 of 40) | 14,155,776 | 1,769,472 x 8 |
+| top-8 routed experts, per layer, q6_k-down blocks (3 of 40) | 16,318,464 | 2,039,808 x 8 |
+| shared expert, per layer (always active, q8_0) | 3,342,336 | 1,114,112 x 3 |
+| router, per layer (f32) | 2,105,344 | 2,097,152 + 8,192 |
+| **per token, 40 layers, routed only** | **572,719,104 (0.573 GB)** | 37 x 14,155,776 + 3 x 16,318,464 |
+| **per token, 40 layers, everything uncached** | **790,626,304 (0.791 GB)** | routed + 40 x (3,342,336 + 2,105,344) |
 
-**This corrects `docs/NEXT-PLAN.md` B4's stated 0.78 GB per token.** The
-measured, index-derived figure for routed experts alone is 1.007 GB per
-token (decimal GB), about 29% higher than the plan's number, and 1.154 GB
-per token if the shared expert and router are also assumed uncached every
-token (they are small and a real implementation would almost certainly
-pin them resident, so 1.007 GB is the more realistic "streamed" quantity
-and 1.154 GB is the pessimistic ceiling). I did not find an arithmetic
-path from this index to 0.78 GB; the plan's figure does not reproduce
-from the pack as measured, and the corrected number should replace it.
+**This confirms, not corrects, `docs/NEXT-PLAN.md` B4's 0.78 GB per
+token figure**, computed correctly (the plan's number was right; the
+error was entirely in this report's first pass, not in the plan). The
+precise, per-block figure including the shared expert and router is
+0.791 GB per token, 1.4% above the plan's stated 0.78 GB, and the gap is
+fully explained by the 3 q6_k-down blocks pushing the uniform-quant
+estimate (0.784 GB) up slightly. Routed experts alone: 0.573 GB per
+token.
 
 ### Scaled to a 100B-class model, same expert width and top-8
 
-The pack fixes bytes-per-expert-per-matrix (1,048,576, tied to hidden
-size and quantization) and top-8 by definition of the brief's scenario.
-The only free variable left for a 100B-class model at the same expert
-width is layer count, and that is a modeling assumption, not a
-measurement: I scaled layer count by total-parameter ratio,
-40 x (100/35) = 114.3 layers, holding expert width, expert count, and
-top-k fixed. A different architecture (wider experts, more experts,
-different layer/width tradeoff) would give a different number; this is
-the same-expert-width, same-top-8 case the brief asked for, nothing more.
+Same method as before: expert width, expert count, and top-k held fixed,
+layer count scaled by total-parameter ratio, 40 x (100/35) = 114.3
+layers. The corrected per-layer average (using the actual 35B pack's
+mixed q4_k/q6_k mix, 572,719,104 / 40 = 14,317,978 bytes routed,
+790,626,304 / 40 = 19,765,658 bytes full) is what gets scaled, since a
+100B-class model's own precision mix is unknown and holding the measured
+average fixed is the same "same expert width" assumption as before,
+applied correctly this time.
 
 | quantity | 35B (measured) | 100B-class (scaled) |
 |---|---|---|
 | layers | 40 | 114.3 |
-| per token, routed only | 1.007 GB | 2.876 GB |
-| per token, everything uncached | 1.154 GB | 3.296 GB |
-| ms/token at 28.7 GB/s H2D, routed only | 35.1 ms | 100.2 ms |
-| ms/token at 28.7 GB/s H2D, everything uncached | 40.2 ms | 114.8 ms |
+| per token, routed only | 0.573 GB | 1.636 GB |
+| per token, everything uncached | 0.791 GB | 2.259 GB |
+| ms/token at 28.78 GB/s H2D, routed only | 19.9 ms | 56.9 ms |
+| ms/token at 28.78 GB/s H2D, everything uncached | 27.5 ms | 78.5 ms |
 
-**This does not confirm `docs/NEXT-PLAN.md`'s "1 to 2 GB per token,
-40 to 80 ms per token" range.** At the corrected per-expert bytes and this
-box's measured PCIe rate, the 100B-class, fully-uncached-per-token number
-is 2.9 to 3.3 GB per token, 100 to 115 ms per token, not 1 to 2 GB / 40 to
-80 ms. The plan's range is low by roughly 1.4x to 1.9x against this
-arithmetic.
+**This confirms `docs/NEXT-PLAN.md`'s "1 to 2 GB per token, 40 to 80 ms
+per token" range**, with one caveat worth stating plainly rather than
+rounding away: the routed-only number (1.636 GB, 56.9 ms) sits
+comfortably inside the plan's range; the everything-uncached number
+(2.259 GB, 78.5 ms) sits just outside the top of the stated 1-2 GB
+band (13% over) while its time figure (78.5 ms) still lands inside the
+stated 40-80 ms. Which of these is the right one to cite depends on
+whether the shared expert and router are assumed resident (a reasonable
+assumption in a real implementation, since they are small, constant
+every token, and the obvious first thing to pin) or streamed from host
+RAM like the routed experts every token (the pessimistic case). With that
+one caveat, the plan's range holds.
 
 ### Resident fraction required to hit a tok/s target
 
 Transfer-only bound: what fraction R of the per-token expert bytes must
 already be resident on-device (zero PCIe cost) so that the remaining
-(1-R) fraction, moved at 28.7 GB/s, fits inside the token budget. This
-is optimistic: it charges the entire token budget to PCIe transfer and
+(1-R) fraction, moved at 28.78 GB/s (this box's measured, 2 GiB H2D
+pinned median, section 1), fits inside the token budget. This is
+optimistic: it charges the entire token budget to PCIe transfer and
 assumes zero time for compute (GEMV, attention, sampling), which is not
 real. A negative or zero R means the uncached case already fits with
 room to spare; it does not mean compute is free.
 
 | model | target | token budget | R (resident fraction needed), routed only | R, everything uncached |
 |---|---|---|---|---|
-| 35B (this pack) | 10 tok/s | 100 ms | 0 (35 ms fits, 2.85x headroom) | 0 (40 ms fits, 2.5x headroom) |
-| 35B (this pack) | 30 tok/s | 33.3 ms | 5.0% | 17.1% |
-| 100B-class (scaled) | 10 tok/s | 100 ms | 0.2% (right at the edge) | 12.9% |
-| 100B-class (scaled) | 30 tok/s | 33.3 ms | 66.7% | 71.0% |
+| 35B (this pack) | 10 tok/s | 100 ms | 0 (19.9 ms fits, 5x headroom) | 0 (27.5 ms fits, 3.6x headroom) |
+| 35B (this pack) | 30 tok/s | 33.3 ms | 0 (19.9 ms fits, 1.7x headroom) | 0 (27.5 ms fits, 1.2x headroom) |
+| 100B-class (scaled) | 10 tok/s | 100 ms | 0 (56.9 ms fits, 1.8x headroom) | 0 (78.5 ms fits, 1.3x headroom) |
+| 100B-class (scaled) | 30 tok/s | 33.3 ms | 41.4% | 57.5% |
 
 ## What this means for B4's feasibility
 
-- **Our existing 35B MoE, at 10 tok/s, does not need locality at all on
-  transfer time alone**: uncached per-token streaming costs 35 to 40 ms
-  against a 100 ms budget, with headroom left for compute. At 30 tok/s
-  the transfer-only budget is tight (5% to 17% residency required) but
-  not implausible.
-- **The 100B-class extrapolation does not clear the interactive bar at
-  measured rates, once compute time is accounted for.** At 10 tok/s the
-  transfer-only bound is right at the wall (0.2% to 13% residency,
-  meaning essentially the entire compute budget would need to run inside
-  whatever margin residency buys, which the 0% case does not have); at
-  30 tok/s, two-thirds to three-quarters of every token's expert bytes
-  would need to already be resident on the 24 GB card. That is a strong
-  locality requirement, not the light caching implied by "prefetch hides
-  most of it" in the plan's phrasing, and it is stronger than either the
-  bytes-per-token or the ms-per-token numbers the plan currently states.
-  **The claim as currently phrased in `docs/NEXT-PLAN.md` (0.78 GB,
-  40 to 80 ms) does not hold against this pack's measured arithmetic; the
-  corrected numbers (1.0 to 1.15 GB at 35B, 2.9 to 3.3 GB at 100B-class,
-  35 to 115 ms depending on scale and cache assumption) make the 30 tok/s
-  target for a 100B-class model dependent on a specific, large (roughly
-  two-thirds) resident fraction that stage 2 has not yet shown is
-  achievable, and the 10 tok/s target has much less margin than stated.**
+- **Our existing 35B MoE needs no residency on transfer time alone, at
+  either 10 or 30 tok/s.** Uncached per-token streaming costs 19.9 to
+  27.5 ms; even the 30 tok/s budget (33.3 ms) has headroom left over for
+  compute (1.2x to 1.7x depending on whether the shared expert and router
+  are assumed resident).
+- **The 100B-class extrapolation clears 10 tok/s on transfer time alone
+  (56.9 to 78.5 ms against a 100 ms budget), but 30 tok/s requires real
+  locality.** At 30 tok/s the transfer-only bound needs 41% to 58% of
+  every token's expert bytes to already be resident on the 24 GB card;
+  that is the point at which B4's claim stops being "streaming with light
+  prefetch" and starts depending on a specific, large cache-hit rate that
+  stage 2 has not yet shown is achievable.
+- **`docs/NEXT-PLAN.md`'s stated numbers (0.78 GB, 1 to 2 GB at 100B-class,
+  40 to 80 ms) hold, with the one caveat above about whether the shared
+  expert and router are counted as streamed or resident.** The claim that
+  needed correcting was this report's first pass, not the plan.
 - This is a transfer-only bound in B4's favor: it assumes zero compute
   time competes with the PCIe budget. Real per-token compute (GEMV over
   the resident and freshly-streamed experts, attention, sampling) will
   eat into the same token budget, so every resident-fraction number above
-  is a floor, not a sufficient condition.
+  is a floor, not a sufficient condition, and the 10 tok/s "0 residency
+  needed" rows are transfer-only headroom, not a claim that compute is
+  free.
 
 ## The one question stage 2 must answer first
 
@@ -246,11 +268,12 @@ overlaps a compute kernel; it was not tested here and is out of this
 stage's scope. If transfer-compute overlap is real and substantial on
 this card, the resident-fraction requirements in section 2 shrink
 sharply and B4's claim gets much more room. If it is not, or is small,
-the 30 tok/s / 100B-class case likely needs the roughly two-thirds
-residency this report computed, which is a strong constraint on host-RAM
-streaming as B4 currently frames it. Stage 2 should answer this before
-building any engine changes, host tier, or LRU on top of an unverified
-overlap assumption.
+the 30 tok/s / 100B-class case likely needs the 41% to 58% residency
+this report computed, which is a real constraint on host-RAM streaming
+as B4 currently frames it, even though the 10 tok/s case and the plan's
+bytes-per-token range hold up without it. Stage 2 should answer this
+before building any engine changes, host tier, or LRU on top of an
+unverified overlap assumption.
 
 ## GPU minutes used
 
