@@ -3,12 +3,12 @@ from max.gpu.host import DeviceContext, DeviceBuffer
 from layout import TileTensor, TensorLayout, row_major
 
 from elementwise import (
-    amar_rmsnorm, amar_rmsnorm_cast, amar_embed_lookup_pos, amar_argmax_pos, amar_tok_copy, amar_tok_remap,
+    amar_rmsnorm, amar_rmsnorm_cast, amar_rmsnorm_cast2, amar_embed_lookup_pos, amar_argmax_pos, amar_tok_copy, amar_tok_remap,
     amar_quantize_q8_rows,
 )
 from matmul_skinny import (
     amar_matmul_skinny_q8row, amar_matmul_skinny_q4rowb, amar_skinny_reduce, amar_skinny_reduce_add,
-    amar_skinny_reduce_swiglu_bf16, amar_matmul_skinny_q8dot, SM, SPLITK, ROW_WAVES, ROW_THREADS,
+    amar_skinny_reduce_swiglu_bf16, amar_matmul_skinny_q8dot, amar_matmul_skinny_m1_row2, SM, SPLITK, ROW_WAVES, ROW_THREADS,
 )
 from matmul_ternary import (
     amar_matmul_skinny_q2b3row, amar_matmul_skinny_tq1row, amar_matmul_skinny_tq2row,
@@ -31,7 +31,7 @@ from attn import (
     amar_attn_prefill, amar_attn_prefill_wmma, HD, NQH, NKVH, KVT, TCAP, KVPAGE, KVHSTR, PA_ROWS, PW_ROWS, PW_THREADS,
 )
 from model import H, FFN, VOCAB, QF, KV, N_LAYERS, N_SSM, N_ATT, MEGA_ALLOWED, IS_MOE
-from moe import amar_moe_down_q6k
+from moe import amar_moe_down_q6k, amar_moe_router_top8_sig, moe_down_q8_0_res
 
 comptime TMAX = 1088
 comptime GEN_N = 64

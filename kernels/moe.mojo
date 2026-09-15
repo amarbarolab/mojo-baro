@@ -109,6 +109,71 @@ def amar_moe_router_top8[
             W[j] = rebind[W.ElementType](rebind[Scalar[f32]](W[j]) / wsum)
 
 
+def amar_moe_router_top8_sig[
+    LLayout: TensorLayout, ILayout: TensorLayout, WLayout: TensorLayout,
+    XLayout: TensorLayout, GLayout: TensorLayout, OLayout: TensorLayout
+](
+    L: TileTensor[f32, LLayout, MutAnyOrigin],
+    IDX: TileTensor[i32, ILayout, MutAnyOrigin],
+    W: TileTensor[f32, WLayout, MutAnyOrigin],
+    X: TileTensor[f32, XLayout, MutAnyOrigin],
+    G: TileTensor[f32, GLayout, MutAnyOrigin],
+    O: TileTensor[f32, OLayout, MutAnyOrigin],
+    k_dim: Int32,
+):
+    comptime assert L.flat_rank == 1 and IDX.flat_rank == 1 and W.flat_rank == 1
+    comptime assert X.flat_rank == 1 and G.flat_rank == 1 and O.flat_rank == 1
+    comptime PER = N_EXP // WARP_SIZE
+    var lane = Int(lane_id())
+    var v = InlineArray[Scalar[f32], PER](uninitialized=True)
+    var lm = Scalar[f32](-3.4028234663852886e38)
+    comptime for m in range(PER):
+        v[m] = rebind[Scalar[f32]](L[lane + m * WARP_SIZE])
+        if v[m] > lm:
+            lm = v[m]
+    var mx = warp.max(lm)
+    var ls = Scalar[f32](0)
+    comptime for m in range(PER):
+        v[m] = exp(v[m] - mx)
+        ls += v[m]
+    var tot = warp.sum(ls)
+    comptime for m in range(PER):
+        v[m] = v[m] / tot
+    var wsum = Scalar[f32](0)
+    for j in range(TOPK):
+        var best = Scalar[f32](-1)
+        var bi = N_EXP
+        comptime for m in range(PER):
+            if v[m] > best:
+                best = v[m]
+                bi = lane + m * WARP_SIZE
+        var gbest = warp.max(best)
+        var cand = bi if best == gbest else N_EXP
+        var gi = -warp.max(-cand)
+        if gi == bi and best == gbest:
+            comptime for m in range(PER):
+                if lane + m * WARP_SIZE == gi:
+                    v[m] = Scalar[f32](-1)
+        if lane == 0:
+            IDX[j] = rebind[IDX.ElementType](Int32(gi))
+            W[j] = rebind[W.ElementType](gbest)
+        wsum += gbest
+    if lane == 0:
+        for j in range(TOPK):
+            W[j] = rebind[W.ElementType](rebind[Scalar[f32]](W[j]) / wsum)
+    var K = Int(k_dim)
+    var Xv = X.vectorize[8]()
+    var Gv = G.vectorize[8]()
+    var acc = SIMD[f32, 8](0)
+    var i = lane
+    while i < K // 8:
+        acc = fma(rebind[SIMD[f32, 8]](Xv[i]), rebind[SIMD[f32, 8]](Gv[i]), acc)
+        i += WARP_SIZE
+    var t = warp.sum(acc.reduce_add())
+    if lane == 0:
+        O[0] = rebind[O.ElementType](Scalar[f32](1) / (Scalar[f32](1) + exp(-t)))
+
+
 def amar_moe_sig_gate[
     XLayout: TensorLayout, GLayout: TensorLayout, OLayout: TensorLayout
 ](
@@ -438,24 +503,6 @@ def moe_matmul_q8_0_m1[
         O[row] = rebind[O.ElementType](dot)
 
 
-def moe_add3[
-    ALayout: TensorLayout, BLayout: TensorLayout, XLayout: TensorLayout,
-](
-    A: TileTensor[f32, ALayout, MutAnyOrigin],
-    B: TileTensor[f32, BLayout, MutAnyOrigin],
-    X: TileTensor[f32, XLayout, MutAnyOrigin],
-    n: Int32,
-):
-    comptime assert A.flat_rank == 1 and B.flat_rank == 1 and X.flat_rank == 1
-    var i = global_idx.x
-    if i < Int(n):
-        X[i] = rebind[X.ElementType](
-            rebind[Scalar[f32]](X[i])
-            + rebind[Scalar[f32]](A[i])
-            + rebind[Scalar[f32]](B[i])
-        )
-
-
 def moe_sig_gate_q8_0[
     XLayout: TensorLayout, OLayout: TensorLayout,
 ](
@@ -472,12 +519,12 @@ def moe_sig_gate_q8_0[
 
 def moe_gate_up_q8_0[
     NSEL: Int, FFN: Int,
-    XLayout: TensorLayout, ILayout: TensorLayout, HLayout: TensorLayout,
+    XLayout: TensorLayout, ILayout: TensorLayout, HLayout: TensorLayout, out_dt: DType = f32,
 ](
     X: TileTensor[bf16, XLayout, MutAnyOrigin],
     W: MutPointer[Scalar[u8], MutAnyOrigin],
     IDX: TileTensor[i32, ILayout, MutAnyOrigin],
-    HO: TileTensor[f32, HLayout, MutAnyOrigin],
+    HO: TileTensor[out_dt, HLayout, MutAnyOrigin],
     k_dim: Int32,
     row_bytes: Int32,
     up_offset: Int32,
@@ -493,7 +540,7 @@ def moe_gate_up_q8_0[
     var g = q8_0_row_dot(X, W, 0, row_base, Int(k_dim))
     var u = q8_0_row_dot(X, W, 0, row_base + Int(up_offset), Int(k_dim))
     if lane_id() == 0:
-        HO[wid] = rebind[HO.ElementType](g / (Scalar[f32](1) + exp(-g)) * u)
+        HO[wid] = rebind[HO.ElementType]((g / (Scalar[f32](1) + exp(-g)) * u).cast[out_dt]())
 
 
 def moe_down_q8_0[
@@ -520,6 +567,35 @@ def moe_down_q8_0[
         out += rebind[Scalar[f32]](WT[j]) * q8_0_row_dot(Hb, WD, j, row_base, FFN)
     if lane_id() == 0:
         O[c] = rebind[O.ElementType](out)
+
+
+def moe_down_q8_0_res[
+    NSEL: Int, FFN: Int,
+    HLayout: TensorLayout, ILayout: TensorLayout, WLayout: TensorLayout,
+    ALayout: TensorLayout, XLayout: TensorLayout,
+](
+    Hb: TileTensor[bf16, HLayout, MutAnyOrigin],
+    WD: MutPointer[Scalar[u8], MutAnyOrigin],
+    IDX: TileTensor[i32, ILayout, MutAnyOrigin],
+    WT: TileTensor[f32, WLayout, MutAnyOrigin],
+    A: TileTensor[f32, ALayout, MutAnyOrigin],
+    X: TileTensor[f32, XLayout, MutAnyOrigin],
+    n: Int32,
+    row_bytes: Int32,
+):
+    comptime assert Hb.flat_rank == 2 and IDX.flat_rank == 1 and WT.flat_rank == 1 and A.flat_rank == 1 and X.flat_rank == 1
+    var c = Int(block_idx.x) * MOE_WAVES + Int(thread_idx.x) // WARP_SIZE
+    if c >= Int(n):
+        return
+    var out = Scalar[f32](0)
+    for j in range(NSEL):
+        var e = Int(rebind[Scalar[i32]](IDX[j]))
+        var row_base = (e * Int(n) + c) * Int(row_bytes)
+        out += rebind[Scalar[f32]](WT[j]) * q8_0_row_dot(Hb, WD, j, row_base, FFN)
+    if lane_id() == 0:
+        X[c] = rebind[X.ElementType](
+            rebind[Scalar[f32]](X[c]) + rebind[Scalar[f32]](A[c]) + out
+        )
 
 
 def amar_moe_gate_up_q4k[
@@ -550,12 +626,12 @@ def amar_moe_gate_up_q4k[
 
 def moe_gate_up_q4k_pack[
     NSEL: Int, FFN: Int,
-    XLayout: TensorLayout, ILayout: TensorLayout, HLayout: TensorLayout
+    XLayout: TensorLayout, ILayout: TensorLayout, HLayout: TensorLayout, out_dt: DType = f32
 ](
     Xb: TileTensor[bf16, XLayout, MutAnyOrigin],
     W: MutPointer[Scalar[u8], MutAnyOrigin],
     IDX: TileTensor[i32, ILayout, MutAnyOrigin],
-    HO: TileTensor[f32, HLayout, MutAnyOrigin],
+    HO: TileTensor[out_dt, HLayout, MutAnyOrigin],
     k_dim: Int32,
     up_offset: Int32,
 ):
@@ -571,7 +647,7 @@ def moe_gate_up_q4k_pack[
     var g = q4k_dot_blocks(Xb, W, 0, row_base, Int(k_dim))
     var u = q4k_dot_blocks(Xb, W, 0, row_base + Int(up_offset), Int(k_dim))
     if lane_id() == 0:
-        HO[wid] = rebind[HO.ElementType](g / (Scalar[f32](1) + exp(-g)) * u)
+        HO[wid] = rebind[HO.ElementType]((g / (Scalar[f32](1) + exp(-g)) * u).cast[out_dt]())
 
 
 def amar_moe_down_q4k[

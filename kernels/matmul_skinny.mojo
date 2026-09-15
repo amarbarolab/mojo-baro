@@ -254,6 +254,60 @@ def amar_matmul_skinny_m1_row[
         O[row] = rebind[O.ElementType](total)
 
 
+def amar_matmul_skinny_m1_row2[
+    in_dtype: DType, UNROLL: Int,
+    ALayout: TensorLayout, WLayout: TensorLayout, OLayout: TensorLayout
+](
+    A: TileTensor[in_dtype, ALayout, MutAnyOrigin],
+    W1: TileTensor[in_dtype, WLayout, MutAnyOrigin],
+    W2: TileTensor[in_dtype, WLayout, MutAnyOrigin],
+    O1: TileTensor[dtype, OLayout, MutAnyOrigin],
+    O2: TileTensor[dtype, OLayout, MutAnyOrigin],
+    n: Int32,
+    k_dim: Int32,
+):
+    comptime assert A.flat_rank == 2 and W1.flat_rank == 2 and O1.flat_rank == 1
+
+    var N = Int(n)
+    var K = Int(k_dim)
+    var lane = Int(lane_id())
+    var row = Int(block_idx.x) * ROW_WAVES + Int(thread_idx.x) // WARP_SIZE
+    if row >= 2 * N:
+        return
+    var second = row >= N
+    if second:
+        row -= N
+
+    var Wv = W2.vectorize[1, ROW_VEC]() if second else W1.vectorize[1, ROW_VEC]()
+    var Av = A.vectorize[1, ROW_VEC]()
+    comptime STEP = WARP_SIZE * ROW_VEC
+    var acc = SIMD[dtype, ROW_VEC](0)
+
+    var kk = 0
+    while kk + UNROLL * STEP <= K:
+        var ws = InlineArray[SIMD[in_dtype, ROW_VEC], UNROLL](uninitialized=True)
+
+        comptime for u in range(UNROLL):
+            ws[u] = rebind[SIMD[in_dtype, ROW_VEC]](Wv[row, (kk + u * STEP) // ROW_VEC + lane])
+
+        comptime for u in range(UNROLL):
+            var a = rebind[SIMD[in_dtype, ROW_VEC]](Av[0, (kk + u * STEP) // ROW_VEC + lane]).cast[dtype]()
+            acc += ws[u].cast[dtype]() * a
+        kk += UNROLL * STEP
+    while kk < K:
+        var w = rebind[SIMD[in_dtype, ROW_VEC]](Wv[row, kk // ROW_VEC + lane]).cast[dtype]()
+        var a = rebind[SIMD[in_dtype, ROW_VEC]](Av[0, kk // ROW_VEC + lane]).cast[dtype]()
+        acc += w * a
+        kk += STEP
+
+    var total = warp.sum(acc.reduce_add())
+    if lane == 0:
+        if second:
+            O2[row] = rebind[O2.ElementType](total)
+        else:
+            O1[row] = rebind[O1.ElementType](total)
+
+
 def amar_matmul_skinny_q8row[
     UNROLL: Int, MR: Int,
     ALayout: TensorLayout, QLayout: TensorLayout, SLayout: TensorLayout,

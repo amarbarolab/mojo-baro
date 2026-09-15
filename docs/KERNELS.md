@@ -24,6 +24,7 @@ must be reachable from `serve/registry.mojo`, a bench, or a test.
 | `amar_quantize_q8_rows` | `elementwise.mojo` | `ALayout: TensorLayout, QLayout: TensorLayout, SLayout: TensorLayout` |  | serve/registry.mojo, bench/bench_coldcache_mrow.mojo |
 | `amar_rmsnorm` | `elementwise.mojo` | `XLayout: TensorLayout, GLayout: TensorLayout, OLayout: TensorLayout` | rms_m, rms_h2 | serve/registry.mojo, kernels/test_attn_block.mojo, kernels/test_elementwise.mojo, kernels/test_mega_block.mojo, kernels/test_ssm_block.mojo |
 | `amar_rmsnorm_cast` | `elementwise.mojo` | `XLayout: TensorLayout, GLayout: TensorLayout, OLayout: TensorLayout` | rmsc_k, rmsc_h2, rmsc_p | serve/registry.mojo, serve/spark.mojo, kernels/test_mega_block.mojo |
+| `amar_rmsnorm_cast2` | `elementwise.mojo` | `XLayout: TensorLayout, GLayout: TensorLayout, OLayout: TensorLayout, FLayout: TensorLayout` |  | serve/registry.mojo |
 | `amar_rope_rows` | `elementwise.mojo` | `XLayout: TensorLayout` |  | kernels/test_elementwise.mojo |
 | `amar_softmax_rows` | `elementwise.mojo` | `XLayout: TensorLayout` |  | kernels/test_elementwise.mojo |
 | `amar_swiglu` | `elementwise.mojo` | `GLayout: TensorLayout, ULayout: TensorLayout, OLayout: TensorLayout` |  | kernels/test_elementwise.mojo, kernels/test_q8_gemm.mojo |
@@ -44,6 +45,7 @@ must be reachable from `serve/registry.mojo`, a bench, or a test.
 | `amar_matmul_skinny` | `matmul_skinny.mojo` | `in_dtype: DType, ALayout: TensorLayout, BLayout: TensorLayout, PLayout: TensorLayout` |  | bench/bench_coldcache.mojo, bench/bench_decode.mojo, kernels/test_attn_block.mojo, kernels/test_gguf_gemm.mojo, kernels/test_q8_gemm.mojo, kernels/test_ssm_block.mojo |
 | `amar_matmul_skinny_m1` | `matmul_skinny.mojo` | `in_dtype: DType, CPT: Int, ALayout: TensorLayout, BLayout: TensorLayout, PLayout: TensorLayout` |  | bench/bench_coldcache_m1.mojo, bench/bench_coldcache_q8row.mojo, bench/bench_coldcache_row.mojo |
 | `amar_matmul_skinny_m1_row` | `matmul_skinny.mojo` | `in_dtype: DType, UNROLL: Int, ALayout: TensorLayout, WLayout: TensorLayout, OLayout: TensorLayout` |  | bench/bench_coldcache_q8row.mojo, bench/bench_coldcache_row.mojo, kernels/test_moe_block.mojo |
+| `amar_matmul_skinny_m1_row2` | `matmul_skinny.mojo` | `in_dtype: DType, UNROLL: Int, ALayout: TensorLayout, WLayout: TensorLayout, OLayout: TensorLayout` |  | serve/registry.mojo |
 | `amar_matmul_skinny_q4row` | `matmul_skinny.mojo` | `UNROLL: Int, MR: Int, ALayout: TensorLayout, QLayout: TensorLayout, SLayout: TensorLayout, PLayout: TensorLayout` |  | bench/bench_coldcache_mrow.mojo, kernels/test_mega_block.mojo |
 | `amar_matmul_skinny_q4rowb` | `matmul_skinny.mojo` | `UNROLL: Int, MR: Int, ALayout: TensorLayout, QLayout: TensorLayout, SLayout: TensorLayout, PLayout: TensorLayout, KSPLIT: Int = 1` |  | serve/registry.mojo, bench/bench_coldcache_mrow.mojo, bench/bench_fixedm_kernel_invariance.mojo, bench/bench_prefill.mojo, bench/bench_prefill_abl.mojo, kernels/test_prefill.mojo |
 | `amar_matmul_skinny_q8b` | `matmul_skinny.mojo` | `ALayout: TensorLayout, QLayout: TensorLayout, SLayout: TensorLayout, PLayout: TensorLayout` |  | bench/bench_coldcache.mojo, kernels/test_q8_gemm.mojo |
@@ -68,6 +70,7 @@ must be reachable from `serve/registry.mojo`, a bench, or a test.
 | `amar_moe_gate_up` | `moe.mojo` | `NSEL: Int, FFN: Int, XLayout: TensorLayout, GLayout: TensorLayout, ULayout: TensorLayout, ILayout: TensorLayout, HLayout: TensorLayout` |  | kernels/test_moe_block.mojo |
 | `amar_moe_gate_up_q4k` | `moe.mojo` | `NSEL: Int, FFN: Int, XLayout: TensorLayout, ILayout: TensorLayout, HLayout: TensorLayout` |  | kernels/test_moe_block.mojo |
 | `amar_moe_router_top8` | `moe.mojo` | `LLayout: TensorLayout, ILayout: TensorLayout, WLayout: TensorLayout` |  | kernels/test_moe_block.mojo |
+| `amar_moe_router_top8_sig` | `moe.mojo` | `LLayout: TensorLayout, ILayout: TensorLayout, WLayout: TensorLayout, XLayout: TensorLayout, GLayout: TensorLayout, OLayout: TensorLayout` |  | serve/registry.mojo |
 | `amar_moe_sig_gate` | `moe.mojo` | `XLayout: TensorLayout, GLayout: TensorLayout, OLayout: TensorLayout` |  | kernels/test_moe_block.mojo |
 | `amar_realign_gather` | `realign_kernels.mojo` | `TLayout: TensorLayout, PLayout: TensorLayout, PartLayout: TensorLayout` |  | kernels/test_realign.mojo |
 | `amar_realign_reduce` | `realign_kernels.mojo` | `PartLayout: TensorLayout, ELayout: TensorLayout` |  | kernels/test_realign.mojo |
