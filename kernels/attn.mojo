@@ -284,6 +284,78 @@ def amar_kv_append[
     )
 
 
+def amar_head_rmsnorm_rope[
+    XLayout: TensorLayout, GLayout: TensorLayout
+](
+    X: TileTensor[f32, XLayout, MutAnyOrigin],
+    G: TileTensor[f32, GLayout, MutAnyOrigin],
+    eps: Float32,
+    pos: Int32,
+    nh: Int32,
+):
+    comptime assert X.flat_rank == 2 and G.flat_rank == 1
+    var row = Int(block_idx.x)
+    var d = thread_idx.x
+    var v = rebind[Scalar[f32]](X[row, d])
+    var ssq = warp.sum(v * v)
+    var sums = stack_allocation[f32, address_space = AddressSpace.SHARED](
+        row_major[HD // WARP_SIZE]()
+    )
+    if lane_id() == 0:
+        sums[d // WARP_SIZE] = rebind[sums.ElementType](ssq)
+    barrier()
+    var total: Float32 = 0
+    comptime for w in range(HD // WARP_SIZE):
+        total += rebind[Scalar[f32]](sums[w])
+    X[row, d] = rebind[X.ElementType](
+        v * rsqrt(total / Float32(HD) + eps) * rebind[Scalar[f32]](G[d])
+    )
+    barrier()
+    var j = Int(d)
+    if j >= NROT // 2:
+        return
+    var r = row // Int(nh)
+    var theta_ex = Float32(Int(pos) + r) * exp(
+        Float32(-2 * j) / Float32(NROT) * log(FREQ_BASE)
+    )
+    var theta_in = FREQ_SCALE * theta_ex
+    var ramp = (Float32(j) - YARN_LOW) / max(YARN_HIGH - YARN_LOW, 0.001)
+    ramp = min(max(ramp, 0), 1)
+    var theta = theta_in * (1 - ramp) + theta_ex * ramp
+    var c = cos(theta) * MSCALE
+    var s = sin(theta) * MSCALE
+    var x0 = rebind[Scalar[f32]](X[row, j])
+    var x1 = rebind[Scalar[f32]](X[row, j + NROT // 2])
+    X[row, j] = rebind[X.ElementType](x0 * c - x1 * s)
+    X[row, j + NROT // 2] = rebind[X.ElementType](x0 * s + x1 * c)
+
+
+def amar_kv_append2[
+    CLayout: TensorLayout, NLayout: TensorLayout, NAT: Int
+](
+    Kc: TileTensor[KVT, CLayout, MutAnyOrigin],
+    Vc: TileTensor[KVT, CLayout, MutAnyOrigin],
+    Kn: TileTensor[f32, NLayout, MutAnyOrigin],
+    Vn: TileTensor[f32, NLayout, MutAnyOrigin],
+    t_idx: Int32,
+    att_i: Int32,
+):
+    comptime assert Kc.flat_rank == 1 and Kn.flat_rank == 2
+    var h = block_idx.x
+    var r = Int(block_idx.y)
+    var d = thread_idx.x
+    var t = Int(t_idx) + r
+    var cb = kv_off[NAT](t, Int(att_i), Int(h)) + Int(d)
+    if block_idx.z == 0:
+        Kc.ptr[unsafe_offset=cb] = rebind[Scalar[KVT]](
+            rebind[Scalar[f32]](Kn[r * NKVH + h, d]).cast[KVT]()
+        )
+    else:
+        Vc.ptr[unsafe_offset=cb] = rebind[Scalar[KVT]](
+            rebind[Scalar[f32]](Vn[r * NKVH + h, d]).cast[KVT]()
+        )
+
+
 comptime PA_TK = 16
 comptime PA_ROWS = 2
 comptime PA_KS = HD + 4

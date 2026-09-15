@@ -27,11 +27,12 @@ from mega import amar_mega_token, amar_mega_window, MEGA_G, MEGA_G_WIN, DATT_NLD
 from sample import amar_sample_row, amar_sample_probs, amar_spec_accept, SAMP_THREADS
 from dattn import amar_dattn_split, amar_dattn_combine, dattn_nsplit
 from attn import (
+    amar_head_rmsnorm_rope, amar_kv_append2,
     amar_head_rmsnorm, amar_attn_decode, amar_gate_mul_cast, amar_qgate_split, amar_rope_yarn, amar_kv_append,
     amar_attn_prefill, amar_attn_prefill_wmma, HD, NQH, NKVH, KVT, TCAP, KVPAGE, KVHSTR, PA_ROWS, PW_ROWS, PW_THREADS,
 )
 from model import H, FFN, VOCAB, QF, KV, N_LAYERS, N_SSM, N_ATT, MEGA_ALLOWED, IS_MOE
-from moe import amar_moe_down_q6k, amar_moe_router_top8_sig, moe_down_q8_0_res
+from moe import amar_moe_down_q6k, amar_moe_router_top8_sig, moe_down_q8_0_res, moe_matmul_q8_0_m1_add
 
 comptime TMAX = 1088
 comptime GEN_N = 64
@@ -244,6 +245,9 @@ comptime hrms_kv = amar_head_rmsnorm[type_of(kvm_layout), type_of(hd_layout)]
 comptime rope_q = amar_rope_yarn[type_of(qm_layout)]
 comptime rope_k = amar_rope_yarn[type_of(kvm_layout)]
 comptime append_k = amar_kv_append[type_of(cache_layout), type_of(kvm_layout), N_ATT]
+comptime append2_k = amar_kv_append2[type_of(cache_layout), type_of(kvm_layout), N_ATT]
+comptime hrr_q = amar_head_rmsnorm_rope[type_of(qm_layout), type_of(hd_layout)]
+comptime hrr_kv = amar_head_rmsnorm_rope[type_of(kvm_layout), type_of(hd_layout)]
 comptime append_1 = amar_kv_append[type_of(cache1_layout), type_of(kvm_layout), 1]
 comptime att_k = amar_attn_decode[type_of(qm_layout), type_of(cache_layout), type_of(qm_layout), N_ATT]
 comptime att_1 = amar_attn_decode[type_of(qm_layout), type_of(cache1_layout), type_of(qm_layout), 1]

@@ -503,6 +503,27 @@ def moe_matmul_q8_0_m1[
         O[row] = rebind[O.ElementType](dot)
 
 
+def moe_matmul_q8_0_m1_add[
+    OLayout: TensorLayout, ALayout: TensorLayout, XLayout: TensorLayout,
+](
+    A: TileTensor[bf16, ALayout, MutAnyOrigin],
+    W: MutPointer[Scalar[u8], MutAnyOrigin],
+    O: TileTensor[f32, OLayout, MutAnyOrigin],
+    X: TileTensor[f32, XLayout, MutAnyOrigin],
+    n: Int32,
+    k_dim: Int32,
+    row_bytes: Int32,
+):
+    comptime assert A.flat_rank == 2 and O.flat_rank == 1 and X.flat_rank == 1
+    var row = Int(block_idx.x) * MOE_WAVES + Int(thread_idx.x) // WARP_SIZE
+    if row >= Int(n):
+        return
+    var dot = q8_0_row_dot(A, W, 0, row * Int(row_bytes), Int(k_dim))
+    if lane_id() == 0:
+        O[row] = rebind[O.ElementType](dot)
+        X[row] = rebind[X.ElementType](rebind[Scalar[f32]](X[row]) + dot)
+
+
 def moe_sig_gate_q8_0[
     XLayout: TensorLayout, OLayout: TensorLayout,
 ](

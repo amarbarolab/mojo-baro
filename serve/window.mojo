@@ -16,7 +16,7 @@ from registry import *
 from expert_tier import ExpertTier
 from serve_proto import SampleParams
 from moe import (
-    moe_embed_q8_0_pos, moe_matmul_q8_0_m1,
+    moe_embed_q8_0_pos, moe_matmul_q8_0_m1, moe_matmul_q8_0_m1_add,
     amar_moe_router_top8_sig, moe_gate_up_q4k_pack,
     amar_moe_down_q4k, amar_moe_down_q6k, moe_gate_up_q8_0, moe_down_q8_0_res,
     MOE_WAVES, MOE_THREADS, N_EXP, TOPK, E_FFN, SH_FFN,
@@ -979,9 +979,10 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                     gemm_w[QF, H](ctx, CurBm, b.wbuf, b.off[w + 1], cfg.pack_q4, Pqf, m)
                 else:
                     ctx.enqueue_function[moe_matmul_q8_0_m1[type_of(h_layout), type_of(xm_layout)]](
-                        CurBm, b.wbuf.unsafe_ptr().unsafe_offset(b.off[moe_base + 1]), row_f32(ctx, b.p_qf_d, 0, QF, h_layout), Int32(QF), Int32(H), Int32((H // 32) * 34),
+                        CurBm, b.wbuf.unsafe_ptr().unsafe_offset(b.off[moe_base + 1]), row_f32(ctx, b.qf_d, 0, QF, h_layout), Int32(QF), Int32(H), Int32((H // 32) * 34),
                         grid_dim=ceildiv(QF, 8), block_dim=256)
-                ctx.enqueue_function[r_qf](Pqf, Qfm, Int32(m), Int32(QF), grid_dim=ceildiv(m * QF, 256), block_dim=256)
+                comptime if MEGA_ALLOWED:
+                    ctx.enqueue_function[r_qf](Pqf, Qfm, Int32(m), Int32(QF), grid_dim=ceildiv(m * QF, 256), block_dim=256)
                 if cfg.dump4 and cfg.dump and m == 1 and layer == cfg.dump_layer and st.pos + 1 >= cfg.n_prompt:
                     # slots 8-11: llama Qcur_full-N, the fused q+gate projection
                     ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr().unsafe_offset(8 * H), QF, owning=False), src_buf=DeviceBuffer[f32](ctx, b.qf_d.unsafe_ptr(), QF, owning=False))
@@ -989,35 +990,45 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                     gemm_w[KV, H](ctx, CurBm, b.wbuf, b.off[w + 2], cfg.pack_q4, Pkv, m)
                 else:
                     ctx.enqueue_function[moe_matmul_q8_0_m1[type_of(h_layout), type_of(xm_layout)]](
-                        CurBm, b.wbuf.unsafe_ptr().unsafe_offset(b.off[moe_base + 2]), row_f32(ctx, b.p_kv_d, 0, KV, h_layout), Int32(KV), Int32(H), Int32((H // 32) * 34),
+                        CurBm, b.wbuf.unsafe_ptr().unsafe_offset(b.off[moe_base + 2]), row_f32(ctx, b.k_d, 0, KV, h_layout), Int32(KV), Int32(H), Int32((H // 32) * 34),
                         grid_dim=ceildiv(KV, 8), block_dim=256)
-                ctx.enqueue_function[r_kv](Pkv, Kflat, Int32(m), Int32(KV), grid_dim=ceildiv(m * KV, 256), block_dim=256)
+                comptime if MEGA_ALLOWED:
+                    ctx.enqueue_function[r_kv](Pkv, Kflat, Int32(m), Int32(KV), grid_dim=ceildiv(m * KV, 256), block_dim=256)
                 comptime if MEGA_ALLOWED:
                     gemm_w[KV, H](ctx, CurBm, b.wbuf, b.off[w + 3], cfg.pack_q4, Pkv, m)
                 else:
                     ctx.enqueue_function[moe_matmul_q8_0_m1[type_of(h_layout), type_of(xm_layout)]](
-                        CurBm, b.wbuf.unsafe_ptr().unsafe_offset(b.off[moe_base + 3]), row_f32(ctx, b.p_kv_d, 0, KV, h_layout), Int32(KV), Int32(H), Int32((H // 32) * 34),
+                        CurBm, b.wbuf.unsafe_ptr().unsafe_offset(b.off[moe_base + 3]), row_f32(ctx, b.v_d, 0, KV, h_layout), Int32(KV), Int32(H), Int32((H // 32) * 34),
                         grid_dim=ceildiv(KV, 8), block_dim=256)
-                ctx.enqueue_function[r_kv](Pkv, Vflat, Int32(m), Int32(KV), grid_dim=ceildiv(m * KV, 256), block_dim=256)
+                comptime if MEGA_ALLOWED:
+                    ctx.enqueue_function[r_kv](Pkv, Vflat, Int32(m), Int32(KV), grid_dim=ceildiv(m * KV, 256), block_dim=256)
                 ctx.enqueue_function[split_k](Qfm, Q, Gate, grid_dim=(NQH, m), block_dim=HD)
-                ctx.enqueue_function[hrms_q](Q, Qn, Float32(1e-6), grid_dim=m * NQH, block_dim=HD)
-                ctx.enqueue_function[hrms_kv](Khd, Kn, Float32(1e-6), grid_dim=m * NKVH, block_dim=HD)
+                comptime if MEGA_ALLOWED:
+                    ctx.enqueue_function[hrms_q](Q, Qn, Float32(1e-6), grid_dim=m * NQH, block_dim=HD)
+                    ctx.enqueue_function[hrms_kv](Khd, Kn, Float32(1e-6), grid_dim=m * NKVH, block_dim=HD)
+                else:
+                    ctx.enqueue_function[hrr_q](Q, Qn, Float32(1e-6), Int32(st.pos), Int32(NQH), grid_dim=m * NQH, block_dim=HD)
+                    ctx.enqueue_function[hrr_kv](Khd, Kn, Float32(1e-6), Int32(st.pos), Int32(NKVH), grid_dim=m * NKVH, block_dim=HD)
                 if cfg.dump4 and cfg.dump and m == 1 and layer == cfg.dump_layer and st.pos + 1 >= cfg.n_prompt:
                     # slots 12-13: llama Qcur_normed-N, after the per-head q norm
                     ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr().unsafe_offset(12 * H), ATT, owning=False), src_buf=DeviceBuffer[f32](ctx, b.q_d.unsafe_ptr(), ATT, owning=False))
                 if cfg.dump4 and cfg.dump and m == 1 and layer == cfg.dump_layer and st.pos + 1 >= cfg.n_prompt:
                     # slot 16: llama Kcur_normed-N, after the per-head k norm
                     ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr().unsafe_offset(16 * H), KV, owning=False), src_buf=DeviceBuffer[f32](ctx, b.k_d.unsafe_ptr(), KV, owning=False))
-                ctx.enqueue_function[rope_q](Q, Int32(st.pos), Int32(NQH), grid_dim=(NQH, m), block_dim=32)
-                ctx.enqueue_function[rope_k](Khd, Int32(st.pos), Int32(NKVH), grid_dim=(NKVH, m), block_dim=32)
+                comptime if MEGA_ALLOWED:
+                    ctx.enqueue_function[rope_q](Q, Int32(st.pos), Int32(NQH), grid_dim=(NQH, m), block_dim=32)
+                    ctx.enqueue_function[rope_k](Khd, Int32(st.pos), Int32(NKVH), grid_dim=(NKVH, m), block_dim=32)
                 if cfg.dump4 and cfg.dump and m == 1 and layer == cfg.dump_layer and st.pos + 1 >= cfg.n_prompt:
                     # slots 14-15: llama Qcur-N, q after rope
                     ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr().unsafe_offset(14 * H), ATT, owning=False), src_buf=DeviceBuffer[f32](ctx, b.q_d.unsafe_ptr(), ATT, owning=False))
                 if cfg.dump4 and cfg.dump and m == 1 and layer == cfg.dump_layer and st.pos + 1 >= cfg.n_prompt:
                     # slot 17: llama Kcur-N, k after rope
                     ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr().unsafe_offset(17 * H), KV, owning=False), src_buf=DeviceBuffer[f32](ctx, b.k_d.unsafe_ptr(), KV, owning=False))
-                ctx.enqueue_function[append_k](Kc, Khd, Int32(st.pos), Int32(att_i), grid_dim=(NKVH, m), block_dim=HD)
-                ctx.enqueue_function[append_k](Vc, Vhd, Int32(st.pos), Int32(att_i), grid_dim=(NKVH, m), block_dim=HD)
+                comptime if MEGA_ALLOWED:
+                    ctx.enqueue_function[append_k](Kc, Khd, Int32(st.pos), Int32(att_i), grid_dim=(NKVH, m), block_dim=HD)
+                    ctx.enqueue_function[append_k](Vc, Vhd, Int32(st.pos), Int32(att_i), grid_dim=(NKVH, m), block_dim=HD)
+                else:
+                    ctx.enqueue_function[append2_k](Kc, Vc, Khd, Vhd, Int32(st.pos), Int32(att_i), grid_dim=(NKVH, m, 2), block_dim=HD)
                 if st.pos + 1 > cfg.att_split:
                     var dns = dattn_nsplit[HD, DATT_NLD, NKVH](st.pos + 1, m, MEGA_G)
                     var Pa = TileTensor(b.p_ffn_d, p_att_layout)
@@ -1034,15 +1045,16 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                 comptime if MEGA_ALLOWED:
                     gemm_w[H, ATT](ctx, AoBm, b.wbuf, b.off[w + 6], cfg.pack_q4, Ph, m)
                 else:
-                    ctx.enqueue_function[moe_matmul_q8_0_m1[type_of(h_layout), type_of(attm_layout)]](
-                        AoBm, b.wbuf.unsafe_ptr().unsafe_offset(b.off[moe_base + 6]), row_f32(ctx, b.p_h_d, 0, H, h_layout), Int32(H), Int32(ATT), Int32((ATT // 32) * 34),
+                    ctx.enqueue_function[moe_matmul_q8_0_m1_add[type_of(h_layout), type_of(attm_layout), type_of(h_layout)]](
+                        AoBm, b.wbuf.unsafe_ptr().unsafe_offset(b.off[moe_base + 6]), row_f32(ctx, b.p_h_d, 0, H, h_layout), row_f32(ctx, b.x_d, 0, H, h_layout), Int32(H), Int32(ATT), Int32((ATT // 32) * 34),
                         grid_dim=ceildiv(H, 8), block_dim=256)
                 if cfg.dump4 and cfg.dump and m == 1 and layer == cfg.dump_layer and st.pos + 1 >= cfg.n_prompt:
                     # slot 6: the output projection result, the value added to
                     # the residual. Splits "attention is wrong" from "o_proj is
                     # wrong" in one run.
                     ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr().unsafe_offset(6 * H), H, owning=False), src_buf=DeviceBuffer[f32](ctx, b.p_h_d.unsafe_ptr(), H, owning=False))
-                ctx.enqueue_function[r_add](Ph, Xm, Int32(m), Int32(H), grid_dim=ceildiv(m * H, 256), block_dim=256)
+                comptime if MEGA_ALLOWED:
+                    ctx.enqueue_function[r_add](Ph, Xm, Int32(m), Int32(H), grid_dim=ceildiv(m * H, 256), block_dim=256)
                 att_i += 1
                 w += 7
             else:
@@ -1082,7 +1094,7 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                     gemm_w[NH_V, H](ctx, CurBm, b.wbuf, b.off[w + 4], cfg.pack_q4, Pab2, m)
                 else:
                     ctx.enqueue_function[moe_matmul_q8_0_m1[type_of(h_layout), type_of(xm_layout)]](
-                        CurBm, b.wbuf.unsafe_ptr().unsafe_offset(b.off[moe_base + 1]), row_f32(ctx, b.p_qf_d, 0, CONV, h_layout), Int32(CONV), Int32(H), Int32((H // 32) * 34),
+                        CurBm, b.wbuf.unsafe_ptr().unsafe_offset(b.off[moe_base + 1]), row_f32(ctx, b.qkv_d, 0, CONV, h_layout), Int32(CONV), Int32(H), Int32((H // 32) * 34),
                         grid_dim=ceildiv(CONV, 8), block_dim=256)
                     ctx.enqueue_function[moe_matmul_q8_0_m1[type_of(h_layout), type_of(xm_layout)]](
                         CurBm, b.wbuf.unsafe_ptr().unsafe_offset(b.off[moe_base + 2]), row_f32(ctx, b.p_h_d, 0, H, h_layout), Int32(H), Int32(H), Int32((H // 32) * 34),
@@ -1109,7 +1121,8 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                         tens_f32(ctx, b.wbuf, b.off[moe_base + 4], NH_V * H, ssm_gate_w_layout),
                         row_f32(ctx, b.p_32_d, 0, NH_V, ssm_gate_o_layout), row_f32(ctx, b.p_32b_d, 0, NH_V, ssm_gate_o_layout),
                         Int32(NH_V), Int32(H), grid_dim=ceildiv(2 * NH_V, ROW_WAVES), block_dim=ROW_THREADS)
-                ctx.enqueue_function[r_qf](Pq, Qkvm, Int32(m), Int32(CONV), grid_dim=ceildiv(m * CONV, 256), block_dim=256)
+                comptime if MEGA_ALLOWED:
+                    ctx.enqueue_function[r_qf](Pq, Qkvm, Int32(m), Int32(CONV), grid_dim=ceildiv(m * CONV, 256), block_dim=256)
                 comptime if MEGA_ALLOWED:
                     ctx.enqueue_function[r_h](Ph, ZmOld, Int32(m), Int32(H), grid_dim=ceildiv(m * H, 256), block_dim=256)
                 else:
@@ -1170,14 +1183,15 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                 comptime if MEGA_ALLOWED:
                     gemm_w[H, H](ctx, ResBmOld, b.wbuf, b.off[w + 9], cfg.pack_q4, Ph, m)
                 else:
-                    ctx.enqueue_function[moe_matmul_q8_0_m1[type_of(h_layout), type_of(moe_inner_m_layout)]](
-                        ResBm, b.wbuf.unsafe_ptr().unsafe_offset(b.off[decode_base + 9]), row_f32(ctx, b.p_h_d, 0, H, h_layout), Int32(H), Int32(NH_V * SSTATE), Int32((NH_V * SSTATE // 32) * 34),
+                    ctx.enqueue_function[moe_matmul_q8_0_m1_add[type_of(h_layout), type_of(moe_inner_m_layout), type_of(h_layout)]](
+                        ResBm, b.wbuf.unsafe_ptr().unsafe_offset(b.off[decode_base + 9]), row_f32(ctx, b.p_h_d, 0, H, h_layout), row_f32(ctx, b.x_d, 0, H, h_layout), Int32(H), Int32(NH_V * SSTATE), Int32((NH_V * SSTATE // 32) * 34),
                         grid_dim=ceildiv(H, 8), block_dim=256)
                 if cfg.dump4 and cfg.dump and m == 1 and layer == cfg.dump_layer and st.pos + 1 >= cfg.n_prompt:
                     # slot 7: the ssm_out projection result, i.e. llama's
                     # linear_attn_out, the last value before the residual add.
                     ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr().unsafe_offset(7 * H), H, owning=False), src_buf=DeviceBuffer[f32](ctx, b.p_h_d.unsafe_ptr(), H, owning=False))
-                ctx.enqueue_function[r_add](Ph, Xm, Int32(m), Int32(H), grid_dim=ceildiv(m * H, 256), block_dim=256)
+                comptime if MEGA_ALLOWED:
+                    ctx.enqueue_function[r_add](Ph, Xm, Int32(m), Int32(H), grid_dim=ceildiv(m * H, 256), block_dim=256)
                 ssm_i += 1
                 w += 10
 

@@ -11,7 +11,9 @@ must be reachable from `serve/registry.mojo`, a bench, or a test.
 | `amar_gate_mul` | `attn.mojo` | `XLayout: TensorLayout, GLayout: TensorLayout` |  | kernels/test_attn_block.mojo |
 | `amar_gate_mul_cast` | `attn.mojo` | `XLayout: TensorLayout, GLayout: TensorLayout, OLayout: TensorLayout` | gmul_k, gmul_p | serve/registry.mojo, kernels/test_mega_block.mojo |
 | `amar_head_rmsnorm` | `attn.mojo` | `XLayout: TensorLayout, GLayout: TensorLayout` | hrms_q, hrms_kv, hrms_qp, hrms_kvp | serve/registry.mojo, kernels/test_attn_block.mojo, kernels/test_mega_block.mojo |
+| `amar_head_rmsnorm_rope` | `attn.mojo` | `XLayout: TensorLayout, GLayout: TensorLayout` | hrr_q, hrr_kv | serve/registry.mojo |
 | `amar_kv_append` | `attn.mojo` | `CLayout: TensorLayout, NLayout: TensorLayout, NAT: Int` | append_k, append_1, append_p | serve/registry.mojo, kernels/test_attn_block.mojo, kernels/test_mega_block.mojo |
+| `amar_kv_append2` | `attn.mojo` | `CLayout: TensorLayout, NLayout: TensorLayout, NAT: Int` | append2_k | serve/registry.mojo |
 | `amar_qgate_split` | `attn.mojo` | `FLayout: TensorLayout, QLayout: TensorLayout, GLayout: TensorLayout` | split_k, split_p | serve/registry.mojo, kernels/test_attn_block.mojo, kernels/test_mega_block.mojo |
 | `amar_rope_yarn` | `attn.mojo` | `XLayout: TensorLayout` | rope_q, rope_k, rope_qp, rope_kp | serve/registry.mojo, kernels/test_attn_block.mojo, kernels/test_mega_block.mojo |
 | `amar_dattn_combine` | `dattn.mojo` | `HD: Int, MAXS: Int, PLayout: TensorLayout, OLayout: TensorLayout,` | dcomb_k | serve/registry.mojo, kernels/dattn_harness.mojo |
