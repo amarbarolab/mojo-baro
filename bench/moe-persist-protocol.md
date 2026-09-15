@@ -232,3 +232,27 @@ per-layer X parity on p09, 20-prompt A/B through `bench/ab-prompts.sh`
 Fold order = the order above; each fold is one commit with its own build,
 so a lost fold is found by bisection, not by diagnosis. GPU: gates only,
 minutes each.
+
+### R6.0 result (2026-09-15): five folds land, 1117 -> 857 launches, 1.132x
+
+Receipts (`.work/moe-perf/lc-r60.log`, `.work/moe-perf/ab-r60.log`,
+`.work/moe-perf/ab-r60/`): launches per token **857.0** by the difference
+method (23960 at 16 tokens, 37672 at 32), the frozen prediction exactly.
+20-prompt A/B, same stint, engine-head (sha be820d1a) against engine-r60
+(sha cfbb664e), both on `.work/moe-w1/pack`, power cap 290 W read back:
+**head 94.79 tok/s_gen (spread 0.9%) -> r60 107.27 (spread 1.2%), ratio
+1.132**; GENERATED identical on 20/20 prompts, fail word 0 on all 40 runs,
+no NOT-RESIDENT exit. Predicted +15%, measured +13.2%, kill line +5%:
+holds. The head arm measured 94.79 in this stint against R4's 99.92
+receipt; the ratio is the claim, the absolute number is stint-bound
+(P4), and the llama.cpp 109.4 comparison needs its own same-stint arm
+before it is stated either way. The BARO_DUMP per-layer compare was not
+run: bit-identical GENERATED on 20/20 prompts is the stronger statement
+of the same property for a change that reorders no sum.
+Not folded, still on the launch path: the attention layers' `gemm_w`
+split-K reduces (about 100 per token), the SSM small chain
+(reduce_gates, conv, l2norm, delta, gated_out: 150), `kv_append`/rope/
+head norms on the 10 attention layers (about 60). Those are R6.0b if
+the maintainer wants a second fold round before R6 proper; the gap per launch is
+unchanged at about 3.1 us, so the ceiling of a full second round is
+about 300 launches, 0.9 ms, +9%.
