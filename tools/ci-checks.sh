@@ -134,6 +134,7 @@ benchbad=0; benchn=0; benchskip=""
 for f in bench/*.mojo; do
   grep -q '^def main' "$f" || continue
   if grep -q '^from grammar' "$f"; then benchskip="$benchskip $(basename "$f")"; continue; fi
+  if grep -q '^# ci-checks: needs' "$f"; then benchskip="$benchskip $(basename "$f")"; continue; fi
   benchn=$((benchn + 1))
   "$MOJO" build "$f" -o .work/ci-bench-bin -I . -I kernels -I serve \
     -Xlinker -L.work/shim-build -Xlinker -lamarbaro_shim -Xlinker -rpath -Xlinker "$PWD/.work/shim-build" \
@@ -141,7 +142,7 @@ for f in bench/*.mojo; do
 done
 rm -f .work/ci-bench-bin
 [ "$benchbad" = 0 ] && ok "$benchn bench sources build"
-[ -n "$benchskip" ] && echo "  skip (external grammar package):$benchskip"
+[ -n "$benchskip" ] && echo "  skip (external grammar package, or a '# ci-checks: needs' marker for extra link flags):$benchskip"
 
 printf '\n'
 if [ "$fails" = 0 ]; then echo "all non-GPU checks passed"; else echo "$fails check(s) failed"; fi

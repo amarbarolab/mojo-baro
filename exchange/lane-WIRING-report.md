@@ -396,3 +396,96 @@ is deliberately not wired into `run-tests.sh` (not green yet, per the
 preregistration's own "wire it into run-tests.sh only once green").
 `./run-tests.sh` and `tools/ci-checks.sh` both green (regenerated
 `docs/KERNELS.md` again for the same reason as the M5 commit).
+
+### C3 coordinator decision, closed `5e79276`
+
+Coordinator answered (option c): lift `serve/engine.mojo`'s refusal for the
+four shapes gate 2 passed cleanly (top_p<1 and/or top_k>0, with or without
+min_p); add a new refusal, same error style, for the untruncated shape
+(temperature>0, top_p=1, top_k=0, min_p<=0); do not touch
+`kernels/sample.mojo`. Root cause of the T1 finding, diagnosed by the
+coordinator: `unif()` draws a 24-bit float32 uniform, capping the Gumbel key
+used for argmax selection at roughly 17.3 nats, so every one of the 248320
+tokens carries a floor chance of about `2^-24` per draw regardless of its
+true probability -- a numpy simulation of the exact `unif()` mapping
+reproduces the observed excess on all three real rows (p01 sim 18.2% vs
+observed 17.2%, p02 sim 4.9% vs observed 5.2%, p03 sim 2.15% vs observed
+2.6%), while an exact (non-quantized) Gumbel draw matches the oracle's true
+tail. Both `serve/sample_ref.mojo` and `kernels/sample.mojo` share this
+`unif()` mapping, which is why the C3 fix round's gate 1 barely mismatched:
+the two sides agree with each other, both against the same floor.
+
+Applied verbatim in `serve/engine.mojo` (`5e79276`): the refusal condition
+became `top_p >= 1 and top_k == 0 and min_p <= 0`, replacing the prior
+`top_p < 1 and min_p <= 0`. Preregistered the "C3 tail round" in
+`bench/chat-protocol.md` per the coordinator's spec (H1 = 53-bit float64
+uniform from two rng words for the Gumbel key on both sides, gates = the C3
+fix round's own 20000-draw chi-square rerun on `T1_k0_p1` plus the four
+already-passing shapes, plus a temperature-0 byte-identical rerun).
+**Not run this session** -- this leg only lands the refusal split, not the
+tail-round fix itself.
+
+Verified live against a freshly built engine (`.work/engine-c3-postref`,
+`tools/test_server.sh`'s own build command): `temperature=0.7, top_p=0.8`
+(previously refused) now returns 12 generated tokens
+(`.work/c3-refusal-verify/case1.json`); `temperature=0.7` with no
+truncation now returns
+`"untruncated sampling has a 2^-24 uniform tail floor (bench/chat-protocol.md
+C3 tail round); use top_p<1, top_k>0 or min_p>0"`
+(`.work/c3-refusal-verify/case2.json`); `temperature=0` unaffected, since
+both refusal branches are guarded by `sample.temperature > 0`
+(`.work/c3-refusal-verify/case3.json`). `./run-tests.sh` and
+`tools/ci-checks.sh` both rerun green after the commit.
+
+**C3 is closed.** Moving to B3.
+
+## B3: same-GPU HIP IPC handoff probe, KILL
+
+Preregistered `~/AMDHQ/docs/design/latent-os/06-experiments.md` ("E12-ipc")
+before any code or GPU minute, per the brief. New file
+`bench/latentos-ipc-probe.mojo`: two processes (fork, same topology as
+`~/AMDHQ/tools/latent-os/test_live_ipc.mojo`), each with its own
+`DeviceContext` on the one GPU. Child allocates a 2 GiB `DeviceBuffer`,
+fills it deterministically (`hipMemset` bulk plus head/tail canaries),
+calls `hipIpcGetMemHandle`, sends the raw 64-byte handle over a unix socket
+(`latentos.ipc`/`sys`, plain `sys_read`/`sys_write` -- a HIP IPC handle is
+bytes, not a file descriptor). Parent calls `hipIpcOpenMemHandle`, times a
+device-to-device `hipMemcpy`, both sides sha256 the transferred 2 GiB.
+
+**A bare `external_call` did not link** -- undefined reference to every
+`hip*` symbol (MAX's GPU runtime does not expose `libamdhip64.so`'s
+symbols globally); this answers half the open question from the
+preregistration by itself. Rebuilt per the prereg's own fallback,
+`-Xlinker -lamdhip64 -Xlinker -L/opt/rocm/lib`, which links clean.
+
+**`hipIpcGetMemHandle` (child) returns `hipSuccess` every run.
+`hipIpcOpenMemHandle` (parent, a different process) returns
+`hipErrorInvalidValue` (rc 1) on all 3 runs, no variance.** A separate
+diagnostic run confirmed the 64-byte handle's content byte-for-byte at
+three points (child's own bytes, the parent's raw socket bytes, the
+parent's bytes read back through the `HipIpcMemHandle` FFI value) --
+all three matched exactly, ruling out the socket transfer or the
+raw-to-struct reinterpretation as the cause. What remains open, named but
+not chased further (a probe's scope, not a debugging session): a genuine
+driver/environment restriction on this ROCm/kernel combination, or Mojo's
+`external_call` not correctly implementing the SysV x86-64 ABI's
+MEMORY-class convention for a by-value struct argument over 16 bytes --
+every struct-passing example in Mojo's own C-FFI docs is 16 bytes or
+under, so a 64-byte by-value argument is genuinely undemonstrated there.
+
+**Per the preregistration's frozen kill clause: KILL.** No `hipMemcpy`
+timing collected (the run never reaches it), no sha256 comparison possible.
+The memfd path (E12/E12-long) stays the same-GPU handoff mechanism too,
+not just the cross-process one. Full write-up:
+`~/AMDHQ/docs/design/latent-os/06-experiments.md` E12-ipc "Result" section.
+
+`tools/ci-checks.sh` caught the probe failing its generic bench-compile
+loop (needs the extra link flags above, which that loop doesn't pass) --
+excluded the same way it already excludes `bench_latent_handoff.mojo`
+(external `grammar` import): a `# ci-checks: needs` marker comment, checked
+for by `tools/ci-checks.sh`'s bench-compile step alongside its existing
+`^from grammar` check. `tools/ci-checks.sh` reruns green.
+
+**B3 is closed (KILL, both HIP calls confirmed reproducible, root cause
+named as an open question rather than resolved).** C3 and B3 both land this
+leg; reporting DONE to `w82:p1`.
