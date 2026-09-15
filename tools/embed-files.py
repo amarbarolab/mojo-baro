@@ -7,18 +7,20 @@ gguf's own commit (exchange/scorer-integrity-report.md, P-A, 2026-09-08).
 
     tools/gguf-embed.py SRC.gguf DST.gguf $(tools/embed-files.py)
     tools/embed-files.py --arch spark   # serve/spark.mojo closure (spark.mojo itself is the
-                                        # harness, taken from git); uregex/minja come in
-                                        # whole, as a package glob (vendored at repo root
-                                        # since M1, briefs/2026-09-15-wiring-lane.md -- no
-                                        # longer external, but still not a single kernels/X.mojo
-                                        # or serve/X.mojo candidate, so EXT is still how the
-                                        # closure walker pulls a whole package directory in)
+                                        # harness, taken from git); uregex/minja/latentos come
+                                        # in whole, as a package glob (vendored at repo root
+                                        # since M1, briefs/2026-09-15-wiring-lane.md, and
+                                        # briefs/2026-09-15-vendor-latentos.md for latentos --
+                                        # no longer external, but still not a single
+                                        # kernels/X.mojo or serve/X.mojo candidate, so EXT is
+                                        # still how the closure walker pulls a whole package
+                                        # directory in)
 """
 import re, sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-EXT = {"uregex": ROOT / "uregex", "minja": ROOT / "minja"}
+EXT = {"uregex": ROOT / "uregex", "minja": ROOT / "minja", "latentos": ROOT / "latentos"}
 ARCH = {"qwythos": (["serve/window.mojo", "serve/registry.mojo"], "serve/engine.mojo"),
         "spark": (["serve/spark.mojo"], "serve/spark.mojo"),
         # The W2 kernel-parity closure, kept for the expert-kernel gate.
@@ -52,9 +54,30 @@ def closure(roots):
     return sorted(x for x in seen if isinstance(x, str)) + sorted(str(x) for x in seen if not isinstance(x, str))
 
 
+def harness_ext_files(harness):
+    """EXT packages (uregex, minja, latentos) the harness itself imports
+    directly, e.g. serve/engine.mojo's `from latentos.ipc import ...`. The
+    harness's own single-file imports (harness.mojo, prefix.mojo, ...) are
+    NOT walked here -- tools/gguf-closure.sh fetches those fresh from git at
+    the gguf's commit when it rebuilds; only a whole vendored package, which
+    that rebuild has no other way to reconstruct, is pulled in at bake time."""
+    text = (ROOT / harness).read_text()
+    out = []
+    for m in re.finditer(r"^from (\w+)[.\w]* import|^import (\w+)", text, re.M):
+        mod = m.group(1) or m.group(2)
+        if mod in EXT:
+            for p in sorted(EXT[mod].glob("*.mojo")):
+                if str(p) not in out:
+                    out.append(str(p))
+    return out
+
+
 if __name__ == "__main__":
     arch = sys.argv[sys.argv.index("--arch") + 1] if "--arch" in sys.argv else "qwythos"
     roots, harness = ARCH[arch]
     files = [f for f in closure(roots) if f != harness]
+    for f in harness_ext_files(harness):
+        if f not in files:
+            files.append(f)
     assert "serve/engine.mojo" not in files
     print("\n".join(files) if "-1" in sys.argv else " ".join(files))

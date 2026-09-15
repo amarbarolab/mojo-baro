@@ -21,7 +21,7 @@ die() { echo "FAIL $1: $2" | tee -a "$out/SUMMARY.txt"; exit 1; }
 prompt_json=$(python3 -c "import sys; print([int(x) for x in open('$pack/prompt-tokens.txt').read().split()])")
 
 if [ ! -x .work/engine ] || [ serve/engine.mojo -nt .work/engine ] || [ serve/registry.mojo -nt .work/engine ]; then
-  ./.venv/bin/mojo build serve/engine.mojo -I kernels -o .work/engine > "$out/build-engine.log" 2>&1 || die build "$(grep -m1 error: "$out/build-engine.log" | cut -c1-160)"
+  ./.venv/bin/mojo build serve/engine.mojo -I . -I kernels -o .work/engine > "$out/build-engine.log" 2>&1 || die build "$(grep -m1 error: "$out/build-engine.log" | cut -c1-160)"
 fi
 (cd serve && cargo build --release) > "$out/cargo-build.log" 2>&1 || die build "$(grep -m1 error "$out/cargo-build.log")"
 ok build "engine + baro-serve"

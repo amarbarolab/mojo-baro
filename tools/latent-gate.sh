@@ -29,9 +29,9 @@ PACK=${BARO_PACK:-.work/engine-pack-q4}
 REF=${LATENT_REF_ENGINE:-.work/engine}
 
 echo "== build from the committed tree" | tee -a "$out/gate.log"
-$MOJO build serve/engine.mojo -I kernels -I serve -o "$out/engine" > "$out/build-engine.log" 2>&1 \
+$MOJO build serve/engine.mojo -I . -I kernels -I serve -o "$out/engine" > "$out/build-engine.log" 2>&1 \
   || { fail "engine build: $(grep -m1 'error:' "$out/build-engine.log" | cut -c1-160)"; exit 1; }
-$MOJO build tools/latent-recv.mojo -I kernels -I serve -o "$out/recv" > "$out/build-recv.log" 2>&1 \
+$MOJO build tools/latent-recv.mojo -I . -I kernels -I serve -o "$out/recv" > "$out/build-recv.log" 2>&1 \
   || { fail "recv build: $(grep -m1 'error:' "$out/build-recv.log" | cut -c1-160)"; exit 1; }
 echo "engine $(sha256sum "$out/engine" | cut -c1-16)  recv $(sha256sum "$out/recv" | cut -c1-16)" | tee -a "$out/gate.log"
 

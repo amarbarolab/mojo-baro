@@ -359,7 +359,7 @@ def build_arm(name, overrides, edits, sites):
         for f in sorted(os.listdir(os.path.join(ROOT, sub))):
             if f.endswith(".mojo"):
                 shutil.copy(os.path.join(ROOT, sub, f), os.path.join(d, sub, f))
-    os.symlink(os.path.join(ROOT, "serve/latentos"), os.path.join(d, "serve/latentos"))
+    os.symlink(os.path.join(ROOT, "latentos"), os.path.join(d, "latentos"))
     for path, ref in overrides:
         text = git_show(ref, path)
         for old, new in edits.get(path, []):

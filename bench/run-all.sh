@@ -18,7 +18,7 @@ for t in test_elementwise test_ssm_block test_attn_block test_q8_gemm test_gguf_
   echo "--- $t"; ./.venv/bin/mojo build kernels/$t.mojo -o .work/$t $L 2>&1 | grep -E "error" -A3 | head -6; ./.work/$t 2>&1 | grep -viE crashpad | tail -4
 done
 sec "engine: repo build vs closure build, interleaved x3"
-./.venv/bin/mojo build serve/engine.mojo -I kernels -o .work/engine 2>&1 | grep -E "error" -A3
+./.venv/bin/mojo build serve/engine.mojo -I . -I kernels -o .work/engine 2>&1 | grep -E "error" -A3
 for i in 1 2 3; do ./.work/engine > .work/ra-repo$i.log; echo "repo    $(grep -oE 'tok/s_gen: [0-9.]+' .work/ra-repo$i.log)"; ./.work/engine-closure > .work/ra-clos$i.log; echo "closure $(grep -oE 'tok/s_gen: [0-9.]+' .work/ra-clos$i.log)"; done
 tools/check-tokens.sh .work/engine-pack/ref-tokens-64.txt .work/ra-repo1.log; tools/check-tokens.sh .work/engine-pack/ref-tokens-64.txt .work/ra-clos1.log
 cmp -s .work/gguf-src/engine.mojo serve/engine.mojo && echo "closure engine.mojo == repo" || echo "closure engine.mojo DIFFERS from repo"

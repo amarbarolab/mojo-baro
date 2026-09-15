@@ -27,7 +27,7 @@ ok clippy "no warnings"
 ok cargo-test "$(grep -m1 -oE '[0-9]+ passed' "$out/cargo-test.log")"
 (cd serve && cargo build --release) > "$out/cargo-build.log" 2>&1 || die build "$(grep -m1 error "$out/cargo-build.log")"
 if [ ! -x .work/engine ] || [ serve/engine.mojo -nt .work/engine ] || [ serve/registry.mojo -nt .work/engine ]; then
-  ./.venv/bin/mojo build serve/engine.mojo -I kernels -o .work/engine > "$out/build-engine.log" 2>&1 || die build "$(grep -m1 error: "$out/build-engine.log" | cut -c1-160)"
+  ./.venv/bin/mojo build serve/engine.mojo -I . -I kernels -o .work/engine > "$out/build-engine.log" 2>&1 || die build "$(grep -m1 error: "$out/build-engine.log" | cut -c1-160)"
 fi
 ok build "engine + baro-serve"
 

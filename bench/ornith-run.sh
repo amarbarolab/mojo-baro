@@ -17,7 +17,7 @@ die() { echo "FAIL $1: $2" | tee -a "$OUT/SUMMARY.txt"; exit 1; }
 [ -d "$PACK" ] || die setup "no $PACK -- run tools/engine-pack.py ... --q8 first"
 
 echo "== build engine =="
-./.venv/bin/mojo build serve/engine.mojo -I kernels -o .work/engine > "$OUT/build-engine.log" 2>&1 \
+./.venv/bin/mojo build serve/engine.mojo -I . -I kernels -o .work/engine > "$OUT/build-engine.log" 2>&1 \
   || die build "$(grep -m1 error: "$OUT/build-engine.log" | cut -c1-200)"
 ok build "engine"
 

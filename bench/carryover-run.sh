@@ -19,7 +19,7 @@ HW=/sys/class/drm/card1/device/hwmon/hwmon0
 build_stamped() {
   for arm in C D2; do
     local bin=".work/carryover/engine-${arm}s"
-    ./.venv/bin/mojo build ".work/carryover/src-$arm/serve/engine.mojo" -I ".work/carryover/src-$arm/kernels" \
+    ./.venv/bin/mojo build ".work/carryover/src-$arm/serve/engine.mojo" -I ".work/carryover/src-$arm" -I ".work/carryover/src-$arm/kernels" \
       -o "$bin" > ".work/carryover/build-engine-${arm}s.log" 2>&1 \
       || { echo "FAIL build $arm: $(grep -m1 'error:' ".work/carryover/build-engine-${arm}s.log")"; exit 1; }
   done

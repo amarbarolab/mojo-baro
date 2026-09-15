@@ -403,7 +403,11 @@ in the SSM sub-block and expert time, not bytes.
 - Both carry `baro.hw.*` (card, driver, ROCm, power cap, 20-prompt median,
   config, protocol) and `baro.kernel.model`; `tools/gguf-verify.sh MODEL.gguf`
   is the contributor's one-command check (`docs/amd-family.md`).
-- **Caveat until LatentOS is vendored:** the harness `serve/engine.mojo`
-  imports `latentos` from `~/AMDHQ/src` (not in the repo); the closure states
-  it as an external dependency. A clone cannot build the engine until the
-  vendoring lane lands (`briefs/2026-09-15-vendor-latentos.md`).
+- **LatentOS vendored** (`briefs/2026-09-15-vendor-latentos.md`): `latentos/`
+  is now a real directory at the repo root (upstream `~/AMDHQ/src/latentos`,
+  same shape as `uregex/`/`minja`/M1), and `tools/embed-files.py` pulls it
+  into the gguf's own `baro.kernel.src.latentos/*` KVs. The two ggufs above
+  (`aa3f147`) predate this and still carry the old external-dependency
+  closure marker; a clone can build the ENGINE from a fresh checkout now, but
+  those two specific files need a re-bake before their own closure is
+  self-contained (coordinator's call, not re-baked by this lane).
