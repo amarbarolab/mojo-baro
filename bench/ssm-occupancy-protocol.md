@@ -459,3 +459,154 @@ pressure from the split) is withdrawn; its number was the refactor. Nothing
 lands. The working tree keeps the `JSPLIT` machinery at `SSM_JSPLIT = 1`,
 receipt-identical to `main` at every MR and within 0.5% on tok/s (J1), for
 the maintainer to keep or drop.
+
+## Carry-over probe 2026-09-15: is the 3.3% a clock artifact, a cache effect, or neither? (preregistered before the first timed run)
+
+Brief `~/Brain/mojo/mojo-baro/briefs/2026-09-15-carryover-probe.md`. Question:
+the 2026-09-15 re-run put 11 to 14 of the 20 ms end-to-end loss of the split
+arms in the FFN sub-block, whose kernels the split never touches, measured with
+`BARO_PROFILE=1` host syncs. This section decides between H1 (clock or power
+state left by the 64-workgroup split kernel), H2 (cache state left by its write
+order) and H3 (neither), and answers whether per-kernel (Gate 2 style) timing
+can judge a launch-geometry change on this card. Nothing is fixed downstream.
+Working tree only, nothing committed; `main` @ `a063d19`, tracked
+`kernels/ssm.mojo` and `serve/registry.mojo` untouched (byte-identical to
+`a9c0106`). Freeze receipt: sha256 of this file in
+`.work/carryover/prereg.sha256`, stamped before the first launch.
+
+### Arms (four binaries, sha256 prefixes read back per run)
+
+- **C** `.work/jsplit-review/engine-C` (`fc976cd91f4d`), **D2**
+  `.work/jsplit-review/engine-D2` (`614968b64033`): the 2026-09-15 binaries,
+  unstamped, used only to reproduce their own recorded figures.
+- **Cs** `.work/carryover/engine-Cs` (`e6b9875f42df`), **D2s**
+  `.work/carryover/engine-D2s` (`568bdcd410c5`): built by
+  `.work/carryover/mkprobe.py` from copies of `kernels/*.mojo` and
+  `serve/*.mojo` under `.work/carryover/src-C` and `src-D2` (D2 takes
+  `kernels/ssm.mojo` and `serve/registry.mojo` from `b31f7b5` with
+  `SSM_JSPLIT = 2`, the same split the 09-15 D2 arm ran). Both carry the same
+  stamp patch and nothing else:
+  - an uncommitted copy `amar_matmul_skinny_q4rowb_st` of the q4 row GEMV,
+    with `llvm.readsteadycounter` (100 MHz REALTIME) and
+    `llvm.readcyclecounter` (20-bit SHADER_CYCLES) read at wave entry and after
+    the row store; wave 0 lane 0 of every block does an atomic min of its start
+    and an atomic max of its end into an 8-slot record per launch; block 0
+    additionally stores its own start/end wall and cycle stamps. No barrier
+    added. Dispatched only at the three trunk FFN sites of the launch path
+    (gate, up, down GEMV), through `gemm_w_st` / `gemm_q4_st`; every other
+    kernel, including the split kernel, is the tracked code.
+  - the harness reads `/sys/class/drm/card1/device/gpu_metrics` (v1.3) and
+    `pp_dpm_sclk` at three points OUTSIDE the decode window: before `t0`,
+    after the prefill sync and before `t_prefill_end` is stamped (cost charged
+    to prefill, ~20 us measured, printed per read), and after the decode-end
+    sync once `gpu_total_s` is taken. No clock read of any kind happens inside
+    the timed window; the in-kernel counters are wave-local register reads,
+    the same class as the REALTIME stamps the megakernel already carries.
+  - after the run, the stamp records are copied back and printed as `STAMP`
+    lines (seq, window, layer, site, m, min start, max end, block-0 start/end,
+    block-0 cycles at start/end).
+- ISA receipts (`tools/isa-receipt.py`, `.work/carryover/isa-*.txt`):
+  `amar_ssm_delta_step` spill ladder MR=1..8 is `81 167 235 312 380 458 526
+  603` in C and Cs, `78 155 227 297 366 435 504 573` in D2 and D2s (same as
+  the 09-15 receipts). The stamped GEMV at MR=3 is 157/159 VGPR, 0 spills,
+  0 scratch against 156/158 unstamped (+1 VGPR, no occupancy step); the
+  stamped MR=8 variant spills 43/45 vs 41/42 unstamped but MR=8 is never
+  dispatched in this configuration (read back from the STAMP `m` column;
+  any m outside {1,2,3} voids the run).
+
+### Configuration (every run)
+
+`BARO_SPEC=1 BARO_SPEC_K=2 BARO_PROMPT=bench/mtp-prompts/p09-explain-gpu.tokens`,
+no profiling env, `BARO_MEGA` default (1): the verify windows (MR = 3) run
+the launch path where the split kernel and the stamped FFN GEMVs live. Every
+launch `gpu-wait run --vram 20 --`, `gpu-wait list` read empty before each,
+GPU otherwise idle; `power1_cap` read back per run (290 W at freeze). Runs
+alternate arms so drift lands on both. Read-back per run: `BARO_SPEC: True`,
+`spec k: 2`, `BARO_MEGA: True`, `pack q4 trunk: True`, `mega fail word: 0`,
+`GENERATED` sha `c00468774758` (the 09-15 identity), binary sha, `STAMPS`
+count identical across stamped runs.
+
+### Phases, gates, predictions (frozen)
+
+**Phase R (reproduce, unstamped C / D2, 3 rounds alternating).** Gate: C
+`tok/s_gen` median within 1.5% of the recorded 118.90, control spread under
+1.5%, D2 below C with disjoint ranges. Prediction P0: D2/C = 0.967 +- 0.010.
+If P0 fails nothing downstream may be read; the probe stops and reports.
+
+**Phase S (stamped Cs / D2s, 5 rounds alternating).** Gates: Cs median within
+1.0% of phase-R C (the stamps are free); D2s/Cs within 0.010 of D2/C, disjoint;
+identity and read-backs above. Prediction P1: both hold. If the stamps cost
+more than 1.0%, the atomic min/max (CAS loops on gfx11) are the suspect and the
+instrument is rebuilt with block-0 start / last-block end before anything is
+read.
+
+**Decomposition (Phase S, device-side, no host syncs).** Per trunk window the
+STAMP timeline gives: gate/up/down GEMV spans, the gap gate-end to up-start
+(pure launch bubble), up-end to down-start (swiglu + bubbles), down-end to next
+gate-start (residual add, next layer's norm and attn or SSM sub-block including
+the split kernel, bubbles), and the window total. Sums per run, medians over
+the 5 runs, D2s minus Cs in ms, ranges. The 09-15 FFN attribution predicts
+11 to 14 ms more in the D2s FFN region (GEMV spans + g2u + u2d) per run.
+
+- **H1 (clock/power carry-over) signature:** GEMV spans longer in D2s AND the
+  block-0 shader clock (cycles / wall, per launch, median) lower in D2s by a
+  matching fraction (at least 3%), or the post-decode `avg_gfxclk` lower in
+  D2s outside the run-to-run range of Cs.
+- **H2 (cache state) signature:** GEMV spans longer in D2s with the block-0
+  clock equal within 1% (more cycles, same clock).
+- **H3 (neither) signature:** GEMV spans equal within 1%; the difference sits
+  in the gaps or in the down-end to next-gate region, or is absent from the
+  window timeline altogether (then the `BARO_PROFILE=1` FFN attribution was
+  itself an artifact of the sub-block syncs).
+- Prior, stated for the record: H2 or H3 more likely than H1, because the head
+  sub-block (also a q4 GEMV stream) was flat in the 09-15 profile. No
+  magnitude predicted for any hypothesis.
+
+**Falsifiers.** P0 fails: the 3.3% does not reproduce today and the question
+is moot until it does. P1 fails: instrument perturbs the stream, rebuild. A
+`wrap_unsafe` block-0 lifetime (over 300 us) in more than 1% of launches: the
+cycle ratio is not read for that site. Any run with a nonzero fail word, a
+different `GENERATED` sha, or a queue that was not empty at launch is VOID and
+re-run.
+
+**Answer format.** Gate-2 per-kernel timing can judge a geometry change on
+this card only if the whole D2s minus Cs difference lands inside the split
+kernel's own span (it cannot, by the 09-15 Gate 2 result, which showed the
+split kernel faster); the probe reports where it lands instead and what
+instrument sees it. MSPEC: affected iff its window attribution rests on
+per-kernel or host-synced sub-block timing of a stream whose kernels changed
+geometry; the report says how to tell, and touches nothing in MSPEC.
+
+### Amendment 1, 2026-09-15, before the first timed run: stamp scheme
+
+The smoke run of the first stamped build (numbers not read as results)
+showed the block-0 cycles / wall ratio inconsistent across sites (3.1 to
+4.5 GHz), and the two int64 atomic min/max lowered to CAS loops. Both stamped
+engines were rebuilt before any timed run with: an explicit
+`s_waitcnt(0)` before the end stamps; per block, wave 0 adds its own wall
+span and its own 20-bit-masked cycle span into two per-launch sums with
+native `global_atomic_add_u64` (blocks with a wall span over 300 us are
+excluded and counted); the launch end is the end stamp of the last block to
+arrive at a per-launch counter; block 0 stores the launch start and its own
+spans. The shader clock per launch is therefore the lifetime-weighted mean
+over all blocks (1536 or 512 samples), not one wave. STAMP layout: start,
+end, sum_rt, sum_cyc, arrivals, b0_rt, b0_cyc, unsafe. New shas: Cs
+`e5e95f6f9c00`, D2s `7fdd2a0a5428`. Arrivals must equal the grid (1536 for
+gate/up, 512 for down) on every launch; the H1/H2 clock signature now reads
+the summed ratio, thresholds unchanged. Nothing else in the preregistration
+changes.
+
+### Results 2026-09-15 (carry-over probe, working tree)
+
+Phase R: C 118.89 tok/s_gen (118.82..118.98), D2 115.96 (115.40..116.16),
+ratio 0.975, disjoint; P0 holds. Phase S: Cs 116.14 (115.40..116.33), D2s
+113.85 (113.69..114.20), ratio 0.980, disjoint; the stamps cost 2.3%, over the
+1.0% gate, and the arm difference is preserved (deviation and reasoning in
+`exchange/2026-09-15-carryover-probe.md`). Decomposition, D2s minus Cs per
+run: gate GEMV +2.34 ms, up -0.11, down +4.15, gaps flat, rest of layer
++5.08, windows +11.95, decode +10.9. Shader clock during the GEMVs equal
+within 0.6% (in-kernel), sysfs gfxclk 3020 vs 3026 MHz, power 304 vs 303 W at
+the 290 W cap. **H1 falsified; H2-class cost (more cycles at equal clock in
+untouched kernels), mechanism not identified. Gate-2 per-kernel timing cannot
+judge a geometry change; the untraced tok/s and the in-stream device timeline
+can.** Report: `exchange/2026-09-15-carryover-probe.md`.
