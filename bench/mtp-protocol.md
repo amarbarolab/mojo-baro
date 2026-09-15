@@ -486,3 +486,24 @@ Why these two and not one: aggregate agreement with a per-draw disagreement is
 exactly the sampler defect this repo shipped once already
 (`exchange/2026-09-15-m5-sampler-diagnosis.md`). gate4 passing while gate3
 fails is a failure.
+
+### Result (2026-09-15): both gates pass at real vocab, on both draft arms
+
+`kernels/test_sample_device.mojo` at `.work/b1/tsd3.log`, one `gpu-wait` job,
+about 30 GPU seconds for the whole file (5 sampler shapes plus 2 spec shapes,
+3 rows, 20,000 draws each).
+
+- **gate3: 0 mismatches of 64 on every row, shape and arm** (12 runs). The
+  device probability rows match the host reference to 5.96e-08 at
+  T0.7_k20_p0.8 and 4.17e-07 at T1_k0_p1, which is the f32 rounding floor,
+  reported as a receipt and not a threshold.
+- **gate4: every chi-square well under its p=0.001 critical value** (12 runs),
+  for example p01-water near T1_k0_p1 chi2 55.96 against crit 99.68 on df 60,
+  and p02-python-fib near T0.7_k20_p0.8 chi2 1.96 against 14.13 on df 2.
+
+The two draft arms matter and the first run proved it: with the draft taken
+from another prompt's row ("far"), acceptance is **0 of 64** and 155 of 20,000,
+so that arm tests the residual branch and nothing else. The "near" arm (same
+row at 1.3x temperature) accepts 33 to 58 of 64 and 12,061 to 18,292 of 20,000.
+Running only the far arm would have left the accept branch uncovered while
+every gate printed PASS.

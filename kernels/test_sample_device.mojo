@@ -40,8 +40,8 @@ from max.gpu.host import DeviceContext, DeviceBuffer
 from layout import TileTensor, row_major
 
 from registry import *
-from sample import amar_sample_row, SAMP_THREADS
-from sample_ref import sample_row_ref, is_valid
+from sample import amar_sample_row, amar_sample_probs, amar_spec_accept, SAMP_THREADS, SAMP_CAP
+from sample_ref import sample_row_ref, sample_probs_ref, spec_accept_ref, is_valid
 
 comptime FMAX = Float32(3.4028234663852886e38)
 comptime x_l = row_major[1, VOCAB]()
@@ -51,6 +51,15 @@ comptime xb_l = row_major[BATCH, VOCAB]()
 comptime tb_l = row_major[BATCH]()
 comptime N_DRAWS = 20000
 comptime N_BATCHES = N_DRAWS // BATCH
+# Speculative gates (A1, bench/spec-sample-protocol.md). Smaller batch than the
+# sampler gates because each spec draw needs three real-vocab rows resident per
+# lane (target probs, draft probs, draft logits) instead of one: 200 x VOCAB x 4
+# is about 200 MB per buffer, and the three together stay well inside the card
+# while 1000 would not.
+comptime SBATCH = 200
+comptime S_BATCHES = N_DRAWS // SBATCH
+comptime xs_l = row_major[SBATCH, VOCAB]()
+comptime ts_l = row_major[SBATCH]()
 
 
 @fieldwise_init
@@ -230,23 +239,247 @@ def gate2_row(ctx: DeviceContext, mut xd: DeviceBuffer[f32], row_name: String, m
             fails += 1
 
 
+def spec_configs() -> List[Cfg]:
+    # Both shapes have an oracle file already (the slugs match configs()), so
+    # the spec gates compare against the same independent numpy distribution
+    # the sampler gates use, not against our own reference.
+    var c = List[Cfg]()
+    c.append(Cfg("T1_k0_p1", Float32(1.0), 0, Float32(1.0), Float32(0.0)))
+    c.append(Cfg("T0.7_k20_p0.8", Float32(0.7), 20, Float32(0.8), Float32(0.0)))
+    return c^
+
+
+def fill_rows(ctx: DeviceContext, mut dst: DeviceBuffer[f32], row: List[Float32], n: Int) raises:
+    var h = ctx.enqueue_create_host_buffer[f32](n * VOCAB)
+    ctx.synchronize()
+    for r in range(n):
+        unsafe_memcpy(
+            dest=h.unsafe_ptr().unsafe_offset(r * VOCAB).unsafe_bitcast[UInt8](),
+            src=row.unsafe_ptr().unsafe_bitcast[UInt8](),
+            count=VOCAB * 4,
+        )
+    ctx.enqueue_copy(dst_buf=dst, src_buf=h)
+    ctx.synchronize()
+
+
+def probs_device(ctx: DeviceContext, mut xd: DeviceBuffer[f32], c: Cfg) raises -> List[Float32]:
+    """One truncated probability row from the device kernel, read back."""
+    var pd = ctx.enqueue_create_buffer[f32](VOCAB)
+    comptime k = amar_sample_probs[type_of(x_l), type_of(x_l), SAMP_CAP]
+    ctx.enqueue_function[k](
+        TileTensor(xd, x_l), TileTensor(pd, x_l), Int32(VOCAB), c.t, Int32(c.k), c.p, c.mp,
+        grid_dim=1, block_dim=SAMP_THREADS,
+    )
+    var ph = ctx.enqueue_create_host_buffer[f32](VOCAB)
+    ctx.enqueue_copy(dst_buf=ph, src_buf=pd)
+    ctx.synchronize()
+    var out = List[Float32](unsafe_uninit_length=VOCAB)
+    for i in range(VOCAB):
+        out[i] = ph[i]
+    return out^
+
+
+def gate3_row(
+    ctx: DeviceContext, row_name: String, label: String, target: List[Float32], draft: List[Float32],
+    dtemp: Float32, mut fails: Int,
+) raises:
+    """Per-draw equality: device amar_spec_accept == spec_accept_ref.
+
+    The draft distribution comes from a DIFFERENT prompt's logits row, so the
+    accept branch is not the only one exercised: with q far from p, most draws
+    reject and take the residual norm(max(0, p - q)) path, which is the part
+    that carries the C3 tail fix.
+    """
+    var xt = ctx.enqueue_create_buffer[f32](VOCAB)
+    var xq = ctx.enqueue_create_buffer[f32](VOCAB)
+    fill_rows(ctx, xt, target, 1)
+    fill_rows(ctx, xq, draft, 1)
+    for cfg in spec_configs():
+        var dc = Cfg(cfg.slug, cfg.t * dtemp, cfg.k, cfg.p, cfg.mp)
+        var pt_h = sample_probs_ref(target, cfg.t, cfg.k, cfg.p, cfg.mp)
+        var pd_h = sample_probs_ref(draft, dc.t, dc.k, dc.p, dc.mp)
+        var pt_d_row = probs_device(ctx, xt, cfg)
+        var pd_d_row = probs_device(ctx, xq, dc)
+        var pmax = Float32(0)
+        for i in range(VOCAB):
+            pmax = max(pmax, abs(pt_d_row[i] - pt_h[i]))
+            pmax = max(pmax, abs(pd_d_row[i] - pd_h[i]))
+        var ptd = ctx.enqueue_create_buffer[f32](VOCAB)
+        var pdd = ctx.enqueue_create_buffer[f32](VOCAB)
+        fill_rows(ctx, ptd, pt_d_row, 1)
+        fill_rows(ctx, pdd, pd_d_row, 1)
+        var mismatches = 0
+        var accepts = 0
+        for counter in range(64):
+            var dx = device_sample(ctx, xq, dc.t, dc.k, dc.p, dc.mp, UInt64(7), UInt64(counter))
+            var x = dx[0]
+            var td = ctx.enqueue_create_buffer[DType.int32](1)
+            var oud = ctx.enqueue_create_buffer[DType.int32](1)
+            var acd = ctx.enqueue_create_buffer[DType.int32](1)
+            var th0 = ctx.enqueue_create_host_buffer[DType.int32](1)
+            ctx.synchronize()
+            th0[0] = Int32(x)
+            ctx.enqueue_copy(dst_buf=td, src_buf=th0)
+            comptime sp = amar_spec_accept[type_of(x_l), type_of(o_l)]
+            ctx.enqueue_function[sp](
+                TileTensor(ptd, x_l), TileTensor(pdd, x_l), TileTensor(td, o_l),
+                TileTensor(oud, o_l), TileTensor(acd, o_l), Int32(VOCAB), UInt64(9), UInt64(counter),
+                grid_dim=1, block_dim=SAMP_THREADS,
+            )
+            var oh = ctx.enqueue_create_host_buffer[DType.int32](1)
+            var ah = ctx.enqueue_create_host_buffer[DType.int32](1)
+            ctx.enqueue_copy(dst_buf=oh, src_buf=oud)
+            ctx.enqueue_copy(dst_buf=ah, src_buf=acd)
+            ctx.synchronize()
+            var h = spec_accept_ref(pt_d_row, pd_d_row, x, UInt64(9), UInt64(counter), 0)
+            if ah[0] == 1:
+                accepts += 1
+            if Int(oh[0]) != Int(h[0]) or (ah[0] == 1) != h[1]:
+                mismatches += 1
+                if mismatches <= 3:
+                    print("    mismatch counter", counter, "x", x, ": device", oh[0], ah[0], "host", h[0], h[1])
+        if mismatches == 0:
+            print("  PASS gate3", row_name, label, cfg.slug, ": device == host on all 64 spec draws, accepted",
+                  accepts, "of 64, max |probs device - host|", pmax)
+        else:
+            print("  FAIL gate3", row_name, label, cfg.slug, ":", mismatches, "of 64 spec draws disagree")
+            fails += 1
+
+
+def gate4_row(
+    ctx: DeviceContext, row_name: String, label: String, target: List[Float32], draft: List[Float32],
+    dtemp: Float32, mut fails: Int,
+) raises:
+    """Distribution: the tokens the speculative rule emits are distributed as p.
+
+    That is the whole theorem (Leviathan 2211.17192), so the binning and the
+    critical value are gate2's, against the same independent numpy oracle: if
+    the rule is right, accepting from q and resampling the residual is
+    indistinguishable from sampling p directly.
+    """
+    var xt = ctx.enqueue_create_buffer[f32](VOCAB)
+    var xq1 = ctx.enqueue_create_buffer[f32](VOCAB)
+    fill_rows(ctx, xt, target, 1)
+    fill_rows(ctx, xq1, draft, 1)
+    for cfg in spec_configs():
+        var oracle_path = ".work/m5/oracle-" + row_name.split("-")[0] + "-" + cfg.slug + ".txt"
+        if not path_exists(oracle_path):
+            print("  SKIP gate4", row_name, label, cfg.slug, ": no oracle file", oracle_path)
+            continue
+        var ids = List[Int]()
+        var probs = List[Float64]()
+        var rest = Float64(0)
+        load_oracle(oracle_path, ids, probs, rest)
+        var dc = Cfg(cfg.slug, cfg.t * dtemp, cfg.k, cfg.p, cfg.mp)
+        var pt_row = probs_device(ctx, xt, cfg)
+        var pd_row = probs_device(ctx, xq1, dc)
+        var ptd = ctx.enqueue_create_buffer[f32](SBATCH * VOCAB)
+        var pdd = ctx.enqueue_create_buffer[f32](SBATCH * VOCAB)
+        var xqb = ctx.enqueue_create_buffer[f32](SBATCH * VOCAB)
+        fill_rows(ctx, ptd, pt_row, SBATCH)
+        fill_rows(ctx, pdd, pd_row, SBATCH)
+        fill_rows(ctx, xqb, draft, SBATCH)
+        var counts = List[Int](capacity=len(ids))
+        for _ in range(len(ids)):
+            counts.append(0)
+        var rest_count = 0
+        var accepted = 0
+        var t0 = perf_counter_ns()
+        for b in range(S_BATCHES):
+            var td = ctx.enqueue_create_buffer[DType.int32](SBATCH)
+            var qp = ctx.enqueue_create_buffer[f32](SBATCH)
+            comptime kern = amar_sample_row[type_of(xs_l), type_of(ts_l), type_of(ts_l)]
+            ctx.enqueue_function[kern](
+                TileTensor(xqb, xs_l), TileTensor(td, ts_l), TileTensor(qp, ts_l), Int32(VOCAB),
+                dc.t, Int32(dc.k), dc.p, dc.mp, UInt64(3000 + b), UInt64(b), grid_dim=SBATCH, block_dim=SAMP_THREADS,
+            )
+            var oud = ctx.enqueue_create_buffer[DType.int32](SBATCH)
+            var acd = ctx.enqueue_create_buffer[DType.int32](SBATCH)
+            comptime sp = amar_spec_accept[type_of(xs_l), type_of(ts_l)]
+            ctx.enqueue_function[sp](
+                TileTensor(ptd, xs_l), TileTensor(pdd, xs_l), TileTensor(td, ts_l),
+                TileTensor(oud, ts_l), TileTensor(acd, ts_l), Int32(VOCAB), UInt64(4000 + b), UInt64(b),
+                grid_dim=SBATCH, block_dim=SAMP_THREADS,
+            )
+            var oh = ctx.enqueue_create_host_buffer[DType.int32](SBATCH)
+            var ah = ctx.enqueue_create_host_buffer[DType.int32](SBATCH)
+            ctx.enqueue_copy(dst_buf=oh, src_buf=oud)
+            ctx.enqueue_copy(dst_buf=ah, src_buf=acd)
+            ctx.synchronize()
+            for i in range(SBATCH):
+                if ah[i] == 1:
+                    accepted += 1
+                var tok = Int(oh[i])
+                var found = False
+                for j in range(len(ids)):
+                    if ids[j] == tok:
+                        counts[j] += 1
+                        found = True
+                        break
+                if not found:
+                    rest_count += 1
+        var dt = Float64(perf_counter_ns() - t0) / 1e9
+        var n = S_BATCHES * SBATCH
+        var stat = 0.0
+        var bins = 0
+        var po = 0.0
+        var pe = 0.0
+        var lo = 0.0
+        var le = 0.0
+        for j in range(len(ids)):
+            var e = probs[j] * Float64(n)
+            if e >= 5.0:
+                stat += (Float64(counts[j]) - e) ** 2 / e
+                bins += 1
+                lo = Float64(counts[j])
+                le = e
+            else:
+                po += Float64(counts[j])
+                pe += e
+        if rest > 0:
+            var er = rest * Float64(n)
+            po += Float64(rest_count)
+            pe += er
+        if pe >= 5.0:
+            stat += (po - pe) ** 2 / pe
+            bins += 1
+        elif pe > 0.0:
+            stat -= (lo - le) ** 2 / le
+            stat += (lo + po - le - pe) ** 2 / (le + pe)
+        var cv = crit(bins - 1)
+        var over = stat >= cv and bins > 1
+        print("  ", "PASS" if not over else "FAIL", "gate4", row_name, label, cfg.slug, ": chi2", stat, "df", bins - 1,
+              "crit(p=0.001)", cv, "n", n, "accepted", accepted, "rest_count", rest_count, "elapsed_s", dt)
+        if over:
+            fails += 1
+
+
 def main() raises:
     comptime assert has_accelerator(), "GPU required"
     var ctx = DeviceContext()
     var fails = 0
     var ran_any = False
+    # Every row is loaded up front, because the speculative gates need a
+    # SECOND real row as the draft distribution (row i verifies against row
+    # i+1's logits): a draft equal to the target accepts every draw and never
+    # exercises the residual, which is the branch the C3 tail fix lives in.
+    var names = List[String]()
+    var rows_l = List[List[Float32]]()
     for row_spec in rows():
-        var row_name = row_spec[0]
-        var row_path = row_spec[1]
         var row: List[Float32]
         try:
-            row = load_logits(row_path)
+            row = load_logits(row_spec[1])
         except:
-            print("SKIP", row_name, ": ", row_path, "not present")
+            print("SKIP", row_spec[0], ": ", row_spec[1], "not present")
             continue
         if len(row) != VOCAB:
-            print("SKIP", row_name, ": ", len(row), "entries, this build's VOCAB is", VOCAB)
+            print("SKIP", row_spec[0], ": ", len(row), "entries, this build's VOCAB is", VOCAB)
             continue
+        names.append(row_spec[0])
+        rows_l.append(row^)
+    for ri in range(len(names)):
+        var row_name = names[ri]
+        ref row = rows_l[ri]
         ran_any = True
         print("== row", row_name)
 
@@ -284,11 +517,28 @@ def main() raises:
         ctx.synchronize()
         gate2_row(ctx, xbd, row_name, fails)
 
+        # Speculative gates (A1): draft = the next row's logits, wrapping.
+        # Two draft arms, because one branch each is not coverage. "near" is
+        # the same row at 1.3x temperature: q is close to p, most draws accept,
+        # and the accept branch carries the weight. "far" is the next row's
+        # logits: q is unrelated to p, almost nothing accepts, and every draw
+        # goes through the residual norm(max(0, p - q)), which is where the C3
+        # tail fix lives. The far arm alone accepted 0 of 64 on the first run,
+        # which is why the near arm exists.
+        gate3_row(ctx, row_name, "near", row, row, Float32(1.3), fails)
+        gate4_row(ctx, row_name, "near", row, row, Float32(1.3), fails)
+        if len(names) > 1:
+            ref draft = rows_l[(ri + 1) % len(names)]
+            gate3_row(ctx, row_name, "far", row, draft, Float32(1.0), fails)
+            gate4_row(ctx, row_name, "far", row, draft, Float32(1.0), fails)
+        else:
+            print("  SKIP gate3/gate4 far", row_name, ": need a second row for the draft distribution")
+
     if not ran_any:
         print("SKIP: no rows present (see .work/m5/logits-*.bin)")
         return
     if fails == 0:
-        print("PASS: device sampler matches serve/sample_ref.mojo (C3-fixed) at real vocab, all rows and shapes")
+        print("PASS: device sampler and speculative accept match serve/sample_ref.mojo (C3-fixed) at real vocab")
     else:
         print("FAIL:", fails, "check(s) failed")
         exit(1)
