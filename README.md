@@ -39,14 +39,25 @@ targets are verified end to end against llama.cpp on the same GGUF
 | granite-4.2-3b BF16 | `granite` | 20/20 prompts, 98.4-100% | 164.5-169.0 |
 | lily-cybersecurity-7b Q6_K | `llama` (Mistral-arch, SPM) | 20/20 prompts, 96.9-100% | 94.1-95.0 |
 
-**These four decode; they do not serve.** `serve/spark.mojo` is a one-shot CLI
-and does not implement the request/response protocol the Rust front speaks, so
-there is no `/v1/chat/completions` path to them today. Only the `qwen35` and
-`qwen35moe` models above are reachable through `baro-serve`.
+**All four are now servable.** `serve/spark.mojo` speaks the same
+request/response protocol as `serve/engine.mojo` (`serve/PROTOCOL.md`), reusing
+its byte-scanner JSON reader and request parser (`serve/serve_proto.mojo`)
+rather than defining a second wire format. `baro-serve --engine
+.work/<target>/spark-engine --pack .work/<target>` reaches any of the four
+through the same HTTP surface as `qwen35`/`qwen35moe`. Verified end to end for
+two targets so far: a real `POST /v1/chat/completions` against a running
+`baro-serve` returned a correct completion for Qwen2.5-7B-Instruct
+("The capital of France is Paris.") and granite-4.2-3b
+("<think></think>Paris."), both with `finish_reason: "stop"` (spark now acts
+on the `stop` field it previously only parsed). Llama-3.2-1B and
+lily-cybersecurity-7b are wired through the identical code path but not yet
+verified through the HTTP front this round (no `tokenizer.json` fetched for
+them; Llama-3.2 is gated on HF and needs an accepted-license token).
 
 Two gaps the four checkpoints did not exercise: Granite's embedding/residual
 scale folding at pack time (both multipliers are 1.0 in the only Granite
-checkpoint available), and any chat-template path through the HTTP front.
+checkpoint available), and sampling (`temperature`/`top_p`/... are parsed and
+carried, not yet acted on -- spark always decodes greedy, same as `qwen35`).
 
 Model weights are not distributed with this repo.
 

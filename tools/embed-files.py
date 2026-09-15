@@ -7,15 +7,18 @@ gguf's own commit (exchange/scorer-integrity-report.md, P-A, 2026-09-08).
 
     tools/gguf-embed.py SRC.gguf DST.gguf $(tools/embed-files.py)
     tools/embed-files.py --arch spark   # serve/spark.mojo closure (spark.mojo itself is the
-                                        # harness, taken from git); external packages
-                                        # (uregex, minja) come in whole, as absolute paths
+                                        # harness, taken from git); uregex/minja come in
+                                        # whole, as a package glob (vendored at repo root
+                                        # since M1, briefs/2026-09-15-wiring-lane.md -- no
+                                        # longer external, but still not a single kernels/X.mojo
+                                        # or serve/X.mojo candidate, so EXT is still how the
+                                        # closure walker pulls a whole package directory in)
 """
 import re, sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-EXT = {"uregex": Path.home() / "Projects/mojo/mojo-uregex/src/uregex",
-       "minja": Path.home() / "Projects/mojo/mojo-minja/src/minja"}
+EXT = {"uregex": ROOT / "uregex", "minja": ROOT / "minja"}
 ARCH = {"qwythos": (["serve/window.mojo", "serve/registry.mojo"], "serve/engine.mojo"),
         "spark": (["serve/spark.mojo"], "serve/spark.mojo"),
         # The W2 kernel-parity closure, kept for the expert-kernel gate.

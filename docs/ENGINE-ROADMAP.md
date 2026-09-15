@@ -22,7 +22,7 @@ Current state is in the right-hand column, updated 2026-09-12.
 | Elementwise kernels | RMSNorm, RoPE, SwiGLU, softmax | nothing | all present in `kernels/elementwise.mojo`, <=1e-6 vs fp64 host refs |
 | Attention | flash-decode style, GQA | nothing | GQA decode path + hybrid SSM sub-block (`attn.mojo`, `ssm.mojo`) |
 | KV cache | paged, quantized cache | nothing | contiguous f16 cache + (k+1)-slot ring for MTP rollback; not paged, not quantized |
-| Forward pass | graph per arch family | nothing | six architectures: `qwen35` dense (token-identical to llama.cpp 64/64), `qwen35moe` 256-expert MoE, and `spark2_5` plus `llama`, `qwen2`, `granite` on the profile-driven dense engine (`serve/spark.mojo`, recipe read from the GGUF by `tools/gen-profile.mojo`; decode only, not wired to the HTTP front) |
+| Forward pass | graph per arch family | nothing | six architectures: `qwen35` dense (token-identical to llama.cpp 64/64), `qwen35moe` 256-expert MoE, and `spark2_5` plus `llama`, `qwen2`, `granite` on the profile-driven dense engine (`serve/spark.mojo`, recipe read from the GGUF by `tools/gen-profile.mojo`; now wired to the HTTP front too, `serve/PROTOCOL.md`, verified end to end for Qwen2.5-7B and granite-4.2-3b) |
 | Sampling | full menu | nothing | device sampler kernels exist and are distribution-tested, but are not in the decode loop; generation is greedy today |
 | Server | OpenAI-compatible HTTP | empty `serve/src` | `baro-serve` (Rust, axum/tokio): chat + completions with SSE, models, cancel, tokenize, detokenize, health (`serve/PROTOCOL.md`) |
 | Prefill | batched, causal-mask | n/a | batched and chunked, WMMA flash attention + one-wave SSM scan; within ~1.3x of llama.cpp at 8k to 32k (`docs/prefill-long-ctx-2026-09-11.md`) |

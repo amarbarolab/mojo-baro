@@ -1,9 +1,18 @@
 # Engine <-> server protocol
 
-`serve/engine.mojo` is a single-request decoder. `serve/src` (`baro-serve`,
-Rust) keeps one engine process alive and turns HTTP requests into engine
-requests one at a time. This file is the contract between the two, and the
-seam where the process boundary is later replaced by a C ABI.
+`serve/engine.mojo` (qwen35, qwen35moe) and `serve/spark.mojo` (the dense
+families: llama, qwen2, granite, spark2_5) are both single-request decoders
+that speak this same line protocol under `BARO_SERVE=1`, sharing the
+byte-scanner reader and request parser in `serve/serve_proto.mojo` rather
+than each defining their own wire format. `serve/src` (`baro-serve`, Rust)
+keeps one engine process alive (either binary, selected with `--engine`) and
+turns HTTP requests into engine requests one at a time. This file is the
+contract between the two, and the seam where the process boundary is later
+replaced by a C ABI. Not every optional field is acted on by every engine:
+spark has no draft head (`spec` is parsed and ignored, `spec_k` in its
+`ready` line is always `0`) and no prefix-checkpoint chain (`ckpt` is parsed
+and ignored); `stop` and the required id/prompt/n fields are honored by
+both.
 
 ## Process model
 

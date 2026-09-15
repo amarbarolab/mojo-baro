@@ -11,6 +11,7 @@ from elementwise import amar_rmsnorm_cast
 from matmul_skinny import ROW_WAVES, ROW_THREADS
 from tokenizer import Tokenizer
 from minja import render_chat
+from serve_proto import read_line, parse_request, default_sample_params
 from spark_kernels import (
     amar_embed_lookup_f32, amar_gemv_q8, amar_argmax_part, amar_argmax_final, amar_rope_kv_append, amar_attn_decode_swa_gated, amar_rope_plain, amar_bias_add,
 )
@@ -199,52 +200,36 @@ def read_prompt(path: String) raises -> List[Int]:
     return prompt^
 
 
+def tok_line(id: Int, tok: Int) -> String:
+    return String("{\"id\":") + String(id) + ",\"tok\":" + String(tok) + "}"
+
+
+def err_line(id: Int, msg: String) -> String:
+    return String("{\"id\":") + String(id) + ",\"error\":\"" + msg + "\"}"
+
+
 def main() raises:
     comptime assert has_accelerator(), "GPU required"
     var ctx = DeviceContext()
     var packdir = getenv("BARO_PACK", ".work/spark/pack-q8")
-    var gen_n = atol(getenv("BARO_GEN", "64"))
-    var prompt: List[Int]
-    var text_path = getenv("BARO_PROMPT_TEXT", "")
-    var chat_path = getenv("BARO_CHAT", "")
-    if text_path != "" or chat_path != "":
-        var gguf = getenv("BARO_GGUF", "")
-        if gguf == "":
-            raise Error("BARO_PROMPT_TEXT / BARO_CHAT need BARO_GGUF (tokenizer + template source)")
-        var t0 = perf_counter_ns()
-        var tok = Tokenizer(gguf)
-        var text: String
-        if chat_path != "":
-            var case_json: String
-            with open(chat_path, "r") as f:
-                case_json = f.read()
-            text = render_chat(tok.chat_template, case_json, tok.token_str(tok.bos_id), tok.token_str(tok.eos_id), tok.token_str(tok.pad_id))
-            print("chat template rendered:", text.byte_length(), "bytes (mojo-minja)")
-        else:
-            with open(text_path, "r") as f:
-                text = f.read()
-        prompt = tok.encode(text)
-        print("tokenized", len(prompt), "ids in", Float64(perf_counter_ns() - t0) / 1e9, "s (mojo tokenizer,", tok.pre, ")")
-        var ps = String()
-        for i in range(len(prompt)):
-            ps += String(prompt[i]) + " "
-        print("prompt ids:", ps)
-    else:
-        prompt = read_prompt(getenv("BARO_PROMPT", packdir + "/prompt-tokens.txt"))
-    var n_prompt = len(prompt)
-    var n_total = n_prompt + gen_n
-    if n_total > TMAX:
-        raise Error("prompt + gen exceeds TMAX")
-    print("prompt tokens:", n_prompt, "gen:", gen_n)
+    var serve = getenv("BARO_SERVE", "0") == "1"
+    print("BARO_SERVE:", serve)
+    var force = List[Int]()
+    var force_path = getenv("BARO_FORCE", "")
+    if force_path != "":
+        force = read_prompt(force_path)
 
     var off = List[Int]()
     var wbuf = load_pack(ctx, packdir, off)
 
+    # Buffers allocated once (serve/PROTOCOL.md); a served request refills
+    # toks_h/toks_d from position 0 and every kernel below only ever reads a
+    # position it has itself just written this request, so no explicit KV
+    # cache clear is needed between requests -- position 0 always overwrites
+    # whatever an earlier request left at that slot.
     var toks_h = ctx.enqueue_create_host_buffer[DType.int32](TMAX)
-    for i in range(TMAX):
-        toks_h[i] = Int32(prompt[i]) if i < n_prompt else Int32(0)
     var toks_d = ctx.enqueue_create_buffer[DType.int32](TMAX)
-    ctx.enqueue_copy(dst_buf=toks_d, src_buf=toks_h)
+    var tok1_h = ctx.enqueue_create_host_buffer[DType.int32](1)
 
     var x_d = ctx.enqueue_create_buffer[f32](H)
     var xb_d = ctx.enqueue_create_buffer[bf16](H)
@@ -257,18 +242,14 @@ def main() raises:
     var fgb_d = ctx.enqueue_create_buffer[bf16](FFN)
     var dummy_d = ctx.enqueue_create_buffer[bf16](1)
     var logits_d = ctx.enqueue_create_buffer[f32](VOCAB)
+    var pred_d = ctx.enqueue_create_buffer[DType.int32](TMAX)
     ctx.synchronize()
 
     var Emb = wf(ctx, wbuf, off[0], VOCAB * H, emb_l)
     var X = TileTensor(x_d, x_l)
     var Xb = TileTensor(xb_d, xb_l)
     var Toks = TileTensor(toks_d, toks_l)
-    var pred_d = ctx.enqueue_create_buffer[DType.int32](TMAX)
     var Pred = TileTensor(pred_d, toks_l)
-    var force = List[Int]()
-    var force_path = getenv("BARO_FORCE", "")
-    if force_path != "":
-        force = read_prompt(force_path)
     var Qkv1 = TileTensor(qkv_d, qkv1_l)
     var X1 = TileTensor(x_d, h1_l)
     var Dummy = TileTensor(dummy_d, dummy_l)
@@ -293,63 +274,168 @@ def main() raises:
     var Woq = wq(ctx, wbuf, out_off, VOCAB * H, q_out)
     var Wos = ws(ctx, wbuf, out_off, VOCAB * H, s_out)
 
-    var t_gen_start: Int = 0
-    ctx.synchronize()
-    var t_pf_start = perf_counter_ns()
-    for pos in range(n_total - 1):
-        if pos == n_prompt - 1:
-            ctx.synchronize()
-            t_gen_start = perf_counter_ns()
-            print("prefill_s:", Float64(t_gen_start - t_pf_start) / 1e9, " prefill rows:", n_prompt - 1, " chunk: 0")
-        ctx.enqueue_function[k_emb](Emb, X, Toks, Int32(pos), Int32(H), grid_dim=(ceildiv(H, 256), 1), block_dim=256)
-        for i in range(N_LAYERS):
-            var e = 1 + LSTRIDE * i
-            var swa = (i % SWA_PERIOD) != SWA_FULL_PHASE
-            var AttnNorm = wf(ctx, wbuf, off[e], H, h_l)
-            var FfnNorm = wf(ctx, wbuf, off[e + OFF_FFN_NORM], H, h_l)
-            ctx.enqueue_function[k_rms](X, AttnNorm, Xb, Int32(H), NORM_EPS, grid_dim=1, block_dim=256)
-            ctx.enqueue_function[k_qkv](Xb, wq(ctx, wbuf, off[e + 1], QKV * H, q_qkv), ws(ctx, wbuf, off[e + 1], QKV * H, s_qkv), Qkv1, Dummy, Int32(QKV), Int32(H), grid_dim=ceildiv(QKV, ROW_WAVES), block_dim=ROW_THREADS)
-            comptime if QKV_BIAS:
-                var QkvBias = wf(ctx, wbuf, off[e + OFF_QKV_BIAS], QKV, qkv1_l)
-                ctx.enqueue_function[k_bias](Qkv1, QkvBias, Int32(QKV), grid_dim=ceildiv(QKV, 256), block_dim=256)
-            if swa:
-                ctx.enqueue_function[k_rope_swa](Q, Int32(pos), Int32(NQH), BASE_SWA, grid_dim=(NQH, 1), block_dim=NROT_SWA // 2)
-                ctx.enqueue_function[k_kv_swa](Kc, Vc, K, V, Int32(pos), BASE_SWA, Int32(i), grid_dim=(NKVH, 2), block_dim=HD)
+    if serve:
+        print("{\"ready\":true,\"tmax\":" + String(TMAX) + ",\"mrows\":1,\"kmax\":0,\"spec_k\":0,\"pack\":\"" + packdir + "\"}")
+
+    # No cancel support this milestone (M4, briefs/2026-09-15-wiring-lane.md):
+    # spark has no draft head and no spec decode, so a request always runs to
+    # completion quickly; {"cancel":ID} lines are not sent by a client that
+    # never streams past this engine's own doneness. A future round wanting
+    # cancel reuses serve_proto.cancel_pending exactly as engine.mojo does.
+    var req_id = 0
+    while True:
+        var prompt: List[Int]
+        var gen_n = atol(getenv("BARO_GEN", "64"))
+        var stop_seqs = List[List[Int]]()
+        if serve:
+            var line_in = read_line(0)
+            if not line_in:
+                break
+            prompt = List[Int]()
+            var req_n = 0
+            var req_spec = False
+            var req_has_spec = False
+            var ckpt_hints = List[Int]()
+            var sample = default_sample_params()
+            var perr = parse_request(line_in.value(), req_id, prompt, req_n, req_spec, req_has_spec, stop_seqs, ckpt_hints, sample)
+            if perr == "" and len(prompt) < 1:
+                perr = "empty prompt"
+            if perr == "" and req_n < 1:
+                perr = "n must be >= 1"
+            if perr == "" and len(prompt) + req_n > TMAX:
+                perr = "prompt+n exceeds TMAX " + String(TMAX)
+            if perr != "":
+                print(err_line(req_id, perr))
+                continue
+            gen_n = req_n
+        else:
+            var text_path = getenv("BARO_PROMPT_TEXT", "")
+            var chat_path = getenv("BARO_CHAT", "")
+            if text_path != "" or chat_path != "":
+                var gguf = getenv("BARO_GGUF", "")
+                if gguf == "":
+                    raise Error("BARO_PROMPT_TEXT / BARO_CHAT need BARO_GGUF (tokenizer + template source)")
+                var t0 = perf_counter_ns()
+                var tok = Tokenizer(gguf)
+                var text: String
+                if chat_path != "":
+                    var case_json: String
+                    with open(chat_path, "r") as f:
+                        case_json = f.read()
+                    text = render_chat(tok.chat_template, case_json, tok.token_str(tok.bos_id), tok.token_str(tok.eos_id), tok.token_str(tok.pad_id))
+                    print("chat template rendered:", text.byte_length(), "bytes (mojo-minja)")
+                else:
+                    with open(text_path, "r") as f:
+                        text = f.read()
+                prompt = tok.encode(text)
+                print("tokenized", len(prompt), "ids in", Float64(perf_counter_ns() - t0) / 1e9, "s (mojo tokenizer,", tok.pre, ")")
+                var ps = String()
+                for i in range(len(prompt)):
+                    ps += String(prompt[i]) + " "
+                print("prompt ids:", ps)
             else:
-                ctx.enqueue_function[k_rope_full](Q, Int32(pos), Int32(NQH), BASE_FULL, grid_dim=(NQH, 1), block_dim=NROT_FULL // 2)
-                ctx.enqueue_function[k_kv_full](Kc, Vc, K, V, Int32(pos), BASE_FULL, Int32(i), grid_dim=(NKVH, 2), block_dim=HD)
-            comptime if HAS_GATE:
-                ctx.enqueue_function[k_gate](Xb, wq(ctx, wbuf, off[e + OFF_GATE], NQH * H, q_gate), ws(ctx, wbuf, off[e + OFF_GATE], NQH * H, s_gate), Gate, Dummy, Int32(NQH), Int32(H), grid_dim=ceildiv(NQH, ROW_WAVES), block_dim=ROW_THREADS)
-            ctx.enqueue_function[k_att](Q, Kc, Vc, Gate, AoB2, Int32(pos + 1), Int32(SWA_WIN if swa else 0), ATTN_SCALE, Int32(i), grid_dim=(NQH, 1), block_dim=HD)
-            ctx.enqueue_function[k_o](AoB, wq(ctx, wbuf, off[e + OFF_O], H * QDIM, q_o), ws(ctx, wbuf, off[e + OFF_O], H * QDIM, s_o), X1, Dummy, Int32(H), Int32(QDIM), grid_dim=ceildiv(H, ROW_WAVES), block_dim=ROW_THREADS)
-            ctx.enqueue_function[k_rms](X, FfnNorm, Xb, Int32(H), NORM_EPS, grid_dim=1, block_dim=256)
-            ctx.enqueue_function[k_ffn_gate](Xb, wq(ctx, wbuf, off[e + OFF_FFN_GATE], FFN * H, q_ffn), ws(ctx, wbuf, off[e + OFF_FFN_GATE], FFN * H, s_ffn), G1, Dummy, Int32(FFN), Int32(H), grid_dim=ceildiv(FFN, ROW_WAVES), block_dim=ROW_THREADS)
-            ctx.enqueue_function[k_ffn_up](Xb, wq(ctx, wbuf, off[e + OFF_FFN_UP], FFN * H, q_ffn), ws(ctx, wbuf, off[e + OFF_FFN_UP], FFN * H, s_ffn), G1, Fgb1, Int32(FFN), Int32(H), grid_dim=ceildiv(FFN, ROW_WAVES), block_dim=ROW_THREADS)
-            ctx.enqueue_function[k_down](Fgb, wq(ctx, wbuf, off[e + OFF_DOWN], H * FFN, q_down), ws(ctx, wbuf, off[e + OFF_DOWN], H * FFN, s_down), X1, Dummy, Int32(H), Int32(FFN), grid_dim=ceildiv(H, ROW_WAVES), block_dim=ROW_THREADS)
-        if pos >= n_prompt - 1:
-            ctx.enqueue_function[k_rms](X, OutNorm, Xb, Int32(H), NORM_EPS, grid_dim=1, block_dim=256)
-            ctx.enqueue_function[k_head](Xb, Woq, Wos, Logits1, Dummy, Int32(VOCAB), Int32(H), grid_dim=ceildiv(VOCAB, ROW_WAVES), block_dim=ROW_THREADS)
-            ctx.enqueue_function[k_argmax](Logits1, Amv, Ami, Int32(VOCAB), grid_dim=AM_NB, block_dim=256)
-            var fi = pos + 1 - n_prompt
-            var forced = Int32(force[fi]) if fi < len(force) else Int32(-1)
-            ctx.enqueue_function[k_argmax_final](Amv, Ami, Toks, Pred, Int32(pos + 1), forced, grid_dim=1, block_dim=32)
-    ctx.synchronize()
-    var dt = Float64(perf_counter_ns() - t_gen_start) / 1e9
-    ctx.enqueue_copy(dst_buf=toks_h, src_buf=toks_d)
-    ctx.synchronize()
-    var s = String("")
-    for i in range(n_prompt, n_total):
-        s += String(Int(toks_h[i])) + " "
-    print("generated:", s)
-    if len(force) > 0:
-        ctx.enqueue_copy(dst_buf=toks_h, src_buf=pred_d)
+                prompt = read_prompt(getenv("BARO_PROMPT", packdir + "/prompt-tokens.txt"))
+        var n_prompt = len(prompt)
+        var n_total = n_prompt + gen_n
+        if n_total > TMAX:
+            raise Error("prompt + gen exceeds TMAX")
+        print("prompt tokens:", n_prompt, "gen:", gen_n)
+
+        for i in range(TMAX):
+            toks_h[i] = Int32(prompt[i]) if i < n_prompt else Int32(0)
+        ctx.enqueue_copy(dst_buf=toks_d, src_buf=toks_h)
+
+        var t_gen_start: Int = 0
+        var generated_ids = List[Int]()
+        var finish = String("length")
         ctx.synchronize()
-        var ps = String("")
-        var agree = 0
-        for i in range(n_prompt, n_total):
-            ps += String(Int(toks_h[i])) + " "
-            if i - n_prompt < len(force) and Int(toks_h[i]) == force[i - n_prompt]:
-                agree += 1
-        print("predicted:", ps)
-        print("forced agreement:", agree, "/", min(gen_n, len(force)))
-    print("tok/s_gen:", Float64(gen_n) / dt, "(", gen_n, "steps,", dt, "s )")
+        var t_pf_start = perf_counter_ns()
+        for pos in range(n_total - 1):
+            if pos == n_prompt - 1:
+                ctx.synchronize()
+                t_gen_start = perf_counter_ns()
+                print("prefill_s:", Float64(t_gen_start - t_pf_start) / 1e9, " prefill rows:", n_prompt - 1, " chunk: 0")
+            ctx.enqueue_function[k_emb](Emb, X, Toks, Int32(pos), Int32(H), grid_dim=(ceildiv(H, 256), 1), block_dim=256)
+            for i in range(N_LAYERS):
+                var e = 1 + LSTRIDE * i
+                var swa = (i % SWA_PERIOD) != SWA_FULL_PHASE
+                var AttnNorm = wf(ctx, wbuf, off[e], H, h_l)
+                var FfnNorm = wf(ctx, wbuf, off[e + OFF_FFN_NORM], H, h_l)
+                ctx.enqueue_function[k_rms](X, AttnNorm, Xb, Int32(H), NORM_EPS, grid_dim=1, block_dim=256)
+                ctx.enqueue_function[k_qkv](Xb, wq(ctx, wbuf, off[e + 1], QKV * H, q_qkv), ws(ctx, wbuf, off[e + 1], QKV * H, s_qkv), Qkv1, Dummy, Int32(QKV), Int32(H), grid_dim=ceildiv(QKV, ROW_WAVES), block_dim=ROW_THREADS)
+                comptime if QKV_BIAS:
+                    var QkvBias = wf(ctx, wbuf, off[e + OFF_QKV_BIAS], QKV, qkv1_l)
+                    ctx.enqueue_function[k_bias](Qkv1, QkvBias, Int32(QKV), grid_dim=ceildiv(QKV, 256), block_dim=256)
+                if swa:
+                    ctx.enqueue_function[k_rope_swa](Q, Int32(pos), Int32(NQH), BASE_SWA, grid_dim=(NQH, 1), block_dim=NROT_SWA // 2)
+                    ctx.enqueue_function[k_kv_swa](Kc, Vc, K, V, Int32(pos), BASE_SWA, Int32(i), grid_dim=(NKVH, 2), block_dim=HD)
+                else:
+                    ctx.enqueue_function[k_rope_full](Q, Int32(pos), Int32(NQH), BASE_FULL, grid_dim=(NQH, 1), block_dim=NROT_FULL // 2)
+                    ctx.enqueue_function[k_kv_full](Kc, Vc, K, V, Int32(pos), BASE_FULL, Int32(i), grid_dim=(NKVH, 2), block_dim=HD)
+                comptime if HAS_GATE:
+                    ctx.enqueue_function[k_gate](Xb, wq(ctx, wbuf, off[e + OFF_GATE], NQH * H, q_gate), ws(ctx, wbuf, off[e + OFF_GATE], NQH * H, s_gate), Gate, Dummy, Int32(NQH), Int32(H), grid_dim=ceildiv(NQH, ROW_WAVES), block_dim=ROW_THREADS)
+                ctx.enqueue_function[k_att](Q, Kc, Vc, Gate, AoB2, Int32(pos + 1), Int32(SWA_WIN if swa else 0), ATTN_SCALE, Int32(i), grid_dim=(NQH, 1), block_dim=HD)
+                ctx.enqueue_function[k_o](AoB, wq(ctx, wbuf, off[e + OFF_O], H * QDIM, q_o), ws(ctx, wbuf, off[e + OFF_O], H * QDIM, s_o), X1, Dummy, Int32(H), Int32(QDIM), grid_dim=ceildiv(H, ROW_WAVES), block_dim=ROW_THREADS)
+                ctx.enqueue_function[k_rms](X, FfnNorm, Xb, Int32(H), NORM_EPS, grid_dim=1, block_dim=256)
+                ctx.enqueue_function[k_ffn_gate](Xb, wq(ctx, wbuf, off[e + OFF_FFN_GATE], FFN * H, q_ffn), ws(ctx, wbuf, off[e + OFF_FFN_GATE], FFN * H, s_ffn), G1, Dummy, Int32(FFN), Int32(H), grid_dim=ceildiv(FFN, ROW_WAVES), block_dim=ROW_THREADS)
+                ctx.enqueue_function[k_ffn_up](Xb, wq(ctx, wbuf, off[e + OFF_FFN_UP], FFN * H, q_ffn), ws(ctx, wbuf, off[e + OFF_FFN_UP], FFN * H, s_ffn), G1, Fgb1, Int32(FFN), Int32(H), grid_dim=ceildiv(FFN, ROW_WAVES), block_dim=ROW_THREADS)
+                ctx.enqueue_function[k_down](Fgb, wq(ctx, wbuf, off[e + OFF_DOWN], H * FFN, q_down), ws(ctx, wbuf, off[e + OFF_DOWN], H * FFN, s_down), X1, Dummy, Int32(H), Int32(FFN), grid_dim=ceildiv(H, ROW_WAVES), block_dim=ROW_THREADS)
+            if pos >= n_prompt - 1:
+                ctx.enqueue_function[k_rms](X, OutNorm, Xb, Int32(H), NORM_EPS, grid_dim=1, block_dim=256)
+                ctx.enqueue_function[k_head](Xb, Woq, Wos, Logits1, Dummy, Int32(VOCAB), Int32(H), grid_dim=ceildiv(VOCAB, ROW_WAVES), block_dim=ROW_THREADS)
+                ctx.enqueue_function[k_argmax](Logits1, Amv, Ami, Int32(VOCAB), grid_dim=AM_NB, block_dim=256)
+                var fi = pos + 1 - n_prompt
+                var forced = Int32(force[fi]) if fi < len(force) else Int32(-1)
+                ctx.enqueue_function[k_argmax_final](Amv, Ami, Toks, Pred, Int32(pos + 1), forced, grid_dim=1, block_dim=32)
+                if serve:
+                    ctx.enqueue_copy(dst_buf=tok1_h, src_buf=DeviceBuffer[DType.int32](ctx, toks_d.unsafe_ptr().unsafe_offset(pos + 1), 1, owning=False))
+                    ctx.synchronize()
+                    var new_tok = Int(tok1_h[0])
+                    print(tok_line(req_id, new_tok))
+                    generated_ids.append(new_tok)
+                    # Checked once per generated token (spark decodes m=1 at a
+                    # time, unlike engine.mojo's per-window check): the tail
+                    # of what has been generated so far against every stop
+                    # sequence; a match ends generation right here.
+                    for seq in stop_seqs:
+                        if len(seq) > 0 and len(seq) <= len(generated_ids):
+                            var matched = True
+                            for k in range(len(seq)):
+                                if generated_ids[len(generated_ids) - len(seq) + k] != seq[k]:
+                                    matched = False
+                                    break
+                            if matched:
+                                finish = "stop"
+                    if finish == "stop":
+                        break
+        ctx.synchronize()
+        var dt = Float64(perf_counter_ns() - t_gen_start) / 1e9
+        var n_gen = len(generated_ids) if serve else gen_n
+        ctx.enqueue_copy(dst_buf=toks_h, src_buf=toks_d)
+        ctx.synchronize()
+        var s = String("")
+        for i in range(n_prompt, n_prompt + n_gen):
+            s += String(Int(toks_h[i])) + " "
+        print("generated:", s)
+        if len(force) > 0:
+            ctx.enqueue_copy(dst_buf=toks_h, src_buf=pred_d)
+            ctx.synchronize()
+            var ps = String("")
+            var agree = 0
+            for i in range(n_prompt, n_prompt + n_gen):
+                ps += String(Int(toks_h[i])) + " "
+                if i - n_prompt < len(force) and Int(toks_h[i]) == force[i - n_prompt]:
+                    agree += 1
+            print("predicted:", ps)
+            print("forced agreement:", agree, "/", min(n_gen, len(force)))
+        print("tok/s_gen:", Float64(n_gen) / dt, "(", n_gen, "steps,", dt, "s )")
+        if serve:
+            var tok_s = Float64(n_gen - 1) / dt if n_gen > 1 else 0.0
+            print(
+                "{\"id\":" + String(req_id) + ",\"done\":true,\"n\":" + String(n_gen)
+                + ",\"prefill_s\":" + String(Float64(t_gen_start - t_pf_start) / 1e9)
+                + ",\"decode_s\":" + String(dt) + ",\"tok_s\":" + String(tok_s)
+                + ",\"finish\":\"" + finish + "\"}"
+            )
+        else:
+            break
