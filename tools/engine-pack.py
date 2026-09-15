@@ -358,6 +358,9 @@ def pack_dense(model, outdir):
     print(f"packed {arch}, {n_layers} layers, bias={has_bias}, tied={tied}, {off/2**30:.2f} GiB")
 
 
+MOE_DENSE_Q8 = {"attn_q", "attn_k", "attn_v", "attn_output", "attn_qkv", "attn_gate", "ssm_out"}
+
+
 def pack_moe(model, outdir):
     """Pack qwen35moe in fixed lexical tensor order without expanding experts."""
     f, infos, data_start, kv = ge.parse(model)
@@ -388,6 +391,13 @@ def pack_moe(model, outdir):
                 raw_bf16 = dequantize_kquant(f, data_start, toff, ttype, shape)
                 q, d = quantize_q8_0(np.frombuffer(raw_bf16, dtype=np.uint16).reshape(shape))
                 raw = q.tobytes() + d.tobytes()
+                dt = "q8"
+            elif dt == "q8_0" and name.split(".")[-2] in MOE_DENSE_Q8:
+                # R6a (bench/moe-persist-protocol.md): projections in the dense q8
+                # layout the megakernel phases read, a byte split of the q8_0
+                # blocks (32 int8 + f16 scale each), every value bit-equal.
+                blk = np.frombuffer(raw, dtype=np.uint8).reshape(-1, 34)
+                raw = blk[:, 2:].tobytes() + blk[:, :2].tobytes()
                 dt = "q8"
             out.write(raw)
             idx_lines.append(f"{name} {dt} {off} {n_elem}")
