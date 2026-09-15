@@ -534,3 +534,72 @@ Two caveats kept in the open rather than buried: the LRU resets per prompt, so
 this is within-request locality over 64 tokens and a longer request would
 score higher; and applying this hit rate to a 100B-class model, which is what
 B4's claim needs, is an assumption until such a model is traced.
+
+---
+
+## 12. B2 E14, agents that share memory: LANDED (w82:p3), verified by me
+
+Commit `e7d770b` (`bench/e14-handoff.mojo`, the task set, the llama.cpp arm
+and the identity checker), report `exchange/2026-09-15-p3-b2-e14-report.md`,
+receipt `~/AMDHQ/runs/latent-os/E14-2026-09-15.md`, preregistered in that
+repo's `06-experiments.md` before any GPU minute.
+
+One reader prefills a 32k document; N followers each answer a different
+question about it, from the reader's KV plus SSM state rather than by
+re-reading. **Identity is the gate, not task accuracy**, and the result is
+split:
+
+- **N=3: PASS, 3/3 followers byte-identical** to the text arm.
+- **N=10: FAIL, 9/10.** I checked the raw arms myself rather than taking the
+  summary: nine followers are 64/64 identical, and `q08` diverges at **token
+  62 of 64**, on the digits of a multiple-choice option the model was still
+  listing after it had already produced the correct answer (`5105164`,
+  identical in both arms). The tails are `...D) 116` against `...D) 149`.
+  That matches the class E12-long's own checker caught once, a near-tie after
+  floating-point reduction-order differences between a restored-state decode
+  and a freshly-prefilled one. Under the frozen gate it is still a FAIL, and
+  the pane reported it as one rather than rounding it to a pass.
+
+Speed, against the frozen prediction: the KV arm beats llama.cpp **1.68x at
+N=3 and 3.70x at N=10**, where the preregistration had predicted KV might
+*lose* at N=3. The prediction was stale rather than wrong, and the report says
+which change made it stale: a prefill speedup that landed after E12-long's
+numbers were written and is already in this tree.
+
+The pane also found and worked around a real obstacle rather than forcing it:
+`bench/bench_latent_handoff.mojo` cannot express one-reader-N-followers (its
+per-item loop re-decodes the producer every time) and no longer compiles
+against this tree, so E14 got its own harness built against the
+currently-compiling references.
+
+---
+
+## Lane summary
+
+Every item in the brief's build order is landed except A2, which the
+coordinator is holding until its `dattn` paging design exists.
+
+| item | state | where |
+|---|---|---|
+| A0.1 served-path MoE timing | LANDED `615dbf1` | `bench/moe-served-protocol.md` |
+| A0.3 C IPC probe | LANDED `d060a72`, B3 reopened | `~/AMDHQ/runs/latent-os/E12-ipc-c-2026-09-15.md` |
+| B1 `baro run` and the receipt ledger | LANDED `e977116`..`b3b4856` | `docs/METHOD.md` section 6 |
+| A5 tool calling and structured output | LANDED `0950c6f` (host half) | `exchange/2026-09-15-p2-a5-report.md` |
+| A1 sampled speculation | LANDED `b3c0d90`, 5 gates | `bench/spec-sample-protocol.md` |
+| B2 E14 | LANDED `e7d770b`, PASS N=3, FAIL N=10 | `~/AMDHQ/runs/latent-os/E14-2026-09-15.md` |
+| B5 fork endpoint | LANDED `a400c67` | `bench/fork-protocol.md` |
+| B6 method write-up | LANDED `cd25815` | `docs/METHOD.md` |
+| A2 allocator side | NOT STARTED, held by the coordinator | |
+| A3 plan document | LANDED `34e5e1d` | `docs/A3-PLAN.md` |
+| B4 stages 1 and 2 | LANDED `9f45e86`, `1aa06d5` | `bench/moe-locality-protocol.md` |
+| R4 (extra, delegated mid-lane) | LANDED `7145b71` | `bench/moe-persist-protocol.md` |
+
+Gates at the final commit: `tools/ci-checks.sh` exit 0, `./run-tests.sh` exit
+0 with 104 PASS lines.
+
+**One defect of mine, self-reported.** `dfd65cd` added a field to `WindowCfg`
+and broke every hand-written constructor in the repo, including one file
+ci-checks builds and one run-tests builds. Both gates were red for about
+fifteen minutes and it blocked another pane's commit. Fixed at `2431838`, and
+the ledger entry says why my own gate run did not catch it: I ran the gates
+before making the change, not on the tree I was about to commit.
