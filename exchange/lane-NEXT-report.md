@@ -124,11 +124,132 @@ there: the file must carry its own reference prompt and reference ids.
 
 ---
 
-## 4 onwards
+## 4. B1 a model file that runs itself and proves its numbers: LANDED
 
-`baro run` and the receipt ledger (B1) are in progress; the coordinator
-approved a two-mode design (run mode with an embedded harness under
-`baro.run.src.engine.mojo` whose numbers are labelled self-reported, verify
-mode which takes the harness from git at `baro.kernel.commit`, refuses on any
-difference, and is the only mode that may append to `baro.hw.receipts`).
-Untouched so far: A5, A1, B2, B5, A2, A3, B4.
+Commits `e977116` (the tooling), `abfc452` (run closure), `e340ee1` (env and
+the pack tool's dependency). Bake:
+`~/Models/RegesCore-1.0-35/RegesCore-1.0-35B-UD-Q4_K_S-BARO-e340ee1.gguf`.
+Protocol for the design: the coordinator's two-mode ruling, recorded in
+`docs/METHOD.md` section 6.
+
+### What was actually broken
+
+`tools/gguf-verify.sh`, the command `docs/amd-family.md` gives a contributor,
+**exited 1 on every MoE bake**. The closure's qwen35moe branch defaulted
+`BARO_PROMPT` to `.work/moe-w3/one.tokens` and its reference to
+`.work/moe-closure-ref.txt`, local scratch paths the file never carried, and
+the first is gone since the 2026-09-12 `.work` clear. `docs/BASELINE.md`
+claimed the bake "rebuilds the harness with no path outside the file"; for
+that model class it did not. Found by w82:p3's B6 check, not by reading.
+
+### The two modes
+
+The plan wants a file that runs with no checkout, and the repo's integrity
+rule (`exchange/scorer-integrity-report.md` P-A) wants the stopwatch to come
+from outside the artifact under test. Both hold, in separate modes:
+
+- `tools/baro run` builds the engine from the harness the FILE carries
+  (`baro.run.src.engine.mojo` plus its serve-module closure), builds the pack
+  from the file's own tensors with the `engine-pack.py` the file carries,
+  applies `baro.run.env`, and serves. Every number it prints is labelled
+  self-reported.
+- `tools/baro verify` takes `serve/engine.mojo` from git at the file's own
+  `baro.kernel.commit`, refuses on any byte of difference from the embedded
+  copy, then rebuilds and gates tokens. Only it may write a receipt.
+- `tools/gguf-receipt.py` is the ledger and refuses any record without
+  `mode: verified` and the commit its harness was checked against. Sidecar
+  JSONL by default, `baro.hw.receipts` inside the file with `--in-file`
+  (a 21 GB rewrite, hence opt-in).
+- `tools/bake.sh` makes the bake re-runnable and refuses a dirty source tree.
+
+The closure walk is unchanged: `baro.kernel.src.*` still carries no harness.
+
+### Checks, all run, none skipped
+
+1. **verify on the new bake: PASS 64 tokens match, exit 0**, with
+   `prompt: from the file (13 ids)` and `reference: from the file (64 ids)` in
+   the closure log, so nothing outside the file was consulted for either. The
+   harness check printed `embedded copy is byte-identical to serve/engine.mojo
+   at <commit> (23b37b6c...)` before any GPU work.
+2. **run mode served the model and answered a real HTTP request**: a live
+   `baro-serve` started from the file alone (`engine ... built from this
+   file's harness`, `pack ... (733 tensors)`, `env from the file:
+   BARO_MEGA=0 BARO_SPEC=0`), `GET /health` returned `"status":"ok"`, and
+   `POST /v1/completions` with p01-water's token ids returned 32 tokens
+   beginning 279 42900 7035 369 220 16, matching the reference, at
+   `tok_s_gen` 91.38 self-reported.
+3. The receipt ledger: `tools/baro verify --append` then
+   `tools/baro receipts`.
+
+Two defects were found by running it, not by reading it, and each is a commit:
+the run-mode build died on `unable to locate module 'prefix'` (the harness's
+serve-module closure was not in the file, because `gguf-closure.sh` pulls
+those from git and run mode cannot), and then the engine exited before the
+server's ready line with `BARO_MEGA=1 is not supported by the qwen35moe model
+profile` (the engine's own default; the file now carries `baro.run.env`).
+
+### Limits, stated
+
+- A pack has no `tokenizer.json` unless one was built beside it, so a model
+  served this way takes token ids on `/v1/completions` and refuses the text
+  and chat endpoints. Converting the gguf's own tokenizer is not built.
+- `tools/baro verify` holds the GPU through the closure build, which is
+  minutes of CPU inside a GPU reservation. `baro run --no-serve` already
+  splits the CPU half out; `gguf-verify.sh` should do the same. Not done here.
+- The ledger's `--in-file` mode copies the whole container. For the 21 GB MoE
+  bake that is a real cost and a disk-space consideration, which is why the
+  sidecar is the default.
+
+---
+
+## 5. B4 stage 1 PCIe bandwidth and expert bytes: LANDED (w82:p3), section 1 verified, section 2 CORRECTED BY ME
+
+Commit `9f45e86` (`bench/pcie-bandwidth.mojo` and
+`exchange/2026-09-15-p3-b4-stage1-report.md`). GPU: under 1 minute for a
+19.5 s sweep, plus 20 s for my own re-run.
+
+### Section 1, the measurement: verified, keep it
+
+Sustained H2D at 2 GiB, pinned: **28.78 GB/s median** on their run, **28.51
+GB/s** on my independent re-run of the same binary, with the link read back
+from sysfs as 16.0 GT/s x16, current equal to max. Pinned and pageable are
+within 0.6% of each other on this box, which is worth knowing and is the
+opposite of the usual assumption. Their "both at once" arm shows no
+concurrent transfer, and their report says plainly that the API has no stream
+selector so the arm cannot settle the question, which is the right way to
+report it.
+
+### Section 2, the arithmetic: wrong, and the correction matters
+
+The report treats column 4 of `.work/moe-w1/pack/index.txt` as bytes. It is
+`n_elem`, as `tools/engine-pack.py`'s own docstring says. The index proves it
+without any outside knowledge: `blk.0.ffn_down_exps.weight` is at offset
+26746880 and the next tensor at 177741824, so it occupies 150,994,944 bytes
+for 268,435,456 elements, which is 0.5625 bytes per element, exactly q4_k's
+144 bytes per 256 elements. The same method gives q8_0 1.0625, q6_k 0.8203,
+f32 4.0, and summing every tensor's gap gives 21,005,191,680 bytes, equal to
+`pack.bin` to the byte.
+
+So every byte figure in that section is inflated by 1/0.5625 = 1.78x, and its
+headline conclusion is backwards:
+
+| | report | correct |
+|---|---|---|
+| per expert per matrix | 1,048,576 B | 589,824 B |
+| top-8 per layer | 25,165,824 B | 14,155,776 B |
+| routed per token, 40 layers | 1.007 GB | **0.566 GB** |
+| routed + shared + router per token | 1.154 GB | **0.784 GB** |
+| 100B-class scaled (114.3 layers) | 2.876 / 3.296 GB | **1.617 / 2.240 GB** |
+| ms per token at 28.7 GB/s, 100B-class | 100 to 115 ms | **56 to 78 ms** |
+| residency needed, 100B-class at 30 tok/s | 67 to 71% | **41 to 57%** |
+
+**`docs/NEXT-PLAN.md`'s 0.78 GB per token reproduces exactly** (0.78413824 GB
+is routed plus shared expert plus router, uncached), and its "1 to 2 GB per
+token, 40 to 80 ms" for a 100B-class model is confirmed by the corrected
+arithmetic rather than refuted. The plan needs no change; the report does, and
+w82:p3 has the correction with the evidence to redo that section.
+
+Their stage 2 question stands and is the right one: does an expert-weight H2D
+transfer overlap with compute on already-resident layers through this API, and
+does the overlap save wall clock. Every number above is transfer-only and
+charges nothing to compute.
