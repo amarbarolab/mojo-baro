@@ -69,6 +69,23 @@ Find your gfx target with `rocminfo | grep -m1 gfx`.
    script writes a receipt marked `"valid": false` with the reason rather than
    nothing.
 
+## Verify a self-describing model file on your card
+
+Every `*-BARO-<sha>.gguf` we publish carries the kernel sources that produced
+its numbers (`baro.kernel.src.*`) plus the receipt they were measured under
+(`baro.hw.*`: card, driver, ROCm, power cap, the 20-prompt tok/s median and
+the protocol file). One command rebuilds the engine from the file alone,
+checks its tokens against the reference, and prints your card next to ours:
+
+```sh
+gpu-wait run --vram 20 -- tools/gguf-verify.sh ~/Models/.../Qwythos-...-BARO-<sha>.gguf
+```
+
+Exit 0 means the sources in the file are complete and reproduce the tokens
+on your card. The tok/s line it prints is a receipt for your hardware report,
+not a pass or fail: a different card has a different number, and that
+difference is the data we want.
+
 ## Going further on your card
 
 Optional, for people who want to dig in:

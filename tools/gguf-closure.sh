@@ -68,7 +68,7 @@ if grep -qx spark_kernels.mojo "$out/FILES"; then
   sed 's/^generated:/GENERATED:/' "$out/run.log" | tools/check-tokens.sh "${ref:-.work/spark/ref/ref-tokens-64.txt}" /dev/stdin
   exit
 fi
-ref=${ref:-.work/engine-pack/ref-tokens-64.txt}
+ref=${ref:-.work/engine-pack-q4/ref-tokens-64.txt}
 if [ -f "$out/window.mojo" ] && ! grep -q '^def main' "$out/engine.mojo" 2>/dev/null; then
   kcommit=$(jq -r '.["baro.kernel.commit"]' "$out/meta.json")
   git show "$kcommit:serve/engine.mojo" > "$out/closure_main.mojo" || { echo "no serve/engine.mojo at gguf commit $kcommit"; exit 1; }

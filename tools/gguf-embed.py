@@ -36,8 +36,17 @@ def src_key(k):
 
 
 def main():
-    src, dst = Path(sys.argv[1]), Path(sys.argv[2])
-    kfiles = [Path(p) for p in sys.argv[3:]]
+    extra = []
+    args = []
+    for a in sys.argv[1:]:
+        if a.startswith("--kv="):
+            k, v = a[5:].split("=", 1)
+            assert k.startswith("baro.") and not k.startswith("baro.kernel."), f"--kv key must be baro.<ns>.<name>, not kernel: {k}"
+            extra.append((k, v))
+        else:
+            args.append(a)
+    src, dst = Path(args[0]), Path(args[1])
+    kfiles = [Path(p) for p in args[2:]]
     assert src.exists() and not dst.exists(), "dst must not exist"
 
     f = open(src, "rb")
@@ -59,6 +68,11 @@ def main():
         new_kv.append((f"baro.kernel.ext.{pkg.name}.commit", c))
     if os.environ.get("BARO_KERNEL_PARENT"):
         new_kv.append(("baro.kernel.parent", os.environ["BARO_KERNEL_PARENT"]))
+    # --kv=baro.hw.<name>=<value> (repeatable): the receipts a verifier on another
+    # card compares against (card, driver, power cap, the 20-prompt number and the
+    # protocol that produced it). Earlier baro.hw.* keys are replaced like the
+    # kernel set, so a re-bake never carries two scoreboards.
+    new_kv.extend(extra)
     for k in kfiles:
         new_kv.append((f"baro.kernel.src.{src_key(k)}", k.read_text()))
 
@@ -78,7 +92,7 @@ def main():
         key = key.decode("utf-8") if isinstance(key, bytes) else key
         (vtype,) = struct.unpack("<I", f.read(4))
         ge.read_value(f, vtype, want=False)
-        if not key.startswith("baro.kernel."):
+        if not key.startswith("baro.kernel.") and not key.startswith("baro.hw."):
             keep.append((a, f.tell()))
     kv_end = f.tell()
     for _ in range(n_tensors):
