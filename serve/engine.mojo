@@ -378,19 +378,22 @@ def main() raises:
                 perr = "n must be >= 1"
             if perr == "" and len(prompt) + req_n > tmax:
                 perr = "prompt+n exceeds TMAX " + String(tmax)
-            # M5 gate-2 finding (exchange/2026-09-15-m5-sampler-diagnosis.md):
-            # serve/sample_ref.mojo's top-p cutoff is wrong at real vocab
-            # width when min_p is not also set (the ceil() in its pmass_target
-            # port rounds the mass target up to most or all of the top-k set
-            # on a peaked row); kernels/sample.mojo's device cutoff is the
-            # correct side, but gate 2 cannot yet confirm the device's own
-            # shape independently, so a request that would exercise the
-            # unverified cutoff is refused rather than served from a set the
-            # gate cannot confirm. Fix round preregistered in
-            # bench/chat-protocol.md ("C3 fix round"); neither sampler file
-            # changes until that round lands.
-            if perr == "" and sample.temperature > 0 and sample.top_p < 1 and sample.min_p <= 0:
-                perr = "top_p without min_p is unverified at real vocab (exchange/2026-09-15-m5-sampler-diagnosis.md, bench/chat-protocol.md C3 fix round); use min_p > 0 or top_p = 1"
+            # C3 fix round (bench/chat-protocol.md, exchange/lane-WIRING-report.md
+            # C3 section): serve/sample_ref.mojo's ceil'd top-p mass target was
+            # the root cause of the M5 gate-2 finding above; fixed in 054bd22
+            # and gate 2 now passes clean on all four truncated shapes
+            # (top_p<1 and/or top_k>0, with or without min_p), so the refusal
+            # for those shapes is lifted.
+            #
+            # C3 tail round (bench/chat-protocol.md): the untruncated shape
+            # (top_p=1, top_k=0, min_p<=0) is a separate, still-open defect —
+            # unif()'s 24-bit float32 uniform caps the Gumbel key at ~17.3
+            # nats, giving every one of the vocab's tokens a ~2^-24 floor
+            # chance per draw regardless of true probability, inflating the
+            # observed deep tail (1.48% of draws affected). Refused until the
+            # C3 tail round's 53-bit uniform fix lands.
+            if perr == "" and sample.temperature > 0 and sample.top_p >= 1 and sample.top_k == 0 and sample.min_p <= 0:
+                perr = "untruncated sampling has a 2^-24 uniform tail floor (bench/chat-protocol.md C3 tail round); use top_p<1, top_k>0 or min_p>0"
             if perr != "":
                 print(err_line(req_id, perr))
                 continue

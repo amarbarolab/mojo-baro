@@ -1717,3 +1717,56 @@ Escalated to the coordinator (`herd tell`) rather than guessed at; the
 source fix itself (`serve/sample_ref.mojo`) is committed on its own
 strength (three of four gates clean, the fourth gate's failure is in a shape
 the fix does not touch), the refusal is NOT lifted pending that answer.
+
+### Coordinator decision 2026-09-15
+
+Answer (option c): lift the `serve/engine.mojo` refusal for the four shapes
+gate 2 passed clean (top_p<1 and/or top_k>0, with or without min_p); add a
+new refusal, same error style, for the untruncated shape (temperature>0,
+top_p=1, top_k=0, min_p<=0), citing the C3 tail round below.
+`kernels/sample.mojo` not touched.
+
+## C3 tail round: Gumbel key uniform width (preregistered 2026-09-15, not run)
+
+Root cause, diagnosed by the coordinator: `unif()` draws a 24-bit float32
+uniform (`((w>>8)+0.5) * 2^-24`), so the Gumbel key `-ln(-ln(u))` used to
+pick each draw's argmax caps at roughly 17.3 nats; every one of the
+248320 tokens gets a floor chance of about `2^-24` per draw regardless of
+its true probability, since a key drawn from the saturated top of the
+uniform's range can occasionally still win against a merely-unlikely real
+token. A numpy simulation of the exact `unif()` mapping reproduces the C3
+fix round's observed excess (p01 sim 18.2% vs observed 17.2%; p02 sim 4.9%
+vs observed 5.2%; p03 sim 2.15% vs observed 2.6%), while an exact
+(non-quantized) Gumbel draw matches the oracle's true tail. Both
+`serve/sample_ref.mojo` and `kernels/sample.mojo` share this `unif()`
+mapping, which is why the C3 fix round's gate 1 (per-token, 64 draws)
+mismatched almost nowhere: the two sides agree with each other, both against
+the same floor.
+
+Arms, frozen before any code:
+- H0: `unif()` as committed (24-bit float32 uniform, both sides).
+- H1: a 53-bit uniform in float64, built from two rng words, used for the
+  Gumbel key on both the host reference and the device kernel.
+- Oracle: `tools/sample-nucleus-oracle.py` (unchanged, independent of both).
+
+Gates, real vocab (`.work/m5/logits-p01.bin`, `-p02.bin`, `-p03.bin`, the same
+three rows as the C3 fix round):
+1. The C3 fix round's own 20000-draw chi-square (gate 2), rerun on all three
+   rows, for the untruncated shape (`T1_k0_p1`) plus the four shapes the fix
+   round already passed (must stay clean, not regress).
+2. Byte-identical at temperature 0 (M5 gate 1 style A/B), since `unif()` must
+   not be called on the `temperature <= 0` argmax path.
+
+Predictions: H1 passes both gates on `T1_k0_p1` (chi2 under critical on all
+three rows) and does not regress the four already-passing shapes.
+Falsifier: `T1_k0_p1` still fails gate 1 under H1; then the tail-floor
+diagnosis is wrong and the defect is elsewhere in the Gumbel/argmax path,
+not the uniform width.
+
+On PASS: lift the `serve/engine.mojo` refusal for the untruncated shape, in
+the same commit as the fix, gate named. Until then the refusal stands.
+
+**Not run this session.** `serve/engine.mojo`'s refusal split (four shapes
+lifted, untruncated shape newly refused) landed ahead of this round per the
+coordinator's decision, since the refusal's job is to gate what the engine
+serves, not to gate when this round runs.
