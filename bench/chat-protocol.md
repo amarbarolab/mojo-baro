@@ -1647,3 +1647,73 @@ any shape; then the device is also wrong and the round widens to
 
 On PASS: lift the M5 refusal of `top_p < 1` without `min_p`, in the same commit
 as the fix, with the gate named. Until then the refusal stands.
+
+### Result 2026-09-15 (H1 landed, gate 2 mixed: top-p shapes PASS, T1 no-truncation FAILS)
+
+H1 applied verbatim to both `sample_row_ref` and `sample_probs_ref` in
+`serve/sample_ref.mojo` (the ceil bug was duplicated in both; leaving one
+unfixed would have broken gate 3's own cross-check between them). Three real
+rows: `.work/m5/logits-p01.bin` (p01-water, already on record),
+`.work/m5/logits-p02.bin` (p02-python-fib), `.work/m5/logits-p03.bin`
+(p03-story), each a one-shot engine run's own MTP draft-head logits. Gate 2's
+chi-square oracle (`.work/m5/oracle2.py`, independent of both
+`sample_ref.mojo` and `kernels/sample.mojo`) writes the correct nucleus set
+and its tempered distribution per (row, config); real-vocab distributions
+that exceed 60 candidates are capped at the top 60 explicit bins plus one
+aggregate "rest" bin (not specified by the preregistration, which only fixed
+the formula, not the real-vocab binning scheme -- a discretionary
+implementation choice, named here).
+
+**Gate 1 (per-token, 64 draws, 5 shapes, 3 rows = 960 draws): 959/960 match.**
+The one mismatch (p03-story, `T1_k0_p1`, counter 34) is a probability-1.6e-11
+vs 2.8e-11 tie in the deep tail of an untruncated 248320-wide distribution --
+both sides pick a different token at a probability where floating-point noise
+in an independently-derived Gumbel draw is expected to occasionally flip the
+argmax between two near-equally-unlikely candidates.
+
+**Gate 2 (20000-draw chi-square, real vocab): the four top-p/top-k shapes this
+round targets all PASS cleanly on all three rows** (`T0.8_k30_p1`,
+`T0.7_k20_p0.8`, `T1.3_k12_p0.9_minp0.05`, `T0.5_k0_p0.6`; chi2 well under
+critical in every case, `rest_count` 0 throughout since none of these
+truncated sets exceed 60 candidates). **`T1_k0_p1` (no truncation) FAILS on
+2 of 3 rows** (p02: chi2 136.0 vs crit 77.5; p03: chi2 555.7 vs crit 86.7;
+p01 passes, chi2 75.8 vs crit 99.7). In every failing case essentially the
+entire excess sits in the "rest" bin: device draws land in the aggregate tail
+more often than the independent oracle predicts, and the excess grows as the
+row's true tail mass shrinks (p01 true tail 16.3%, observed 17.2%, close;
+p02 true tail 3.8%, observed 5.2%; p03 true tail 0.9%, observed 2.6%, nearly
+3x). `top_p = 1` never enters the ceil'd code path this round fixed (`p_on =
+top_p < 1.0` is false), so this is not the bug just fixed -- it reads as a
+separate, previously unmeasured deep-tail effect specific to real-vocab
+width, invisible to `kernels/test_sample.mojo`'s VS=64 chi-square (which
+already runs a "T1 k- p-" case and passes, chi2 11.6 vs crit 40.9, but a
+64-token vocab has no meaningful deep tail to expose this in).
+
+**Gate 3: `kernels/test_sample_ref.mojo` still green** (host reference
+self-tests, `.work/test_sample_ref_c3`), but one VS=64 fixture's retained-set
+size changed as the preregistration said to expect and report: `T0.7 k16
+p0.8` moved from `df 10` (pre-fix) to `df 1` (post-fix) -- `ceil` was not a
+no-op for this fixture either, confirming the bug was never real-vocab-only,
+just far more visible there. Reported per the preregistration's own
+instruction, not silently updated.
+
+**Gate 4: M5 gate 1 (temperature 0 byte-identical) rerun, PASS** -- expected
+trivially, since `serve/sample_ref.mojo` is a test-only host reference never
+linked into `serve/engine.mojo`'s decode path (`amar_sample_row`, the device
+kernel, is what actually runs); verified anyway rather than assumed, same
+before/after A/B as every other gate-1 rerun this lane, `GENERATED`
+byte-identical.
+
+**Verdict: the falsifier's literal condition fired** ("the device fails gate
+2 at real vocab on any shape") for `T1_k0_p1`, on 2 of 3 rows, by a wide
+margin, not a boundary case. Per the round's own rule this widens to
+`kernels/sample.mojo` (kernel work) and is NOT something this milestone
+fixes or waves off. Held rather than decided alone: whether the M5 refusal
+(which only ever covered `top_p < 1` without `min_p` -- `T1_k0_p1` was
+always allowed, unaffected by the refusal in either direction) should lift
+for the four shapes that cleanly pass while the T1 finding is tracked
+separately, or whether the whole round stays blocked until T1 is resolved.
+Escalated to the coordinator (`herd tell`) rather than guessed at; the
+source fix itself (`serve/sample_ref.mojo`) is committed on its own
+strength (three of four gates clean, the fourth gate's failure is in a shape
+the fix does not touch), the refusal is NOT lifted pending that answer.

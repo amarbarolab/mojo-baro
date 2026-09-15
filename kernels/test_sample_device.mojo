@@ -1,20 +1,40 @@
-"""Device sampler vs host reference, on the real fixed logits row (M5,
-briefs/2026-09-15-wiring-lane.md, gate 2: "device sampler matches
-serve/sample_ref.mojo per token on fixed seed and fixed logits").
+"""Device sampler vs host reference, on real fixed logits rows (M5,
+briefs/2026-09-15-wiring-lane.md gate 2, extended for the C3 fix round,
+bench/chat-protocol.md "C3 fix round: host top-p mass target").
 
-kernels/test_sample.mojo already device-tests amar_sample_row's distribution
-and seed reproducibility (P-K1, P-K3/P-K4) on a small synthetic vocab (VS=64);
-kernels/test_sample_ref.mojo already host-tests sample_ref.mojo including one
-real-vocab row. Neither compares the two implementations against each other
-on the same inputs, which is what gate 2 asks for -- this file is that cross
-check, at the real VOCAB width serve/window.mojo actually calls with.
+Two checks, both at real VOCAB width (not kernels/test_sample.mojo's VS=64
+synthetic vocab):
+  1. Per-token: amar_sample_row (device) vs sample_row_ref (host, C3-fixed)
+     on the same (seed, counter) draws, every config shape, every row.
+  2. Distribution: 20000 device draws per (row, config), binned by rank
+     against an INDEPENDENT numpy oracle (tools/sample-nucleus-oracle.py;
+     neither kernels/sample.mojo nor serve/sample_ref.mojo), chi-square at a
+     preregistered p=0.001 critical value.
+
+Not wired into run-tests.sh yet (bench/chat-protocol.md: "wire it into
+run-tests.sh only once green") -- gate 2's T1_k0_p1 (no truncation) shape
+currently fails on 2 of 3 rows; see the C3 Result in bench/chat-protocol.md.
 
 Build: ./.venv/bin/mojo build kernels/test_sample_device.mojo -I kernels -I serve -o .work/test_sample_device
-Needs .work/draft-logits.bin (a real decode row, written as a side effect of
-run-tests.sh / the one-shot engine path); skips cleanly if absent.
+Needs .work/m5/logits-p01.bin, logits-p02.bin, logits-p03.bin (real decode
+rows from three different prompts, and their oracle files
+.work/m5/oracle-pNN-<slug>.txt); skips a row cleanly if its files are
+absent. To regenerate:
+  mkdir -p .work/m5
+  gpu-wait run --vram 20 -- bash -c '
+    BARO_PACK=.work/engine-pack-q4 BARO_PROMPT=bench/mtp-prompts/p01-water.tokens .work/engine
+    cp .work/draft-logits.bin .work/m5/logits-p01.bin
+    BARO_PACK=.work/engine-pack-q4 BARO_PROMPT=bench/mtp-prompts/p02-python-fib.tokens .work/engine
+    cp .work/draft-logits.bin .work/m5/logits-p02.bin
+    BARO_PACK=.work/engine-pack-q4 BARO_PROMPT=bench/mtp-prompts/p03-story.tokens .work/engine
+    cp .work/draft-logits.bin .work/m5/logits-p03.bin
+  '
+  for p in p01 p02 p03; do ./.venv/bin/python3 tools/sample-nucleus-oracle.py .work/m5/logits-$p.bin .work/m5/oracle-$p; done
 """
-from std.math import sqrt
+from std.math import exp, log, sqrt
+from std.memory import unsafe_memcpy
 from std.sys import has_accelerator, exit
+from std.time import perf_counter_ns
 
 from max.gpu.host import DeviceContext, DeviceBuffer
 from layout import TileTensor, row_major
@@ -26,10 +46,43 @@ from sample_ref import sample_row_ref, is_valid
 comptime FMAX = Float32(3.4028234663852886e38)
 comptime x_l = row_major[1, VOCAB]()
 comptime o_l = row_major[1]()
+comptime BATCH = 1000
+comptime xb_l = row_major[BATCH, VOCAB]()
+comptime tb_l = row_major[BATCH]()
+comptime N_DRAWS = 20000
+comptime N_BATCHES = N_DRAWS // BATCH
 
 
-def load_logits() raises -> List[Float32]:
-    var path = ".work/draft-logits.bin"
+@fieldwise_init
+struct Cfg(Copyable, Movable):
+    var slug: String
+    var t: Float32
+    var k: Int
+    var p: Float32
+    var mp: Float32
+
+
+def configs() -> List[Cfg]:
+    # Must match .work/m5/oracle2.py's CONFIGS exactly (name and values), so
+    # the two sides read the same shape by the same slug.
+    var c = List[Cfg]()
+    c.append(Cfg("T1_k0_p1", Float32(1.0), 0, Float32(1.0), Float32(0.0)))
+    c.append(Cfg("T0.8_k30_p1", Float32(0.8), 30, Float32(1.0), Float32(0.0)))
+    c.append(Cfg("T0.7_k20_p0.8", Float32(0.7), 20, Float32(0.8), Float32(0.0)))
+    c.append(Cfg("T1.3_k12_p0.9_minp0.05", Float32(1.3), 12, Float32(0.9), Float32(0.05)))
+    c.append(Cfg("T0.5_k0_p0.6", Float32(0.5), 0, Float32(0.6), Float32(0.0)))
+    return c^
+
+
+def rows() -> List[Tuple[String, String]]:
+    var r = List[Tuple[String, String]]()
+    r.append(("p01-water", ".work/m5/logits-p01.bin"))
+    r.append(("p02-python-fib", ".work/m5/logits-p02.bin"))
+    r.append(("p03-story", ".work/m5/logits-p03.bin"))
+    return r^
+
+
+def load_logits(path: String) raises -> List[Float32]:
     with open(path, "r") as f:
         var data = f.read_bytes()
         var n = len(data) // 4
@@ -58,72 +111,184 @@ def device_sample(
     return (Int(th[0]), Float32(ph[0]))
 
 
-def main() raises:
-    comptime assert has_accelerator(), "GPU required"
-    var row: List[Float32]
-    try:
-        row = load_logits()
-    except:
-        print("SKIP: .work/draft-logits.bin not present (run run-tests.sh first)")
-        return
-    if len(row) != VOCAB:
-        print("SKIP: draft-logits.bin has", len(row), "entries, this build's VOCAB is", VOCAB)
-        return
-
-    var ctx = DeviceContext()
-    var xh = ctx.enqueue_create_host_buffer[f32](VOCAB)
-    ctx.synchronize()
-    for i in range(VOCAB):
-        xh[i] = row[i]
-    var xd = ctx.enqueue_create_buffer[f32](VOCAB)
-    ctx.enqueue_copy(dst_buf=xd, src_buf=xh)
-    ctx.synchronize()
-
-    var fails = 0
-
-    # Greedy (temperature = 0): device must match the host reference, which
-    # kernels/test_sample_ref.mojo already showed matches plain argmax.
-    var dg = device_sample(ctx, xd, Float32(0), 0, Float32(1.0), Float32(0.0), UInt64(0), UInt64(0))
-    var hg = sample_row_ref(row, Float32(0), 0, Float32(1.0), Float32(0.0), UInt64(0), UInt64(0), 0)
-    if dg[0] == Int(hg[0]) and dg[1] == hg[1]:
-        print("PASS greedy (T=0): device token", dg[0], "prob", dg[1], "== host")
-    else:
-        print("FAIL greedy (T=0): device", dg[0], dg[1], "!= host", hg[0], hg[1])
-        fails += 1
-
-    # Sampling configs x many (seed, counter) pairs, row fixed at 0 (both
-    # sides use the same "row" in the RNG stream, matching the single-row
-    # decode step this kernel is actually called with in window.mojo).
-    var configs = List[Tuple[String, Float32, Int, Float32, Float32]]()
-    configs.append(("T1 k0 p1", Float32(1.0), 0, Float32(1.0), Float32(0.0)))
-    configs.append(("T0.7 k20 p0.8", Float32(0.7), 20, Float32(0.8), Float32(0.0)))
-    configs.append(("T1.3 k12 p0.9 minp0.05", Float32(1.3), 12, Float32(0.9), Float32(0.05)))
-    configs.append(("T0.5 k0 p0.6", Float32(0.5), 0, Float32(0.6), Float32(0.0)))
-
-    for ci in range(len(configs)):
-        var name = configs[ci][0]
-        var t = configs[ci][1]
-        var k = configs[ci][2]
-        var p = configs[ci][3]
-        var mp = configs[ci][4]
+def gate1_row(ctx: DeviceContext, mut xd: DeviceBuffer[f32], row_name: String, row: List[Float32], mut fails: Int) raises:
+    for cfg in configs():
         var mismatches = 0
         var checked = 0
         for counter in range(64):
-            var d = device_sample(ctx, xd, t, k, p, mp, UInt64(42), UInt64(counter))
-            var h = sample_row_ref(row, t, k, p, mp, UInt64(42), UInt64(counter), 0)
+            var d = device_sample(ctx, xd, cfg.t, cfg.k, cfg.p, cfg.mp, UInt64(42), UInt64(counter))
+            var h = sample_row_ref(row, cfg.t, cfg.k, cfg.p, cfg.mp, UInt64(42), UInt64(counter), 0)
             checked += 1
             if d[0] != Int(h[0]) or abs(d[1] - h[1]) > Float32(1e-4):
                 mismatches += 1
                 if mismatches <= 3:
-                    print("  mismatch counter", counter, ": device", d[0], d[1], "host", h[0], h[1])
+                    print("    mismatch counter", counter, ": device", d[0], d[1], "host", h[0], h[1])
         if mismatches == 0:
-            print("PASS", name, ": device == host on all", checked, "(seed, counter) draws")
+            print("  PASS gate1", row_name, cfg.slug, ": device == host on all", checked, "draws")
         else:
-            print("FAIL", name, ":", mismatches, "of", checked, "draws disagree")
+            print("  FAIL gate1", row_name, cfg.slug, ":", mismatches, "of", checked, "draws disagree")
             fails += 1
 
+
+def path_exists(path: String) -> Bool:
+    try:
+        with open(path, "r"):
+            return True
+    except:
+        return False
+
+
+def load_oracle(path: String, mut ids: List[Int], mut probs: List[Float64], mut rest: Float64) raises:
+    with open(path, "r") as f:
+        var lines = f.read().splitlines()
+        var head = lines[0].split(" ")
+        var n = Int(head[0])
+        rest = Float64(head[1])
+        for i in range(1, n + 1):
+            var parts = lines[i].split(" ")
+            ids.append(Int(parts[0]))
+            probs.append(Float64(parts[1]))
+
+
+def crit(df: Int) -> Float64:
+    if df <= 0:
+        return 1e-9
+    var d = Float64(df)
+    var a = 2.0 / (9.0 * d)
+    var c = 1.0 - a + 3.090232 * sqrt(a)
+    return d * c * c * c
+
+
+def gate2_row(ctx: DeviceContext, mut xd: DeviceBuffer[f32], row_name: String, mut fails: Int) raises:
+    for cfg in configs():
+        var oracle_path = ".work/m5/oracle-" + row_name.split("-")[0] + "-" + cfg.slug + ".txt"
+        if not path_exists(oracle_path):
+            print("  SKIP gate2", row_name, cfg.slug, ": no oracle file", oracle_path)
+            continue
+        var ids = List[Int]()
+        var probs = List[Float64]()
+        var rest = Float64(0)
+        load_oracle(oracle_path, ids, probs, rest)
+        var counts = List[Int](capacity=len(ids))
+        for _ in range(len(ids)):
+            counts.append(0)
+        var rest_count = 0
+        var t0 = perf_counter_ns()
+        for b in range(N_BATCHES):
+            var td = ctx.enqueue_create_buffer[DType.int32](BATCH)
+            var pd = ctx.enqueue_create_buffer[f32](BATCH)
+            comptime kern = amar_sample_row[type_of(xb_l), type_of(tb_l), type_of(tb_l)]
+            ctx.enqueue_function[kern](
+                TileTensor(xd, xb_l), TileTensor(td, tb_l), TileTensor(pd, tb_l), Int32(VOCAB),
+                cfg.t, Int32(cfg.k), cfg.p, cfg.mp, UInt64(1000 + b), UInt64(b), grid_dim=BATCH, block_dim=SAMP_THREADS,
+            )
+            var th = ctx.enqueue_create_host_buffer[DType.int32](BATCH)
+            ctx.enqueue_copy(dst_buf=th, src_buf=td)
+            ctx.synchronize()
+            for i in range(BATCH):
+                var tok = Int(th[i])
+                var found = False
+                for j in range(len(ids)):
+                    if ids[j] == tok:
+                        counts[j] += 1
+                        found = True
+                        break
+                if not found:
+                    rest_count += 1
+        var dt = Float64(perf_counter_ns() - t0) / 1e9
+        var n = N_BATCHES * BATCH
+        var stat = 0.0
+        var bins = 0
+        var po = 0.0
+        var pe = 0.0
+        var lo = 0.0
+        var le = 0.0
+        for j in range(len(ids)):
+            var e = probs[j] * Float64(n)
+            if e >= 5.0:
+                stat += (Float64(counts[j]) - e) ** 2 / e
+                bins += 1
+                lo = Float64(counts[j])
+                le = e
+            else:
+                po += Float64(counts[j])
+                pe += e
+        if rest > 0:
+            var er = rest * Float64(n)
+            po += Float64(rest_count)
+            pe += er
+        if pe >= 5.0:
+            stat += (po - pe) ** 2 / pe
+            bins += 1
+        elif pe > 0.0:
+            stat -= (lo - le) ** 2 / le
+            stat += (lo + po - le - pe) ** 2 / (le + pe)
+        var cv = crit(bins - 1)
+        var over = stat >= cv and bins > 1
+        print("  ", "PASS" if not over else "FAIL", "gate2", row_name, cfg.slug, ": chi2", stat, "df", bins - 1, "crit(p=0.001)", cv, "n", n, "candidates", len(ids), "rest_count", rest_count, "elapsed_s", dt)
+        if over:
+            fails += 1
+
+
+def main() raises:
+    comptime assert has_accelerator(), "GPU required"
+    var ctx = DeviceContext()
+    var fails = 0
+    var ran_any = False
+    for row_spec in rows():
+        var row_name = row_spec[0]
+        var row_path = row_spec[1]
+        var row: List[Float32]
+        try:
+            row = load_logits(row_path)
+        except:
+            print("SKIP", row_name, ": ", row_path, "not present")
+            continue
+        if len(row) != VOCAB:
+            print("SKIP", row_name, ": ", len(row), "entries, this build's VOCAB is", VOCAB)
+            continue
+        ran_any = True
+        print("== row", row_name)
+
+        var xh = ctx.enqueue_create_host_buffer[f32](VOCAB)
+        ctx.synchronize()
+        for i in range(VOCAB):
+            xh[i] = row[i]
+        var xd = ctx.enqueue_create_buffer[f32](VOCAB)
+        ctx.enqueue_copy(dst_buf=xd, src_buf=xh)
+        ctx.synchronize()
+
+        # Greedy sanity check (temperature = 0): device must match host.
+        var dg = device_sample(ctx, xd, Float32(0), 0, Float32(1.0), Float32(0.0), UInt64(0), UInt64(0))
+        var hg = sample_row_ref(row, Float32(0), 0, Float32(1.0), Float32(0.0), UInt64(0), UInt64(0), 0)
+        if dg[0] == Int(hg[0]) and dg[1] == hg[1]:
+            print("  PASS greedy (T=0): device token", dg[0], "prob", dg[1], "== host")
+        else:
+            print("  FAIL greedy (T=0): device", dg[0], dg[1], "!= host", hg[0], hg[1])
+            fails += 1
+
+        gate1_row(ctx, xd, row_name, row, fails)
+
+        # Batch buffer for gate 2: BATCH copies of the same row, filled once,
+        # reused across every config (the logits do not change per config).
+        var xbh = ctx.enqueue_create_host_buffer[f32](BATCH * VOCAB)
+        ctx.synchronize()
+        for r in range(BATCH):
+            unsafe_memcpy(
+                dest=xbh.unsafe_ptr().unsafe_offset(r * VOCAB).unsafe_bitcast[UInt8](),
+                src=row.unsafe_ptr().unsafe_bitcast[UInt8](),
+                count=VOCAB * 4,
+            )
+        var xbd = ctx.enqueue_create_buffer[f32](BATCH * VOCAB)
+        ctx.enqueue_copy(dst_buf=xbd, src_buf=xbh)
+        ctx.synchronize()
+        gate2_row(ctx, xbd, row_name, fails)
+
+    if not ran_any:
+        print("SKIP: no rows present (see .work/m5/logits-*.bin)")
+        return
     if fails == 0:
-        print("PASS: device sampler matches serve/sample_ref.mojo, fixed logits")
+        print("PASS: device sampler matches serve/sample_ref.mojo (C3-fixed) at real vocab, all rows and shapes")
     else:
         print("FAIL:", fails, "check(s) failed")
         exit(1)

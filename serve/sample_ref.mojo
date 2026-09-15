@@ -11,7 +11,7 @@ selection -- a reference is not required to be sub-linear per cut, only
 correct. Not the device kernel: this is the flag-gated reference path and
 the oracle the kernel is checked against once it lands.
 """
-from std.math import ceil, exp, log
+from std.math import exp, log
 
 comptime FMAX = Float32(3.4028234663852886e38)
 
@@ -148,7 +148,14 @@ def sample_row_ref(
         var zc: Float64 = 0
         for j in range(mk):
             zc += Float64(exp(logits[order[j]] - lmax))
-        var w = ceil(Float64(top_p) * zc)
+        # C3 fix round (bench/chat-protocol.md, exchange/2026-09-15-m5-sampler-diagnosis.md):
+        # the device's pmass_target ceils a FIXED-POINT mass (2^-40 units,
+        # where ceil is exact); this host port had ceil'd a float64 mass
+        # whose unit is exp(lmax) = 1, rounding the target up to most or all
+        # of the top-k set on a peaked row. No ceil here: w is the raw mass
+        # target, clamped to [the top-1 token's own mass (1.0 in these
+        # units), the full retained mass].
+        var w = Float64(top_p) * zc
         if w < 1:
             w = 1
         if w > zc:
@@ -236,7 +243,14 @@ def sample_probs_ref(
         var zc: Float64 = 0
         for j in range(mk):
             zc += Float64(exp(logits[order[j]] - lmax))
-        var w = ceil(Float64(top_p) * zc)
+        # C3 fix round (bench/chat-protocol.md, exchange/2026-09-15-m5-sampler-diagnosis.md):
+        # the device's pmass_target ceils a FIXED-POINT mass (2^-40 units,
+        # where ceil is exact); this host port had ceil'd a float64 mass
+        # whose unit is exp(lmax) = 1, rounding the target up to most or all
+        # of the top-k set on a peaked row. No ceil here: w is the raw mass
+        # target, clamped to [the top-1 token's own mass (1.0 in these
+        # units), the full retained mass].
+        var w = Float64(top_p) * zc
         if w < 1:
             w = 1
         if w > zc:
