@@ -273,7 +273,7 @@ def reset_and_load(ctx: DeviceContext, mut b: WindowBufs, context: List[Int], tm
 def make_cfg(pack_q4: Bool, q4_off: Int, e: Int, pf_rows: Int, pf_tail: Int, n_prompt: Int, n_total: Int) -> WindowCfg:
     return WindowCfg(
         pack_q4=pack_q4, draft_q4=False, q4_off=q4_off, e=e, kcfg=2,
-        spec=False, spec_dbg=False, serve=False, req_id=0, prof=False, pf2=False, pf3=False, pf4=False,
+        spec=False, expert_trace=False, spec_dbg=False, serve=False, req_id=0, prof=False, pf2=False, pf3=False, pf4=False,
         dump=False, mega=True, att_split=n_total, mega_win=False, dot3=False, pf_chunk=CP,
         pf_rows=pf_rows, pf_tail=pf_tail, n_total=n_total, fr_k=0, fr_off=0, fr_ids_off=0, n_prompt=n_prompt,
     )

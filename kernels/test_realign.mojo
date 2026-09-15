@@ -19,6 +19,7 @@ from max.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
 from layout import TileTensor, row_major
 from registry import *
 from window import *
+from serve_proto import default_sample_params
 from realign import realign_expected_embedding, final_norm_hidden
 from realign_kernels import amar_realign_gather, amar_realign_reduce, REALIGN_SPLIT
 
@@ -245,7 +246,22 @@ def alloc_bufs_min(ctx: DeviceContext, wbuf: DeviceBuffer[DType.uint8], off: Lis
     var dump_h = ctx.enqueue_create_host_buffer[f32](GEN_N * 2 * N_LAYERS * H)
     var stream_h = ctx.enqueue_create_host_buffer[DType.int32](KMAX + 1)
     ctx.synchronize()
+    var pt_d = ctx.enqueue_create_buffer[f32](MROWS * VOCAB)
+    var pd_d = ctx.enqueue_create_buffer[f32](MROWS * VOCAB)
+    var etrace_d = ctx.enqueue_create_buffer[DType.int32](TRACE_TOK * N_LAYERS * TOPK_TRACE)
+    var etrace_h = ctx.enqueue_create_host_buffer[DType.int32](TRACE_TOK * N_LAYERS * TOPK_TRACE)
+    var zidx_d = ctx.enqueue_create_buffer[DType.int32](1)
+    var dids_d = ctx.enqueue_create_buffer[DType.int32](KMAX + 1)
+    var sout_d = ctx.enqueue_create_buffer[DType.int32](KMAX + 1)
+    var sacc_d = ctx.enqueue_create_buffer[DType.int32](KMAX + 1)
+    var sout_h = ctx.enqueue_create_host_buffer[DType.int32](KMAX + 1)
+    var sacc_h = ctx.enqueue_create_host_buffer[DType.int32](KMAX + 1)
     return WindowBufs(
+        # A1 and B4 stage 2 added these to WindowBufs; this harness builds the
+        # struct by hand, so it carries them too. Sizes match serve/harness.mojo.
+        pt_d=pt_d.copy(), pd_d=pd_d.copy(), etrace_d=etrace_d.copy(), etrace_h=etrace_h.copy(),
+        zidx_d=zidx_d.copy(), dids_d=dids_d.copy(), sout_d=sout_d.copy(), sacc_d=sacc_d.copy(),
+        sout_h=sout_h.copy(), sacc_h=sacc_h.copy(),
         wbuf=wbuf.copy(), off=off.copy(), dtok_h=dtok_h.copy(), win_h=win_h.copy(), x_d=x_d.copy(),
         curb_d=curb_d.copy(), qkv_d=qkv_d.copy(), z_d=z_d.copy(), eg_d=eg_d.copy(), beta_d=beta_d.copy(),
         conv_d=conv_d.copy(), so_d=so_d.copy(), resb_d=resb_d.copy(), qf_d=qf_d.copy(), q_d=q_d.copy(),
@@ -313,9 +329,10 @@ def main() raises:
         reset_buffers(ctx, bufs, prompt, tmax)
         var cfg_prompt = WindowCfg(
             pack_q4=pack_q4, draft_q4=False, q4_off=q4_off, e=e, kcfg=2,
-            spec=False, spec_dbg=False, serve=False, req_id=0, prof=False, pf2=False, pf3=False, pf4=False,
-            dump=False, mega=True, att_split=TMAX, mega_win=False, dot3=False, pf_chunk=1024,
-            pf_rows=0, pf_tail=0, n_total=plen, fr_k=0, fr_off=0, fr_ids_off=0, n_prompt=plen,
+            spec=False, expert_trace=False, spec_dbg=False, serve=False, req_id=0, prof=False, pf2=False, pf3=False, pf4=False,
+            dump=False, dump4=False, dump_layer=-1, mega=True, att_split=TMAX, mega_win=False,
+            dot3=False, pf_chunk=1024, pf_rows=0, pf_tail=0, n_total=plen, fr_k=0, fr_off=0,
+            fr_ids_off=0, n_prompt=plen, sample=default_sample_params(),
         )
         wst.reset(perf_counter_ns())
         while wst.pos < plen:
