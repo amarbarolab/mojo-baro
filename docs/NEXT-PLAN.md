@@ -14,6 +14,23 @@ families served; sampling on device with two shapes refused pending rounds;
 self-describing bakes verified at `8184f7d`; LatentOS KV/SSM handoff 27x
 faster than re-prefill at 32k.
 
+
+## GPU rule for every item (the maintainer, 2026-09-15): short experiments that prove
+
+The GPU is in constant use. No lane gets GPU-days. Every claim is proven by
+a preregistered experiment that holds the GPU for minutes, not hours:
+- Each gate below is sized to run in under 10 minutes of GPU time
+  (one-prompt receipts for direction, the 20-prompt median only for a
+  landing decision, never for exploration).
+- Anything longer (training, sweeps) runs as `gpu-wait run --preemptible
+  --priority 10` in slices that checkpoint every few minutes, so interactive
+  work at `--priority 90` preempts it and nothing is lost; it never holds the
+  card outright.
+- A build lane reports GPU minutes used per gate in its report; a gate that
+  needs more than 10 minutes is split or redesigned before it runs.
+- Reads, builds, ISA receipts, parity tests on fixtures and host oracles are
+  CPU and free; do them first and often.
+
 ## Part A: the five gaps
 
 ### A1. Sampled speculation (M, sonnet; after the C3 tail round, S)
@@ -63,7 +80,7 @@ to its single-request run at T=0; aggregate tok/s at m=4 against the P5
 row-scaling receipt (delta phase scales 1.46x at m=2, so predict, do not
 assume); no regression of the single-request 20-prompt median.
 
-### A4. Trained draft head (M code plus 6 to 8 GPU hours, sonnet)
+### A4. Trained draft head (M code; GPU in preemptible slices, sonnet)
 
 Acceptance is the lever only through training: DeepSeek-V3's trained MTP
 head reaches 85 to 90% second-token acceptance (2412.19437) against our 42%.
@@ -72,8 +89,11 @@ E13's trainer, converter and Mojo projector are built and verified
 next-token prediction from the trunk's last hidden state. Expected tokens
 per pass (1 - a^(K+1)) / (1 - a) divided by the window cost t(K)
 (Sequoia 2402.12374) is the frozen prediction; at a=0.8, K=2: 2.44 / 1.45.
-Gates: acceptance on the 20-prompt set; 20-prompt tok/s at k=2 and k=3;
-T=0 identity unchanged (the draft never changes the target's argmax).
+Proof before any long run: a 10-minute training smoke on 2000 sequences
+must move acceptance on 5 prompts above the untrained 42% (frozen: >= 50%
+or the item is killed); only then a preemptible, checkpointed run in
+slices. Gates: acceptance on the 20-prompt set; 20-prompt tok/s at k=2 and
+k=3; T=0 identity unchanged (the draft never changes the target's argmax).
 Caveat from EAGLE Table 3: on the MoE model the win is bounded by extra
 expert reads per verified token; predict it, do not promise it.
 
