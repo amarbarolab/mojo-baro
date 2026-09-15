@@ -258,3 +258,152 @@ Their stage 2 question stands and is the right one: does an expert-weight H2D
 transfer overlap with compute on already-resident layers through this API, and
 does the overlap save wall clock. Every number above is transfer-only and
 charges nothing to compute.
+
+---
+
+## 6. A5 tool calling and structured output, host half: LANDED (w82:p2), verified by me
+
+Commit `0950c6f`, report `3e16e47`
+(`exchange/2026-09-15-p2-a5-report.md`). 2.9 GPU minutes over 5 launches.
+
+A5 splits into a host and API half and a device half (the grammar mask before
+Gumbel, which needs `kernels/sample.mojo` and therefore belongs to the
+coordinator). p2 built the host half and stopped at the device boundary with
+an interface request rather than guessing, which is what the brief asked for.
+
+I verified the three claims with my own requests against a `baro-serve` I
+started myself, rather than from their report:
+
+- `chat_template_kwargs` reaches the template and changes what the model is
+  asked: the same prompt at T=0 answers with a reasoning preamble by default
+  and **"Blue"** with `{"enable_thinking": false}`.
+- `tools`: a real round trip comes back parsed into the OpenAI shape,
+  `tool_calls[0].function = {"name": "get_weather", "arguments":
+  "{\"location\":\"Paris\"}"}`. Qwythos emits its own XML tool-call format,
+  which p2's parser converts; that is worth knowing before anyone assumes the
+  OpenAI JSON convention.
+- `response_format` returns **HTTP 400**, not a silently ignored field. That
+  is the right call under P1: an accepted-and-ignored parameter is the
+  silently-inert-parameter defect this repo has already been burned by twice.
+
+Their KERNEL request went to the coordinator with my review of the interface.
+Two changes came out of that review and are in the landed kernel
+(`b7cecb1`, `amar_sample_row_masked`): the mask is indexed per ROW, because a
+speculative window runs k+1 rows at different positions with different grammar
+states, and the DRAFT head stays unmasked, because the speculative rule
+rejects a grammar-forbidden token for free (p = 0 makes min(1, p/q) = 0 and
+the residual draws from the masked target). That second one removes the
+per-draft-step host round trip p2's proposal assumed it needed.
+
+---
+
+## 7. A1 sampled speculation: gates 1, 2 and 3 PASS, 4 and 5 running
+
+Protocol `bench/spec-sample-protocol.md`, preregistered at `6f48c70` before a
+line of the round's code. Thresholds for the real-vocab gates frozen in
+`bench/mtp-protocol.md` in the same commit (P2).
+
+**Gate 1, T=0 byte identity: PASS 20/20, min 100.0%, mean 100.0%, no voids.**
+`bench/force-ab.sh` against an engine built from a clean `git archive` of
+HEAD (`shaRef 397dcfa43ed0fa46`, `shaCand 2dc924a29937d252`). This is the gate
+that protects every parity claim in the repo: the sampled-speculation path is
+new code in the same window, and the T=0 path must not move.
+
+**Gates 2 and 3 at real vocab: PASS, 24 of 24 checks** (`f56206d`,
+`.work/b1/tsd3.log`). Per draw, `amar_spec_accept` equals `spec_accept_ref` on
+all 64 draws for 3 rows x 2 shapes x 2 draft arms, with the device and host
+probability rows agreeing to 5.96e-08. Distributionally, 20,000 emitted tokens
+per cell land under the p=0.001 chi-square critical value against the same
+independent numpy oracle the sampler gates use, which is the theorem's own
+claim: accept-plus-residual is distributed exactly as the target.
+
+The two draft arms are the part worth copying. A draft taken from another
+prompt's logits ("far") accepts **0 of 64** and 155 of 20,000, so it exercises
+the residual branch and nothing else; the same row at 1.3x temperature
+("near") accepts 33 to 58 of 64. The first version of this test had only the
+far arm and passed every gate while never once taking the accept path.
+
+What the wiring does: the draft head draws from its own truncated q and keeps
+the whole q row (the residual needs every entry, not just q(x)), with a mixed
+seed so draft and target never share a Gumbel key at the same counter; the
+verify window truncates the target's rows into p, draws one token per row from
+p, and runs the accept plus residual rule against the drafted ids. The
+megakernel window is forced off under sampling for the same reason the
+single-token megakernel already was: it writes the window's tokens itself and
+cannot host the rule.
+
+### A1 gates 4 and 5, and the prediction that did not survive
+
+**Gate 5 PASS.** The untruncated shape (top_p 1, top_k 0, min_p 0) is served
+with speculation on, drafted 29, accepted 17, 112.89 tok/s; the two truncated
+shapes are served too. `drafted`/`accepted` on every row are the read-back
+that the window really speculated.
+
+**Gate 4: the frozen prediction is falsified, and the round is not.**
+Four arms, one resident process, one stint, 20 prompts each:
+
+| arm | median tok/s | drafted | accepted | acceptance |
+|---|---|---|---|---|
+| T=0.7 top_p 0.9, spec on | **147.15** | 1061 | 733 | **0.691** |
+| T=0.7 top_p 0.9, spec off | 109.19 | 0 | 0 | |
+| T=0, spec on | 150.24 | 1093 | 721 | 0.660 |
+| T=0, spec off | 134.97 | 0 | 0 | |
+
+The prediction was that the T>0 speculative gain lands within 5% of the T=0
+gain and that acceptance falls to 0.7x to 1.0x of greedy. Measured: gains
+1.348x against 1.113x (ratio 1.211), acceptance 1.047x. Both wrong, and the
+reason is one measurement in the table: **sampling itself costs 19% of decode
+at this vocab** (109.19 against 134.97 with no speculation on either side).
+The prediction had assumed the two no-spec baselines were comparable. They are
+not, so a ratio of gains was the wrong statistic to freeze; the acceptance
+rates and the absolute medians are the comparable ones.
+
+The defect falsifier ("gain below half the T=0 gain") did not fire. What a
+user gets is the absolute number: **sampled decoding at T=0.7 with
+speculation runs at 147.15 tok/s, faster than greedy decoding without
+speculation at 134.97.**
+
+A bug found by running it: `grid_dim = m - 1` is zero when the window
+collapses to a single row, which killed the engine on the first request of the
+first gate-4 attempt. Fixed (m == 1 emits the target's own draw, which is what
+the greedy path does there), and gate 1 was re-run on the final binary rather
+than inherited from the earlier one.
+
+---
+
+## 8. B5 forking a conversation: LANDED (w82:p2), reviewed by me
+
+Commit `a400c67` (`POST /v1/fork`), protocol `20500e7` frozen before any gate,
+report `ad22a39` (`exchange/2026-09-15-p2-b5-report.md`). 5.0 GPU minutes over
+5 launches.
+
+The pane read `serve/prefix.mojo` first and found the M1a/M1b checkpoint chain
+already restores on any repeated prompt hash, so `/v1/fork` is a thin wrapper
+rather than new plumbing, and no ENGINE request was needed. Its three frozen
+gates are confirmed with bodies pasted: branch 0 at T=0 is byte-identical to a
+from-scratch completion; same seed reproduces, different seeds diverge; and
+restore time is **flat at 2.2 to 4.3 ms across a 32x range of prefix length**
+against recompute prefill scaling 0.29 s to 16.1 s, for 2.55x / 3.71x / 3.86x
+wall clock at 1k / 8k / 32k.
+
+One caveat I would want closed before the identity claim is quoted broadly:
+the two seed-2 branches at T=0.7 produced exactly the T=0 greedy sequence for
+all 8 tokens. On a numeric, highly peaked prompt that is plausible, and the
+seed-1 branches did diverge, so temperature is reaching the engine. It is
+still the shape a silently-inert sampler parameter would take, and one run on
+a less peaked prompt would settle it.
+
+The pane also reported, unprompted, that its first three launches used
+`--priority 60` without stating a reason and starved this lane's identity
+gates twice, and that it corrected course. Recording that here because the
+report is more trustworthy for containing it.
+
+### Gate status at the A1 commit (`b3c0d90`)
+
+`./run-tests.sh` prints **104 PASS lines and exits 1 on one check**, the
+kernel census: `ORPHAN: amar_sample_row_masked sample.mojo`. That kernel came
+in at `b7cecb1` (the A5 device half, the coordinator's file) and nothing calls
+the masked variant yet, so the census gate flags it. `tools/ci-checks.sh` fails
+the same single check and passes every other one. Neither failure is caused by
+this lane's change and neither is chased here (P6 on pre-existing red); it was
+reported to the coordinator, who owns that file, with the two ways to clear it.
