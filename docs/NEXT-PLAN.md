@@ -111,6 +111,17 @@ round trip through the server with the call parsed and the tool result fed
 back; spec on with at least one rollback exercised; T=0 identity unchanged
 when no grammar is set.
 
+
+### A6. Sampler cost at real vocab (M, fable; found by A1's gate 4)
+
+Sampling itself costs 19% of decode at this vocab (T=0.7 no-spec 109.19 vs
+greedy no-spec 134.97 tok/s, `bench/spec-sample-protocol.md`): the device
+sampler scans 248320 logits per draw where the argmax path is one reduction.
+KSAMP-c's design (sampled window, exact compaction, `bench/chat-protocol.md`)
+is the fix shape; it was measured on synthetic rows only. Gates: the C3 device
+test unchanged (per-token host equality, chi-square on three real rows), T=0
+byte-identical, and 20-prompt no-spec T=0.7 within 5% of greedy.
+
 ### A0. Prerequisites and hygiene
 
 - Served-path timing of the MoE model after R1 to R3 (one gpu-wait launch;
