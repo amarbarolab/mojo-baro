@@ -21,7 +21,7 @@ minutes, no model weights needed.
 | Qwythos-9B | `qwen35` (hybrid SSM + attention, MTP head) | main engine: chat server, speculative decode, prefix checkpoints, RULER at 32k |
 | Ornith-1.5-9B | `qwen35` | same engine, packed from a Q4_K GGUF; 98.4% teacher-forced agreement with llama.cpp |
 | Spark-X2.5-4B | `spark2_5` (gated sliding-window attention) | its own engine, `serve/spark.mojo` |
-| RegesCore-35B | `qwen35moe` (256 experts, top 8) | decodes and serves; 53.20/64 mean teacher-forced agreement with llama.cpp over 20 prompts, above the dense path's own 51.90 on a quant-matched arm. No performance round yet. |
+| RegesCore-35B | `qwen35moe` (256 experts, top 8) | decodes and serves; 53.20/64 mean teacher-forced agreement with llama.cpp over 20 prompts, above the dense path's own 51.90 on a quant-matched arm. Decode 93.46 tok/s_gen (20-prompt median, `bench/moe-perf-protocol.md`, 2026-09-15) against llama.cpp's 109.4 on the same GGUF, up from 42.88 that morning. |
 
 ### Dense families on the Spark path
 

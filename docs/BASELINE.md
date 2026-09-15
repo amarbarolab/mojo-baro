@@ -380,3 +380,15 @@ build -- a loop that changes there with unchanged source is the register
 allocator, and only the real-pack A/B settles it. `rocdl.waves_per_eu`
 cannot be set through `@__llvm_metadata` (six spellings rejected).
 
+
+## qwen35moe decode (2026-09-15, `bench/moe-perf-protocol.md`)
+
+RegesCore-35B, pack `.work/moe-w1/pack` (Q4_K experts, Q8_0 projections, Q6_K
+head), launch path (`BARO_MEGA=0`), no spec. **93.46 tok/s_gen, 20-prompt
+median** (was 42.88), three landed arms in one session: vectorized Q4_K
+expert dot (`8130f65`), vectorized Q8_0 row dot (`d49bfc3`), one-wave router
+top-8 (R3). llama.cpp 109.4 on the same GGUF. Teacher-forced agreement
+53.15/64 mean (band 52.70..53.70 around the W3 bar). Every MoE weight path
+used to dequantize one element per lane per load; the bytes-per-token floor
+is about 3.2 ms (2.7 GB), so the remaining gap is launch-bound small kernels
+in the SSM sub-block and expert time, not bytes.
