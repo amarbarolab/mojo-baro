@@ -22,7 +22,7 @@ mkdir -p "$out"
 } | tee "$out/arm.txt"
 BARO_TMAX=$tmax BARO_SPEC=0 serve/target/release/baro-serve --engine "$eng" --port "$port" > "$out/server.log" 2>&1 &
 srv=$!
-trap 'kill "$srv" 2>/dev/null; wait "$srv" 2>/dev/null' EXIT
+trap 'rc=$?; kill "$srv" 2>/dev/null; wait "$srv" 2>/dev/null; exit $rc' EXIT
 up=0
 for _ in $(seq 1 300); do
   curl -sf -m 2 "http://127.0.0.1:$port/health" > /dev/null 2>&1 && { up=1; break; }
