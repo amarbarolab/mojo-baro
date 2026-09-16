@@ -6,7 +6,7 @@
 # binary builds, dense and MoE engines build, baro-serve builds and its unit tests pass.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-stamp() { git ls-files -co --exclude-standard -z | xargs -0 sha256sum 2>/dev/null | sha256sum | cut -c1-32; }
+stamp() { git ls-files -co --exclude-standard | while IFS= read -r f; do [ -f "$f" ] && printf '%s\n' "$f"; done | tr '\n' '\0' | xargs -0 sha256sum | sha256sum | cut -c1-32; }
 if [ "${1:-}" = --check ]; then
   [ "$(cat .work/preflight.ok 2>/dev/null)" = "$(stamp)" ] && exit 0
   echo "FAIL preflight: no passing bench/preflight.sh for the current file contents; run it first" >&2
@@ -28,5 +28,6 @@ step baro-serve
 cargo test --release --manifest-path serve/Cargo.toml > .work/preflight/cargo.log 2>&1 || fail cargo .work/preflight/cargo.log
 cargo build --release --manifest-path serve/Cargo.toml >> .work/preflight/cargo.log 2>&1 || fail cargo .work/preflight/cargo.log
 rm -f .work/preflight/bin
-stamp > .work/preflight.ok
-echo "PASS preflight $(cut -c1-12 .work/preflight.ok)"
+st=$(stamp) || fail stamp "file hashing failed"
+echo "$st" > .work/preflight.ok
+echo "PASS preflight ${st:0:12}"
