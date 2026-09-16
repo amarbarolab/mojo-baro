@@ -1016,3 +1016,144 @@ def amar_spec_accept[
     if tid == 0:
         Out[row] = rebind[Out.ElementType](Int32(-1) if tok == NO_IDX else tok)
         Acc[row] = rebind[Acc.ElementType](Int32(0))
+
+
+comptime PEN_THREADS = 256
+
+
+def amar_apply_penalties[
+    XLayout: TensorLayout, ILayout: TensorLayout, CLayout: TensorLayout, NLayout: TensorLayout
+](
+    X: TileTensor[f32, XLayout, MutAnyOrigin],
+    Ids: TileTensor[i32, ILayout, MutAnyOrigin],
+    Cnt: TileTensor[i32, CLayout, MutAnyOrigin],
+    Npen: TileTensor[i32, NLayout, MutAnyOrigin],
+    n: Int32,
+    presence: Float32,
+    frequency: Float32,
+):
+    comptime assert X.flat_rank == 2 and Ids.flat_rank == 2 and Cnt.flat_rank == 2 and Npen.flat_rank == 1
+    var row = Int(block_idx.x)
+    var N = Int(n)
+    var m = Int(rebind[Scalar[i32]](Npen[row]))
+    var cap = Int(Ids.dim[1]())
+    if m > cap:
+        m = cap
+    var i = Int(thread_idx.x)
+    while i < m:
+        var t = Int(rebind[Scalar[i32]](Ids[row, i]))
+        var c = Int(rebind[Scalar[i32]](Cnt[row, i]))
+        if t >= 0 and t < N and c > 0:
+            X[row, t] = rebind[X.ElementType](
+                rebind[Scalar[f32]](X[row, t]) - (presence + frequency * Float32(c))
+            )
+        i += PEN_THREADS
+
+
+def amar_topn_probs[
+    XLayout: TensorLayout, ILayout: TensorLayout, PLayout: TensorLayout, CAP: Int = SAMP_CAP
+](
+    X: TileTensor[f32, XLayout, MutAnyOrigin],
+    TopIds: TileTensor[i32, ILayout, MutAnyOrigin],
+    TopProbs: TileTensor[f32, PLayout, MutAnyOrigin],
+    n: Int32,
+    nsel: Int32,
+    temperature: Float32,
+    top_k: Int32,
+    top_p: Float32,
+    min_p: Float32,
+):
+    comptime assert X.flat_rank == 2 and TopIds.flat_rank == 2 and TopProbs.flat_rank == 2
+    var N = Int(n)
+    var row = block_idx.x
+    var tid = thread_idx.x
+    var base = row * Int(X.dim[1]())
+    var NMAX = Int(TopIds.dim[1]())
+    var K = Int(nsel)
+    if K > NMAX:
+        K = NMAX
+    if K > CAP:
+        K = CAP
+    var redf = stack_allocation[f32, address_space = AddressSpace.SHARED](row_major[SAMP_THREADS]())
+    var redi = stack_allocation[i32, address_space = AddressSpace.SHARED](row_major[SAMP_THREADS]())
+    var hist = stack_allocation[u64, address_space = AddressSpace.SHARED](row_major[256]())
+    var hc = stack_allocation[u64, address_space = AddressSpace.SHARED](row_major[NBAND]())
+    var hm = stack_allocation[u64, address_space = AddressSpace.SHARED](row_major[NBAND]())
+    var st = stack_allocation[u64, address_space = AddressSpace.SHARED](row_major[4]())
+    var srt = stack_allocation[u64, address_space = AddressSpace.SHARED](row_major[CAP]())
+    var mas = stack_allocation[u64, address_space = AddressSpace.SHARED](row_major[CAP]())
+    var redu = stack_allocation[u64, address_space = AddressSpace.SHARED](row_major[SAMP_THREADS]())
+
+    var temp = temperature
+    var tk = top_k
+    var tp = top_p
+    var mp = min_p
+    if temperature <= 0:
+        temp = Float32(1)
+        tk = Int32(0)
+        tp = Float32(1)
+        mp = Float32(0)
+    var cut = sample_cut[CAP=CAP](
+        X, hist, hc, hm, st, srt, mas, redu, redf, redi, row, base, N, tid, tk, tp, mp
+    )
+    var lmax = cut[0]
+    var none = cut[1] == 0
+    var ck = cut[2]
+    var ci = cut[3]
+    var mpe = min(mp, Float32(1))
+    var vcut = cut_val(ck)
+    var zt: Float32 = 0
+    var g = tid * 4
+    while g < N and not none:
+        var a = load4(X, base, g, N)
+        comptime for e in range(4):
+            if member(a[e], g + e, lmax, vcut, ck, ci, mpe):
+                zt += exp((a[e] - lmax) / temp)
+        g += 4 * SAMP_THREADS
+    var z = bsum_f32(redf, tid, zt)
+
+    var sel = sample_cut[CAP=CAP](
+        X, hist, hc, hm, st, srt, mas, redu, redf, redi, row, base, N, tid, Int32(K), Float32(1), Float32(0)
+    )
+    var ck2 = sel[2]
+    var ci2 = sel[3]
+    var vcut2 = cut_val(ck2)
+    if tid == 0:
+        st[3] = 0
+    barrier()
+    var i = tid
+    while i < N and not none:
+        var v = rebind[Scalar[f32]](X[row, i])
+        if member(v, i, lmax, vcut2, ck2, ci2, Float32(0)):
+            var slot = Int(Atomic.fetch_add(st.ptr.unsafe_offset(3), UInt64(1)))
+            if slot < K:
+                srt[slot] = rebind[srt.ElementType](
+                    (okey(v).cast[u64]() << 32) | (UInt32(0xFFFFFFFF) - UInt32(i)).cast[u64]()
+                )
+        i += SAMP_THREADS
+    barrier()
+    var cnt = Int(rebind[Scalar[u64]](st[3]))
+    if cnt > K:
+        cnt = K
+    if tid == 0:
+        for a in range(1, cnt):
+            var key = rebind[Scalar[u64]](srt[a])
+            var b = a
+            while b > 0 and rebind[Scalar[u64]](srt[b - 1]) < key:
+                srt[b] = rebind[srt.ElementType](rebind[Scalar[u64]](srt[b - 1]))
+                b -= 1
+            srt[b] = rebind[srt.ElementType](key)
+    barrier()
+    if tid < NMAX:
+        if tid < cnt:
+            var key = rebind[Scalar[u64]](srt[tid])
+            var v = okey_inv((key >> 32).cast[u32]())
+            var idx = Int(UInt32(0xFFFFFFFF) - (key & 0xFFFFFFFF).cast[u32]())
+            var p: Float32 = 0
+            if member(v, idx, lmax, vcut, ck, ci, mpe):
+                p = exp((v - lmax) / temp) / z
+            TopIds[row, tid] = rebind[TopIds.ElementType](Int32(idx))
+            TopProbs[row, tid] = rebind[TopProbs.ElementType](p)
+        else:
+            TopIds[row, tid] = rebind[TopIds.ElementType](Int32(-1))
+            TopProbs[row, tid] = rebind[TopProbs.ElementType](Float32(0))
