@@ -1900,3 +1900,36 @@ residual 0.13 ms per token is the launch-path head plus sampler against the
 folded head. P-A6d PASS: T=0.7 spec 146.61 (was 146.89 / 147.15), T=0 spec
 149.37, acceptance 0.691 / 0.660 unchanged. Kill line not reached; the
 `fold_head = 3` round is not needed for the 5% target and stays a lever.
+
+### A6.3 Penalties, top_logprobs and grammar on the megakernel (frozen 2026-09-16, before its build's timed run)
+
+**Change (host only).** `serve/engine.mojo`: `mega_req = mega` (no request
+field excludes the megakernel any more). `serve/window.mojo`: one
+`plain_head` predicate (temperature <= 0, no penalties, no top_logprobs, no
+grammar) decides `fold_head` and `head_folded`; every other m == 1 decode
+step runs the layers in the megakernel with `fold_head = 0` and the
+launch-path head, penalties, top-N and (masked) draw after it, unchanged
+code. `bench/grammar-protocol.md` gate 5 recorded exactly this gap
+(1.253x, "a grammar request cannot use the megakernel"); the shape from
+A6.2 closes it without a masked megakernel head. New harness
+`bench/pen-ab.sh` (two engines, arms U plain / P penalties / L top_logprobs
+at T=0, identity per prompt, penalty and logprob receipts).
+
+**Predictions.**
+- P-A6e T=0 plain byte-identical: `force-ab.sh` 20/20 at 100.0% against
+  the A6.2 engine `d5021bb6c385b0b5`.
+- P-A6f `pen-ab.sh` A6.2 engine (arms P/L on the launch path) vs this
+  build (megakernel layers): identity 20/20 on every arm, both receipts
+  fire on both engines; arm U 133 to 137 on both; arms P and L 105 to 110
+  on the A6.2 engine and 128 to 135 on this build, within 5% of its own
+  arm U.
+- P-A6g grammar gate 1 (`bench/grammar-gate.py`, full corpus, live
+  `baro-serve` on this build) 66/66 valid with masked draws == accepted on
+  every request; gate 5 (`bench/grammar-cost.py`) ratio at or below 1.05x
+  (was 1.253x; mask cost 1.013x measured at `BARO_MEGA=0`, plus the
+  launch-path head residual of A6.2).
+- P-A6h `tools/test_server.sh` ALL PASS, `run-tests.sh` exit 0,
+  `ci-checks.sh` exit 0.
+- Kill line: any identity miss in P-A6f or a validity miss in P-A6g means
+  the branch is not merged; the first diagnosis is megakernel-vs-launch
+  layer parity on that prompt (`BARO_DUMP`), not the sampler.

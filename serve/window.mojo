@@ -946,6 +946,7 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
         var moe_w = 1
         var ssm_i = 0
         var att_i = 0
+        var plain_head = cfg.sample.temperature <= 0 and cfg.sample.presence_penalty == 0 and cfg.sample.frequency_penalty == 0 and cfg.sample.top_logprobs <= 0 and not st.grammar.__bool__()
         var use_mega = cfg.mega and m == 1 and not win_spec and st.pos + 1 >= cfg.n_prompt
         var use_mega_win = cfg.mega_win and win_spec and m == MEGA_MR
         comptime if not MEGA_ALLOWED:
@@ -980,7 +981,7 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                         TileTensor(b.p_ffn_d, pf_sm), TileTensor(b.p_ffn2_d, pf_sm), TileTensor(b.fgb_d, ffnm_layout),
                         TileTensor(b.ctr_d, ctr_layout), b.prof_d.unsafe_ptr(), b.dbg_d.unsafe_ptr(),
                         Toks, Dtok0, Hnm0, b.hmax_d.unsafe_ptr(), b.hidx_d.unsafe_ptr(),
-                        Int32(st.ring), Int32(SLOTS), Int32(st.pos), Int32(1), Int32(1 if cfg.dump else 0), Int32(1 if cfg.sample.temperature <= 0 else 0), Int32(cfg.att_split), grid_dim=MEGA_G, block_dim=ROW_THREADS,
+                        Int32(st.ring), Int32(SLOTS), Int32(st.pos), Int32(1), Int32(1 if cfg.dump else 0), Int32(1 if plain_head else 0), Int32(cfg.att_split), grid_dim=MEGA_G, block_dim=ROW_THREADS,
                     )
                 elif use_mega:
                     ctx.enqueue_function[mega_token_k](
@@ -995,7 +996,7 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                         TileTensor(b.p_ffn_d, pf_sm), TileTensor(b.p_ffn2_d, pf_sm), TileTensor(b.fgb_d, ffnm_layout),
                         TileTensor(b.ctr_d, ctr_layout), b.prof_d.unsafe_ptr(), b.dbg_d.unsafe_ptr(),
                         Toks, Dtok0, Hnm0, b.hmax_d.unsafe_ptr(), b.hidx_d.unsafe_ptr(),
-                        Int32(st.ring), Int32(SLOTS), Int32(st.pos), Int32(1), Int32(1 if cfg.dump else 0), Int32(1 if cfg.sample.temperature <= 0 else 0), Int32(cfg.att_split), grid_dim=MEGA_G, block_dim=ROW_THREADS,
+                        Int32(st.ring), Int32(SLOTS), Int32(st.pos), Int32(1), Int32(1 if cfg.dump else 0), Int32(1 if plain_head else 0), Int32(cfg.att_split), grid_dim=MEGA_G, block_dim=ROW_THREADS,
                     )
                 else:
                     ctx.enqueue_function[mega_win_k](
@@ -1413,7 +1414,7 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                 st.pf_ffn += Int(now - st.tp)
                 st.tp = now
 
-        var head_folded = use_mega and cfg.sample.temperature <= 0
+        var head_folded = use_mega and plain_head
         comptime if not MEGA_ALLOWED:
             head_folded = False
             w = moe_w
@@ -1533,7 +1534,7 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                     ctx.synchronize()
                     st.p3[3] += Int(perf_counter_ns() - t_acc)
                 m = n_acc + 1
-            elif cfg.sample.temperature <= 0 and cfg.sample.presence_penalty == 0 and cfg.sample.frequency_penalty == 0 and cfg.sample.top_logprobs <= 0 and not st.grammar.__bool__():
+            elif plain_head:
                 ctx.enqueue_function[argmax_k](Logitsm, Toks, Int32(VOCAB), Int32(st.pos + 1), grid_dim=m, block_dim=256)
             else:
                 # Sampling (M5). engine.mojo forces spec and the megakernel
