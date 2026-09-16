@@ -11,6 +11,11 @@ Conference: `exchange/conference/moe-stage3/` (19-builder, 12-engineer, 18-skept
 Report: `exchange/lane-MOE3-report.md`. Protocol: `bench/moe-tier-protocol.md`, new section "Stage 3",
 frozen by commit before each item's timed run. Every item has Files / Change / Check / Receipt / Done.
 
+Packs and receipts: split pack `.work/moe-tier` (trunk `pack.bin` + `experts.bin`, the `BARO_PACK` of
+every tier run), stage-2b receipts and the full-pack reference ids under `.work/b4/g23main/`, run
+commands in `bench/moe-tier-protocol.md` and `exchange/lane-B4-stage2b-report.md`. The worktree gets
+`.venv`, `.work/moe-tier`, `.work/b4` and the shim build linked or built by the lane prep script.
+
 ## What the record and the code say (read before item 0)
 
 - Full-pack MoE, experts in VRAM: 111.89 tok/s = 8.94 ms per token. Tier at cap 64: 39.06 tok/s =
