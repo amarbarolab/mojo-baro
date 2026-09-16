@@ -21,6 +21,7 @@ minutes, no model weights needed.
 |---|---|---|
 | Qwythos-9B | `qwen35` (hybrid SSM + attention, MTP head) | main engine: chat server, speculative decode, prefix checkpoints, RULER at 32k |
 | Ornith-1.5-9B | `qwen35` | same engine, packed from a Q4_K GGUF; 98.4% teacher-forced agreement with llama.cpp |
+| Qwythos-9B-v2-MTP | `qwen35` | same engine, packed from a Q6_K GGUF; 99.2% median teacher-forced agreement with llama.cpp (`bench/qwythos-v2-protocol.md`, 2026-09-16) |
 | Spark-X2.5-4B | `spark2_5` (gated sliding-window attention) | its own engine, `serve/spark.mojo` |
 | RegesCore-35B | `qwen35moe` (256 experts, top 8) | decodes and serves; 53.20/64 mean teacher-forced agreement with llama.cpp over 20 prompts, above the dense path's own 51.90 on a quant-matched arm. Decode **111.89 tok/s_gen** (20-prompt median, 727 launches per token, `bench/moe-persist-protocol.md`, 2026-09-15) against llama.cpp's 109.92 on the same GGUF, up from 42.88 at the start of that day. The two numbers come from different stints; in llama.cpp's own stint the previous champion read 0.973x. An experimental expert tier runs it with the routed experts in host RAM (2.68 GB of VRAM instead of 21 GB, output identical on 20/20 prompts) at 39 tok/s, bound by host round trips (`exchange/lane-B4-stage2b-report.md`). |
 

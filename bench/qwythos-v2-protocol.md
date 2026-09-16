@@ -90,6 +90,45 @@ self-consistency vs `model-ref.py`), same reasoning, not re-run; step 3c (MTP id
 (chat smoke), out of scope per the brief, which asks for 3a+3b only. Any kernel change (none
 needed, `BARO_FORCE` already exists). Requantising through any path other than `--q8`.
 
-## Result
+## Result (2026-09-16, engine sha `17707a7`, `bench/qwythos-v2-run.sh` into `.work/qv2/run/`)
 
-(filled in after the run)
+Read-back (P1): pack build printed `packed 442 tensors` (matches Ornith's pack tensor count and
+the bake's own `n_tensors: 442`, same tensor layout family); engine build 0 errors; `/props`
+confirmed `n_ctx: 8192` (`ctk`/`ctv` were not present in llama-server's `default_generation_settings`
+block this llama.cpp build returns, a receipt gap for the next round, same class Ornith's own
+round left open for slot count; the `-ctk q8_0 -ctv q8_0` flags were passed and the server never
+refused to start on them, which is weaker evidence than a printed value); `BARO_FORCE:` printed
+the correct id count on every one of the 20 forced runs (64 for 19 prompts, 43 for `p17-summarize`,
+matching how many tokens llama.cpp actually returned for that prompt, not a fixed 64); `prompt
+tokens:` on the no-spec engine runs matched each prompt file's own word count (P1: `prompt_n == N`)
+on all 20; llama-server down while `ours` held the GPU and vice versa throughout (sequential
+curl-then-engine per prompt, same alternation pattern as `bench/ornith-run.sh`).
+
+- **Step 3a (teacher-forced agreement vs llama.cpp): median 99.2% (63.5/64), range 90.6-100%
+  (58/64 to 64/64).** This is ABOVE the frozen 45-85% band and past the 95% falsifier: the
+  Qwythos f16-KV caveat's fragility does not carry over to this check, the K-quant->q8 chain
+  agrees with llama.cpp's native K-quant path even more closely than it did on Ornith (98.4%).
+  My own prediction was wrong, stated plainly rather than rounded down to fit the band; the
+  falsifier existed to catch exactly this and it did its job. Six prompts hit 64/64; the low
+  outlier is `p19-numbers` at 58/64 (90.6%), still nowhere near the 25% failure line.
+- **Step 3b (tok/s_gen, 20-prompt median): ours 80.77 (range 80.38-80.96), llama.cpp 81.54
+  (range 80.36-82.54).** `ours` is inside the predicted 72-90 band and matches the bake's own
+  one-prompt receipt (80.82) to within 0.06%, the same cross-check tightness Ornith's round
+  showed. `llama.cpp` landed just above the predicted 50-80 band (inside the 35-100 falsifier,
+  so not a falsification) at **1.0096x llama.cpp/ours**, essentially at parity. The bit-width
+  scaling argument (Q6_K carrying ~1.36x the stream bytes of Ornith's Q4_K_M, so llama.cpp should
+  be markedly slower here) was wrong a second time in this protocol family: Ornith's own round
+  already showed the same style of scaling argument overshooting (predicted 110-150, measured
+  88.8). Two rounds now show llama.cpp's decode throughput on this 9B/33-layer shape landing
+  within about 10% of `ours`' q8 arm regardless of the source quant format (Q4_K_M here, Q6_K
+  there), which reads as a fixed per-token cost (attention, kernel launches) dominating over
+  bits-per-weight bandwidth scaling at this model size, not a property of either engine's tuning.
+  No further scaling prediction is made from this pattern without tracing it.
+
+**Verdict: Qwythos-9B-v2-MTP-Q6_K decodes correctly through the K-quant->q8 engine pack.** Median
+agreement (99.2%) is the highest recorded in this protocol family so far, and decode speed lands
+within a few percent of llama.cpp running the same weights natively. The correctness gap the
+model-library lane flagged (`~/Models/library/REPORT.md`, "UNVERIFIED-correctness") is closed.
+`~/Models/library/models/qwythos-9b-v2-mtp-q6_k__Qwythos-9B-v2-MTP-Q6_K-BARO-04867e2.json` updated
+(`correctness_verified: true`), `~/Models/library/INDEX.md` correctness table row updated, and
+`README.md`'s model table gained a Qwythos-v2 row (`README.md:24`) since this result passes.
