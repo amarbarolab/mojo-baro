@@ -377,6 +377,16 @@ run-tests, identity on every runnable pack with spec on/off, ref tokens,
 per-sub-block device profile, `BARO_DUMP=path` dumps X per layer for both
 arms. Round receipts: `bench/megakernel-protocol.md`.
 
+**Sampled decode on the megakernel since 2026-09-16 (lane-A6, `54fb4bb`,
+`bench/chat-protocol.md` A6): no-spec T=0.7/top_p 0.9 132.30 tok/s_gen
+against no-spec T=0 134.65 in the same stint (98.3%), was 108.32.** The 19%
+"sampler cost" found by A1 was the megakernel bypass at `temperature > 0`;
+the sampler kernel itself costs nothing measurable against the launch path's
+argmax. A sampling request now runs `mega_token_*` with `fold_head = 0` and
+the launch-path head plus `amar_sample_row` after it; T<=0 is byte-identical
+(force-ab 20/20). Penalties, top_logprobs and grammar requests still take the
+launch path. Report `exchange/2026-09-16-A6-report.md`.
+
 **q4 m=1 champion since 2026-09-11 (`3824e20`, merge of lane-dattn): 136.37
 tok/s_gen no-spec, 20-prompt median** (was 133.9). Post-merge A/B against
 pre-merge main (`.work/engine-premerge`, same pack and env): 127.98 -> 136.37
