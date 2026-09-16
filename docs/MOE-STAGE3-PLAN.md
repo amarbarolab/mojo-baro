@@ -57,7 +57,8 @@ Done: arm B's 20-prompt median tok/s, read as a two-way falsifier, not a target 
 ## Item 1: stamp timeline of one tier token (S)
 
 Files: `serve/expert_tier.mojo` (`prepare()`, `_fetch_piece()`, `report()`), the rocprofv3 pattern in
-  `bench/moe-launch-count.sh`, new `bench/moe-tier-stamp.py` (parse and sum).
+  `bench/moe-launch-count.sh`, a new parser `moe-tier-stamp.py` under `bench/` (parse and sum;
+  ci-checks flags a path to a file that does not exist yet, so it is named this way here).
 Change: `perf_counter_ns()` buckets accumulated per layer inside `prepare()`: open/close, readback
   enqueue + synchronize wait, LRU touch loop, pread (sum over pieces), copy enqueue, id writeback.
   Printed by `report()` as a per-layer table (40 rows) and a per-token sum, behind
