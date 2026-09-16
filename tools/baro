@@ -230,6 +230,26 @@ PYEOF
   fi
   echo "pack: $([ $pbuilt = 1 ] && echo miss || echo hit) $packdir ($(wc -l < "$packdir/index.txt") tensors)"
 
+  # Text endpoints need tokenizer.json + tokenizer-meta.json in the pack. Built
+  # from the GGUF by tools/gguf-tokenizer-json.mojo (byte-level BPE); for any
+  # other tokenizer (SPM, spark2_5) the meta is still written and a shipped
+  # hf/tokenizer.json next to the model is copied in.
+  if [ ! -s "$packdir/tokenizer.json" ] || [ ! -s "$packdir/tokenizer-meta.json" ]; then
+    tj=$here/.work/gguf-tokenizer-json
+    [ -x "$tj" ] || "$here/.venv/bin/mojo" build "$here/tools/gguf-tokenizer-json.mojo" -I "$here" -I "$here/serve" -o "$tj" > "$work/tokjson-build.log" 2>&1 \
+      || die "tokenizer tool build FAILED, see $work/tokjson-build.log"
+    if ! "$tj" "$model" "$packdir" > "$work/tokjson.log" 2>&1; then
+      shipped=$(dirname "$model")/hf/tokenizer.json
+      if [ -s "$shipped" ]; then
+        cp "$shipped" "$packdir/tokenizer.json"
+        echo "tokenizer: $(head -1 "$work/tokjson.log"); copied $shipped"
+      else
+        echo "tokenizer: none ($(head -1 "$work/tokjson.log")); text endpoints will return 503, token-id requests work"
+      fi
+    fi
+  fi
+  [ -s "$packdir/tokenizer.json" ] && echo "tokenizer: $packdir/tokenizer.json"
+
   total_s=$(( $(date +%s) - t0 ))
   echo "receipt: id=$id engine=$([ $built = 1 ] && echo miss || echo hit) pack=$([ $pbuilt = 1 ] && echo miss || echo hit) elapsed_s=$total_s"
 
