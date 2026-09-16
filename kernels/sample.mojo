@@ -238,7 +238,7 @@ def bargmax[
 
 @always_inline
 def greedy_tok[
-    XL: TensorLayout, FL: TensorLayout, IL: TensorLayout
+    MASK: Bool, XL: TensorLayout, FL: TensorLayout, IL: TensorLayout
 ](
     X: TileTensor[f32, XL, MutAnyOrigin],
     mut redf: TileTensor[f32, FL, MutUntrackedOrigin, address_space = AddressSpace.SHARED],
@@ -246,20 +246,28 @@ def greedy_tok[
     base: Int,
     N: Int,
     tid: Int,
+    mask: MutPointer[Scalar[u64], MutAnyOrigin],
+    mrow: Int,
 ) -> Int32:
     var best_v = Float32(-3.4e38)
-    var best_i: Int32 = 0
+    var best_i: Int32 = NO_IDX if MASK else 0
     var g = tid * 4
     while g < N:
         var g2 = g + 4 * SAMP_THREADS
         var a = load4(X, base, g, N)
         var b = load4(X, base, g2, N)
+        var ma = UInt64(15)
+        var mb = UInt64(15)
+        comptime if MASK:
+            ma = (mask[unsafe_offset=mrow + (g >> 6)] >> UInt64(g & 63)) & UInt64(15)
+            if g2 < N:
+                mb = (mask[unsafe_offset=mrow + (g2 >> 6)] >> UInt64(g2 & 63)) & UInt64(15)
         comptime for e in range(4):
-            if a[e] > best_v:
+            if ((ma >> UInt64(e)) & 1) != 0 and a[e] > best_v:
                 best_v = a[e]
                 best_i = Int32(g + e)
         comptime for e in range(4):
-            if b[e] > best_v:
+            if ((mb >> UInt64(e)) & 1) != 0 and b[e] > best_v:
                 best_v = b[e]
                 best_i = Int32(g2 + e)
         g += 8 * SAMP_THREADS
@@ -784,10 +792,14 @@ def sample_row_body[
     var redi = stack_allocation[i32, address_space = AddressSpace.SHARED](row_major[SAMP_THREADS]())
 
     if temperature <= 0:
-        var g = greedy_tok(X, redf, redi, base, N, tid)
+        var g = greedy_tok[MASK](X, redf, redi, base, N, tid, mask, row * mask_stride)
         if tid == 0:
-            Out[row] = rebind[Out.ElementType](g)
-            Prob[row] = rebind[Prob.ElementType](Float32(1))
+            if g == NO_IDX:
+                Out[row] = rebind[Out.ElementType](Int32(-1))
+                Prob[row] = rebind[Prob.ElementType](Float32(0))
+            else:
+                Out[row] = rebind[Out.ElementType](g)
+                Prob[row] = rebind[Prob.ElementType](Float32(1))
         return
 
     var hist = stack_allocation[u64, address_space = AddressSpace.SHARED](row_major[256]())
@@ -901,7 +913,7 @@ def amar_sample_probs[
     var redi = stack_allocation[i32, address_space = AddressSpace.SHARED](row_major[SAMP_THREADS]())
 
     if temperature <= 0:
-        var gt = Int(greedy_tok(X, redf, redi, base, N, tid))
+        var gt = Int(greedy_tok[False](X, redf, redi, base, N, tid, X.ptr.unsafe_bitcast[Scalar[u64]](), 0))
         var i = tid
         while i < N:
             P[row, i] = rebind[P.ElementType](Float32(1) if i == gt else Float32(0))

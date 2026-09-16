@@ -179,9 +179,13 @@ streaming, `/v1/models`, `/v1/cancel`, `/v1/fork`, `/tokenize`, `/detokenize`,
   models (distribution, seed and HTTP gates, `exchange/lane-SAMPLE-report.md`).
 - `tools` calls come back in the OpenAI `tool_calls` shape, and
   `chat_template_kwargs` reaches the chat template (for example
-  `enable_thinking: false`). `response_format` is validated and refused with
-  HTTP 400 rather than silently ignored: the grammar engine compiles the
-  schema, but the device mask is not in the decode loop yet.
+  `enable_thinking: false`). `response_format` with a JSON schema is enforced on
+  the qwen35 dense and MoE engines by a device token mask: every output over
+  the 32-schema corpus is valid JSON for its schema at T=0 and T=0.7, with
+  reasoning models masked only after `</think>`. Those requests run without
+  speculation or the megakernel (about 1.25x slower per token); the
+  `serve/spark.mojo` families still refuse it with HTTP 400
+  (`bench/grammar-protocol.md`).
 - `/v1/fork` branches a conversation from its checkpoint: restore takes 2 to
   4 ms at any prefix length, 2.6x to 3.9x faster wall clock than re-prefilling
   at 1k to 32k tokens.
@@ -202,7 +206,30 @@ uv sync            # repo-local .venv with the pinned Mojo/MAX toolchain
 ./bench/run.py     # correctness gate, then throughput
 ```
 
-Serving a model (after packing a GGUF with `tools/engine-pack.py`):
+Serving a model, one command, any supported GGUF (self-describing `-BARO-*.gguf`
+bakes; `~/Models/library/INDEX.md` lists the verified ones):
+
+```sh
+tools/baro serve MODEL.gguf [--port 8080] [--rebuild]
+```
+
+Resolves a structural id from the GGUF's own header (`tools/model-id.py`:
+architecture, every dimension the engine compiles in, layer pattern, expert
+count -- never the weights), builds the engine binary and weight pack only on
+a cache miss, and reuses them on every later `baro serve` of a same-shape
+checkpoint. Cache: `~/.cache/baro/<id>/{engine,manifest.json,packs/<gguf-sha256>/}`
+(override with `$BARO_CACHE`); packs are keyed by id + the checkpoint's own
+sha256, since weights differ per checkpoint even at one shape. Eviction is
+manual: `rm -rf ~/.cache/baro/<id>` drops an engine and every pack under it,
+`rm -rf ~/.cache/baro/<id>/packs/<sha>` drops one pack. `--rebuild` forces a
+fresh engine and pack even on a hit. Engine selection: qwen35/qwen35moe get
+`serve/engine.mojo` with `-D BARO_MODEL=<arch>`; llama/qwen2/granite/spark2_5
+get `serve/spark.mojo` with a profile read straight from the checkpoint. An
+unsupported architecture or tokenizer refuses with the exact missing piece
+before any build starts.
+
+Manual build (no cache, one specific engine/pack pair, after packing a GGUF
+with `tools/engine-pack.py`):
 
 ```sh
 ./.venv/bin/mojo build serve/engine.mojo -I . -I kernels -o .work/engine

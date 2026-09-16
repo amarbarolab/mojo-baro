@@ -177,7 +177,7 @@ def make_cfg(pack: Pack, mega: Bool, pf_rows: Int, pf_tail: Int, n_total: Int, n
         pack_q4=pack.pack_q4, draft_q4=False, q4_off=pack.q4_off, e=pack.e, kcfg=2, spec=False, expert_trace=False, spec_dbg=False,
         serve=False, req_id=0, prof=False, pf2=False, pf3=False, pf4=False, dump=False, dump4=False, dump_layer=0, mega=mega, att_split=TMAX,
         mega_win=False, dot3=False, pf_chunk=CP, pf_rows=pf_rows, pf_tail=pf_tail, n_total=n_total, fr_k=0, fr_off=0, fr_ids_off=0, n_prompt=n_prompt,
-        sample=default_sample_params(),
+        sample=default_sample_params(), dump_pen=False,
     )
 
 
@@ -238,7 +238,7 @@ def finish(ctx: DeviceContext, mut bufs: WindowBufs, pack: Pack, mega: Bool, mut
 
 
 def fresh_state() -> WindowState:
-    return WindowState(pos=0, pos_prev=0, ring=0, n_drafted=0, n_accepted=0, n_spec_windows=0, n_dumped=0, tp=0, tq=0, pf_att=0, pf_ssm=0, pf_ffn=0, pf_head=0, pf_proc=0, pf_draft=0, fc=[0, 0, 0, 0, 0, 0], pc=[0, 0, 0, 0, 0, 0, 0, 0], p3=[0, 0, 0, 0], pfx=[0, 0, 0, 0])
+    return WindowState(pos=0, pos_prev=0, ring=0, n_drafted=0, n_accepted=0, n_spec_windows=0, n_dumped=0, tp=0, tq=0, pf_att=0, pf_ssm=0, pf_ffn=0, pf_head=0, pf_proc=0, pf_draft=0, fc=[0, 0, 0, 0, 0, 0], pc=[0, 0, 0, 0, 0, 0, 0, 0], p3=[0, 0, 0, 0], pfx=[0, 0, 0, 0], grammar=None, grammar_mask=Bitset(1), grammar_pending_think=False, grammar_think_buf=List[UInt8](), grammar_stop=False, grammar_masked_draws=0, grammar_accepted=0)
 
 
 def run_cold(ctx: DeviceContext, mut bufs: WindowBufs, pack: Pack, mega: Bool, prompt: List[Int], split_at: Int, mut chain: Chain) raises -> Snap:

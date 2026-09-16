@@ -325,13 +325,23 @@ def main() raises:
             var req_spec = False
             var req_has_spec = False
             var ckpt_hints = List[Int]()
-            var perr = parse_request(line_in.value(), req_id, prompt, req_n, req_spec, req_has_spec, stop_seqs, ckpt_hints, sample)
+            var sp_state_save = String("")
+            var sp_state_load = String("")
+            var perr = parse_request(line_in.value(), req_id, prompt, req_n, req_spec, req_has_spec, stop_seqs, ckpt_hints, sample, sp_state_save, sp_state_load)
             if perr == "" and len(prompt) < 1:
                 perr = "empty prompt"
             if perr == "" and req_n < 1:
                 perr = "n must be >= 1"
             if perr == "" and len(prompt) + req_n > TMAX:
                 perr = "prompt+n exceeds TMAX " + String(TMAX)
+            # Items 3-4, briefs/2026-09-16-sampling-all-models-lane.md: spark
+            # parses presence_penalty/frequency_penalty/top_logprobs (M5/C3)
+            # but has never acted on them -- silently ignoring a parameter
+            # the caller asked for is the inert-parameter defect P1 forbids,
+            # so refuse loudly rather than serve a request that looks
+            # penalized/logprob'd and isn't, until this is wired here too.
+            if perr == "" and (sample.presence_penalty != 0 or sample.frequency_penalty != 0 or sample.top_logprobs > 0):
+                perr = "presence_penalty/frequency_penalty/top_logprobs are not yet wired for this engine (spark); only the dense/MoE engine (serve/engine.mojo) supports them"
             if perr != "":
                 print(err_line(req_id, perr))
                 continue

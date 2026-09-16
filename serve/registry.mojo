@@ -26,7 +26,7 @@ from matmul_prefill import (
 from matmul_prefill_lds import amar_matmul_prefill_lds, LDS_THREADS
 from mega import amar_mega_token, amar_mega_window, MEGA_G, MEGA_G_WIN, DATT_NLD
 from mega_moe import amar_mega_moe_token, MOE_BARRIERS, W_ATT as MOE_W_ATT, W_SSM as MOE_W_SSM
-from sample import amar_sample_row, amar_sample_probs, amar_spec_accept, amar_apply_penalties, amar_topn_probs, SAMP_THREADS, SAMP_CAP
+from sample import amar_sample_row, amar_sample_row_masked, amar_sample_probs, amar_spec_accept, amar_apply_penalties, amar_topn_probs, SAMP_THREADS, SAMP_CAP
 from dattn import amar_dattn_split, amar_dattn_combine, dattn_nsplit
 from attn import (
     amar_head_rmsnorm_rope, amar_kv_append2,
@@ -214,6 +214,12 @@ comptime argmax_d = amar_argmax_pos[type_of(vm_layout), type_of(dtok_layout)]
 # temperature > 0 forces) -- reusing scratch rather than allocating new
 # buffers, same as reusing hmax_d for Prob.
 comptime sample_row_k = amar_sample_row[type_of(vm_layout), type_of(dtok_layout), type_of(dtok_layout)]
+# JSON-enforcement item 1 (briefs/2026-09-16-json-enforcement-lane.md): same
+# instantiation, masked, both temperature > 0 and masked greedy at <= 0.
+# m == 1 only (grammar requests run with spec off) -- vrow_layout would also work
+# for m == 1, but reusing vm_layout keeps one alias for both the plain and
+# masked call sites at the window.mojo sampling branch.
+comptime sample_row_masked_k = amar_sample_row_masked[type_of(vm_layout), type_of(dtok_layout), type_of(dtok_layout)]
 # A1 (bench/spec-sample-protocol.md): sampled speculation needs the truncated
 # probability row of the target and of the draft, and the accept plus residual
 # draw. Both kernels already exist and are not touched by this round; these are

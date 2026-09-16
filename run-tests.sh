@@ -11,7 +11,7 @@ cmake --build "$S" -j"$(nproc)" >/dev/null
 
 # M1a prefix checkpoints: byte-exact restore against the real engine path
 # (needs the q4 pack at BARO_PACK, default .work/engine-pack-q4).
-./.venv/bin/mojo build kernels/test_prefix.mojo -o .work/test_prefix -I kernels -I serve
+./.venv/bin/mojo build kernels/test_prefix.mojo -o .work/test_prefix -I . -I kernels -I serve
 ./.work/test_prefix
 
 # C3 host reference sampler: pure CPU, no accelerator needed, matched
@@ -21,7 +21,7 @@ cmake --build "$S" -j"$(nproc)" >/dev/null
 
 # Penalties and top-N logprobs: device kernels vs the host reference at real
 # VOCAB width (briefs/2026-09-16-fable-sample-kernels.md).
-./.venv/bin/mojo build kernels/test_sample_pen.mojo -o .work/test_sample_pen -I kernels -I serve
+./.venv/bin/mojo build kernels/test_sample_pen.mojo -o .work/test_sample_pen -I . -I kernels -I serve
 ./.work/test_sample_pen
 
 # KATT head-dimension parity: the Spark attention path at HD 64/128/256,
@@ -37,6 +37,11 @@ mkdir -p .work/katt
 # imports only one side leaves the other side's breakage invisible.
 ./.venv/bin/mojo build kernels/test_latent.mojo -I . -I kernels -I serve -o .work/test_latent
 ./.work/test_latent
+
+# JSON-enforcement lane item 1 prep: the request-line schema slice
+# (briefs/2026-09-16-json-enforcement-lane.md), pure string handling.
+./.venv/bin/mojo build serve/test_serve_proto.mojo -I . -I serve -o .work/test_serve_proto
+./.work/test_serve_proto
 
 ./.venv/bin/mojo build tools/kernel-census.mojo -o .work/kernel-census
 ./.work/kernel-census --check
