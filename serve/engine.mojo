@@ -377,6 +377,8 @@ def main() raises:
         var stop_seqs = List[List[Int]]()
         var ckpt_hints = List[Int]()
         var sample = default_sample_params()
+        var req_state_save = String("")
+        var req_state_load = String("")
         if serve:
             var line_in = Optional[String](None)
             if len(pending) > 0:
@@ -388,7 +390,7 @@ def main() raises:
             var req_n = 0
             var req_spec = False
             var req_has_spec = False
-            var perr = parse_request(line_in.value(), req_id, prompt, req_n, req_spec, req_has_spec, stop_seqs, ckpt_hints, sample)
+            var perr = parse_request(line_in.value(), req_id, prompt, req_n, req_spec, req_has_spec, stop_seqs, ckpt_hints, sample, req_state_save, req_state_load)
             if perr == "" and len(prompt) < 1:
                 perr = "empty prompt"
             if perr == "" and req_n < 1:
@@ -443,6 +445,21 @@ def main() raises:
             # exactly as on the cold path. A miss is today's path.
             # spec mode replays at least one prompt row so the draft head's
             # hidden rows (hn_d) are fresh: the checkpoint at len-1 is skipped.
+            if req_state_load != "":
+                # Checkpoint API: bring the named state file into the chain
+                # before the lookup; the lookup then finds it by prefix hash.
+                # A refusal (different pack, bad file) is this request's
+                # error, never the engine's death.
+                var load_err = String("")
+                try:
+                    var t_ld = perf_counter_ns()
+                    var lpos = load_state(ctx, chain, bufs.kc_d, bufs.vc_d, req_state_load, tmax)
+                    print("state loaded:", req_state_load, " pos", lpos, " in", Float64(perf_counter_ns() - t_ld) / 1e9, "s")
+                except e:
+                    load_err = String(e)
+                if load_err != "":
+                    print(err_line(req_id, load_err))
+                    continue
             ckpt_idx = chain.lookup(prompt, len(prompt) - 1 if spec else len(prompt))
             cached = chain.pos_of(ckpt_idx)
             chain.invalidate_above(cached)
@@ -662,6 +679,10 @@ def main() raises:
             print("latent: exported", exported, "checkpoints, chain gen", latent_gen)
         if state_save != "":
             save_state(ctx, chain, bufs.kc_d, bufs.vc_d, state_save, prompt, len(prompt) - 1)
+        if req_state_save != "":
+            var t_sv = perf_counter_ns()
+            save_state(ctx, chain, bufs.kc_d, bufs.vc_d, req_state_save, prompt, len(prompt) - 1)
+            print("state saved:", req_state_save, " pos", len(prompt) - 1, " in", Float64(perf_counter_ns() - t_sv) / 1e9, "s")
         var dt = Float64(perf_counter_ns() - t0) / 1e9
         print("host_enqueue_s:", t_host, " gpu_total_s:", dt)
         var flw = ctx.enqueue_create_host_buffer[DType.uint32](3)
