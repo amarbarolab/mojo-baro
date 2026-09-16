@@ -285,15 +285,14 @@ def pack_dense(model, outdir):
     token_embd re-quantised to q8 when the GGUF has no separate output tensor
     (tools/gen-profile.mojo's TIE_EMBED), else that tensor quantised directly.
 
-    Spark2_5's own per-head attention gate has no analogue here -- this mode
-    is for the recipes that don't have one; use tools/spark-pack.py for that.
+    Spark2_5's per-head attention gate is emitted as q8 between attn_qkv and
+    attn_output when present, matching the order tools/spark-pack.py writes.
     """
     f, infos, data_start, kv = ge.parse(model)
     arch = kv["general.architecture"]
     n_layers = kv[f"{arch}.block_count"]
     has_bias = "blk.0.attn_q.bias" in infos
-    if "blk.0.attn_gate.weight" in infos:
-        raise SystemExit(f"{arch}: has a per-head attention gate, use tools/spark-pack.py instead")
+    has_gate = "blk.0.attn_gate.weight" in infos
     tied = "output.weight" not in infos
 
     outdir.mkdir(parents=True, exist_ok=True)
@@ -314,14 +313,18 @@ def pack_dense(model, outdir):
             emit(b + "attn_norm.weight", _read_f32(f, data_start, infos, b + "attn_norm.weight"),
                  "f32", int(np.prod(infos[b + "attn_norm.weight"][0])))
 
-            qw, qsh = _read_bf16(f, data_start, infos, b + "attn_q.weight")
-            kw, ksh = _read_bf16(f, data_start, infos, b + "attn_k.weight")
-            vw, vsh = _read_bf16(f, data_start, infos, b + "attn_v.weight")
-            qkv = np.concatenate([
-                np.frombuffer(qw, dtype=np.uint16).reshape(qsh),
-                np.frombuffer(kw, dtype=np.uint16).reshape(ksh),
-                np.frombuffer(vw, dtype=np.uint16).reshape(vsh),
-            ], axis=0)
+            if b + "attn_qkv.weight" in infos:
+                qkvw, qkvsh = _read_bf16(f, data_start, infos, b + "attn_qkv.weight")
+                qkv = np.frombuffer(qkvw, dtype=np.uint16).reshape(qkvsh)
+            else:
+                qw, qsh = _read_bf16(f, data_start, infos, b + "attn_q.weight")
+                kw, ksh = _read_bf16(f, data_start, infos, b + "attn_k.weight")
+                vw, vsh = _read_bf16(f, data_start, infos, b + "attn_v.weight")
+                qkv = np.concatenate([
+                    np.frombuffer(qw, dtype=np.uint16).reshape(qsh),
+                    np.frombuffer(kw, dtype=np.uint16).reshape(ksh),
+                    np.frombuffer(vw, dtype=np.uint16).reshape(vsh),
+                ], axis=0)
             q, d = quantize_q8_0(qkv)
             emit(b + "attn_qkv.weight", q.tobytes() + d.tobytes(), "q8", qkv.size)
 
@@ -331,6 +334,11 @@ def pack_dense(model, outdir):
                 vb = np.frombuffer(_read_f32(f, data_start, infos, b + "attn_v.bias"), dtype=np.float32)
                 bias = np.concatenate([qb, kb, vb])
                 emit(b + "attn_qkv.bias", bias.astype(np.float32).tobytes(), "f32", bias.size)
+
+            if has_gate:
+                gw, gsh = _read_bf16(f, data_start, infos, b + "attn_gate.weight")
+                q, d = quantize_q8_0(np.frombuffer(gw, dtype=np.uint16).reshape(gsh))
+                emit(b + "attn_gate.weight", q.tobytes() + d.tobytes(), "q8", gsh[0] * gsh[1])
 
             ow, osh = _read_bf16(f, data_start, infos, b + "attn_output.weight")
             q, d = quantize_q8_0(np.frombuffer(ow, dtype=np.uint16).reshape(osh))
@@ -355,7 +363,7 @@ def pack_dense(model, outdir):
         emit("output.weight", q.tobytes() + d.tobytes(), "q8", osh[0] * osh[1])
 
     (outdir / "index.txt").write_text("\n".join(idx_lines) + "\n")
-    print(f"packed {arch}, {n_layers} layers, bias={has_bias}, tied={tied}, {off/2**30:.2f} GiB")
+    print(f"packed {arch}, {n_layers} layers, bias={has_bias}, gate={has_gate}, tied={tied}, {off/2**30:.2f} GiB")
 
 
 MOE_DENSE_Q8 = {"attn_q", "attn_k", "attn_v", "attn_output", "attn_qkv", "attn_gate", "ssm_out"}
