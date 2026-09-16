@@ -163,6 +163,12 @@ struct ExpertTier(Copyable, Movable):
     var hits: Int
     var bytes_fetched: Int
     var fetch_ns: Int
+    var b_open: List[Int]
+    var b_readback: List[Int]
+    var b_lru: List[Int]
+    var b_pread: List[Int]
+    var b_copy: List[Int]
+    var b_writeback: List[Int]
 
     def __init__(
         out self, ctx: DeviceContext, packdir: String, cap: Int, n_layers: Int
@@ -202,6 +208,19 @@ struct ExpertTier(Copyable, Movable):
         self.hits = 0
         self.bytes_fetched = 0
         self.fetch_ns = 0
+        self.b_open = List[Int]()
+        self.b_readback = List[Int]()
+        self.b_lru = List[Int]()
+        self.b_pread = List[Int]()
+        self.b_copy = List[Int]()
+        self.b_writeback = List[Int]()
+        for _ in range(n_layers):
+            self.b_open.append(0)
+            self.b_readback.append(0)
+            self.b_lru.append(0)
+            self.b_pread.append(0)
+            self.b_copy.append(0)
+            self.b_writeback.append(0)
         ctx.synchronize()
         if self.pinned:
             with open(self.store_path, "r") as f:
@@ -242,6 +261,12 @@ struct ExpertTier(Copyable, Movable):
         self.hits = 0
         self.bytes_fetched = 0
         self.fetch_ns = 0
+        self.b_open = List[Int]()
+        self.b_readback = List[Int]()
+        self.b_lru = List[Int]()
+        self.b_pread = List[Int]()
+        self.b_copy = List[Int]()
+        self.b_writeback = List[Int]()
 
     def layer_base(self, layer: Int) -> Int:
         return layer * self.layer_bytes
@@ -263,17 +288,19 @@ struct ExpertTier(Copyable, Movable):
             self.lru[i].reset()
 
     def _fetch_piece(
-        mut self, ctx: DeviceContext, fd: Int, host_off: Int, dev_off: Int, nbytes: Int
+        mut self, ctx: DeviceContext, fd: Int, host_off: Int, dev_off: Int, nbytes: Int, layer: Int
     ) raises:
         """One expert projection, host to device, through the staging buffer
         unless the whole store is pinned (then the copy is direct)."""
         if self.pinned:
+            var tc0 = perf_counter_ns()
             ctx.enqueue_copy(
                 dst_buf=DeviceBuffer[DType.uint8](
                     ctx, self.cache.unsafe_ptr().unsafe_offset(dev_off), nbytes, owning=False
                 ),
                 src_buf=self.store.create_sub_buffer[DType.uint8](host_off, nbytes),
             )
+            self.b_copy[layer] = self.b_copy[layer] + Int(perf_counter_ns() - tc0)
             self.bytes_fetched += nbytes
             return
         if nbytes > SLOT_BYTES:
@@ -282,6 +309,7 @@ struct ExpertTier(Copyable, Movable):
         self.slot_next += 1
         var base = slot * SLOT_BYTES
         var got = 0
+        var tp0 = perf_counter_ns()
         while got < nbytes:
             var n = external_call["pread", c_ssize_t](
                 fd, self.stage.unsafe_ptr().unsafe_offset(base + got),
@@ -290,12 +318,15 @@ struct ExpertTier(Copyable, Movable):
             if n <= 0:
                 raise Error("expert tier: short read at " + String(host_off))
             got += Int(n)
+        self.b_pread[layer] = self.b_pread[layer] + Int(perf_counter_ns() - tp0)
+        var tc0 = perf_counter_ns()
         ctx.enqueue_copy(
             dst_buf=DeviceBuffer[DType.uint8](
                 ctx, self.cache.unsafe_ptr().unsafe_offset(dev_off), nbytes, owning=False
             ),
             src_buf=self.stage.create_sub_buffer[DType.uint8](base, nbytes),
         )
+        self.b_copy[layer] = self.b_copy[layer] + Int(perf_counter_ns() - tc0)
         self.bytes_fetched += nbytes
 
     def prepare(
@@ -309,14 +340,18 @@ struct ExpertTier(Copyable, Movable):
         router has run.
         """
         var t0 = perf_counter_ns()
+        var to0 = perf_counter_ns()
         var fh = open(self.store_path, "r")
         var fd = fh._get_raw_fd()
         self.slot_next = 0
+        self.b_open[layer] = self.b_open[layer] + Int(perf_counter_ns() - to0)
+        var trb0 = perf_counter_ns()
         ctx.enqueue_copy(
             dst_buf=self.slots_h,
             src_buf=DeviceBuffer[DType.int32](ctx, idx_d.unsafe_ptr(), TOPK, owning=False),
         )
         ctx.synchronize()
+        self.b_readback[layer] = self.b_readback[layer] + Int(perf_counter_ns() - trb0)
         # Copied out, not held as a reference: _fetch_piece takes `mut self`
         # (it counts bytes), which invalidates an interior reference into
         # self.geom while the fetch loop still needs the geometry.
@@ -330,26 +365,32 @@ struct ExpertTier(Copyable, Movable):
             var e = Int(self.slots_h[j])
             if e < 0 or e >= N_EXP:
                 raise Error("expert tier: router returned expert id " + String(e))
+            var tl0 = perf_counter_ns()
             var r = self.lru[layer].touch(e)
+            self.b_lru[layer] = self.b_lru[layer] + Int(perf_counter_ns() - tl0)
             var slot = r[0]
             self.refs += 1
             if r[1]:
                 self.hits += 1
             else:
-                self._fetch_piece(ctx, fd, gate_store + e * eb, lbase + slot * eb, eb)
+                self._fetch_piece(ctx, fd, gate_store + e * eb, lbase + slot * eb, eb, layer)
                 self._fetch_piece(
-                    ctx, fd, up_store + e * eb, lbase + self.cap * eb + slot * eb, eb
+                    ctx, fd, up_store + e * eb, lbase + self.cap * eb + slot * eb, eb, layer
                 )
                 self._fetch_piece(
                     ctx, fd, down_store + e * ebd,
-                    lbase + 2 * self.cap * eb + slot * ebd, ebd,
+                    lbase + 2 * self.cap * eb + slot * ebd, ebd, layer,
                 )
             self.slots_h[j] = Int32(slot)
+        var tw0 = perf_counter_ns()
         ctx.enqueue_copy(
             dst_buf=DeviceBuffer[DType.int32](ctx, idx_d.unsafe_ptr(), TOPK, owning=False),
             src_buf=self.slots_h,
         )
+        self.b_writeback[layer] = self.b_writeback[layer] + Int(perf_counter_ns() - tw0)
+        var tc1 = perf_counter_ns()
         fh.close()
+        self.b_open[layer] = self.b_open[layer] + Int(perf_counter_ns() - tc1)
         self.fetch_ns += Int(perf_counter_ns() - t0)
 
     def report(self, tokens: Int):
@@ -361,3 +402,27 @@ struct ExpertTier(Copyable, Movable):
             " bytes_per_token", Float64(self.bytes_fetched) / Float64(tokens) if tokens > 0 else 0.0,
             " fetch_s", Float64(self.fetch_ns) / 1e9,
         )
+        if getenv("BARO_TIER_STAMP", "0") == "1":
+            print(
+                "tier stamp: layer  open_us  readback_us  lru_us  pread_us  copy_us",
+                " writeback_us  row_us",
+            )
+            var sum_ns = 0
+            for l in range(self.n_layers):
+                var row_ns = (
+                    self.b_open[l] + self.b_readback[l] + self.b_lru[l]
+                    + self.b_pread[l] + self.b_copy[l] + self.b_writeback[l]
+                )
+                sum_ns += row_ns
+                print(
+                    "tier stamp:", l, Float64(self.b_open[l]) / 1e3,
+                    Float64(self.b_readback[l]) / 1e3, Float64(self.b_lru[l]) / 1e3,
+                    Float64(self.b_pread[l]) / 1e3, Float64(self.b_copy[l]) / 1e3,
+                    Float64(self.b_writeback[l]) / 1e3, Float64(row_ns) / 1e3,
+                )
+            print(
+                "tier stamp: sum_s", Float64(sum_ns) / 1e9,
+                " fetch_s", Float64(self.fetch_ns) / 1e9,
+                " sum_per_token_us",
+                Float64(sum_ns) / Float64(tokens) / 1e3 if tokens > 0 else 0.0,
+            )

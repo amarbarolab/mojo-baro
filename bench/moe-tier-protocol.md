@@ -167,3 +167,15 @@ dominant term (model: 8.94 ms compute + 5.81 ms PCIe still on the critical
 path + 40 sync bubbles of 50-150 us = 17-21 ms, 48-58 tok/s). **Arm B near 39
 (below 43)** means it is not, and item 1's stamp table decides what is.
 Either result, item 0 ships no code.
+
+### Item 1: stamp timeline of one tier token
+
+`BARO_TIER_STAMP=1` buckets (open/close, readback+sync, LRU touch, pread,
+copy enqueue, id writeback) accumulated per layer in `ExpertTier`, printed by
+`report()` as a 40-row table plus a run sum. `bench/moe-tier-stamp.py` parses
+and sums a log. Check: buckets sum to `fetch_ns` within 5% on the same run;
+one `rocprofv3` kernel trace of the same request (`bench/moe-launch-count.sh`
+pattern) gives GPU busy time per token, and decode wall minus kernel busy
+(GPU idle) must be accounted for within 20% by the host buckets that overlap
+GPU idle (pread, LRU, enqueue, open/close). `bench/clock-probe.sh` sampled
+during the run.
