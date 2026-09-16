@@ -429,3 +429,19 @@ receipt (gen 0 vs 470 per token) and fail word in `results.txt`, identity
 column PASS on 20/20, `isa-loops` fingerprint of the timed kernel recorded
 in the report, `run-tests.sh` and `tools/ci-checks.sh` green at the commit
 that carries the default flip.
+
+### R6.2 lever 1 result (2026-09-16): G above 96 is NOT-RESIDENT, the knob is dead
+
+`BARO_MOE_G` builds at 96, 192, 288 on p03/p09/p12 (`.work/r6/gsweep/`):
+G = 96 fail word 0, gen 470 per token, kernel span 8327 to 8382 us; **G = 192
+and G = 288 fail word 1 with gen 0 on 6/6 runs** (the first barrier timed
+out, the run's tokens are void). The 3-blocks-per-CU arithmetic in the
+preregistration used a 1536-VGPR file per SIMD; the `persistent-kernel-gfx11`
+rule (waves per SIMD = floor(768 / vgpr), vgpr 256 -> 1 block per CU ->
+ceiling 96) was right and G = 96 has zero slack, as the dense kernel has. The
+falsifier for lever 2 ("G = 192 moves the q8 phases by 20%") cannot be
+evaluated: occupancy is not a knob at 256 VGPRs. Lever 2 proceeds on its own
+prediction (q8 phases 2709 -> at most 1700 us in the stamp profile, kernel
+span under 7000 us), which is the same mechanism the dense kernel uses at
+the same 2 waves per SIMD (`q8_row_dot` UNROLL = 4). Raising occupancy by
+cutting VGPRs to 192 or below is a separate step after R6.2, not this round.
