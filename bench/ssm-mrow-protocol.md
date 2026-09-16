@@ -263,3 +263,70 @@ scale like gemm4 (weights dominate), the elementwise ones like conv.
 
 Measurement only: no kernel changes in this lane. GPU budget: 36 profiled runs plus 4 traced
 runs, about 3 s each on the q4 pack, under 3 GPU minutes.
+
+### Round 2 result (2026-09-16): delta is not the batching limiter, the m = 8 GEMMs are; A2 + A3 as planned with N = 4
+
+Receipts `.work/mrow2/` (`bench/ssm-mrow-run.sh`, `bench/ssm-mrow-summarize.py`). Engine
+sha `808243c5...`, built and printed in the same command; every run read back
+`BARO_MEGA: False`, `BARO_SPEC`, `spec k`, `mtp: drafted/accepted`, `tokens: 64`,
+`prompt tokens: 7`. Windows: m = 1 63; m = 2 35 (k 1); m = 4 23.7 (k 3); m = 8 20.4 (k 7).
+Every delta-stage spread under 1% (bar 5%). Power cap 290 W read back.
+
+**Two void runs before the valid one, both disclosed.** The dense engine now takes the
+megakernel at m = 1 by default (2026-09-06, after round 1), so an m = 1 arm without
+`BARO_MEGA=0` runs one launch per token and the stage timers see only the prompt-replay
+window: the first run's m = 1 stage times were 20x too small. `BARO_MEGA` was not in the
+read-back list; it is now, and the summarizer voids any run without `BARO_MEGA: False`. The
+second run was void because the fix script aborted before writing. The valid run is the third.
+
+**Round 1 reproduced** on the m = 2 row: delta 1.068 / 0.748 = 1.43x (band 1.39 to 1.53).
+
+Per-window ms, mode 2 (SSM stages, serialized), ratio vs m = 1, per-row efficiency m / ratio:
+
+| stage | m = 1 | m = 2 | m = 4 | m = 8 |
+|---|---|---|---|---|
+| gemm4+reduce2 | 2.376 | 2.945 1.24x (1.61) | 3.864 1.63x (2.46) | 10.774 4.53x (1.76) |
+| rgates | 0.713 | 0.910 1.28x | 1.363 1.91x | 2.269 3.18x |
+| conv | 0.487 | 0.491 1.01x | 0.531 1.09x | 0.578 1.19x |
+| l2 | 0.463 | 0.467 1.01x | 0.511 1.10x | 0.556 1.20x |
+| **delta** | 0.748 | 1.068 **1.43x** (1.40) | 1.568 **2.10x** (1.91) | 2.460 **3.29x** (2.43) |
+| gated | 0.470 | 0.473 1.01x | 0.520 1.11x | 0.576 1.23x |
+| out_gemm+add | 0.903 | 1.073 1.19x | 1.268 1.40x | 3.294 3.65x |
+| SSM serialized total | 6.161 | 7.428 1.21x (1.66) | 9.625 1.56x (2.56) | 20.507 3.33x (2.40) |
+| delta share | 0.037 | 0.045 | 0.048 | 0.029 |
+
+Mode 4 (FFN stages): rmsnorm, swiglu, r_add flat to 1.1x through m = 8; gemm_gate 1.25 /
+1.74 / **5.94x**, gemm_up 1.24 / 1.53 / **5.79x**, gemm_down 1.26 / 1.85 / **5.77x** at
+m = 2 / 4 / 8. Mode 1 (sub-block totals, the aggregate basis):
+
+| | m = 1 | m = 2 | m = 4 | m = 8 |
+|---|---|---|---|---|
+| attn | 1.193 | 1.410 1.18x | 1.755 1.47x | 4.240 3.56x |
+| ssm | 3.973 | 5.342 1.34x | 7.464 1.88x | 18.337 4.62x |
+| ffn | 5.323 | 6.721 1.26x | 9.098 1.71x | 33.399 6.27x |
+| head | 0.833 | 0.999 1.20x | 1.267 1.52x | 5.869 7.04x |
+| step total | 11.322 | 14.473 1.28x | 19.584 1.73x | 61.845 5.46x |
+| **aggregate ceiling vs single stream** | 1.00 | **1.56** | **2.31** | **1.46** |
+
+Cross-check, rocprofv3 device time per launch of `amar_ssm_delta_step[m]` (median over
+launches; the m = 1 trace is partial, 867 of 1512 launches, because the traced engine hung at
+exit and was killed after 10 minutes on the coordinator's call; m = 2, 4, 8 traces complete):
+**10.68 / 21.48 / 41.24 / 75.48 us at m = 1 / 2 / 4 / 8, ratios 2.01 / 3.86 / 7.07.** The
+kernel's device time is linear in m. The host-synced stage timer reads 31 us per delta launch
+at m = 1 (0.748 ms / 24), so two thirds of round 1's "delta" stage was launch and sync
+overhead, and its 1.46x was that overhead amortising, not state columns being reused. Round
+1's mechanism explanation is withdrawn; its verdict (delta is a small share of the sub-block)
+stands because the kernel is 11 to 75 us against a 4 to 18 ms sub-block.
+
+**Predictions:** delta at m = 4 predicted 1.69 ms (measured 1.568, in band) and at m = 8
+2.99 (measured 2.460, in band); gemm4 at m = 4 4.22 (3.864, in band); **at m = 8 every
+weight GEMM is 1.8 to 2.4x its linear prediction, so the model's falsifier fired for m = 8
+and the linear aggregate ceiling at m = 8 (2.7 to 3.6x) is withdrawn.** The measured ceiling
+at m = 8 is 1.46x, below m = 4's 2.31x and barely above m = 2's 1.56x.
+
+**Decision rule, as frozen:** delta at m = 4 is 2.10x (bound 2.6x) and its share at m = 8 is
+0.029 (bound 0.30): **A2 + A3 as planned; no delta round before A3.** Recommendation added
+by the measurement: **target N = 4, not 8.** At m = 8 the q4 weight GEMMs (`gemm_w`, all
+five per layer, plus the head) lose their per-row efficiency (1.35 to 1.8 rows per m = 1
+cost against 2.3 to 2.6 at m = 4); that is a GEMM question at the SM = 8 tile, not an SSM
+one, and it is the preregistered round that precedes any N = 8 target.
