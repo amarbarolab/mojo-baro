@@ -1837,3 +1837,52 @@ engine's own `mega` echo at start-up is the receipt. Clock probe
 megakernel T=0 vs launch T=0 (bypass cost), launch T=0 vs launch T=0.7
 (sampler + tokcp cost), megakernel T=0 vs launch T=0.7 (the A1 gap,
 reproduced or not), each as tok/s median and as ms per token.
+
+**A6.1 result (2026-09-16, engine `643593062a0a9018` built from `c82fd6f`,
+`.work/a6/s1-mega`, `.work/a6/s1-launch`, 290 W cap, -100 mV, sclk median
+3006 / 3033 MHz, queue empty).** `BARO_MEGA: True` / `False` echoed by each
+process; every done line carries its temperature, top_p and drafted count.
+
+| arm | median tok/s (min-max) | ms/token |
+|---|---|---|
+| megakernel, T=0 no-spec | 135.00 (134.63-135.42) | 7.41 |
+| launch path, T=0 no-spec | 107.99 (107.85-108.20) | 9.26 |
+| launch path, T=0.7 no-spec | 108.33 (108.01-108.50) | 9.23 |
+| megakernel process, T=0.7 no-spec (= launch path, A1 shape) | 108.32 (107.95-108.51) | 9.23 |
+
+Bypass cost (megakernel T=0 vs launch T=0): 1.85 ms per token, 20.0%.
+Sampler cost (launch T=0.7 vs launch T=0): -0.03 ms, inside the spread.
+A1 gap reproduced: 135.00 vs 108.32, 19.8%. H1 held in full and H2 is
+falsified: `amar_sample_row` at k off / p 0.9 costs no more than the launch
+path's `amar_argmax_row` it replaces (129 us at 256 threads, KSAMP-c table),
+so the sampler kernel is not on the critical path at all. The plan's
+falsifier did not fire.
+
+### A6.2 Change: megakernel layers at temperature > 0 (frozen 2026-09-16, before its build's timed run)
+
+**Change (host only, no kernel edit).** `serve/engine.mojo` no longer
+excludes `temperature > 0` from `mega_req`; `serve/window.mojo` launches
+`mega_token_*` with `fold_head = 0` when `cfg.sample.temperature > 0` and
+sets `head_folded` false there, so the existing launch-path head
+(`rms_m`, `rmsc_k`, `gemm_w`, `r_head`) and the existing sampling branch
+(`amar_sample_row` + `tokcp_k`) run after the megakernel, exactly the shape
+`mega_win_k` already uses for the window. Penalties, top_logprobs and
+grammar requests keep the launch path (unchanged). T<=0 is untouched:
+`fold_head = 1`, argmax inside the megakernel, same launch, same arguments.
+
+**Predictions.**
+- P-A6a T=0 byte-identical: `bench/force-ab.sh` 20/20 at 100.0% against
+  the unchanged engine `643593062a0a9018`, no voids.
+- P-A6b C3 unchanged: `kernels/test_sample.mojo` and
+  `kernels/test_sample_device.mojo` exit 0 (kernel file untouched);
+  `run-tests.sh` exit 0, `tools/ci-checks.sh` exit 0.
+- P-A6c Perf: 20-prompt no-spec T=0.7/top_p 0.9 lands at 128 to 134
+  tok/s against no-spec T=0 in the same stint (134 to 136), i.e. within
+  5% (>= 128.25 for a 135.0 greedy). The residual is the launch-path head
+  (five launches, `amar_argmax_row`-class 129 us argmax replaced by a
+  180 us sampler on a hot row) against the folded head.
+- P-A6d Spec at T=0.7 unchanged within the standing +-2% band: 144 to 150
+  (was 147.15 / 146.89), since the window never used the megakernel.
+- Kill line: no-spec T=0.7 below 95% of the same-stint greedy. Then the
+  next round is `fold_head = 3` in `kernels/mega.mojo` (write the logit row
+  from the folded head instead of reducing it), not a sampler change.

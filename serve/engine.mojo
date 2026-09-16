@@ -682,14 +682,16 @@ def main() raises:
         var want_grammar = wst.grammar.__bool__()
         if want_extra or want_grammar:
             spec = False
-        # The megakernel bakes greedy argmax into its own launch (mega_token_*
-        # kernels take no sampler params); a sampling request always runs the
-        # launch path, which is where the sampler is wired below. Same for a
-        # T<=0 request carrying penalties/top_logprobs: the launch path's
-        # amar_sample_row is argmax-equivalent at temperature<=0 (P-K2), so
-        # routing it there instead of the megakernel is what lets penalties
-        # apply before that equivalent draw.
-        var mega_req = mega and sample.temperature <= 0 and not want_extra and not want_grammar
+        # A6 (bench/chat-protocol.md A6): a sampling request runs the
+        # megakernel for the layers only (fold_head 0, the shape the window
+        # already uses) and the launch-path head plus amar_sample_row after
+        # it; the megakernel bakes greedy argmax into its head phase, so
+        # window.mojo folds that phase only at temperature <= 0. A T<=0
+        # request carrying penalties/top_logprobs, and any grammar request,
+        # stays on the launch path: the launch path's amar_sample_row is
+        # argmax-equivalent at temperature<=0 (P-K2), which is what lets
+        # penalties apply before that equivalent draw.
+        var mega_req = mega and not want_extra and not want_grammar
         # A1: the megakernel WINDOW writes the window's tokens itself, so it
         # cannot host the speculative sampling rule (which needs the target's
         # full probability rows, not its argmax). Sampling therefore stays on

@@ -980,7 +980,7 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                         TileTensor(b.p_ffn_d, pf_sm), TileTensor(b.p_ffn2_d, pf_sm), TileTensor(b.fgb_d, ffnm_layout),
                         TileTensor(b.ctr_d, ctr_layout), b.prof_d.unsafe_ptr(), b.dbg_d.unsafe_ptr(),
                         Toks, Dtok0, Hnm0, b.hmax_d.unsafe_ptr(), b.hidx_d.unsafe_ptr(),
-                        Int32(st.ring), Int32(SLOTS), Int32(st.pos), Int32(1), Int32(1 if cfg.dump else 0), Int32(1), Int32(cfg.att_split), grid_dim=MEGA_G, block_dim=ROW_THREADS,
+                        Int32(st.ring), Int32(SLOTS), Int32(st.pos), Int32(1), Int32(1 if cfg.dump else 0), Int32(1 if cfg.sample.temperature <= 0 else 0), Int32(cfg.att_split), grid_dim=MEGA_G, block_dim=ROW_THREADS,
                     )
                 elif use_mega:
                     ctx.enqueue_function[mega_token_k](
@@ -995,7 +995,7 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                         TileTensor(b.p_ffn_d, pf_sm), TileTensor(b.p_ffn2_d, pf_sm), TileTensor(b.fgb_d, ffnm_layout),
                         TileTensor(b.ctr_d, ctr_layout), b.prof_d.unsafe_ptr(), b.dbg_d.unsafe_ptr(),
                         Toks, Dtok0, Hnm0, b.hmax_d.unsafe_ptr(), b.hidx_d.unsafe_ptr(),
-                        Int32(st.ring), Int32(SLOTS), Int32(st.pos), Int32(1), Int32(1 if cfg.dump else 0), Int32(1), Int32(cfg.att_split), grid_dim=MEGA_G, block_dim=ROW_THREADS,
+                        Int32(st.ring), Int32(SLOTS), Int32(st.pos), Int32(1), Int32(1 if cfg.dump else 0), Int32(1 if cfg.sample.temperature <= 0 else 0), Int32(cfg.att_split), grid_dim=MEGA_G, block_dim=ROW_THREADS,
                     )
                 else:
                     ctx.enqueue_function[mega_win_k](
@@ -1413,7 +1413,7 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                 st.pf_ffn += Int(now - st.tp)
                 st.tp = now
 
-        var head_folded = use_mega
+        var head_folded = use_mega and cfg.sample.temperature <= 0
         comptime if not MEGA_ALLOWED:
             head_folded = False
             w = moe_w
