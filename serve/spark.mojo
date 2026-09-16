@@ -1,5 +1,6 @@
 from std.ffi import c_ssize_t, external_call
 from std.math import ceildiv
+from std.math import log
 from std.os import getenv
 from std.sys import has_accelerator
 from std.time import perf_counter_ns
@@ -11,8 +12,8 @@ from elementwise import amar_rmsnorm_cast, amar_tok_copy
 from matmul_skinny import ROW_WAVES, ROW_THREADS
 from tokenizer import Tokenizer
 from minja import render_chat
-from sample import amar_sample_row, SAMP_THREADS
-from serve_proto import read_line, parse_request, default_sample_params
+from sample import amar_sample_row, amar_topn_probs, SAMP_THREADS
+from serve_proto import read_line, parse_request, default_sample_params, json_key, json_int
 from spark_kernels import (
     amar_embed_lookup_f32, amar_gemv_q8, amar_argmax_part, amar_argmax_final, amar_rope_kv_append, amar_attn_decode_swa_gated, amar_rope_plain, amar_bias_add,
 )
@@ -111,6 +112,9 @@ comptime samp_x_l = row_major[1, VOCAB]()
 comptime samp_o_l = row_major[1]()
 comptime k_sample = amar_sample_row[type_of(samp_x_l), type_of(samp_o_l), type_of(samp_o_l)]
 comptime k_tokcp = amar_tok_copy[type_of(samp_o_l), type_of(toks_l)]
+comptime NTOPLP = 20
+comptime topn_l = row_major[1, NTOPLP]()
+comptime k_topn = amar_topn_probs[type_of(samp_x_l), type_of(topn_l), type_of(topn_l)]
 
 
 def wq[LT: TensorLayout](ctx: DeviceContext, wbuf: DeviceBuffer[DType.uint8], o: Int, n: Int, lt: LT) -> TileTensor[DType.int8, LT, MutAnyOrigin]:
@@ -292,6 +296,13 @@ def main() raises:
     var sprob_d = ctx.enqueue_create_buffer[f32](1)
     var Stok = TileTensor(stok_d, samp_o_l)
     var Sprob = TileTensor(sprob_d, samp_o_l)
+    var sprob_h = ctx.enqueue_create_host_buffer[f32](1)
+    var topn_ids_d = ctx.enqueue_create_buffer[DType.int32](NTOPLP)
+    var topn_probs_d = ctx.enqueue_create_buffer[f32](NTOPLP)
+    var topn_ids_h = ctx.enqueue_create_host_buffer[DType.int32](NTOPLP)
+    var topn_probs_h = ctx.enqueue_create_host_buffer[f32](NTOPLP)
+    var row_h = ctx.enqueue_create_host_buffer[f32](VOCAB)
+    var dump_dir = getenv("BARO_DUMP_LOGITS_DIR", "")
     var OutNorm = wf(ctx, wbuf, off[1 + LSTRIDE * N_LAYERS], H, h_l)
     var out_off = off[2 + LSTRIDE * N_LAYERS]
     var Woq = wq(ctx, wbuf, out_off, VOCAB * H, q_out)
@@ -340,12 +351,29 @@ def main() raises:
             # the caller asked for is the inert-parameter defect P1 forbids,
             # so refuse loudly rather than serve a request that looks
             # penalized/logprob'd and isn't, until this is wired here too.
-            if perr == "" and (sample.presence_penalty != 0 or sample.frequency_penalty != 0 or sample.top_logprobs > 0):
-                perr = "presence_penalty/frequency_penalty/top_logprobs are not yet wired for this engine (spark); only the dense/MoE engine (serve/engine.mojo) supports them"
+            if perr == "" and (sample.presence_penalty != 0 or sample.frequency_penalty != 0):
+                perr = "presence_penalty/frequency_penalty are not yet wired for this engine (spark); only the dense/MoE engine (serve/engine.mojo) supports them"
             if perr != "":
                 print(err_line(req_id, perr))
                 continue
             gen_n = req_n
+            # Per-request teacher forcing, the same "force":[ids] field
+            # serve/engine.mojo reads; absent, the request inherits BARO_FORCE.
+            force = read_prompt(force_path) if force_path != "" else List[Int]()
+            var fi2 = json_key(line_in.value(), "force")
+            if fi2 >= 0:
+                var fb = line_in.value().as_bytes()
+                if fi2 < len(fb) and fb[fi2] == 91:
+                    fi2 += 1
+                    while True:
+                        while fi2 < len(fb) and (fb[fi2] == 32 or fb[fi2] == 44):
+                            fi2 += 1
+                        if fi2 >= len(fb) or fb[fi2] == 93:
+                            break
+                        var fv = 0
+                        if not json_int(line_in.value(), fi2, fv):
+                            break
+                        force.append(fv)
         else:
             var text_path = getenv("BARO_PROMPT_TEXT", "")
             var chat_path = getenv("BARO_CHAT", "")
@@ -436,6 +464,21 @@ def main() raises:
                 # temperature > 0 amar_sample_row replaces the argmax pair;
                 # at 0 (including one-shot, which never sets sample) the
                 # path below is untouched, byte for byte.
+                var want_lp = serve and sample.top_logprobs > 0
+                if want_lp and dump_dir != "":
+                    ctx.enqueue_copy(dst_buf=row_h, src_buf=DeviceBuffer[f32](ctx, logits_d.unsafe_ptr(), VOCAB, owning=False))
+                    ctx.synchronize()
+                    with open(dump_dir + "/row-" + String(pos + 1 - n_prompt) + ".bin", "w") as f:
+                        f.write_bytes(Span[UInt8](unsafe_ptr=row_h.unsafe_ptr().unsafe_bitcast[UInt8](), length=VOCAB * 4))
+                if want_lp:
+                    ctx.enqueue_function[k_topn](
+                        LogitsSample, TileTensor(topn_ids_d, topn_l), TileTensor(topn_probs_d, topn_l),
+                        Int32(VOCAB), Int32(min(sample.top_logprobs, NTOPLP)),
+                        Float32(sample.temperature), Int32(sample.top_k), Float32(sample.top_p), Float32(sample.min_p),
+                        grid_dim=1, block_dim=SAMP_THREADS,
+                    )
+                    ctx.enqueue_copy(dst_buf=topn_ids_h, src_buf=topn_ids_d)
+                    ctx.enqueue_copy(dst_buf=topn_probs_h, src_buf=topn_probs_d)
                 if sample.temperature > 0:
                     ctx.enqueue_function[k_sample](
                         LogitsSample, Stok, Sprob, Int32(VOCAB), Float32(sample.temperature), Int32(sample.top_k),
@@ -452,7 +495,25 @@ def main() raises:
                     ctx.enqueue_copy(dst_buf=tok1_h, src_buf=DeviceBuffer[DType.int32](ctx, toks_d.unsafe_ptr().unsafe_offset(pos + 1), 1, owning=False))
                     ctx.synchronize()
                     var new_tok = Int(tok1_h[0])
-                    print(tok_line(req_id, new_tok))
+                    if want_lp:
+                        var lp = 0.0
+                        if sample.temperature > 0:
+                            ctx.enqueue_copy(dst_buf=sprob_h, src_buf=sprob_d)
+                            ctx.synchronize()
+                            lp = log(Float64(sprob_h[0])) if sprob_h[0] > 0 else -1e30
+                        var tl = String("{\"id\":") + String(req_id) + ",\"tok\":" + String(new_tok) + ",\"logprob\":" + String(lp) + ",\"top_logprobs\":["
+                        for i in range(min(sample.top_logprobs, NTOPLP)):
+                            var tid = Int(topn_ids_h[i])
+                            if tid < 0:
+                                break
+                            if i > 0:
+                                tl += ","
+                            var pr = topn_probs_h[i]
+                            tl += "{\"id\":" + String(tid) + ",\"logprob\":" + String(log(Float64(pr)) if pr > 0 else -1e30) + "}"
+                        tl += "]}"
+                        print(tl)
+                    else:
+                        print(tok_line(req_id, new_tok))
                     generated_ids.append(new_tok)
                     # Checked once per generated token (spark decodes m=1 at a
                     # time, unlike engine.mojo's per-window check): the tail
