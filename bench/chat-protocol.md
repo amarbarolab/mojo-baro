@@ -1999,3 +1999,21 @@ sampled accept rule after the native head is unaffected) with
 `spec-sample-ab.sh` as its gate. **Close rule.** Ratio < 1.03: the flag
 stays 0, the q4 instantiation is kept as the correctness fix for the flag,
 and the report records the number against the record's band.
+
+**A6.4 result (2026-09-16, engine `7237e557c9a357a9` built from `7bc81f5`,
+`.work/a6/win-ab/`, 290 W cap, -100 mV, sclk median 3098 MHz, queue
+empty). CLOSED, prediction missed on the low side.** ISA gate PASS (q4
+window kernel 192 VGPR / 44 spills / 180 B private; q4 m=1 token kernel
+fingerprint unchanged, dual 124/79/79/59). Receipts: `BARO_MEGA_WIN:
+False` / `True` per arm, `spec k: 2`, `mtp: drafted/accepted` on every
+run, `mega barrier gen` 7912 to 11696 on every megawin run and 0 on every
+launch run, fail word 0 on all 40 runs. k=2 spec, 20 prompts: launch path
+**151.68** tok/s_gen, window megakernel **115.39**, ratio **0.761**,
+identity 20/20, and every prompt's own ratio sits in 0.76 to 0.78. The
+record's band was 0.87 to 1.01; the q4 body at m=3 does worse than the q8
+one did, consistent with W3's cause (per-row serialization inside
+persistent waves; the re-rolled q4 dot loop is faster at m=1 and no
+better at m=3). Close rule applied: `BARO_MEGA_WIN` stays 0, the q4
+instantiation stays as the correctness fix for the flag, no temperature
+> 0 extension. Multi-row windows stay on the launch path; the megakernel
+is an m=1 device, now measured on both packs.

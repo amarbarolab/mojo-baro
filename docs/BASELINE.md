@@ -388,7 +388,10 @@ the launch-path head plus `amar_sample_row` after it; T<=0 is byte-identical
 route since `39f6a4c` (A6.3): penalized T=0 109.85 -> 133.38, top_logprobs
 107.45 -> 129.80, identity 20/20 on every arm (`bench/pen-ab.sh`); grammar cost
 1.253x -> 1.010x (`bench/grammar-cost.py`), 66/66 valid. Only a plain greedy
-request folds the head. Report `exchange/2026-09-16-A6-report.md`.
+request folds the head. The speculative window stays on the launch path:
+the q4 window megakernel (`BARO_MEGA_WIN=1`, now correctly instantiated for
+the q4 pack) measured 0.761x of it on k=2 spec (115.39 vs 151.68, A6.4), worse
+than the q8 record (W2/W3). Report `exchange/2026-09-16-A6-report.md`.
 
 **q4 m=1 champion since 2026-09-11 (`3824e20`, merge of lane-dattn): 136.37
 tok/s_gen no-spec, 20-prompt median** (was 133.9). Post-merge A/B against
