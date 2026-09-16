@@ -46,6 +46,13 @@ pub struct Request {
     /// M1b role-boundary checkpoint hint positions (`Text::role_boundaries`),
     /// ascending; empty when the request has no message list.
     pub ckpt: Vec<u32>,
+    /// Checkpoint API (LatentOS plan 10 sec 8): BAROST01 state file the
+    /// engine writes after prefill / loads before the chain lookup. Absent
+    /// keys, so an engine without the feature ignores them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_save: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_load: Option<String>,
     #[serde(flatten)]
     pub sample: SampleParams,
 }
@@ -215,6 +222,8 @@ mod tests {
             spec: false,
             stop: vec![],
             ckpt: vec![],
+            state_save: None,
+            state_load: None,
             sample: SampleParams::default(),
         };
         assert_eq!(r.line(), "{\"id\":7,\"prompt\":[760,6511,314],\"n\":64,\"spec\":false,\"stop\":[],\"ckpt\":[]}\n");
@@ -229,6 +238,8 @@ mod tests {
             spec: false,
             stop: vec![vec![151645], vec![9707, 11]],
             ckpt: vec![],
+            state_save: None,
+            state_load: None,
             sample: SampleParams::default(),
         };
         assert_eq!(
@@ -246,6 +257,8 @@ mod tests {
             spec: false,
             stop: vec![],
             ckpt: vec![7914, 8020],
+            state_save: None,
+            state_load: None,
             sample: SampleParams::default(),
         };
         assert_eq!(
@@ -263,6 +276,8 @@ mod tests {
             spec: false,
             stop: vec![],
             ckpt: vec![],
+            state_save: None,
+            state_load: None,
             sample: SampleParams {
                 temperature: Some(0.8),
                 top_p: Some(0.9),

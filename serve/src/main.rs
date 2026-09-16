@@ -8,6 +8,7 @@
 //! (branches from one shared prompt, B5), POST /tokenize, POST /detokenize.
 //! One request runs at a time; the rest queue.
 
+mod checkpoints;
 mod engine;
 mod protocol;
 mod text;
@@ -36,6 +37,9 @@ struct App {
     engine: EnginePool,
     text: Option<Text>,
     model: String,
+    /// Checkpoint API registry (LatentOS plan 10 sec 8).
+    ckpts: checkpoints::Registry,
+    identity: checkpoints::Identity,
 }
 
 type Shared = Arc<App>;
@@ -117,7 +121,10 @@ async fn main() {
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "mojo-baro".into());
-    let app = Arc::new(App { engine, text, model });
+    let identity = checkpoints::Identity::compute(&opts.pack, &tok_path);
+    let ckpts = checkpoints::Registry::from_env();
+    eprintln!("checkpoints: dir {} cap {} identity {:?}", ckpts.dir.display(), ckpts.cap, identity);
+    let app = Arc::new(App { engine, text, model, ckpts, identity });
 
     let router = Router::new()
         .route("/health", get(health))
@@ -125,6 +132,9 @@ async fn main() {
         .route("/v1/completions", post(completions))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/fork", post(fork))
+        .route("/v1/checkpoints", post(checkpoints::create).get(checkpoints::list))
+        .route("/v1/checkpoints/{id}", get(checkpoints::get_one).delete(checkpoints::delete))
+        .route("/v1/checkpoints/{id}/fork", post(checkpoints::fork))
         .route("/v1/cancel", post(cancel))
         .route("/tokenize", post(tokenize))
         .route("/detokenize", post(detokenize))
@@ -155,6 +165,8 @@ async fn main() {
 enum ApiError {
     Plain(StatusCode, String),
     Exceed { n_prompt_tokens: u64, n_ctx: u64 },
+    /// Checkpoint API: the checkpoint's identity and this server's differ in `field`.
+    Mismatch(String),
 }
 
 impl ApiError {
@@ -171,6 +183,11 @@ impl IntoResponse for ApiError {
             ApiError::Plain(code, msg) => {
                 let body = json!({"error": {"message": msg, "type": "invalid_request_error", "code": code.as_u16()}});
                 (code, Json(body)).into_response()
+            }
+            ApiError::Mismatch(field) => {
+                let body = json!({"error": {"code": 409, "message": "IDENTITY_MISMATCH",
+                    "type": "identity_mismatch", "field": field}});
+                (StatusCode::CONFLICT, Json(body)).into_response()
             }
             ApiError::Exceed { n_prompt_tokens, n_ctx } => {
                 let body = json!({"error": {
@@ -259,6 +276,8 @@ struct Gen {
     /// M1b role-boundary checkpoint hints (`Text::role_boundaries`); empty
     /// for `/v1/completions`, which has no message list.
     ckpt: Vec<u32>,
+    /// Checkpoint API: (state_save, state_load) file paths for the engine.
+    state: (Option<String>, Option<String>),
     /// C3 control block (parsed here, not yet acted on by the engine).
     sample: protocol::SampleParams,
 }
@@ -308,7 +327,7 @@ fn check_and_submit(app: &App, g: &Gen) -> Result<(u64, mpsc::UnboundedReceiver<
         return Err(ApiError::exceed_context(g.prompt.len() as u64, tmax as u64));
     }
     app.engine
-        .submit(g.prompt.clone(), g.n, g.spec, g.stop.clone(), g.ckpt.clone(), g.sample.clone())
+        .submit(g.prompt.clone(), g.n, g.spec, g.stop.clone(), g.ckpt.clone(), g.sample.clone(), g.state.clone())
         .map_err(|e| ApiError::Plain(StatusCode::SERVICE_UNAVAILABLE, e))
 }
 
@@ -589,6 +608,7 @@ async fn completions(State(app): State<Shared>, Json(r): Json<CompletionReq>) ->
         stream: r.stream,
         stop: compute_stop(&app, r.stop),
         ckpt: vec![],
+        state: (None, None),
         sample: r.sampler.to_sample_params(r.logprobs),
     };
     let model = r.model.unwrap_or_else(|| app.model.clone());
@@ -669,6 +689,7 @@ async fn fork(State(app): State<Shared>, Json(r): Json<ForkReq>) -> Result<Respo
             stream: false,
             stop: compute_stop(&app, b.stop),
             ckpt: vec![],
+            state: (None, None),
             // logprobs not supported on /v1/fork branches yet (not in
             // serve/PROTOCOL.md's branch shape); item 4 scoped to the two
             // completion endpoints.
@@ -952,6 +973,7 @@ async fn chat_completions(State(app): State<Shared>, Json(r): Json<ChatReq>) -> 
         stream: r.stream,
         stop: compute_stop(&app, r.stop),
         ckpt,
+        state: (None, None),
         sample: r.sampler.to_sample_params(if r.logprobs == Some(true) { Some(r.top_logprobs.unwrap_or(1)) } else { r.top_logprobs }),
     };
     let model = r.model.unwrap_or_else(|| app.model.clone());

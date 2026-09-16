@@ -140,13 +140,14 @@ impl Engine {
     #[allow(clippy::too_many_arguments)]
     pub fn submit(
         &self, id: u64, prompt: Vec<u32>, n: u32, spec: bool, stop: Vec<Vec<u32>>, ckpt: Vec<u32>, sample: SampleParams,
+        state: (Option<String>, Option<String>),
     ) -> Result<mpsc::UnboundedReceiver<Event>, String> {
         if !self.alive() {
             return Err("engine process has exited".into());
         }
         let (out, rx) = mpsc::unbounded_channel();
         let job = Job {
-            req: Request { id, prompt, n, spec, stop, ckpt, sample },
+            req: Request { id, prompt, n, spec, stop, ckpt, state_save: state.0, state_load: state.1, sample },
             out,
         };
         self.queued.fetch_add(1, Ordering::SeqCst);
@@ -236,6 +237,7 @@ impl EnginePool {
     #[allow(clippy::too_many_arguments)]
     pub fn submit(
         &self, prompt: Vec<u32>, n: u32, spec: bool, stop: Vec<Vec<u32>>, ckpt: Vec<u32>, sample: SampleParams,
+        state: (Option<String>, Option<String>),
     ) -> Result<(u64, mpsc::UnboundedReceiver<Event>), String> {
         let mut best = 0;
         let mut best_q = self.engines[0].queue_depth();
@@ -247,7 +249,7 @@ impl EnginePool {
             }
         }
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        let rx = self.engines[best].submit(id, prompt, n, spec, stop, ckpt, sample)?;
+        let rx = self.engines[best].submit(id, prompt, n, spec, stop, ckpt, sample, state)?;
         Ok((id, rx))
     }
 
