@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# One model's quality row: build, perplexity (ours + llama.cpp), task eval
-# (ours + llama.cpp), score against bench/quality-bands.json, cleanup.
-# bench/quality-protocol.md item 3. usage: bench/quality-run.sh KEY
+# One model's quality row: build, perplexity (ours + llama.cpp, dense/moe
+# engine only this round), task eval (ours + llama.cpp, all engines), score
+# against bench/quality-bands.json, cleanup. bench/quality-protocol.md item
+# 3 + the 2026-09-16 amendment (spark perplexity deferred to w82:p7 landing
+# top_logprobs in serve/spark.mojo). usage: bench/quality-run.sh KEY
 # KEY is a key in bench/quality-models.json / bench/quality-bands.json.
 # Run inside gpu-wait; not self-wrapping (the sweep script wraps the whole
-# 10-model loop in one gpu-wait job so the GPU is not released between
-# models that each hold it for well under its --timeout).
+# 10-model loop in one gpu-wait job).
 set -uo pipefail
 cd "$(dirname "$0")/.."
 KEY=$1
@@ -19,32 +20,43 @@ die() { echo "FAIL $1: $2" | tee -a "$OUT/SUMMARY.txt"; exit 1; }
 
 baro_gguf=$("$PY" -c "import json; print(json.load(open('bench/quality-models.json'))['$KEY']['baro_gguf'])")
 llama_gguf=$("$PY" -c "import json; print(json.load(open('bench/quality-models.json'))['$KEY']['llama_gguf'])")
+engine=$("$PY" -c "import json; print(json.load(open('bench/quality-models.json'))['$KEY']['engine'])")
 [ -f "$baro_gguf" ] || die setup "missing $baro_gguf"
 [ -f "$llama_gguf" ] || die setup "missing $llama_gguf"
-echo "KEY=$KEY baro_gguf=$baro_gguf llama_gguf=$llama_gguf" | tee "$OUT/arm.txt"
+echo "KEY=$KEY engine=$engine baro_gguf=$baro_gguf llama_gguf=$llama_gguf" | tee "$OUT/arm.txt"
 
-echo "== build ours =="
-bench/quality-build.sh "$baro_gguf" "$OUT/build" > "$OUT/build.log" 2>&1 || die build "see $OUT/build.log"
+case "$engine" in
+  moe) buildmode=--moe ;;
+  spark) buildmode=--spark ;;
+  *) buildmode= ;;
+esac
+
+echo "== build ours ($engine) =="
+bench/quality-build.sh "$baro_gguf" "$OUT/build" $buildmode > "$OUT/build.log" 2>&1 || die build "see $OUT/build.log"
 ok build "$(tail -1 "$OUT/build.log")"
-
-echo "== baro-tokenize (shared, build once) =="
-[ -x .work/baro-tokenize ] || $HOME/Projects/mojo/mojo-baro/.venv/bin/mojo build tools/baro-tokenize.mojo -I . -I serve -o .work/baro-tokenize \
-  || die tok "baro-tokenize build failed"
 
 echo "== baro-serve (shared, build once) =="
 [ -x serve/target/release/baro-serve ] || (cd serve && cargo build --release) > "$OUT/cargo-build.log" 2>&1 \
   || die cargo "see $OUT/cargo-build.log"
 
-echo "== perplexity: ours =="
-"$PY" bench/quality-ppl-run.py --engine "$OUT/build/engine" --gguf "$baro_gguf" --pack "$OUT/build/pack" \
-  --text "$WIKI" --ctx 512 --chunks 8 --tokenize-bin .work/baro-tokenize --out "$OUT/ppl-ours" \
-  > "$OUT/ppl-ours.log" 2>&1 || die ppl-ours "see $OUT/ppl-ours.log"
-ok ppl-ours "$(tail -1 "$OUT/ppl-ours.log")"
+if [ "$engine" != "spark" ]; then
+  echo "== baro-tokenize (shared, build once) =="
+  [ -x .work/baro-tokenize ] || $HOME/Projects/mojo/mojo-baro/.venv/bin/mojo build tools/baro-tokenize.mojo -I . -I serve -o .work/baro-tokenize \
+    || die tok "baro-tokenize build failed"
 
-echo "== perplexity: llama.cpp =="
-"$LLAMA_BIN/llama-perplexity" -m "$llama_gguf" -f "$WIKI" -c 512 --chunks 8 -ngl 99 -fa on -ctk f16 -ctv f16 -t 8 \
-  > "$OUT/ppl-llama.log" 2>&1 || die ppl-llama "see $OUT/ppl-llama.log"
-ok ppl-llama "$(grep 'Final estimate' "$OUT/ppl-llama.log")"
+  echo "== perplexity: ours =="
+  "$PY" bench/quality-ppl-run.py --engine "$OUT/build/engine" --gguf "$baro_gguf" --pack "$OUT/build/pack" \
+    --text "$WIKI" --ctx 512 --chunks 8 --tokenize-bin .work/baro-tokenize --out "$OUT/ppl-ours" \
+    > "$OUT/ppl-ours.log" 2>&1 || die ppl-ours "see $OUT/ppl-ours.log"
+  ok ppl-ours "$(tail -1 "$OUT/ppl-ours.log")"
+
+  echo "== perplexity: llama.cpp =="
+  "$LLAMA_BIN/llama-perplexity" -m "$llama_gguf" -f "$WIKI" -c 512 --chunks 8 -ngl 99 -fa on -ctk f16 -ctv f16 -t 8 \
+    > "$OUT/ppl-llama.log" 2>&1 || die ppl-llama "see $OUT/ppl-llama.log"
+  ok ppl-llama "$(grep 'Final estimate' "$OUT/ppl-llama.log")"
+else
+  echo "== perplexity: SKIPPED (spark-family, no top_logprobs wiring yet, bench/quality-protocol.md amendment) =="
+fi
 
 echo "== task eval: start both servers =="
 : > "$OUT/ours-server.stdout"
@@ -86,9 +98,14 @@ cleanup
 trap - EXIT
 
 echo "== score =="
-"$PY" bench/quality-score.py --key "$KEY" --ppl-ours "$OUT/ppl-ours/ppl-result.json" \
-  --ppl-llama-log "$OUT/ppl-llama.log" --task-dir "$OUT/task" --out "$OUT/result.json" \
-  || die score "see above"
+if [ "$engine" != "spark" ]; then
+  "$PY" bench/quality-score.py --key "$KEY" --ppl-ours "$OUT/ppl-ours/ppl-result.json" \
+    --ppl-llama-log "$OUT/ppl-llama.log" --task-dir "$OUT/task" --out "$OUT/result.json" \
+    || die score "see above"
+else
+  "$PY" bench/quality-score.py --key "$KEY" --task-dir "$OUT/task" --out "$OUT/result.json" \
+    || die score "see above"
+fi
 ok score "$(head -c 200 "$OUT/result.json")"
 
 echo "== cleanup: delete pack (disk floor, keep result/logs) =="

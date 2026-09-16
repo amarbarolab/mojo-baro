@@ -194,3 +194,36 @@ truncation, not a smaller valid sample); HTTP prompt token counts from both
 All 10 rows, agree or not, get recorded (item 3 of the brief: "whether or
 not they agree"). GPU via `gpu-wait run --vram <GB> --priority 20 --`,
 whiteboard head and `gpu-wait list` checked before every launch.
+
+## Amendment (mid-lane, coordinator-approved 2026-09-16): spark perplexity deferred
+
+Live on Llama-3.2-1B: `serve/spark.mojo` at this worktree's base has no
+`top_logprobs`/penalty wiring at all (`sample.temperature > 0` is the only
+branch that samples; a `top_logprobs:1` request is silently accepted and
+decodes greedy, 0 rows dumped -- confirmed, not theorized). `bench/quality-
+build.sh` was also rebuilding from the gguf's *embedded* `baro.kernel.commit`
+(every current bake predates today's sampling-lane logprob landing), which
+would have hidden the same gap behind a stale-build symptom even on the
+dense path; fixed to build `serve/engine.mojo` from this worktree's current
+HEAD instead of the bake's own history.
+
+Coordinator decision (asked as item 1's stop condition): both continue now
+and wait. This round: **task eval on all 10 models**, **perplexity on the 4
+dense-family models only** (Ornith, Qwythos-v2, Qwythos champion, RegesCore
+-- `serve/engine.mojo`, confirmed working). The 6 spark-family rows (Llama-
+3.2-1B, lily-7B, Qwen2.5-7B, Qwen2.5-Coder-7B, Granite-4.2-3B, Spark-X2.5-4B)
+get task eval only this round, perplexity marked **"perplexity pending"**
+(not `UNVERIFIED`, not a `MISS`) in the draft table and in
+`result.json` (`ppl_ours: null`). Sampling lane `w82:p7` is wiring
+`top_logprobs`/`amar_topn_probs` into `spark.mojo` after its current fix (at
+main `02cab13`, ahead of this worktree's base, spark already returns 400 on
+`top_logprobs` rather than silently ignoring it); once that lands, this
+worktree rebases and the 6 spark perplexity rows run under this same
+protocol and bands table, no new brief. `BARO_DUMP_LOGITS_DIR` is being
+moved out of `window.mojo` into the harness by that lane's own review; same
+env var name, `bench/quality-ppl-run.py` needs no change, confirm after
+rebase rather than assume.
+
+`bench/quality-bands.json`'s spark rows and predicted bands stand unchanged
+for when their perplexity runs; only the run order and this round's BASELINE
+table cell (`perplexity pending`, not a verdict) change.

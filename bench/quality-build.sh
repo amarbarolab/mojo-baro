@@ -1,70 +1,59 @@
 #!/usr/bin/env bash
-# Build an engine binary + pack from a self-describing BARO gguf, for the
-# quality-protocol harness (bench/quality-protocol.md). Adapted from
-# tools/gguf-closure.sh's build steps (engine.mojo/spark.mojo split-layout
-# + build_pack_from_file), dropping its ref-token verify tail: this script's
-# job ends at "binary + pack exist", never runs a timed/scored request.
-# usage: bench/quality-build.sh MODEL.gguf OUTDIR
+# Build serve/engine.mojo (this worktree's CURRENT source, not a gguf's
+# embedded historical commit) + a pack, for the quality-protocol harness
+# (bench/quality-protocol.md). Dense qwen35/qwen35moe only: the forced-token
+# logprob dump (BARO_DUMP_LOGITS_DIR, window.mojo) is engine.mojo-only,
+# serve/spark.mojo has no top_logprobs wiring at all (confirmed live on
+# Llama-3.2-1B 2026-09-16: request accepted, field silently ignored, 0 rows
+# dumped -- QUESTION sent to w82:p1, spark-family models out of this script).
+#
+# Deliberately NOT tools/gguf-closure.sh's approach (rebuild from the gguf's
+# baro.kernel.commit): every current bake predates today's sampling-lane
+# logprob landing, so that path silently builds an engine without the dump
+# feature at all (same failure, root cause was the commit, not the family,
+# but the family gap is separately real -- see above).
+# usage: bench/quality-build.sh MODEL.gguf OUTDIR [--moe|--spark]
 set -euo pipefail
 cd "$(dirname "$0")/.."
-model=$1; out=$2
-rm -rf "$out"; mkdir -p "$out"
-$HOME/Projects/mojo/mojo-baro/.venv/bin/python3 tools/gguf-extract.py "$model" --meta > "$out/meta.json"
-jq -r '.["baro.kernel.files"]' "$out/meta.json" | tr ',' '\n' > "$out/FILES"
-while read -r f; do
-  mkdir -p "$out/$(dirname "$f")"
-  jq -r --arg k "baro.kernel.src.$f" '.[$k]' "$out/meta.json" > "$out/$f"
-done < "$out/FILES"
-kcommit=$(jq -r '.["baro.kernel.commit"]' "$out/meta.json")
-kmodel=$(jq -r '.["baro.kernel.model"] // empty' "$out/meta.json")
-echo "commit: $kcommit  arch: $(jq -r '.["baro.kernel.arch"]' "$out/meta.json")  model: $kmodel"
+model=$1; out=$2; mode=${3:-}
+MOJO=$HOME/Projects/mojo/mojo-baro/.venv/bin/mojo
+PY=$HOME/Projects/mojo/mojo-baro/.venv/bin/python3
+mkdir -p "$out"
 
-build_pack_from_file() {
-  local packtool packflags
-  packtool=$(jq -r '.["baro.run.pack.tool"] // empty' "$out/meta.json")
-  [ -n "$packtool" ] || { echo "no baro.run.pack.tool: file carries no pack builder"; exit 1; }
-  jq -er --arg k "baro.run.src.$packtool" '.[$k]' "$out/meta.json" > "$out/$packtool" 2>/dev/null \
-    || { echo "no baro.run.src.$packtool embedded"; exit 1; }
-  jq -er '.["baro.run.src.gguf-extract.py"]' "$out/meta.json" > "$out/gguf-extract.py" 2>/dev/null \
-    || cp tools/gguf-extract.py "$out/gguf-extract.py"
-  packflags=$(jq -r '.["baro.run.pack.flags"] // empty' "$out/meta.json")
-  # shellcheck disable=SC2086
-  $HOME/Projects/mojo/mojo-baro/.venv/bin/python3 "$out/$packtool" "$model" "$out/pack" $packflags > "$out/pack.log" 2>&1 \
-    || { tail -20 "$out/pack.log"; echo "pack build FAILED, see $out/pack.log"; exit 1; }
-}
-
-if [ "$kmodel" = "qwen35moe" ]; then
-  git show "$kcommit:serve/engine.mojo" > "$out/closure_main.mojo" || { echo "no serve/engine.mojo at $kcommit"; exit 1; }
-  for m in $(sed -n 's/^from \([a-z_]*\) import.*/\1/p' "$out/closure_main.mojo"); do
-    [ -f "$out/$m.mojo" ] || ! git cat-file -e "$kcommit:serve/$m.mojo" 2>/dev/null || git show "$kcommit:serve/$m.mojo" > "$out/$m.mojo"
-  done
-  $HOME/Projects/mojo/mojo-baro/.venv/bin/mojo build "$out/closure_main.mojo" -I "$out" -D BARO_MODEL=qwen35moe -o "$out/engine" 2>&1 | tee "$out/build.log" | grep -E "error" -A3 && exit 1 || true
+if [ "$mode" = "--spark" ]; then
+  echo "== spark profile (tools/gen-profile.mojo, task-eval only, no logprob dump on this path) =="
+  [ -x .work/gen-profile ] || "$MOJO" build tools/gen-profile.mojo -I tools -o .work/gen-profile > "$out/genprofile-build.log" 2>&1 \
+    || { cat "$out/genprofile-build.log"; exit 1; }
+  mkdir -p "$out/profiledir"
+  .work/gen-profile "$model" "$out/profiledir/profile.mojo" > "$out/genprofile.log" 2>&1 \
+    || { cat "$out/genprofile.log"; exit 1; }
+  echo "== engine (serve/spark.mojo, current worktree HEAD) =="
+  "$MOJO" build serve/spark.mojo -I . -I kernels -I serve -I "$out/profiledir" -o "$out/engine" > "$out/build.log" 2>&1 \
+    || { grep -m1 error: "$out/build.log"; exit 1; }
   [ -x "$out/engine" ] || { echo "engine build FAILED"; cat "$out/build.log"; exit 1; }
-  build_pack_from_file
+  echo "== pack (tools/engine-pack.py --dense) =="
+  "$PY" tools/engine-pack.py "$model" "$out/pack" --dense > "$out/pack.log" 2>&1 \
+    || { tail -20 "$out/pack.log"; exit 1; }
   echo "engine: $out/engine  pack: $out/pack"
   exit 0
 fi
 
-if grep -qx spark_kernels.mojo "$out/FILES"; then
-  git show "$kcommit:serve/spark.mojo" > "$out/harness.mojo" || { echo "no serve/spark.mojo at $kcommit"; exit 1; }
-  [ -f "$out/profile.mojo" ] || { echo "no profile.mojo embedded"; exit 1; }
-  $HOME/Projects/mojo/mojo-baro/.venv/bin/mojo build "$out/harness.mojo" -I "$out" -o "$out/engine" 2>&1 | tee "$out/build.log" | grep -E "error" -A3 && exit 1 || true
-  [ -x "$out/engine" ] || { echo "engine build FAILED"; cat "$out/build.log"; exit 1; }
-  build_pack_from_file
-  echo "engine: $out/engine  pack: $out/pack"
-  exit 0
+echo "== engine (current worktree HEAD, not the gguf's embedded commit) =="
+if [ "$mode" = "--moe" ]; then
+  "$MOJO" build serve/engine.mojo -I . -I kernels -D BARO_MODEL=qwen35moe -o "$out/engine" > "$out/build.log" 2>&1 \
+    || { grep -m1 error: "$out/build.log"; exit 1; }
+else
+  "$MOJO" build serve/engine.mojo -I . -I kernels -o "$out/engine" > "$out/build.log" 2>&1 \
+    || { grep -m1 error: "$out/build.log"; exit 1; }
 fi
-
-# split layout (qwen35, dense): serve/engine.mojo from git at the gguf commit
-entry="$out/engine.mojo"
-if [ -f "$out/window.mojo" ] && ! grep -q '^def main' "$out/engine.mojo" 2>/dev/null; then
-  git show "$kcommit:serve/engine.mojo" > "$out/closure_main.mojo" || { echo "no serve/engine.mojo at $kcommit"; exit 1; }
-  for m in $(sed -n 's/^from \([a-z_]*\) import.*/\1/p' "$out/closure_main.mojo"); do
-    [ -f "$out/$m.mojo" ] || ! git cat-file -e "$kcommit:serve/$m.mojo" 2>/dev/null || git show "$kcommit:serve/$m.mojo" > "$out/$m.mojo"
-  done
-  entry="$out/closure_main.mojo"
-fi
-$HOME/Projects/mojo/mojo-baro/.venv/bin/mojo build "$entry" -I "$out" -o "$out/engine" 2>&1 | tee "$out/build.log" | grep -E "error" -A3 && exit 1 || true
 [ -x "$out/engine" ] || { echo "engine build FAILED"; cat "$out/build.log"; exit 1; }
-build_pack_from_file
+
+echo "== pack (tools/engine-pack.py, current worktree) =="
+if [ "$mode" = "--moe" ]; then
+  "$PY" tools/engine-pack.py "$model" "$out/pack" --arch qwen35moe > "$out/pack.log" 2>&1 \
+    || { tail -20 "$out/pack.log"; exit 1; }
+else
+  "$PY" tools/engine-pack.py "$model" "$out/pack" --q8 > "$out/pack.log" 2>&1 \
+    || { tail -20 "$out/pack.log"; exit 1; }
+fi
 echo "engine: $out/engine  pack: $out/pack"
