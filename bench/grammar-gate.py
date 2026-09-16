@@ -5,7 +5,8 @@ validates; neither shares code with grammar/.
   bench/grammar-gate.py URL SERVE_LOG OUT_DIR       QUICK=N: first N schemas at T=0 and 0.7 + one reasoning case
 
 Requests go one at a time, so the Nth "grammar masked draws:" receipt in
-SERVE_LOG (the engine's stdout as forwarded by baro-serve) belongs to the
+SERVE_LOG (the engine's stdout, which baro-serve forwards to ITS STDERR with
+an "engine:" prefix, so pass the server's stderr file) belongs to the
 Nth request sent here. Gate 4 per request: masked draws == accepted, no
 MISMATCH word, and masked draws == completion_tokens (no reasoning) or
 <= completion_tokens (reasoning on, the think tokens are unmasked).
