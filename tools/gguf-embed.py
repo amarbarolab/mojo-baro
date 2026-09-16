@@ -176,7 +176,7 @@ def main():
     new_kv = [("baro.kernel.arch", "gfx1100"),
               ("baro.kernel.commit", commit),
               ("baro.kernel.files", ",".join(src_key(k) for k in kfiles))]
-    for pkg in sorted({k.resolve().parent for k in kfiles if not k.resolve().is_relative_to(Path(__file__).resolve().parent.parent)}):
+    for pkg in sorted({k.resolve().parent for k in kfiles if k.name != "profile.mojo" and not k.resolve().is_relative_to(Path(__file__).resolve().parent.parent)}):
         c = subprocess.run(["git", "-C", str(pkg), "rev-parse", "--short", "HEAD"], capture_output=True, text=True).stdout.strip()
         dirty = subprocess.run(["git", "-C", str(pkg), "status", "--short"], capture_output=True, text=True).stdout.strip()
         assert not dirty, f"{pkg} dirty"
