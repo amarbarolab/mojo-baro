@@ -1,114 +1,74 @@
 #!/usr/bin/env bash
-# One model's quality row: build, perplexity (ours + llama.cpp, dense/moe
-# engine only this round), task eval (ours + llama.cpp, all engines), score
-# against bench/quality-bands.json, cleanup. bench/quality-protocol.md item
-# 3 + the 2026-09-16 amendment (spark perplexity deferred to w82:p7 landing
-# top_logprobs in serve/spark.mojo). usage: bench/quality-run.sh KEY
-# KEY is a key in bench/quality-models.json / bench/quality-bands.json.
-# Run inside gpu-wait; not self-wrapping (the sweep script wraps the whole
-# 10-model loop in one gpu-wait job).
+# One model's quality row, bench/quality-protocol.md amendment 2.
+#   bench/quality-run.sh KEY        (inside gpu-wait; bench/quality-sweep.sh wraps all 10)
+# CPU llama-server (-ngl 0) on the reference GGUF tokenizes and detokenizes for
+# both arms; the GPU is held by one arm at a time.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 KEY=$1
 PY=$HOME/Projects/mojo/mojo-baro/.venv/bin/python3
+MOJO=$HOME/Projects/mojo/mojo-baro/.venv/bin/mojo
 WIKI=$HOME/Models/quant-lab/wikitext-2-raw/wiki.test.raw
-LLAMA_BIN=$HOME/llama.cpp/build/bin
+LB=$HOME/llama.cpp/build/bin
 OUT=.work/quality/$KEY
-mkdir -p "$OUT"
+rm -rf "$OUT"; mkdir -p "$OUT"
 ok() { echo "OK $1: $2" | tee -a "$OUT/SUMMARY.txt"; }
 die() { echo "FAIL $1: $2" | tee -a "$OUT/SUMMARY.txt"; exit 1; }
+field() { "$PY" -c "import json; print(json.load(open('bench/quality-models.json'))['$KEY']['$1'])"; }
+baro_gguf=$(field baro_gguf); llama_gguf=$(field llama_gguf); engine=$(field engine)
+echo "KEY=$KEY engine=$engine baro_gguf=$baro_gguf llama_gguf=$llama_gguf llama_sha=$(git -C $HOME/llama.cpp rev-parse --short HEAD) head=$(git rev-parse --short HEAD)" | tee "$OUT/arm.txt"
 
-baro_gguf=$("$PY" -c "import json; print(json.load(open('bench/quality-models.json'))['$KEY']['baro_gguf'])")
-llama_gguf=$("$PY" -c "import json; print(json.load(open('bench/quality-models.json'))['$KEY']['llama_gguf'])")
-engine=$("$PY" -c "import json; print(json.load(open('bench/quality-models.json'))['$KEY']['engine'])")
-[ -f "$baro_gguf" ] || die setup "missing $baro_gguf"
-[ -f "$llama_gguf" ] || die setup "missing $llama_gguf"
-echo "KEY=$KEY engine=$engine baro_gguf=$baro_gguf llama_gguf=$llama_gguf" | tee "$OUT/arm.txt"
+tools/baro serve "$baro_gguf" --no-serve > "$OUT/cache.log" 2>&1 || die cache "see $OUT/cache.log"
+cache_engine=$(grep -oE '^engine: (hit|miss) \S+' "$OUT/cache.log" | awk '{print $3}')
+cache_pack=$(grep -oE '^pack: (hit|miss) \S+' "$OUT/cache.log" | awk '{print $3}')
+[ -x "$cache_engine" ] && [ -s "$cache_pack/index.txt" ] || die cache "no engine/pack in $OUT/cache.log"
+ok cache "engine=$cache_engine pack=$cache_pack"
 
-case "$engine" in
-  moe) buildmode=--moe ;;
-  spark) buildmode=--spark ;;
-  *) buildmode= ;;
-esac
+TOKP=8198
+"$LB/llama-server" -m "$llama_gguf" -ngl 0 -c 8192 -t 8 --host 127.0.0.1 --port $TOKP > "$OUT/tok-server.log" 2>&1 &
+TOKPID=$!
+GPUPID=""
+cleanup() { kill $TOKPID $GPUPID 2>/dev/null; wait $TOKPID $GPUPID 2>/dev/null; }
+trap cleanup EXIT
+for _ in $(seq 600); do curl -sf localhost:$TOKP/health >/dev/null 2>&1 && break; kill -0 $TOKPID 2>/dev/null || die tok "cpu server exited"; sleep 1; done
+TOK=http://127.0.0.1:$TOKP
 
-echo "== build ours ($engine) =="
-bench/quality-build.sh "$baro_gguf" "$OUT/build" $buildmode > "$OUT/build.log" 2>&1 || die build "see $OUT/build.log"
-ok build "$(tail -1 "$OUT/build.log")"
-
-echo "== baro-serve (shared, build once) =="
-[ -x serve/target/release/baro-serve ] || (cd serve && cargo build --release) > "$OUT/cargo-build.log" 2>&1 \
-  || die cargo "see $OUT/cargo-build.log"
-
-if [ "$engine" != "spark" ]; then
-  echo "== baro-tokenize (shared, build once) =="
-  [ -x .work/baro-tokenize ] || $HOME/Projects/mojo/mojo-baro/.venv/bin/mojo build tools/baro-tokenize.mojo -I . -I serve -o .work/baro-tokenize \
-    || die tok "baro-tokenize build failed"
-
-  echo "== perplexity: ours =="
-  "$PY" bench/quality-ppl-run.py --engine "$OUT/build/engine" --gguf "$baro_gguf" --pack "$OUT/build/pack" \
-    --text "$WIKI" --ctx 512 --chunks 8 --tokenize-bin .work/baro-tokenize --out "$OUT/ppl-ours" \
-    > "$OUT/ppl-ours.log" 2>&1 || die ppl-ours "see $OUT/ppl-ours.log"
+if [ "$engine" != spark ]; then
+  dflag=""; [ "$engine" = moe ] && dflag="-D BARO_MODEL=qwen35moe"
+  # shellcheck disable=SC2086
+  "$MOJO" build serve/engine.mojo -I . -I kernels $dflag -o "$OUT/engine-head" > "$OUT/build.log" 2>&1 || die build "see $OUT/build.log"
+  meta=$("$PY" tools/gguf-extract.py "$baro_gguf" --meta)
+  rp=$(jq -r '.["baro.run.prompt.tokens"]' <<<"$meta"); rt=$(jq -r '.["baro.run.ref.tokens"]' <<<"$meta")
+  "$PY" bench/quality-ppl-run.py --engine "$OUT/engine-head" --pack "$cache_pack" --text "$WIKI" --tok-url $TOK \
+    --ref-prompt "$rp" --ref-tokens "$rt" --out "$OUT/ppl-ours" > "$OUT/ppl-ours.log" 2>&1 || die ppl-ours "$(tail -2 "$OUT/ppl-ours.log")"
   ok ppl-ours "$(tail -1 "$OUT/ppl-ours.log")"
-
-  echo "== perplexity: llama.cpp =="
-  "$LLAMA_BIN/llama-perplexity" -m "$llama_gguf" -f "$WIKI" -c 512 --chunks 8 -ngl 99 -fa on -ctk f16 -ctv f16 -t 8 \
+  "$LB/llama-perplexity" -m "$llama_gguf" -f "$WIKI" -c 512 --chunks 8 -ngl 99 -fa on -ctk f16 -ctv f16 -t 8 \
     > "$OUT/ppl-llama.log" 2>&1 || die ppl-llama "see $OUT/ppl-llama.log"
   ok ppl-llama "$(grep 'Final estimate' "$OUT/ppl-llama.log")"
-else
-  echo "== perplexity: SKIPPED (spark-family, no top_logprobs wiring yet, bench/quality-protocol.md amendment) =="
 fi
 
-echo "== task eval: start both servers =="
-: > "$OUT/ours-server.stdout"
-BARO_PACK="$OUT/build/pack" serve/target/release/baro-serve --engine "$OUT/build/engine" --pack "$OUT/build/pack" --port 0 \
-  > "$OUT/ours-server.stdout" 2> "$OUT/ours-server.stderr" &
-OURS_PID=$!
-LLAMA_PORT=8199
-"$LLAMA_BIN/llama-server" -m "$llama_gguf" -c 4096 -ngl 99 -fa on -ctk f16 -ctv f16 -b 2048 -ub 512 -t 8 \
-  --host 127.0.0.1 --port "$LLAMA_PORT" > "$OUT/llama-server.log" 2>&1 &
-LLAMA_PID=$!
-cleanup() { kill "$OURS_PID" "$LLAMA_PID" 2>/dev/null; wait "$OURS_PID" "$LLAMA_PID" 2>/dev/null; }
-trap cleanup EXIT
+"$PY" bench/quality-task-ids.py prep --tok-url $TOK --out "$OUT/task" > "$OUT/task.log" 2>&1 || die prep "$(tail -3 "$OUT/task.log")"
+ok prep "$(tail -1 "$OUT/task.log")"
+"$PY" bench/quality-task-ids.py ours --engine "$cache_engine" --pack "$cache_pack" --out "$OUT/task" >> "$OUT/task.log" 2>&1 || die ours "$(tail -3 "$OUT/task.log")"
+ok ours "$(tail -1 "$OUT/task.log")"
 
-OURS_URL=""
-for _ in $(seq 1 120); do
-  line=$(grep -m1 '^listening on' "$OUT/ours-server.stdout" 2>/dev/null || true)
-  [ -n "$line" ] && { OURS_URL=$(echo "$line" | grep -oE 'http://[0-9.]+:[0-9]+'); break; }
-  kill -0 "$OURS_PID" 2>/dev/null || die start "ours server exited: $(tail -5 "$OUT/ours-server.stderr")"
-  sleep 1
-done
-[ -n "$OURS_URL" ] || die start "ours server never printed listening line"
-LLAMA_URL="http://127.0.0.1:$LLAMA_PORT"
-up=0
-for _ in $(seq 1 120); do
-  curl -sf "$LLAMA_URL/health" >/dev/null 2>&1 && { up=1; break; }
-  kill -0 "$LLAMA_PID" 2>/dev/null || die start "llama server exited: $(tail -5 "$OUT/llama-server.log")"
-  sleep 1
-done
-[ "$up" = 1 ] || die start "llama server never came up"
-ok start "ours=$OURS_URL llama=$LLAMA_URL"
+GPUP=8199
+"$LB/llama-server" -m "$llama_gguf" -c 4096 -ngl 99 -fa on -ctk f16 -ctv f16 -t 8 --host 127.0.0.1 --port $GPUP > "$OUT/llama-server.log" 2>&1 &
+GPUPID=$!
+for _ in $(seq 600); do curl -sf localhost:$GPUP/health >/dev/null 2>&1 && break; kill -0 $GPUPID 2>/dev/null || die llama "gpu server exited"; sleep 1; done
+"$PY" bench/quality-task-ids.py llama --url http://127.0.0.1:$GPUP --out "$OUT/task" >> "$OUT/task.log" 2>&1 || die llama "$(tail -3 "$OUT/task.log")"
+ok llama "$(tail -1 "$OUT/task.log")"
+kill $GPUPID; wait $GPUPID 2>/dev/null; GPUPID=""
 
-echo "== task eval: run =="
-"$PY" bench/quality-task-eval.py --ours-url "$OURS_URL" --llama-url "$LLAMA_URL" \
-  --tasks bench/data/e8_tasks.json --out "$OUT/task" > "$OUT/task-eval.log" 2>&1 \
-  || die task "see $OUT/task-eval.log"
-ok task "$(tail -2 "$OUT/task-eval.log" | head -1)"
+"$PY" bench/quality-task-ids.py score --tok-url $TOK --out "$OUT/task" >> "$OUT/task.log" 2>&1 || die score-task "$(tail -3 "$OUT/task.log")"
+ok task "$(tail -1 "$OUT/task.log")"
 
-cleanup
-trap - EXIT
-
-echo "== score =="
-if [ "$engine" != "spark" ]; then
-  "$PY" bench/quality-score.py --key "$KEY" --ppl-ours "$OUT/ppl-ours/ppl-result.json" \
-    --ppl-llama-log "$OUT/ppl-llama.log" --task-dir "$OUT/task" --out "$OUT/result.json" \
-    || die score "see above"
+if [ "$engine" != spark ]; then
+  "$PY" bench/quality-score.py --key "$KEY" --ppl-ours "$OUT/ppl-ours/ppl-result.json" --ppl-llama-log "$OUT/ppl-llama.log" \
+    --task-dir "$OUT/task" --out "$OUT/result.json" || die score "see above"
 else
-  "$PY" bench/quality-score.py --key "$KEY" --task-dir "$OUT/task" --out "$OUT/result.json" \
-    || die score "see above"
+  "$PY" bench/quality-score.py --key "$KEY" --task-dir "$OUT/task" --out "$OUT/result.json" || die score "see above"
 fi
-ok score "$(head -c 200 "$OUT/result.json")"
-
-echo "== cleanup: delete pack (disk floor, keep result/logs) =="
-rm -rf "$OUT/build/pack" "$OUT/ppl-ours/dump"
-df -h /home | tail -1 | tee -a "$OUT/SUMMARY.txt"
-echo "DONE $KEY -> $OUT/result.json"
+ok result "$(head -c 300 "$OUT/result.json")"
+rm -rf "$OUT/ppl-ours/dump" "$OUT/engine-head"
+echo "DONE $KEY"

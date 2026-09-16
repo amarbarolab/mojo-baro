@@ -227,3 +227,39 @@ rebase rather than assume.
 `bench/quality-bands.json`'s spark rows and predicted bands stand unchanged
 for when their perplexity runs; only the run order and this round's BASELINE
 table cell (`perplexity pending`, not a verdict) change.
+
+## Amendment 2 (2026-09-16 eve, before any scored run; lane taken over by the main session after the 14:33 OOM kill)
+
+Found while resuming, before any row was scored (the only prior GPU use is the Ornith pilot, which
+VOIDed at the dump step):
+
+1. **Scoring window matched to llama-perplexity.** `tools/perplexity/perplexity.cpp` scores only the
+   second half of each chunk: `first = n_ctx/2`, logits at positions 256..510 predicting tokens
+   257..511, 255 tokens per chunk, 2,040 over 8 chunks, and replaces each chunk's token 0 with BOS when
+   the vocab adds BOS. The frozen text above ("positions 1..511, 4088 tokens") would have compared a
+   full-window NLL against a second-half NLL and biased the ratio upward. Ours now scores exactly the
+   same 2,040 positions from the same chunk tokens.
+2. **One token stream for both PPL arms.** The wiki text is tokenized once per model by a CPU-only
+   `llama-server -ngl 0` on the reference GGUF (`/tokenize`, `add_special: true`), chunked, BOS
+   substituted exactly as perplexity.cpp does; ours receives those ids. Read-back: first 8 ids of chunk
+   0 and the token count, per model.
+3. **Task eval: identical token ids, one GPU arm at a time.** Our Rust server has no tokenizer for 6 of
+   the 10 models (no `tokenizer.json`), and the committed harness ran both servers on the GPU together
+   (a 35B MoE plus llama-server does not fit in 24 GB). Now: the CPU llama-server renders each task
+   through the model's own chat template (`/apply-template`, Jinja) and tokenizes it (`/tokenize`,
+   `add_special: false`, `parse_special: true`); both arms receive those ids at T=0, max 300 tokens.
+   Ours: the engine binary over its stdin protocol, `stop` = the model's end-of-generation ids (EOS
+   and, when present as single tokens, `<|im_end|>`, `<|eot_id|>`, `<|endoftext|>`,
+   `<|end_of_text|>`). llama.cpp: GPU `llama-server` `/completion` with the same ids. Output ids of both
+   arms are detokenized by the same CPU server and scored by the unchanged scoring functions. This is
+   stricter than "each engine renders its own template": the prompts are identical by construction.
+4. **Ours arm engine and pack.** Task eval uses the engine and pack `tools/baro serve` caches for that
+   bake (`~/.cache/baro/<id>/`, what a user runs; 10/10 passed 64/64 ref tokens today,
+   `exchange/lane-BAROSERVE-report.md`). Perplexity (4 dense/MoE models) uses `serve/engine.mojo` built
+   from this worktree's HEAD (`-D BARO_MODEL=qwen35moe` for RegesCore) on that same cached pack; its
+   first request per model replays the bake's `baro.run.prompt.tokens` and must reproduce
+   `baro.run.ref.tokens` 64/64, else the row is VOID.
+5. **Perplexity host math** in numpy (log-softmax over the dumped f32 row); the pure-Python loop was
+   hours per model.
+
+Bands, verdict rule, models and the spark perplexity deferral are unchanged.
