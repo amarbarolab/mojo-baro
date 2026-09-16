@@ -1,4 +1,5 @@
 from std.math import ceildiv
+from std.sys import get_defined_string
 from max.gpu.host import DeviceContext, DeviceBuffer
 from layout import TileTensor, TensorLayout, row_major
 
@@ -165,6 +166,8 @@ comptime mega_token_q4_k = amar_mega_token[
     N_LAYERS, N_ATT,
 ]
 comptime mega_moe_k = amar_mega_moe_token[type_of(csall_layout), type_of(ssall_layout), N_LAYERS, N_ATT]
+comptime MOE_G_STR = get_defined_string["BARO_MOE_G", "96"]()
+comptime MOE_G = 192 if MOE_G_STR == "192" else (288 if MOE_G_STR == "288" else 96)
 comptime MEGA_MR = 3
 comptime mega_win_k = amar_mega_window[
     MEGA_MR, True, False, type_of(xm_layout), type_of(xm_layout),

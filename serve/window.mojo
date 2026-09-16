@@ -882,7 +882,7 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                     b.hidx_d.unsafe_ptr(), b.hmax_d.unsafe_ptr(), b.p_v_d.unsafe_ptr(), b.fgb_d.unsafe_ptr(), b.fgbp_d.unsafe_ptr(),
                     b.ctr_d.unsafe_ptr(), b.prof_d.unsafe_ptr(), b.dbg_d.unsafe_ptr(),
                     Int32(st.ring), Int32(SLOTS), Int32(st.pos), Int32(1 if cfg.dump else 0), Int32(cfg.att_split),
-                    grid_dim=MEGA_G, block_dim=ROW_THREADS,
+                    grid_dim=MOE_G, block_dim=ROW_THREADS,
                 )
         else:
             if use_mega or use_mega_win:

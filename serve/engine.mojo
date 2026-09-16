@@ -674,7 +674,7 @@ def main() raises:
         # kernel ran this process, and on the MoE profile gen / MOE_BARRIERS is
         # the number of tokens the MoE kernel produced.
         comptime if not MEGA_ALLOWED:
-            print("mega barrier gen:", flw[1], " MoE kernel tokens:", Int(flw[1]) // MOE_BARRIERS, "(", MOE_BARRIERS, "barriers per token )")
+            print("mega barrier gen:", flw[1], " MoE kernel tokens:", Int(flw[1]) // MOE_BARRIERS, "(", MOE_BARRIERS, "barriers per token, grid", MOE_G, ")")
         else:
             print("mega barrier gen:", flw[1])
         if dump:
