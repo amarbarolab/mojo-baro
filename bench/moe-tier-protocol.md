@@ -179,3 +179,27 @@ pattern) gives GPU busy time per token, and decode wall minus kernel busy
 (GPU idle) must be accounted for within 20% by the host buckets that overlap
 GPU idle (pread, LRU, enqueue, open/close). `bench/clock-probe.sh` sampled
 during the run.
+
+### Item 2(a): partial pin, request-scoped hot store
+
+Item 0/1 confirmed pread dominant (arm B 67.12 tok/s >= 55; pread 54.6% of
+fetch_ns, readback/sync 42.6%, cap64 vs cap256's offline ceiling only 4
+points apart). Shape: a per-request, non-evicting host-pinned cache
+(`BARO_TIER_HOT=1`, `BARO_TIER_HOTCAP=128` default) that remembers, per
+layer, every distinct expert already fetched this request; a re-reference to
+one (evicted from the 64-slot VRAM LRU, referenced again) copies directly
+from it instead of paying another `pread`. First touches always `pread`
+(and populate the hot store for later reuse); never touches `LayerLru`.
+
+**Frozen prediction, from a deterministic replay of the real `1aa06d5`-style
+trace** (`.work/moe3/item2/expert-trace.txt`, 20 prompts, this tree,
+cross-checked 20/20 against the full-pack reference before use): of the
+23.27% of references that miss the 64-slot LRU, only 16.4% (3.81% of all
+references) are repeats of an expert already seen this request past HOT_CAP
+eviction-free tracking; 81.9% of misses are genuine first touches no
+request-scoped cache can avoid. **Predicted pread-bucket shrink: about 16%,
+not the item's 50% bar.** This is a below-the-bar prediction, frozen before
+the timed run specifically so a live number near it is not later read as a
+surprise. Kill line unchanged: any identity miss, or a live shrink worse
+than the offline number (would mean the hot store is not being reached,
+P8).

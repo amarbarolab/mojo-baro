@@ -169,6 +169,12 @@ struct ExpertTier(Copyable, Movable):
     var b_pread: List[Int]
     var b_copy: List[Int]
     var b_writeback: List[Int]
+    var hot_active: Bool
+    var hot_cap: Int
+    var hot_layer_base: List[Int]
+    var hot_store: HostBuffer[DType.uint8]
+    var hot_slot_of: List[Dict[Int, Int]]
+    var hot_next: List[Int]
 
     def __init__(
         out self, ctx: DeviceContext, packdir: String, cap: Int, n_layers: Int
@@ -179,19 +185,32 @@ struct ExpertTier(Copyable, Movable):
         self.cap = cap
         self.n_layers = n_layers
         self.pinned = getenv("BARO_TIER_PINNED", "0") == "1"
+        self.hot_active = (not self.pinned) and getenv("BARO_TIER_HOT", "0") == "1"
+        self.hot_cap = Int(getenv("BARO_TIER_HOTCAP", "128"))
         self.geom = List[LayerGeom]()
         self.lru = List[LayerLru]()
+        self.hot_layer_base = List[Int]()
+        self.hot_slot_of = List[Dict[Int, Int]]()
+        self.hot_next = List[Int]()
         var per_layer = 0
         var store_bytes = 0
+        var hot_bytes = 0
         for l in range(n_layers):
             var g = LayerGeom(tensors, l)
             var lb = cap * (2 * g.eb + g.ebd)
             if lb > per_layer:
                 per_layer = lb
             store_bytes += N_EXP * (2 * g.eb + g.ebd)
+            self.hot_layer_base.append(hot_bytes)
+            hot_bytes += self.hot_cap * (2 * g.eb + g.ebd)
+            self.hot_slot_of.append(Dict[Int, Int]())
+            self.hot_next.append(0)
             self.geom.append(g^)
             self.lru.append(LayerLru(cap))
         self.layer_bytes = per_layer
+        self.hot_store = ctx.enqueue_create_host_buffer[DType.uint8](
+            hot_bytes if self.hot_active else 1
+        )
         self.cache = ctx.enqueue_create_buffer[DType.uint8](per_layer * n_layers)
         self.stage = ctx.enqueue_create_host_buffer[DType.uint8](STAGE_BYTES)
         self.slots_h = ctx.enqueue_create_host_buffer[DType.int32](TOPK)
@@ -234,10 +253,16 @@ struct ExpertTier(Copyable, Movable):
                     if n <= 0:
                         raise Error("expert tier: short read of experts.bin")
                     got += Int(n)
+        var mode = String("page-cache")
+        if self.pinned:
+            mode = String("pinned")
+        elif self.hot_active:
+            mode = String("hot ") + String(self.hot_cap)
         print(
             "expert tier: cap", cap, " cache", Float64(per_layer * n_layers) / 1e9,
             "GB  host store", Float64(store_bytes) / 1e9,
-            "GB  mode", "pinned" if self.pinned else "page-cache",
+            "GB  mode", mode,
+            " hot_bytes", Float64(hot_bytes) / 1e9 if self.hot_active else 0.0,
         )
 
     def __init__(out self, ctx: DeviceContext) raises:
@@ -267,6 +292,12 @@ struct ExpertTier(Copyable, Movable):
         self.b_pread = List[Int]()
         self.b_copy = List[Int]()
         self.b_writeback = List[Int]()
+        self.hot_active = False
+        self.hot_cap = 0
+        self.hot_layer_base = List[Int]()
+        self.hot_store = ctx.enqueue_create_host_buffer[DType.uint8](1)
+        self.hot_slot_of = List[Dict[Int, Int]]()
+        self.hot_next = List[Int]()
 
     def layer_base(self, layer: Int) -> Int:
         return layer * self.layer_bytes
@@ -283,15 +314,42 @@ struct ExpertTier(Copyable, Movable):
 
     def reset(mut self):
         """Per request: a new conversation starts with a cold tier, which is
-        also what the offline replay assumed when it reset per prompt."""
+        also what the offline replay assumed when it reset per prompt. The
+        hot store (this request's touched-expert reuse cache, item 2) is
+        request-scoped too: a later request's routing has no bearing on this
+        one's, so a stale hot_slot_of entry would only ever be a wrong guess,
+        never a correctness risk (it is never consulted across resets)."""
         for i in range(self.n_layers):
             self.lru[i].reset()
+        for i in range(self.n_layers):
+            self.hot_slot_of[i] = Dict[Int, Int]()
+            self.hot_next[i] = 0
+
+    def _copy_hot_piece(
+        mut self, ctx: DeviceContext, hot_off: Int, dev_off: Int, nbytes: Int, layer: Int
+    ) raises:
+        """A piece already resident in this request's hot store: direct
+        device copy, no pread."""
+        var tc0 = perf_counter_ns()
+        ctx.enqueue_copy(
+            dst_buf=DeviceBuffer[DType.uint8](
+                ctx, self.cache.unsafe_ptr().unsafe_offset(dev_off), nbytes, owning=False
+            ),
+            src_buf=self.hot_store.create_sub_buffer[DType.uint8](hot_off, nbytes),
+        )
+        self.b_copy[layer] = self.b_copy[layer] + Int(perf_counter_ns() - tc0)
+        self.bytes_fetched += nbytes
 
     def _fetch_piece(
-        mut self, ctx: DeviceContext, fd: Int, host_off: Int, dev_off: Int, nbytes: Int, layer: Int
+        mut self, ctx: DeviceContext, fd: Int, host_off: Int, dev_off: Int, nbytes: Int,
+        layer: Int, hot_dst: Int,
     ) raises:
         """One expert projection, host to device, through the staging buffer
-        unless the whole store is pinned (then the copy is direct)."""
+        unless the whole store is pinned (then the copy is direct), or
+        hot_dst >= 0: this is this request's first touch of an expert with
+        room in the hot store, so the pread lands there instead of the
+        rotating stage ring, persisting for a same-request re-reference
+        (item 2, _copy_hot_piece) instead of paying another pread."""
         if self.pinned:
             var tc0 = perf_counter_ns()
             ctx.enqueue_copy(
@@ -305,27 +363,47 @@ struct ExpertTier(Copyable, Movable):
             return
         if nbytes > SLOT_BYTES:
             raise Error("expert tier: staging slot too small for " + String(nbytes))
-        var slot = self.slot_next % STAGE_SLOTS
-        self.slot_next += 1
-        var base = slot * SLOT_BYTES
+        var use_hot = hot_dst >= 0
+        var base = hot_dst
+        if not use_hot:
+            base = (self.slot_next % STAGE_SLOTS) * SLOT_BYTES
+            self.slot_next += 1
         var got = 0
         var tp0 = perf_counter_ns()
-        while got < nbytes:
-            var n = external_call["pread", c_ssize_t](
-                fd, self.stage.unsafe_ptr().unsafe_offset(base + got),
-                nbytes - got, Int64(host_off + got),
-            )
-            if n <= 0:
-                raise Error("expert tier: short read at " + String(host_off))
-            got += Int(n)
+        if use_hot:
+            while got < nbytes:
+                var n = external_call["pread", c_ssize_t](
+                    fd, self.hot_store.unsafe_ptr().unsafe_offset(base + got),
+                    nbytes - got, Int64(host_off + got),
+                )
+                if n <= 0:
+                    raise Error("expert tier: short read at " + String(host_off))
+                got += Int(n)
+        else:
+            while got < nbytes:
+                var n = external_call["pread", c_ssize_t](
+                    fd, self.stage.unsafe_ptr().unsafe_offset(base + got),
+                    nbytes - got, Int64(host_off + got),
+                )
+                if n <= 0:
+                    raise Error("expert tier: short read at " + String(host_off))
+                got += Int(n)
         self.b_pread[layer] = self.b_pread[layer] + Int(perf_counter_ns() - tp0)
         var tc0 = perf_counter_ns()
-        ctx.enqueue_copy(
-            dst_buf=DeviceBuffer[DType.uint8](
-                ctx, self.cache.unsafe_ptr().unsafe_offset(dev_off), nbytes, owning=False
-            ),
-            src_buf=self.stage.create_sub_buffer[DType.uint8](base, nbytes),
-        )
+        if use_hot:
+            ctx.enqueue_copy(
+                dst_buf=DeviceBuffer[DType.uint8](
+                    ctx, self.cache.unsafe_ptr().unsafe_offset(dev_off), nbytes, owning=False
+                ),
+                src_buf=self.hot_store.create_sub_buffer[DType.uint8](base, nbytes),
+            )
+        else:
+            ctx.enqueue_copy(
+                dst_buf=DeviceBuffer[DType.uint8](
+                    ctx, self.cache.unsafe_ptr().unsafe_offset(dev_off), nbytes, owning=False
+                ),
+                src_buf=self.stage.create_sub_buffer[DType.uint8](base, nbytes),
+            )
         self.b_copy[layer] = self.b_copy[layer] + Int(perf_counter_ns() - tc0)
         self.bytes_fetched += nbytes
 
@@ -373,14 +451,37 @@ struct ExpertTier(Copyable, Movable):
             if r[1]:
                 self.hits += 1
             else:
-                self._fetch_piece(ctx, fd, gate_store + e * eb, lbase + slot * eb, eb, layer)
-                self._fetch_piece(
-                    ctx, fd, up_store + e * eb, lbase + self.cap * eb + slot * eb, eb, layer
-                )
-                self._fetch_piece(
-                    ctx, fd, down_store + e * ebd,
-                    lbase + 2 * self.cap * eb + slot * ebd, ebd, layer,
-                )
+                var hot_off = -1
+                var hot_ready = False
+                if self.hot_active:
+                    if e in self.hot_slot_of[layer]:
+                        hot_off = self.hot_layer_base[layer] + self.hot_slot_of[layer][e] * (2 * eb + ebd)
+                        hot_ready = True
+                    elif self.hot_next[layer] < self.hot_cap:
+                        var new_slot = self.hot_next[layer]
+                        self.hot_next[layer] = new_slot + 1
+                        self.hot_slot_of[layer][e] = new_slot
+                        hot_off = self.hot_layer_base[layer] + new_slot * (2 * eb + ebd)
+                if hot_ready:
+                    self._copy_hot_piece(ctx, hot_off, lbase + slot * eb, eb, layer)
+                    self._copy_hot_piece(ctx, hot_off + eb, lbase + self.cap * eb + slot * eb, eb, layer)
+                    self._copy_hot_piece(ctx, hot_off + 2 * eb, lbase + 2 * self.cap * eb + slot * ebd, ebd, layer)
+                else:
+                    var hot_up = -1
+                    var hot_down = -1
+                    if hot_off >= 0:
+                        hot_up = hot_off + eb
+                        hot_down = hot_off + 2 * eb
+                    self._fetch_piece(
+                        ctx, fd, gate_store + e * eb, lbase + slot * eb, eb, layer, hot_off,
+                    )
+                    self._fetch_piece(
+                        ctx, fd, up_store + e * eb, lbase + self.cap * eb + slot * eb, eb, layer, hot_up,
+                    )
+                    self._fetch_piece(
+                        ctx, fd, down_store + e * ebd,
+                        lbase + 2 * self.cap * eb + slot * ebd, ebd, layer, hot_down,
+                    )
             self.slots_h[j] = Int32(slot)
         var tw0 = perf_counter_ns()
         ctx.enqueue_copy(
