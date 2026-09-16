@@ -332,6 +332,14 @@ def main() raises:
                 perr = "n must be >= 1"
             if perr == "" and len(prompt) + req_n > TMAX:
                 perr = "prompt+n exceeds TMAX " + String(TMAX)
+            # Items 3-4, briefs/2026-09-16-sampling-all-models-lane.md: spark
+            # parses presence_penalty/frequency_penalty/top_logprobs (M5/C3)
+            # but has never acted on them -- silently ignoring a parameter
+            # the caller asked for is the inert-parameter defect P1 forbids,
+            # so refuse loudly rather than serve a request that looks
+            # penalized/logprob'd and isn't, until this is wired here too.
+            if perr == "" and (sample.presence_penalty != 0 or sample.frequency_penalty != 0 or sample.top_logprobs > 0):
+                perr = "presence_penalty/frequency_penalty/top_logprobs are not yet wired for this engine (spark); only the dense/MoE engine (serve/engine.mojo) supports them"
             if perr != "":
                 print(err_line(req_id, perr))
                 continue

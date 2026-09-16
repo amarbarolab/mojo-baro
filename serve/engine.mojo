@@ -542,16 +542,30 @@ def main() raises:
         # stage sum exceeds the unsynchronized sub-block time; compare stages
         # within an arm and the same stage across m, never add these into a budget.
         var pf4 = getenv("BARO_PROFILE", "0") == "4"
+        # Items 3-4 (briefs/2026-09-16-sampling-all-models-lane.md), fix for
+        # the coordinator's P1 inert-parameter finding: penalties/top_logprobs
+        # are only applied on window.mojo's plain (non-spec) single-token
+        # decode step, so a default request (spec ON by default, temperature
+        # possibly 0) could silently never reach it. Force both the
+        # megakernel and speculation off for the rest of THIS request instead
+        # of letting the parameter fall through unused.
+        var want_extra = sample.presence_penalty != 0 or sample.frequency_penalty != 0 or sample.top_logprobs > 0
+        if want_extra:
+            spec = False
         # The megakernel bakes greedy argmax into its own launch (mega_token_*
         # kernels take no sampler params); a sampling request always runs the
-        # launch path, which is where the sampler is wired below.
-        var mega_req = mega and sample.temperature <= 0
+        # launch path, which is where the sampler is wired below. Same for a
+        # T<=0 request carrying penalties/top_logprobs: the launch path's
+        # amar_sample_row is argmax-equivalent at temperature<=0 (P-K2), so
+        # routing it there instead of the megakernel is what lets penalties
+        # apply before that equivalent draw.
+        var mega_req = mega and sample.temperature <= 0 and not want_extra
         # A1: the megakernel WINDOW writes the window's tokens itself, so it
         # cannot host the speculative sampling rule (which needs the target's
         # full probability rows, not its argmax). Sampling therefore stays on
         # the launch path for the window too, exactly as it already does for
         # the single-token megakernel above.
-        var mega_win_req = mega_win and sample.temperature <= 0
+        var mega_win_req = mega_win and sample.temperature <= 0 and not want_extra
         var cfg = WindowCfg(pack_q4=pack_q4, draft_q4=draft_q4, q4_off=q4_off, e=e, kcfg=kcfg, spec=spec, spec_dbg=spec_dbg, expert_trace=expert_trace, serve=serve, req_id=req_id, prof=prof, pf2=pf2, pf3=pf3, pf4=pf4, dump=dump, dump4=dump4, dump_layer=dump_layer, mega=mega_req, att_split=att_split, mega_win=mega_win_req, dot3=dot3, pf_chunk=pf_chunk, pf_rows=pf_rows, pf_tail=pf_tail, n_total=n_total, fr_k=fr_k, fr_off=fr_off, fr_ids_off=fr_ids_off, n_prompt=len(prompt), sample=sample.copy())
         if len(force) > 0 and cfg.spec:
             raise Error("BARO_FORCE requires BARO_SPEC=0 (teacher forcing is a no-spec identity gate)")

@@ -417,6 +417,11 @@ async fn collect(app: &App, mut rx: mpsc::UnboundedReceiver<Event>) -> Result<(A
                 stats = stats_json(&s);
                 break;
             }
+            // serve/PROTOCOL.md: an {"id","error"} line means the request
+            // was "rejected before any GPU work" -- true exactly when no Tok
+            // arrived first, which is the client-error (400) case; an error
+            // after generation started is a mid-request engine failure (502).
+            Event::Error(e) if acc.tokens.is_empty() => return Err(ApiError::Plain(StatusCode::BAD_REQUEST, format!("engine: {e}"))),
             Event::Error(e) => return Err(ApiError::Plain(StatusCode::BAD_GATEWAY, format!("engine: {e}"))),
         }
     }

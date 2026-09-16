@@ -9,6 +9,7 @@ t0, t_prefill_end or dt from here (exchange/scorer-integrity-report.md, P-A).
 """
 from std.collections import Dict
 from std.math import ceildiv, log
+from std.os import getenv
 from std.time import perf_counter_ns
 
 from max.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
@@ -1492,14 +1493,20 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                     ctx.synchronize()
                     st.p3[3] += Int(perf_counter_ns() - t_acc)
                 m = n_acc + 1
-            elif cfg.sample.temperature <= 0:
+            elif cfg.sample.temperature <= 0 and cfg.sample.presence_penalty == 0 and cfg.sample.frequency_penalty == 0 and cfg.sample.top_logprobs <= 0:
                 ctx.enqueue_function[argmax_k](Logitsm, Toks, Int32(VOCAB), Int32(st.pos + 1), grid_dim=m, block_dim=256)
             else:
-                # Sampling (M5): spec and the megakernel are both forced off
-                # whenever temperature > 0 (engine.mojo), so dtok_d and
-                # hmax_d are free scratch here -- sample into them, 0-based,
-                # then reuse the same tokcp_k the spec path already uses to
-                # place the result at the real position.
+                # Sampling (M5). engine.mojo forces spec and the megakernel
+                # off whenever temperature > 0, OR temperature <= 0 with
+                # penalties/top_logprobs requested (items 3-4,
+                # briefs/2026-09-16-sampling-all-models-lane.md) -- the
+                # latter case still lands here rather than argmax_k because
+                # amar_sample_row is argmax-equivalent at temperature <= 0
+                # (P-K2), which is what lets a penalized row still resolve
+                # to the penalized argmax. dtok_d and hmax_d are free scratch
+                # here -- sample into them, 0-based, then reuse the same
+                # tokcp_k the spec path already uses to place the result at
+                # the real position.
                 var SampTok = TileTensor(b.dtok_d, dtok_layout)
                 var SampProb = TileTensor(b.hmax_d, dtok_layout)
                 # Item 3-4, briefs/2026-09-16-sampling-all-models-lane.md:
@@ -1519,6 +1526,33 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                             src_buf=DeviceBuffer[DType.int32](ctx, b.toks_d.unsafe_ptr().unsafe_offset(cfg.n_prompt), hn, owning=False),
                         )
                         ctx.synchronize()
+                    # Item 4 verification (coordinator review, 2026-09-16):
+                    # a per-step raw-row + history dump for an independent
+                    # host comparison, since the wiring needs its own check
+                    # against sample_ref rather than resting on the kernel
+                    # test alone. Off by default (BARO_DUMP_LOGITS_DIR unset).
+                    var dump_dir = getenv("BARO_DUMP_LOGITS_DIR", "")
+                    if dump_dir != "":
+                        var row_h = ctx.enqueue_create_host_buffer[f32](VOCAB)
+                        ctx.enqueue_copy(
+                            dst_buf=row_h,
+                            src_buf=DeviceBuffer[f32](ctx, b.logits_d.unsafe_ptr(), VOCAB, owning=False),
+                        )
+                        ctx.synchronize()
+                        with open(dump_dir + "/row-" + String(hn) + ".bin", "w") as f:
+                            var p = row_h.unsafe_ptr().unsafe_bitcast[UInt8]()
+                            f.write_bytes(Span[UInt8](unsafe_ptr=p, length=VOCAB * 4))
+                        with open(dump_dir + "/row-" + String(hn) + ".json", "w") as jf:
+                            var js = String("{\"temperature\":") + String(cfg.sample.temperature) + ",\"top_k\":" + String(cfg.sample.top_k)
+                            js += ",\"top_p\":" + String(cfg.sample.top_p) + ",\"min_p\":" + String(cfg.sample.min_p)
+                            js += ",\"presence_penalty\":" + String(cfg.sample.presence_penalty) + ",\"frequency_penalty\":" + String(cfg.sample.frequency_penalty)
+                            js += ",\"top_logprobs\":" + String(cfg.sample.top_logprobs) + ",\"history\":["
+                            for i in range(hn):
+                                if i > 0:
+                                    js += ","
+                                js += String(Int(b.pen_hist_h[i]))
+                            js += "]}"
+                            jf.write_bytes(js.as_bytes())
                     var npen = 0
                     if want_pen:
                         var seen = Dict[Int, Int]()
