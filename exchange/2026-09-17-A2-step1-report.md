@@ -25,6 +25,12 @@ dot-loop fingerprint unchanged (dual 124 / 79 / 79 / 59, the champion's); split 
 spills (unchanged); decode 38 / 0 (unchanged); prefill WMMA 192 VGPR, spills 28 -> 25; q8 window
 47 -> 48, q4 window 44 -> 42. No lottery re-roll.
 
+Addendum (isa-diff, built the same day): the q4 token megakernel's fingerprint is SAME; the split
+decode kernel's loop fingerprint CHANGED (four loops of dual 183/183/134/135 before, two of 134/135
+after, same 165 VGPR and 0 spills): the per-span table read restructured its load loops. The measured
+cost is the 0.9% at 32k above; there is no lottery rule for that kernel, so this is recorded, not
+gated.
+
 ## Gates (`bench/a2-gate.sh`, both engines resident, `BARO_TMAX=32768`, refcache on the reference)
 
 | arm | agreement | restored | decode after 32k | receipt |

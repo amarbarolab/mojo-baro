@@ -53,16 +53,16 @@ for L in $sets; do
 done
 runenv="BARO_SERVE=1 BARO_SPEC=0 BARO_TMAX=32768"
 
-# reference arm, cached the P17 way
-key=$(printf '%s\n' "$ha" "$packsha" "n64 T0 spec0" "$(sha256sum "$out/ref-requests.jsonl" | cut -c1-64)" | sha256sum | cut -c1-24)
-refdir=.work/refcache/a2/$key
-if [ -s "$refdir/ref-ids.jsonl" ]; then
-  echo "refcache hit key=$key" | tee -a "$out/arm.txt"
+# reference arm, cached the P17 way (iTools harness/refcache)
+key=$(~/iTools/bin/refcache key "$ha" "$packsha" "n64 T0 spec0" "@$out/ref-requests.jsonl")
+export REFCACHE_ROOT=.work/refcache/a2
+if refids=$(~/iTools/bin/refcache get "$key" ref-ids.jsonl 2> "$out/refcache.txt"); then
+  cat "$out/refcache.txt" | tee -a "$out/arm.txt"
 else
-  echo "refcache miss key=$key" | tee -a "$out/arm.txt"; mkdir -p "$refdir"
+  cat "$out/refcache.txt" | tee -a "$out/arm.txt"
   env $runenv $envx "$ref" < "$out/ref-requests.jsonl" > "$out/ref.out" 2> "$out/ref.err" || true
   grep -q '"ready":true' "$out/ref.out" || { echo "FAIL a2-gate: reference never printed its ready line, see $out/ref.err"; exit 1; }
-  python3 - "$out/ref.out" "$refdir/ref-ids.jsonl" <<'PY'
+  python3 - "$out/ref.out" "$out/ref-ids.jsonl" <<'PY'
 import json, sys
 toks = {}
 for line in open(sys.argv[1]):
@@ -74,12 +74,13 @@ with open(sys.argv[2], "w") as f:
     for i, ids in sorted(toks.items()): f.write(json.dumps({"id": i, "ids": ids}) + "\n")
 print(f"reference: {len(toks)} prompts, {sum(len(v) for v in toks.values())} ids")
 PY
-  grep -E '^(BARO_MEGA|BARO_SPEC|BARO_TMAX|BARO_FORCE):|"ready"' "$out/ref.out" | head -5 > "$refdir/receipt.txt"
-  cp "$out/arm.txt" "$refdir/arm.txt"
+  refids=$(~/iTools/bin/refcache put "$key" ref-ids.jsonl "$out/ref-ids.jsonl")
+  grep -E '^(BARO_MEGA|BARO_SPEC|BARO_TMAX|BARO_FORCE):|"ready"' "$out/ref.out" | head -5 > "$(dirname "$refids")/receipt.txt"
+  cp "$out/arm.txt" "$(dirname "$refids")/arm.txt"
 fi
 
 # candidate arm: same requests plus "force":[ref ids]
-python3 - "$out/ref-requests.jsonl" "$refdir/ref-ids.jsonl" "$out/cand-requests.jsonl" <<'PY'
+python3 - "$out/ref-requests.jsonl" "$refids" "$out/cand-requests.jsonl" <<'PY'
 import json, sys
 ids = {json.loads(l)["id"]: json.loads(l)["ids"] for l in open(sys.argv[2])}
 n = 0
