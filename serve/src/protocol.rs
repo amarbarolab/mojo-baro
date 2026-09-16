@@ -48,6 +48,17 @@ pub struct Request {
     pub ckpt: Vec<u32>,
     #[serde(flatten)]
     pub sample: SampleParams,
+    /// JSON-enforcement item 1 (briefs/2026-09-16-json-enforcement-lane.md):
+    /// `response_format.json_schema.schema`, verbatim -- `serve/grammar_rt.mojo`
+    /// compiles it. Absent for every request that does not set
+    /// `response_format`, which is every request before this lane.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema: Option<Value>,
+    /// Item 2: whether the model is reasoning for this request (from
+    /// `chat_template_kwargs.enable_thinking`, default true). Only read by
+    /// the engine when `schema` is also set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<bool>,
 }
 
 /// The line that cancels the request currently decoding, if its id matches.
@@ -205,6 +216,7 @@ pub fn parse_line(line: &str) -> EngineMsg {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn request_line_is_the_engine_shape() {
@@ -216,6 +228,8 @@ mod tests {
             stop: vec![],
             ckpt: vec![],
             sample: SampleParams::default(),
+            schema: None,
+            reasoning: None,
         };
         assert_eq!(r.line(), "{\"id\":7,\"prompt\":[760,6511,314],\"n\":64,\"spec\":false,\"stop\":[],\"ckpt\":[]}\n");
     }
@@ -230,6 +244,8 @@ mod tests {
             stop: vec![vec![151645], vec![9707, 11]],
             ckpt: vec![],
             sample: SampleParams::default(),
+            schema: None,
+            reasoning: None,
         };
         assert_eq!(
             r.line(),
@@ -247,6 +263,8 @@ mod tests {
             stop: vec![],
             ckpt: vec![7914, 8020],
             sample: SampleParams::default(),
+            schema: None,
+            reasoning: None,
         };
         assert_eq!(
             r.line(),
@@ -273,10 +291,34 @@ mod tests {
                 frequency_penalty: None,
                 top_logprobs: None,
             },
+            schema: None,
+            reasoning: None,
         };
         assert_eq!(
             r.line(),
             "{\"id\":3,\"prompt\":[1],\"n\":8,\"spec\":false,\"stop\":[],\"ckpt\":[],\"temperature\":0.8,\"top_p\":0.9,\"top_k\":40,\"min_p\":0.05,\"seed\":42}\n"
+        );
+    }
+
+    #[test]
+    fn request_line_carries_schema_and_reasoning_only_when_set() {
+        let r = Request {
+            id: 4,
+            prompt: vec![1],
+            n: 8,
+            spec: false,
+            stop: vec![],
+            ckpt: vec![],
+            sample: SampleParams {
+                temperature: Some(0.7),
+                ..SampleParams::default()
+            },
+            schema: Some(json!({"type": "object", "properties": {"a": {"type": "string"}}})),
+            reasoning: Some(false),
+        };
+        assert_eq!(
+            r.line(),
+            "{\"id\":4,\"prompt\":[1],\"n\":8,\"spec\":false,\"stop\":[],\"ckpt\":[],\"temperature\":0.7,\"schema\":{\"properties\":{\"a\":{\"type\":\"string\"}},\"type\":\"object\"},\"reasoning\":false}\n"
         );
     }
 

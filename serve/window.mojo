@@ -25,6 +25,9 @@ from moe import (
 from matmul_skinny import amar_matmul_skinny_m1_row, amar_matmul_skinny_m1_row2
 from ssm import amar_widen_bf16, amar_ssm_gated_out_bf16
 from elementwise import amar_rmsnorm_cast2
+from grammar.automaton import Bitset
+from grammar.matcher import Matcher
+from grammar_rt import reasoning_boundary_observe
 
 comptime rmsc2_k = amar_rmsnorm_cast2[type_of(xm_layout), type_of(h_layout), type_of(xm_layout), type_of(h2_layout)]
 from dattn import dattn_nsplit
@@ -615,6 +618,11 @@ struct WindowBufs(Copyable, Movable):
     # source for the response's chosen-token logprob, since the drawn token
     # is not always top-1 of the top-N list.
     var samp_prob_h: HostBuffer[f32]
+    # JSON-enforcement item 1 (briefs/2026-09-16-json-enforcement-lane.md):
+    # one grammar mask row, VOCAB bits. m == 1 only this round, so one row
+    # is enough while grammar requests run with spec off.
+    var gmask_h: HostBuffer[DType.uint64]
+    var gmask_d: DeviceBuffer[DType.uint64]
     # Item 4 verification staging (coordinator review, 2026-09-16): the raw
     # pre-penalty row, VOCAB-wide, written by an enqueue_copy in
     # window.mojo when cfg.dump_pen; read and written to disk only by
@@ -687,6 +695,30 @@ struct WindowState(Copyable, Movable):
     var pc: List[Int]
     var p3: List[Int]
     var pfx: List[Int]
+    # JSON-enforcement item 1/2 (briefs/2026-09-16-json-enforcement-lane.md):
+    # set explicitly per request by engine.mojo (like st.pos), not by
+    # reset() -- building a Matcher needs the request's schema, which reset()
+    # does not have. grammar is None for every request without
+    # response_format, the overwhelming majority, so those pay nothing.
+    var grammar: Optional[Matcher]
+    var grammar_mask: Bitset
+    # True while still scanning for "</think>" (item 2); grammar is not
+    # consulted for fill_mask/accept until this goes False. Always False
+    # when grammar is None.
+    var grammar_pending_think: Bool
+    var grammar_think_buf: List[UInt8]
+    # True once the matcher reached an accepting state with no further
+    # legal continuation possible in a well-formed document -- the decode
+    # loop stops the request on this the same way it stops on a stop
+    # sequence.
+    var grammar_stop: Bool
+    # Gate 4 receipt (bench/grammar-protocol.md): masked_draws is
+    # incremented at every masked kernel launch, accepted at every
+    # matcher.accept() call past the boundary. Equal at request end proves
+    # the two sides of the host/device boundary stayed in sync -- a NOT-
+    # RESIDENT-style silent skip on either side would desync them.
+    var grammar_masked_draws: Int
+    var grammar_accepted: Int
 
     def reset(mut self, t0: Int):
         # per request; n_dumped spans requests (BARO_DUMP)
@@ -1501,7 +1533,7 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                     ctx.synchronize()
                     st.p3[3] += Int(perf_counter_ns() - t_acc)
                 m = n_acc + 1
-            elif cfg.sample.temperature <= 0 and cfg.sample.presence_penalty == 0 and cfg.sample.frequency_penalty == 0 and cfg.sample.top_logprobs <= 0:
+            elif cfg.sample.temperature <= 0 and cfg.sample.presence_penalty == 0 and cfg.sample.frequency_penalty == 0 and cfg.sample.top_logprobs <= 0 and not st.grammar.__bool__():
                 ctx.enqueue_function[argmax_k](Logitsm, Toks, Int32(VOCAB), Int32(st.pos + 1), grid_dim=m, block_dim=256)
             else:
                 # Sampling (M5). engine.mojo forces spec and the megakernel
@@ -1580,12 +1612,38 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                         ctx.enqueue_copy(dst_buf=b.topn_probs_h.create_sub_buffer[f32](0, NTOPLP), src_buf=DeviceBuffer[f32](ctx, b.topn_probs_d.unsafe_ptr(), NTOPLP, owning=False))
                         ctx.synchronize()
                     did_sample_lp = want_lp
-                ctx.enqueue_function[sample_row_k](
-                    Logitsm, SampTok, SampProb, Int32(VOCAB),
-                    Float32(cfg.sample.temperature), Int32(cfg.sample.top_k),
-                    Float32(cfg.sample.top_p), Float32(cfg.sample.min_p),
-                    cfg.sample.seed, UInt64(st.pos), grid_dim=m, block_dim=SAMP_THREADS,
-                )
+                # JSON-enforcement item 1 (briefs/2026-09-16-json-enforcement-lane.md):
+                # m == 1, matching the penalties/logprobs scope above -- a
+                # grammar governs one generated token at a time, never the
+                # MEGA_ALLOWED batched prompt-tail replay. At temperature <= 0
+                # the masked kernel is a masked argmax. engine.mojo forces
+                # spec and the megakernel off and top_p=1/top_k=0/min_p=0 for
+                # a grammar request: amar_sample_row_masked applies the mask
+                # AFTER truncation, so a truncated draw could land outside
+                # the allowed set and return -1.
+                var grammar_here = m == 1 and st.pos + 1 >= cfg.n_prompt and st.grammar.__bool__() and not st.grammar_pending_think
+                if grammar_here:
+                    st.grammar_masked_draws += 1
+                    ref mm = st.grammar.value()
+                    mm.fill_mask(st.grammar_mask)
+                    for i in range(len(st.grammar_mask.words)):
+                        b.gmask_h[i] = st.grammar_mask.words[i]
+                    ctx.enqueue_copy(dst_buf=b.gmask_d, src_buf=b.gmask_h)
+                    ctx.enqueue_function[sample_row_masked_k](
+                        Logitsm, SampTok, SampProb, Int32(VOCAB),
+                        Float32(cfg.sample.temperature), Int32(cfg.sample.top_k),
+                        Float32(cfg.sample.top_p), Float32(cfg.sample.min_p),
+                        cfg.sample.seed, UInt64(st.pos),
+                        b.gmask_d.unsafe_ptr(), Int32((VOCAB + 63) // 64),
+                        grid_dim=m, block_dim=SAMP_THREADS,
+                    )
+                else:
+                    ctx.enqueue_function[sample_row_k](
+                        Logitsm, SampTok, SampProb, Int32(VOCAB),
+                        Float32(cfg.sample.temperature), Int32(cfg.sample.top_k),
+                        Float32(cfg.sample.top_p), Float32(cfg.sample.min_p),
+                        cfg.sample.seed, UInt64(st.pos), grid_dim=m, block_dim=SAMP_THREADS,
+                    )
                 ctx.enqueue_function[tokcp_k](SampTok, Toks, Int32(0), Int32(st.pos + 1), Int32(m), grid_dim=1, block_dim=32)
             if cfg.serve:
                 if win_spec and cfg.sample.temperature > 0:
@@ -1608,6 +1666,24 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                             src_buf=DeviceBuffer[f32](ctx, b.hmax_d.unsafe_ptr(), 1, owning=False),
                         )
                     ctx.synchronize()
+                    if m == 1 and st.pos + 1 >= cfg.n_prompt and st.grammar.__bool__():
+                        # Item 1/2: advance the reasoning-boundary scan while
+                        # waiting for "</think>", or the matcher once past
+                        # it. Reasoning tokens are never accept()ed -- the
+                        # matcher starts life already positioned at the
+                        # boundary (grammar/test_reasoning_boundary.mojo).
+                        var chosen_tok = Int(b.stream_h[0])
+                        ref mm2 = st.grammar.value()
+                        if chosen_tok < 0:
+                            st.grammar_stop = True
+                        elif st.grammar_pending_think:
+                            if reasoning_boundary_observe(st.grammar_think_buf, mm2.vocab[].token_bytes[chosen_tok]):
+                                st.grammar_pending_think = False
+                        else:
+                            st.grammar_accepted += 1
+                            _ = mm2.accept(chosen_tok)
+                            if mm2.is_terminated():
+                                st.grammar_stop = True
                     if did_sample_lp:
                         var chosen = Int(b.stream_h[0])
                         var lp = log(Float64(b.samp_prob_h[0])) if b.samp_prob_h[0] > 0 else -1e30

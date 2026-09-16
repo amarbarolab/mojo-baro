@@ -169,6 +169,36 @@ def gate_mask_row(ctx: DeviceContext, mut xd: DeviceBuffer[f32], row_name: Strin
     else:
         print("FAIL mask", row_name, ": full-mask mismatches", bad, " masked argmax drawn", hit_argmax)
         fails += 1
+    # T=0 masked greedy: argmax over the allowed set only, -1 on an empty mask.
+    var xh = ctx.enqueue_create_host_buffer[f32](VOCAB)
+    ctx.enqueue_copy(dst_buf=xh, src_buf=xd)
+    ctx.synchronize()
+    var second = -1
+    for i in range(VOCAB):
+        if i != argmax and (second < 0 or xh[i] > xh[second]):
+            second = i
+    var g_cleared = device_sample_masked(ctx, xd, md, Float32(0), 0, Float32(1), Float32(0), UInt64(42), UInt64(0))[0]
+    var only = VOCAB - 7
+    for i in range(NW):
+        mh[i] = UInt64(0)
+    mh[only // 64] = UInt64(1) << UInt64(only % 64)
+    ctx.enqueue_copy(dst_buf=md, src_buf=mh)
+    ctx.synchronize()
+    var g_only = device_sample_masked(ctx, xd, md, Float32(0), 0, Float32(1), Float32(0), UInt64(42), UInt64(0))[0]
+    mh[only // 64] = UInt64(0)
+    ctx.enqueue_copy(dst_buf=md, src_buf=mh)
+    ctx.synchronize()
+    var g_empty = device_sample_masked(ctx, xd, md, Float32(0), 0, Float32(1), Float32(0), UInt64(42), UInt64(0))[0]
+    for i in range(NW):
+        mh[i] = UInt64(0xFFFFFFFFFFFFFFFF)
+    ctx.enqueue_copy(dst_buf=md, src_buf=mh)
+    ctx.synchronize()
+    var g_full = device_sample_masked(ctx, xd, md, Float32(0), 0, Float32(1), Float32(0), UInt64(42), UInt64(0))[0]
+    if g_cleared == second and g_only == only and g_empty == -1 and g_full == argmax:
+        print("PASS mask T=0", row_name, ": argmax cleared ->", second, ", single bit ->", only, ", empty -> -1, full -> argmax")
+    else:
+        print("FAIL mask T=0", row_name, ": cleared", g_cleared, "want", second, " single", g_only, "want", only, " empty", g_empty, " full", g_full, "want", argmax)
+        fails += 1
 
 
 def gate1_row(ctx: DeviceContext, mut xd: DeviceBuffer[f32], row_name: String, row: List[Float32], mut fails: Int) raises:

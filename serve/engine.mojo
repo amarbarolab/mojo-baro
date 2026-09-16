@@ -29,7 +29,10 @@ from latentos.ipc import connect_unix_socket
 from serve_proto import (
     read_line, cancel_pending, json_key, json_int, json_float,
     SampleParams, default_sample_params, parse_request,
+    parse_schema_field, parse_reasoning_field,
 )
+from grammar_rt import GrammarRuntime, compile_schema_matcher
+from grammar.automaton import Bitset
 
 
 
@@ -335,7 +338,7 @@ def main() raises:
         ctx.synchronize()
     var toks_d = bufs.toks_d
 
-    var wst = WindowState(pos=0, pos_prev=0, ring=0, n_drafted=0, n_accepted=0, n_spec_windows=0, n_dumped=0, tp=0, tq=0, pf_att=0, pf_ssm=0, pf_ffn=0, pf_head=0, pf_proc=0, pf_draft=0, fc=[0, 0, 0, 0, 0, 0], pc=[0, 0, 0, 0, 0, 0, 0, 0], p3=[0, 0, 0, 0], pfx=[0, 0, 0, 0])
+    var wst = WindowState(pos=0, pos_prev=0, ring=0, n_drafted=0, n_accepted=0, n_spec_windows=0, n_dumped=0, tp=0, tq=0, pf_att=0, pf_ssm=0, pf_ffn=0, pf_head=0, pf_proc=0, pf_draft=0, fc=[0, 0, 0, 0, 0, 0], pc=[0, 0, 0, 0, 0, 0, 0, 0], p3=[0, 0, 0, 0], pfx=[0, 0, 0, 0], grammar=None, grammar_mask=Bitset(1), grammar_pending_think=False, grammar_think_buf=List[UInt8](), grammar_stop=False, grammar_masked_draws=0, grammar_accepted=0)
     var ckpt_cap = atol(getenv("BARO_CKPT", "8")) if serve else 0
     if ckpt_cap < 0:
         ckpt_cap = 0
@@ -365,6 +368,11 @@ def main() raises:
     # Requests read off fd 0 by the cancel probe mid-generation, in arrival
     # order; the request loop drains these before touching fd 0 again.
     var pending = List[String]()
+    # JSON-enforcement item 1 (briefs/2026-09-16-json-enforcement-lane.md):
+    # the grammar vocab/trie, built once on the first response_format
+    # request (not at startup -- every existing run that never sets it pays
+    # nothing, not even the trie build).
+    var grt: Optional[GrammarRuntime] = None
     if serve:
         print("{\"ready\":true,\"tmax\":" + String(tmax) + ",\"mrows\":" + String(MROWS) + ",\"kmax\":" + String(KMAX) + ",\"spec_k\":" + String(kcfg) + ",\"kv\":\"" + String(KVT) + "\",\"pack\":\"" + packdir + "\"}")
 
@@ -420,6 +428,42 @@ def main() raises:
             # runs the real rule instead (accept with min(1, p/q) on the
             # truncated distributions, residual draw on the first rejection,
             # bonus token from p), so sampling and speculation compose.
+            # JSON-enforcement item 1/2: reset every request, schema or not
+            # -- wst is reused across requests, so a prior request's matcher
+            # must never leak into one that never asked for response_format.
+            wst.grammar = None
+            wst.grammar_pending_think = False
+            wst.grammar_think_buf = List[UInt8]()
+            wst.grammar_stop = False
+            wst.grammar_masked_draws = 0
+            wst.grammar_accepted = 0
+            var schema_raw = parse_schema_field(line_in.value())
+            if schema_raw != "":
+                # Interim (see window.mojo item 1 comment): the masked kernel
+                # filters after truncation today, so a schema request that
+                # also truncates could draw outside the allowed set. Dropped
+                # once the masked-first kernel lands.
+                sample.top_p = 1.0
+                sample.top_k = 0
+                sample.min_p = 0.0
+                spec = False
+                if not grt:
+                    try:
+                        grt = Optional(GrammarRuntime(packdir))
+                    except e:
+                        print(err_line(req_id, "response_format: grammar runtime failed to load: " + String(e)))
+                        continue
+                if grt.value().vocab_size != VOCAB:
+                    print(err_line(req_id, "response_format: grammar vocab_size " + String(grt.value().vocab_size) + " != engine VOCAB " + String(VOCAB) + " (stale pack?)"))
+                    continue
+                try:
+                    wst.grammar = Optional(compile_schema_matcher(grt.value(), schema_raw))
+                except e:
+                    print(err_line(req_id, "response_format schema: " + String(e)))
+                    continue
+                wst.grammar_pending_think = parse_reasoning_field(line_in.value())
+                wst.grammar_mask = Bitset(VOCAB)
+                print("response_format: schema compiled, reasoning wait:", wst.grammar_pending_think)
             print("prompt tokens:", len(prompt), " n:", gen_n, " spec:", spec, " temperature:", sample.temperature)
             # Per-request teacher forcing. BARO_FORCE is read once at startup,
             # so a forced run used to need one process per prompt: 20 pack
@@ -554,7 +598,8 @@ def main() raises:
         # megakernel and speculation off for the rest of THIS request instead
         # of letting the parameter fall through unused.
         var want_extra = sample.presence_penalty != 0 or sample.frequency_penalty != 0 or sample.top_logprobs > 0
-        if want_extra:
+        var want_grammar = wst.grammar.__bool__()
+        if want_extra or want_grammar:
             spec = False
         # The megakernel bakes greedy argmax into its own launch (mega_token_*
         # kernels take no sampler params); a sampling request always runs the
@@ -563,13 +608,13 @@ def main() raises:
         # amar_sample_row is argmax-equivalent at temperature<=0 (P-K2), so
         # routing it there instead of the megakernel is what lets penalties
         # apply before that equivalent draw.
-        var mega_req = mega and sample.temperature <= 0 and not want_extra
+        var mega_req = mega and sample.temperature <= 0 and not want_extra and not want_grammar
         # A1: the megakernel WINDOW writes the window's tokens itself, so it
         # cannot host the speculative sampling rule (which needs the target's
         # full probability rows, not its argmax). Sampling therefore stays on
         # the launch path for the window too, exactly as it already does for
         # the single-token megakernel above.
-        var mega_win_req = mega_win and sample.temperature <= 0 and not want_extra
+        var mega_win_req = mega_win and sample.temperature <= 0 and not want_extra and not want_grammar
         var dump_pen = want_extra and dump_pen_dir != ""
         var cfg = WindowCfg(pack_q4=pack_q4, draft_q4=draft_q4, q4_off=q4_off, e=e, kcfg=kcfg, spec=spec, spec_dbg=spec_dbg, expert_trace=expert_trace, serve=serve, req_id=req_id, prof=prof, pf2=pf2, pf3=pf3, pf4=pf4, dump=dump, dump4=dump4, dump_layer=dump_layer, mega=mega_req, att_split=att_split, mega_win=mega_win_req, dot3=dot3, pf_chunk=pf_chunk, pf_rows=pf_rows, pf_tail=pf_tail, n_total=n_total, fr_k=fr_k, fr_off=fr_off, fr_ids_off=fr_ids_off, n_prompt=len(prompt), sample=sample.copy(), dump_pen=dump_pen)
         if len(force) > 0 and cfg.spec:
@@ -664,6 +709,12 @@ def main() raises:
             if serve and cancel_pending(0, req_id, pending):
                 cancelled = True
                 break
+            if wst.grammar_stop:
+                # JSON-enforcement item 1: the matcher reached an accepting
+                # state with no further legal byte -- same "stop" finish as
+                # a stop sequence, no new wire value.
+                stopped = True
+                break
             if len(stop_seqs) > 0 and wst.pos >= len(prompt):
                 ctx.synchronize()
                 ctx.enqueue_copy(dst_buf=toks_h, src_buf=toks_d)
@@ -709,6 +760,11 @@ def main() raises:
         ctx.enqueue_copy(dst_buf=flw, src_buf=bufs.ctr_d)
         ctx.synchronize()
         print("mega fail word:", flw[2], "" if flw[2] == 0 else " NOT-RESIDENT: a grid barrier timed out, tokens after it are invalid")
+        if wst.grammar.__bool__():
+            # Gate 4 (bench/grammar-protocol.md): masked_draws must equal
+            # accepted every time -- read on every grammar-constrained run,
+            # not just when something looks wrong.
+            print("grammar masked draws:", wst.grammar_masked_draws, " accepted:", wst.grammar_accepted, " terminated:", wst.grammar_stop, "" if wst.grammar_masked_draws == wst.grammar_accepted else " MISMATCH: masked draw and accept counts desynced")
         # P1 receipt from the device, not from the env echo: the grid-barrier
         # generation counter is written only by a persistent kernel's barriers
         # (the launch path never touches ctr_d), so gen = 0 means no persistent

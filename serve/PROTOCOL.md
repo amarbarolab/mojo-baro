@@ -100,6 +100,17 @@ for an unparseable line carries `"id":0`.
   reference, matched against the device kernels. `serve/spark.mojo` parses
   the block and still decodes greedy. Absent, the request line is identical
   to before this field existed.
+- `schema` (a JSON Schema object) and `reasoning` (bool, default true):
+  optional, written by `baro-serve` from `response_format` and
+  `chat_template_kwargs.enable_thinking`. `serve/engine.mojo` compiles the
+  schema into a grammar matcher (`serve/grammar_rt.mojo`, `grammar/`) and
+  draws every generated token with `amar_sample_row_masked`, at any
+  temperature (masked argmax at `temperature <= 0`). With `reasoning` true
+  the mask starts after `</think>` appears in the output. The request runs
+  with spec, the megakernel and truncation (`top_p`/`top_k`/`min_p`) off,
+  stops with `"finish":"stop"` when the document is complete, and the
+  engine logs `grammar masked draws: N accepted: N` per request
+  (`bench/grammar-protocol.md`).
 - `{"cancel":ID}`: a second line shape, written to the same stdin at any
   point while `ID` is decoding (the request line for the *next* id is never
   written before this one's `done` line, so a stray line mid-request can
@@ -136,7 +147,7 @@ makes): about 0.5% of tok/s_gen on the 5-token receipt prompt.
 | `GET /health` | | `status`, `queue` (waiting+running), `tokenizer` (bool), `limits` (the ready line), `pack` |
 | `GET /v1/models` | | one model, id = pack directory name |
 | `POST /v1/completions` | `prompt` (string, or array of token ids), `max_tokens` (default 64), `stream`, `spec` (extension), `stop` (string or array of strings), `temperature`/`top_p`/`top_k`/`min_p`/`seed`/`presence_penalty`/`frequency_penalty`/`logprobs` (C3; the sampler fields act at `temperature > 0`, penalties and `logprobs` are parsed but not acted on) | response adds `choices[0].tokens` (the generated ids) and `timings` (the done line, including `finish`). Token-id prompts need no tokenizer; `stop` needs one (silently `[]` without). |
-| `POST /v1/chat/completions` | `messages`, `max_tokens`/`max_completion_tokens`, `stream`, `spec`, `stop`, the same C3 sampler fields, `tools`, `chat_template_kwargs`, `response_format` | needs the tokenizer; template from `tokenizer-meta.json` (`chat_template`, Jinja via minijinja + pycompat) else ChatML. `tools` and `chat_template_kwargs` are passed to the template (A5 `0950c6f`); a tool call in the output comes back as `choices[0].message.tool_calls`. `response_format` is validated, then refused with 400: no token mask is applied in the decode loop yet. |
+| `POST /v1/chat/completions` | `messages`, `max_tokens`/`max_completion_tokens`, `stream`, `spec`, `stop`, the same C3 sampler fields, `tools`, `chat_template_kwargs`, `response_format` | needs the tokenizer; template from `tokenizer-meta.json` (`chat_template`, Jinja via minijinja + pycompat) else ChatML. `tools` and `chat_template_kwargs` are passed to the template (A5 `0950c6f`); a tool call in the output comes back as `choices[0].message.tool_calls`. `response_format` `{"type":"json_schema","json_schema":{"schema":...}}` is enforced on the dense/MoE engine: the output is valid JSON for the schema (32-schema corpus, T=0 and T=0.7, `bench/grammar-protocol.md`), spec and the megakernel off for that request, about 1.25x slower per token than a plain request with the megakernel. `serve/spark.mojo` engines refuse it with 400. |
 | `POST /v1/fork` | `prompt` (as `/v1/completions`), `branches`: array of `{max_tokens, spec, stop, sampler fields}` | runs the branches in order on one engine; branch 0 prefills and checkpoints the prompt, later branches restore it (B5 `a400c67`, `bench/fork-protocol.md`). Response `{"object":"fork","model","prompt_tokens","branches":[{index,id,text,tokens,finish_reason,usage,timings}]}`. |
 | `POST /v1/cancel` | `{"id": "cmpl-7"}` / `{"id": "chatcmpl-7"}` (the response `id`, or the SSE `id` field of its first chunk -- read while the request is still streaming) | `{"cancelled": bool}`; `true` only if that request was the one actively decoding. A queued-but-not-started or already-finished id returns `false`. |
 | `POST /tokenize` | `{"content": "...", "add_special": false}` | `{"tokens": [...]}` |
