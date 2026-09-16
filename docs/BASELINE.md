@@ -412,6 +412,16 @@ cannot be set through `@__llvm_metadata` (six spellings rejected).
 bit-identical to the previous engine on 20/20 prompts, fail word 0. R6.0 and
 R6.0b fold per-layer elementwise chains into fewer launches; R6.0b landed at
 1.043x, below the preregistered +5% kill line, on the maintainer's recorded override.
+
+**Persistent MoE token kernel (2026-09-16, R6, `kernels/mega_moe.mojo`,
+opt-in):** `BARO_MEGA=1` on the MoE profile runs the 40 layers in one launch
+(8 launches per token with the head), bit-exact with the launch path (dump
+compare 64 tokens x 80 slots identical, teacher-forced 64/64 on 20/20 vs
+`38ee0b7`). 20-prompt A/B 110.90 -> 113.94 tok/s_gen, ratio 1.027, below the
++5% line, so the default stays `BARO_MEGA=0` and the champion above stands.
+Refuses `BARO_TIER` and `BARO_EXPERTS`. Receipt that it ran: the engine's
+`mega barrier gen` line, 470 per token. Details and the remaining pools in
+`bench/moe-persist-protocol.md` R6.2 and `exchange/lane-R6-report.md`.
 llama.cpp on the same GGUF: **109.92** (20-prompt median, 109.49 to 110.01).
 The same-stint ratio is only for R6.0 (106.95, 0.973x); 111.89 was measured in
 a different stint, so the 1.018x it implies is not a same-stint receipt.

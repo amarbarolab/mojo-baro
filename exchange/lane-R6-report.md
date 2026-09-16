@@ -107,3 +107,70 @@ regenerated; 26 bench sources build; vendored copies in sync).
 44 engine runs (2 dump-compare runs, 2 dump4 probe runs, 40 identity runs),
 97 s of pack load plus forward on the GPU, about 1.6 GPU minutes, plus
 `run-tests.sh`. Every gate well under the 10-minute line.
+
+## R6.2: speed (preregistered `b5bbab0`, result below the kill line)
+
+### Receipts before timing
+
+- Per-run device receipt, the maintainer's P1 gap after R6.1: the engine prints the
+  grid-barrier generation counter from `ctr_d` (only a persistent kernel's
+  barriers advance it), 470 per token on the MoE profile; `force-ab.sh` and
+  `ab-prompts.sh` record it and the fail word per run for both arms
+  (`6af3fcc`). rocprofv3 launches per token: launch arm 727.0, persistent arm
+  8.0 (`.work/r6/lc-*.log`).
+- Phase stamps of the kernel as landed, kernel span 8391 us, table in the
+  protocol: the q8 projection phases ran at about 400 GB/s against the launch
+  kernels' 950 for the same bytes.
+- Disclosed instrument reading from the R6.1 identity runs: 0.971 (forced
+  candidate vs greedy reference, host-synced per token).
+
+### Lever 1, grid size: falsified by residency
+
+`BARO_MOE_G` builds at 96/192/288 on three prompts: **G = 192 and 288 are
+NOT-RESIDENT at the first barrier (fail word 1, gen 0) on 6/6 runs**; G = 96
+runs (fail word 0, gen 470 per token). My preregistration's 3-blocks-per-CU
+arithmetic used the wrong register-file size; the `persistent-kernel-gfx11`
+formula (vgpr 256 -> ceiling 96) was right. Occupancy is not a knob at 256
+VGPRs. In the ledger.
+
+### Lever 2, latency hiding inside the wave: bit-exact, 8391 -> 7986 us
+
+Three builds, each gate-1 dump compare identical:
+
+| build | change | vgpr / spills / scratch | kernel span us | note |
+|---|---|---|---|---|
+| r61 | as landed | 256 / 256 / 940 | 8391 | |
+| r62 | q8 U=4 + q4k U=2 | 256 / 315 / 1140 | 8743 | SSM proj -230, down +376 (spills moved into it) |
+| r63 | q8 U=4, q4k original, chunked-fma delta | 256 / 236 / 936 | 7986 | delta 457 -> 253, down 1689 -> 1534, q8 phases flat |
+
+The chunked delta is the `RELOAD=True` form of the dense kernel; its
+`fma()` spelling matches the launch `amar_ssm_delta_step` ISA (fma 1061 /
+mul 346 / add 0 read from the same binary), and the dump compare and the
+20-prompt identity confirm it. `isa-loops` fingerprint of the timed kernel:
+hot loops dual 361/361/51/51/51/227/229/26, totals fma 1691 mul 262 add 387
+scratch 395.
+
+### Confirmation, 20 prompts, one stint
+
+Identity vs champion `38ee0b7`: 20/20 at 64/64, gen 30080 on every
+candidate run (`.work/r6/force-r63/`). A/B one binary (sha
+`7c27c2a82214b485`), `BARO_MEGA=0` vs `1`, clock probe sclk med 3134 MHz,
+cap 290 W, -100 mV, junction 71 C:
+
+| arm | median tok/s_gen | spread | gen per run | fail word |
+|---|---|---|---|---|
+| launch | 110.90 | 1.4% | 0 | 0 |
+| persistent | 113.94 | 1.4% | 30080 | 0 |
+
+**Ratio 1.027, identity PASS 20/20.** Kill line +5% not met; prediction
+(130 to 145) falsified. Default stays `BARO_MEGA=0` on the MoE profile; the
+kernel is in the tree as an opt-in. The protocol's result section names the
+three pools for a next round; the largest is the q8 projection phases, 2.7
+of 8.0 ms at 400 GB/s, which the per-wave unroll did not move.
+
+### GPU minutes, whole lane
+
+R6.1 about 1.6 min plus run-tests; R6.2: launch counts (4 traced serve
+runs), 12 sweep runs, 3 gate runs, 40 identity runs, 40 A/B runs, about 3 s
+of GPU each including the 1.4 s pack load: about 5 minutes, plus two
+run-tests. No gate over 10 minutes.

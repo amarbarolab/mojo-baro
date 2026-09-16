@@ -445,3 +445,47 @@ prediction (q8 phases 2709 -> at most 1700 us in the stamp profile, kernel
 span under 7000 us), which is the same mechanism the dense kernel uses at
 the same 2 waves per SIMD (`q8_row_dot` UNROLL = 4). Raising occupancy by
 cutting VGPRs to 192 or below is a separate step after R6.2, not this round.
+
+### R6.2 result (2026-09-16): 1.027x, below the +5% line; kernel stays opt-in, default stays BARO_MEGA=0
+
+Kernel as timed (`kernels/mega_moe.mojo` at the R6.2 commit): the q8 dots
+issue four block-iterations of loads before consuming them (`q8_dot_u[4]`,
+same fma chain), the expert q4k dots are the launch kernel's (`q4k_dot_u`
+was tried and reverted: +376 us on the untouched down phase from spills,
+gate+up flat), and the delta scan is the chunked 32-wide `fma()` form whose
+ISA the launch `amar_ssm_delta_step` already contracts to (fma 1061 / mul
+346 / add 0, `isa-loops` on the same binary). ISA receipt: 256 VGPRs, 236
+spills, 936 B scratch; fingerprint hot loops dual 361/361/51/51/51/227/229/26,
+totals fma 1691 mul 262 add 387 scratch 395 (`.work/r6/isa-r63`).
+
+Gates before timing: `BARO_DUMP` compare identical over 64 tokens x 80
+slots (p09); teacher-forced agreement 64/64 on 20/20 against
+`engine-ref-38ee0b7`, device receipt gen 30080 on all 20 candidate runs
+(`.work/r6/force-r63/results.txt`).
+
+Timed A/B (`.work/r6/ab-r63/`, `ab-r63.log`): one binary sha `7c27c2a82214b485`,
+`BARO_MEGA=0` vs `BARO_MEGA=1`, 20 prompts alternating, power cap 290 W and
+-100 mV read back, clock probe sclk med 3134 MHz (min 1238 across idle,
+max 3313), junction 71 C. **launch 110.90 tok/s_gen (spread 1.4%) ->
+persistent 113.94 (spread 1.4%), ratio 1.027**; identity PASS 20/20; device
+receipt gen 0 on every launch run and 30080 on every persistent run; fail
+word 0 on all 40.
+
+Prediction (130 to 145, ratio 1.16 to 1.30) **falsified**. Where it went, by
+the stamp profile (kernel span 8391 -> 7986 us, `.work/r6/dump-r63/persist.log`):
+delta 457 -> 253 and down 1689 -> 1534 carried the gain; the q8 projection
+phases stayed at 2717 us (about 400 GB/s) with or without the per-wave
+unroll, so at 2 waves per SIMD the raw 34-byte-stride block loads are not
+hidden by issuing more of them per wave. The persistent kernel removes
+about 2.2 ms of launch gaps and gives back about 2 ms in phases slower than
+the launch kernels they replace; net +3%.
+
+Kill line +5% not met: default unchanged, kernel kept as an opt-in
+(`BARO_MEGA=1` on the MoE profile, refuses BARO_TIER and BARO_EXPERTS).
+Pools for a next round, each its own preregistration: (1) q8 projection
+phases at 400 GB/s, the largest (2.7 of 8.0 ms): either the dense q8
+layout from the R6a pack (aligned 16 B loads; its arithmetic differs from
+the raw-block dot, so it needs the agreement band, not identity) or LDS
+staging of the activation row as the dense kernel does; (2) VGPRs to 192
+or below for 2 blocks per CU (G = 192), which is the occupancy lever this
+round could not pull; (3) expert down at K = 512 uses 16 of 32 lanes.
