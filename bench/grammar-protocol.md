@@ -136,3 +136,11 @@ engine.mojo/window.mojo change, which needs the coordinator's go
 (`briefs/2026-09-16-json-enforcement-lane.md` file-ownership rule:
 `serve/window.mojo`/`serve/engine.mojo` owned by the sampling lane until it
 hands off).
+
+## Result
+
+**Gate 1 run 1** (`8ed860a` + `run-tests` fix): 64/64 reasoning-off requests PASS (32 schemas at
+T=0 and T=0.7, valid JSON, receipt masked draws == accepted == completion_tokens). The two
+reasoning-on requests returned HTTP 400 before reaching the engine: prompt + max_tokens 1024
+exceeds TMAX 1088. That is a defect in the gate script, not in the enforcement; reasoning-on
+max_tokens lowered to 800 and those two cases rerun alone (`GATE_THINK_ONLY=1`).

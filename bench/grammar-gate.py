@@ -31,7 +31,7 @@ def receipts():
     return re.findall(r"grammar masked draws: (\d+)\s+accepted: (\d+)\s+terminated: (\w+)(.*)", serve_log.read_text(errors="replace"))
 
 
-cases = [(n, t, False) for t in (0.0, 0.7) for n in names]
+cases = [] if __import__("os").environ.get("GATE_THINK_ONLY") else [(n, t, False) for t in (0.0, 0.7) for n in names]
 cases.append((names[0], 0.7, True))
 cases.append((names[20], 0.0, True))
 rows, fails = [], 0
@@ -39,7 +39,7 @@ for name, temp, think in cases:
     schema = json.loads((corpus / name).read_text())
     body = {
         "messages": [{"role": "user", "content": "Reply with one JSON value that matches this JSON schema, filled with realistic data: " + json.dumps(schema)}],
-        "max_tokens": 1024 if think else 400, "temperature": temp, "seed": 7,
+        "max_tokens": 800 if think else 400, "temperature": temp, "seed": 7,
         "response_format": {"type": "json_schema", "json_schema": {"name": name[:-5], "schema": schema}},
         "chat_template_kwargs": {"enable_thinking": think},
     }
