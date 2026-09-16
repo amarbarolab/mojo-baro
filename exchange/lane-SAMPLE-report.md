@@ -119,6 +119,104 @@ the kernel-level receipt.
 **Item 1: all gates PASS. Named check for each sub-claim above; nothing
 here is UNVERIFIED.**
 
-## Item 2-4
+## Item 2: Spark engine sampling (5 models)
+
+**Wiring, `3d268d8` (`serve/spark.mojo` only).** `sample` was already parsed
+by `serve_proto` (C3/A5) but never acted on. Hoisted its declaration outside
+the serve/one-shot branch (default `temperature 0`, matching
+`serve/engine.mojo`'s own one-shot convention, so one-shot stays exactly
+the T=0 path it always was). At `temperature > 0`, `amar_sample_row`
+(instantiated at the profile's own `VOCAB`, same pattern as
+`registry.mojo`'s `sample_row_1`) replaces the `amar_argmax_part`/
+`amar_argmax_final` pair; the chosen token lands via the existing
+`amar_tok_copy` indirection. At `temperature <= 0` the pre-existing argmax
+path, including the `BARO_FORCE` override, is untouched, byte for byte.
+Also added `BARO_DUMP_LOGITS` (same convention as `bb636ef`) for the
+distribution test below.
+
+**T=0 forced identity, 20 prompts, `BARO_FORCE` (`bench/dense-run.sh`).**
+
+| model | range | min agreement | matches 09-11 baseline |
+|---|---|---|---|
+| Llama-3.2-1B | 61-64/64 | 95.3% | yes (was 95.3-100%) |
+| Qwen2.5-7B | 62-64/64 (one 14/14) | 96.9% | yes (was 96.9-100%) |
+| granite-4.2-3b | 63-64/64 | 98.4% | yes (was 98.4-100%) |
+| lily-7b | 62-64/64 (one 5/5) | 96.9% | yes (was 96.9-100%) |
+
+Spark-X2.5-4B has no llama.cpp-comparable architecture, so this model's
+T=0 identity is a self A/B instead: built the pre-change commit `44a1742`
+and HEAD `3d268d8` in the same stint (`git worktree`), same pack, same
+prompt. `GENERATED` bit-identical 64/64 (`614 44107 95 344 390 ...` through
+`2908 7629 2692`), which is the direct proof the `temperature > 0` branch
+never executes at `temperature 0`.
+
+**Distribution test at each model's own vocab, real data.** New harness
+`bench/sample-spark-device.mojo` (`4affcad`), same shape as
+`kernels/test_sample_device.mojo`'s gate1/gate2 but parameterized on the
+Spark profile module (lives in `bench/`, not `kernels/`, since
+`kernels/*.mojo` is off limits to this lane; a real reason, not a
+workaround: `test_sample_device.mojo` is hardwired to `registry`/`model`'s
+qwen35 VOCAB, which does not exist in a Spark build). Real rows captured
+via `BARO_DUMP_LOGITS` on `p17-summarize` (`p20-dialog` for Llama-3.2,
+whose `p17` row was too peaked); independent oracle via
+`tools/sample-nucleus-oracle.py`.
+
+| model | VOCAB | gate1 (device==host) | gate2 max df / chi2 vs crit | greedy T=0 |
+|---|---|---|---|---|
+| Spark-X2.5-4B | 131072 | PASS all 3 configs | df=11, 10.58 < 31.43 | PASS |
+| Llama-3.2-1B | 128256 | PASS all 3 configs | df=56, 57.93 < 94.54 | PASS |
+| Qwen2.5-7B | 152064 | PASS all 3 configs | df=1, 0.016 < 11.16 | PASS |
+| granite-4.2-3b | 100352 | PASS all 3 configs | df=32, 23.07 < 62.59 | PASS |
+| lily-7b | 32000 | PASS all 3 configs | df=3, 0.34 < 16.55 | PASS |
+
+All 5: `PASS: device sampler matches serve/sample_ref.mojo at real vocab`.
+
+**Same seed reproduces, different seeds diverge.** Two checks, one honest
+about its own limit: a single (seed=7, counter=3) draw repeated gave the
+same token on all 5 models (reproduces), but the matching single
+(seed=8, counter=3) draw also landed on the same token on all 5 (a real,
+reported non-result, not evidence of anything, since one draw from a
+peaked-enough config can coincide by chance). The real divergence evidence
+is gate2 itself: 20 different seeds (1000..1019) per config, and the
+resulting distribution matches the independent oracle (chi2 under the
+p=0.001 critical value on every row above), which is only possible if the
+draws are genuinely spread, not stuck on one seed's token. The end-to-end
+HTTP seed check below is the decisive version of this same property.
+
+**One real HTTP request per model, temperature 0.7, plus the
+coordinator-requested end-to-end seed check (T=0.9, seeds 7/7/8, same
+107-108 token open-ended prompt as item 1) on all five, not just MoE.**
+Llama-3.2-1B is the one without a usable tokenizer (`meta-llama/Llama-3.2-1B-Instruct`
+is HF-gated, confirmed: `hf download` returns "Access denied. This
+repository requires approval."); served it via `/v1/completions` with the
+prompt as a token-id array instead, which `serve/PROTOCOL.md` already
+documents as needing no tokenizer. The other four fetched a real
+`tokenizer.json` (Qwen2.5-7B-Instruct, granite-4.2-3b, and lily-7b's own
+`segolilylabs/Lily-Cybersecurity-7B-v0.2` from HF; Spark-X2.5-4B already
+had one on disk) and were served via `/v1/chat/completions`.
+
+| model | route | T=0.7 response | seed 7/7 | seed 8 |
+|---|---|---|---|---|
+| Spark-X2.5-4B | chat | "The ocean is a vast and powerful force..." | identical 30/30 | diverges token 1 |
+| Llama-3.2-1B | completions (ids) | 30 tokens, `finish:"length"` | identical 30/30 | diverges token 1 |
+| Qwen2.5-7B | chat | "The ocean covers most of the Earth's..." | identical 30/30 | shares prefix through token 14, diverges token 15 |
+| granite-4.2-3b | chat | "The ocean spreads endlessly..." | identical 30/30 | shares prefix through token 4, diverges token 5 |
+| lily-7b | chat | "The ocean is a vast, mysterious body..." | identical 30/30 | shares prefix through token 1, diverges token 2 |
+
+Every model: the two seed=7 requests are byte-for-byte identical token
+lists, and seed=8 diverges (either immediately or after a shared prefix,
+both are the expected shape depending on how much the position's own
+distribution happens to favor one token).
+
+`run-tests.sh`/`ci-checks.sh` green after every commit in this item.
+`.work/sample-spark/*/pack` (29 GB, rebuildable from
+`tools/engine-pack.py --dense` / `tools/spark-pack.py` + `tools/gen-profile.mojo`)
+deleted after these gates were recorded, per the coordinator's disk note
+(`/home` was at 95%).
+
+**Item 2: all gates PASS on all 5 models. Named check for each sub-claim;
+nothing here is UNVERIFIED.**
+
+## Item 3-4
 
 Not started.
