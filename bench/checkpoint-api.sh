@@ -13,6 +13,11 @@
 #           -> ids == ref, restored true, cached_tokens == len(P) - 1
 #   refuse  fork with a wrong identity.pack                -> 409 IDENTITY_MISMATCH
 #   list / get / delete / get-after-delete                 -> 1 live, 200, deleted true, 404
+#
+# BARO_CKPT_EXTRA_PAIRS (default "p03-story:p04-list-planets,p05-math:p06-translate")
+# runs the create/flush/fork/id-match cycle again for each extra P:Q pair, on
+# top of the P/Q pair above, so a caller can gate on N prompt pairs agreeing
+# (C2-mini, AMDHQ docs/design/latent-os/06-experiments.md).
 set -uo pipefail
 cd "$(dirname "$0")/.."
 eng=$1; pack=$2; out=$3; port=${4:-8098}
@@ -23,6 +28,7 @@ P=bench/mtp-prompts/p01-water.tokens
 Q=bench/mtp-prompts/p02-python-fib.tokens
 F=bench/mtp-prompts/p03-*.tokens
 F=$(ls $F | head -1)
+extra_pairs=${BARO_CKPT_EXTRA_PAIRS:-"p03-story:p04-list-planets,p05-math:p06-translate"}
 for f in "$P" "$Q" "$F"; do [ -f "$f" ] || { echo "missing prompt file $f" >&2; exit 2; }; done
 {
   echo "engine=$eng sha=$(sha256sum "$eng" | cut -c1-16) serve=$serve sha=$(sha256sum "$serve" | cut -c1-16) pack=$pack port=$port"
@@ -42,9 +48,9 @@ done
 [ "$ready" = 1 ] || { echo "VOID: no /health on $port; see $out/serve.err" >&2; exit 3; }
 echo "health: $(cat "$out/health.json")" | tee -a "$out/arm.txt"
 
-python3 - "$out" "$port" "$P" "$Q" "$F" <<'PY'
+python3 - "$out" "$port" "$P" "$Q" "$F" "$extra_pairs" <<'PY'
 import json, pathlib, sys, urllib.request, urllib.error
-out, port, P, Q, F = pathlib.Path(sys.argv[1]), sys.argv[2], *sys.argv[3:6]
+out, port, P, Q, F, extra_pairs = pathlib.Path(sys.argv[1]), sys.argv[2], *sys.argv[3:7]
 ids = lambda f: [int(x) for x in open(f).read().split()]
 p, q, fl = ids(P), ids(Q), ids(F)
 base = f"http://127.0.0.1:{port}"
@@ -85,8 +91,31 @@ s, g1 = call("GET", f"/v1/checkpoints/{cid}"); check(s == 200 and g1.get("id") =
 s, d = call("DELETE", f"/v1/checkpoints/{cid}"); check(s == 200 and d.get("deleted") is True, "delete true")
 s, _ = call("GET", f"/v1/checkpoints/{cid}"); check(s == 404, "get after delete 404")
 check(not list(sf.glob("*.baro")), "state file removed")
+
+# extra prompt pairs (C2-mini identity gate): each pair gets its own cold
+# ref completion, checkpoint, flush, fork, compared for exact id equality.
+pair_results = []
+for spec in [x for x in extra_pairs.split(",") if x]:
+    pn, qn = spec.split(":")
+    pf = pathlib.Path("bench/mtp-prompts") / f"{pn}.tokens"
+    qf = pathlib.Path("bench/mtp-prompts") / f"{qn}.tokens"
+    ep, eq = ids(pf), ids(qf)
+    s, eref = call("POST", "/v1/completions", {"prompt": ep + eq, **greedy}); check(s == 200, f"[{spec}] ref completion 200 (got {s})")
+    eref_ids = eref["choices"][0]["tokens"]
+    s, _ = call("POST", "/v1/completions", {"prompt": fl, "max_tokens": 4, "spec": False}); check(s == 200, f"[{spec}] flush before create")
+    s, ecr = call("POST", "/v1/checkpoints", {"prompt": ep, "ttl_s": 600, "max_tokens": 1, "spec": False}); check(s == 200, f"[{spec}] create 200 (got {s})")
+    ecid = ecr.get("checkpoint", {}).get("id", "")
+    s, _ = call("POST", "/v1/completions", {"prompt": fl, "max_tokens": 4, "spec": False}); check(s == 200, f"[{spec}] flush before fork")
+    s, efk = call("POST", f"/v1/checkpoints/{ecid}/fork", {"branches": [{"prompt_suffix": eq, **greedy}]}); check(s == 200, f"[{spec}] fork 200 (got {s})")
+    ebr = (efk.get("branches") or [{}])[0]
+    id_match = ebr.get("tokens") == eref_ids
+    check(id_match, f"[{spec}] fork ids == ref ids ({len(ebr.get('tokens', []))} tokens)")
+    call("DELETE", f"/v1/checkpoints/{ecid}")
+    pair_results.append({"pair": spec, "ref_ids": eref_ids, "fork_ids": ebr.get("tokens"), "match": id_match})
+
 (out / "receipt.md").write_text("# checkpoint-api DONE check\n\n" + "\n".join(f"- {l}" for l in log)
-    + f"\n\nref ids: {ref_ids}\nfork ids: {br.get('tokens')}\ncreate timings: {json.dumps(cr.get('completion', {}).get('timings'))}\nfork timings: {json.dumps(br.get('timings'))}\n")
+    + f"\n\nref ids: {ref_ids}\nfork ids: {br.get('tokens')}\ncreate timings: {json.dumps(cr.get('completion', {}).get('timings'))}\nfork timings: {json.dumps(br.get('timings'))}\n"
+    + f"\nextra pairs: {json.dumps(pair_results)}\n")
 print("RESULT", "PASS" if fails == 0 else f"FAIL ({fails})")
 sys.exit(1 if fails else 0)
 PY
