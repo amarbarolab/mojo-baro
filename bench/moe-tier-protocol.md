@@ -142,3 +142,64 @@ consistency check that it really evicted nothing.
 Gate 4 on `f798ed4`: `tools/ci-checks.sh` all non-GPU checks passed;
 `./run-tests.sh` exit 0, 104 PASS, census `97 kernels, 52 in registry, 0
 orphans`.
+
+## Stage 3
+
+Lane `MOE3`, plan `docs/MOE-STAGE3-PLAN.md`. Frozen before item 0's run.
+
+### Item 0: pinned store A/B, zero code
+
+Arm A `BARO_TIER_PINNED=0` (page-cache, the current default), arm B
+`BARO_TIER_PINNED=1` (pinned host store), same engine binary, cap 64, the 20
+`bench/mtp-prompts/`, one stint, `bench/clock-probe.sh` around the pair. No
+file changes: the tier already prints `mode pinned|page-cache` at load
+(`serve/expert_tier.mojo:218-222`), which is the P1 read-back, and per-request
+`refs`, `hits`, `bytes_fetched`, `bytes_per_token` (`:355-361`), so the item's
+own "add the echo if the engine does not print it" clause does not apply.
+
+Check: both arms' load line, hit rate and bytes/token equal to 3 digits (same
+LRU, same requests), identity 20/20 both arms and against the stage-2b
+full-pack reference ids.
+
+Frozen two-way falsifier (arithmetic from the measured pread cost, not a
+target): **arm B at or above 55 tok/s** means the blocking pread is the
+dominant term (model: 8.94 ms compute + 5.81 ms PCIe still on the critical
+path + 40 sync bubbles of 50-150 us = 17-21 ms, 48-58 tok/s). **Arm B near 39
+(below 43)** means it is not, and item 1's stamp table decides what is.
+Either result, item 0 ships no code.
+
+### Item 1: stamp timeline of one tier token
+
+`BARO_TIER_STAMP=1` buckets (open/close, readback+sync, LRU touch, pread,
+copy enqueue, id writeback) accumulated per layer in `ExpertTier`, printed by
+`report()` as a 40-row table plus a run sum. `bench/moe-tier-stamp.py` parses
+and sums a log. Check: buckets sum to `fetch_ns` within 5% on the same run;
+one `rocprofv3` kernel trace of the same request (`bench/moe-launch-count.sh`
+pattern) gives GPU busy time per token, and decode wall minus kernel busy
+(GPU idle) must be accounted for within 20% by the host buckets that overlap
+GPU idle (pread, LRU, enqueue, open/close). `bench/clock-probe.sh` sampled
+during the run.
+
+### Item 2(a): partial pin, request-scoped hot store
+
+Item 0/1 confirmed pread dominant (arm B 67.12 tok/s >= 55; pread 54.6% of
+fetch_ns, readback/sync 42.6%, cap64 vs cap256's offline ceiling only 4
+points apart). Shape: a per-request, non-evicting host-pinned cache
+(`BARO_TIER_HOT=1`, `BARO_TIER_HOTCAP=128` default) that remembers, per
+layer, every distinct expert already fetched this request; a re-reference to
+one (evicted from the 64-slot VRAM LRU, referenced again) copies directly
+from it instead of paying another `pread`. First touches always `pread`
+(and populate the hot store for later reuse); never touches `LayerLru`.
+
+**Frozen prediction, from a deterministic replay of the real `1aa06d5`-style
+trace** (`.work/moe3/item2/expert-trace.txt`, 20 prompts, this tree,
+cross-checked 20/20 against the full-pack reference before use): of the
+23.27% of references that miss the 64-slot LRU, only 16.4% (3.81% of all
+references) are repeats of an expert already seen this request past HOT_CAP
+eviction-free tracking; 81.9% of misses are genuine first touches no
+request-scoped cache can avoid. **Predicted pread-bucket shrink: about 16%,
+not the item's 50% bar.** This is a below-the-bar prediction, frozen before
+the timed run specifically so a live number near it is not later read as a
+surprise. Kill line unchanged: any identity miss, or a live shrink worse
+than the offline number (would mean the hot store is not being reached,
+P8).
