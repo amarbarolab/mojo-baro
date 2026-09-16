@@ -60,6 +60,9 @@ def ours(a):
     p = json.loads((Path(a.out) / "prompts.json").read_text())
     env = dict(os.environ)
     env.update(BARO_SERVE="1", BARO_PACK=a.pack)
+    for kv in (a.env or "").split():
+        k, v = kv.split("=", 1)
+        env[k] = v
     proc = subprocess.Popen([a.engine], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                             stderr=open(Path(a.out) / "ours-engine.err", "w"), env=env, text=True, bufsize=1)
     while True:
@@ -152,6 +155,7 @@ def main():
     ap.add_argument("--url")
     ap.add_argument("--engine")
     ap.add_argument("--pack")
+    ap.add_argument("--env", default="", help="the bake's baro.run.env, applied like tools/baro serve does")
     ap.add_argument("--tasks", default="bench/data/e8_tasks.json")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()

@@ -6,6 +6,8 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 KEY=$1
+if [ -x .work/quality/PRE_HOOK.sh ]; then mv .work/quality/PRE_HOOK.sh .work/quality/PRE_HOOK.ran; bash .work/quality/PRE_HOOK.ran; fi
+if [ -f .work/quality/SKIP ] && grep -qx "$KEY" .work/quality/SKIP; then echo "SKIPPED $KEY (listed in .work/quality/SKIP, not run this round)"; exit 0; fi
 PY=$HOME/Projects/mojo/mojo-baro/.venv/bin/python3
 MOJO=$HOME/Projects/mojo/mojo-baro/.venv/bin/mojo
 WIKI=$HOME/Models/quant-lab/wikitext-2-raw/wiki.test.raw
@@ -49,7 +51,8 @@ fi
 
 "$PY" bench/quality-task-ids.py prep --tok-url $TOK --out "$OUT/task" > "$OUT/task.log" 2>&1 || die prep "$(tail -3 "$OUT/task.log")"
 ok prep "$(tail -1 "$OUT/task.log")"
-"$PY" bench/quality-task-ids.py ours --engine "$cache_engine" --pack "$cache_pack" --out "$OUT/task" >> "$OUT/task.log" 2>&1 || die ours "$(tail -3 "$OUT/task.log")"
+renv=$("$PY" tools/gguf-extract.py "$baro_gguf" --meta | jq -r '.["baro.run.env"] // empty')
+"$PY" bench/quality-task-ids.py ours --engine "$cache_engine" --pack "$cache_pack" --env "$renv" --out "$OUT/task" >> "$OUT/task.log" 2>&1 || die ours "$(tail -3 "$OUT/task.log")"
 ok ours "$(tail -1 "$OUT/task.log")"
 
 GPUP=8199

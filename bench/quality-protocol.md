@@ -273,3 +273,20 @@ off before answering, so the task score would measure the cap, not the model, an
 runs 8 parallel slots (`-np 8`, `-c 16384`, so 2,048 context per slot); every item is still one
 independent T=0 request with the same ids. The Ornith pilot's task arm is discarded and rerun under this
 amendment. Its perplexity numbers stand (ours 9.6124, llama.cpp 9.1251).
+
+## Result (2026-09-16 eve)
+
+| model | engine | PPL ours / llama.cpp (ratio) | task ours / llama.cpp | delta | verdict |
+|---|---|---|---|---|---|
+| Llama-3.2-1B-Instruct-Q4_K_M | spark | pending (spark logprobs landed after this sweep) | 22/120 / 24/120 | -1.7 pp | task PASS |
+| lily-cybersecurity-7b-v0.2-Q6_K | spark | pending (spark logprobs landed after this sweep) | 13/120 / 15/120 | -1.7 pp | task PASS |
+| Qwen2.5-7B-Instruct-Q4_K_M | spark | pending (spark logprobs landed after this sweep) | 46/120 / 46/120 | +0.0 pp | task PASS |
+| Qwen2.5-Coder-7B-Instruct-Q4_K_M | spark | pending (spark logprobs landed after this sweep) | 21/120 / 20/120 | +0.8 pp | task PASS |
+| Qwythos-9B-Claude-Mythos-5-1M-MTP-BF16 | dense | 9.301 / 8.410 (1.106) | 70/120 / 80/120 | -8.3 pp | PASS |
+| RegesCore-1.0-35B-UD-Q4_K_S | moe | 6.233 / 6.242 (0.999) | 11/120 / 12/120 | -0.8 pp | PASS |
+
+Every row that ran is inside its frozen band. Scope cut by the maintainer mid-sweep: Ornith, Qwythos-v2 and
+Spark-X2.5 skipped (`.work/quality/SKIP`); Granite VOID (`quality-run.sh` edited while the sweep was
+executing it, bash re-read shifted lines, its prep step failed). RegesCore's first task arm VOIDed because
+the harness ignored the bake's `baro.run.env` (`BARO_MEGA=0 BARO_SPEC=0`); fixed and rerun, row above
+is the rerun. Qwythos compares our q4 pack with llama.cpp on BF16 (see docs/BASELINE.md).
