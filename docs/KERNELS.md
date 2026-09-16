@@ -78,7 +78,7 @@ must be reachable from `serve/registry.mojo`, a bench, or a test.
 | `amar_realign_gather` | `realign_kernels.mojo` | `TLayout: TensorLayout, PLayout: TensorLayout, PartLayout: TensorLayout` |  | kernels/test_realign.mojo |
 | `amar_realign_reduce` | `realign_kernels.mojo` | `PartLayout: TensorLayout, ELayout: TensorLayout` |  | kernels/test_realign.mojo |
 | `amar_sample_probs` | `sample.mojo` | `XLayout: TensorLayout, PLayout: TensorLayout, CAP: Int = SAMP_CAP` | sample_probs_k, sample_probs_1 | serve/registry.mojo, kernels/test_sample.mojo, kernels/test_sample_device.mojo |
-| `amar_sample_row` | `sample.mojo` | `XLayout: TensorLayout, OLayout: TensorLayout, PLayout: TensorLayout, CAP: Int = SAMP_CAP` | sample_row_k, sample_row_1 | serve/registry.mojo, serve/spark.mojo, kernels/test_sample.mojo, kernels/test_sample_device.mojo |
+| `amar_sample_row` | `sample.mojo` | `XLayout: TensorLayout, OLayout: TensorLayout, PLayout: TensorLayout, CAP: Int = SAMP_CAP` | sample_row_k, sample_row_1 | serve/registry.mojo, serve/spark.mojo, bench/sample-spark-device.mojo, kernels/test_sample.mojo, kernels/test_sample_device.mojo |
 | `amar_sample_row_masked` | `sample.mojo` | `XLayout: TensorLayout, OLayout: TensorLayout, PLayout: TensorLayout, CAP: Int = SAMP_CAP` |  | kernels/test_sample_device.mojo |
 | `amar_spec_accept` | `sample.mojo` | `PLayout: TensorLayout, TLayout: TensorLayout` | spec_accept_k | serve/registry.mojo, kernels/test_sample.mojo, kernels/test_sample_device.mojo |
 | `amar_argmax_final` | `spark_kernels.mojo` | `NB: Int, VLayout: TensorLayout, ILayout: TensorLayout, OLayout: TensorLayout` |  | serve/spark.mojo |
