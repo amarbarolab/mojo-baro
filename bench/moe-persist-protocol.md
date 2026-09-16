@@ -327,3 +327,105 @@ override is stated here, not hidden; the line stands for kernel rounds.
 Re-gated on main (the patch re-applied on top of the tier wiring
 `f798ed4`): receipts below.
 Main-tree re-gate (engine sha f52b144e on top of `f798ed4`, `.work/moe-perf/lc-r60b-main.log`, `ab-r60b-main.log`): launches per token 727.0; 20-prompt A/B r60 107.28 (spread 2.0%) -> r60b **111.89** (spread 1.2%), ratio 1.043, identity 20/20, fail word 0 on 40 runs; run-tests 104 PASS, ci-checks 0, census 99 kernels 0 orphans. MoE champion: **111.89 tok/s_gen**, launch path, 727 launches per token; llama.cpp same-box arm 109.92 (different stint, its r60 read 106.95 there).
+
+## R6.1 result (2026-09-16, fable lane): the persistent MoE token kernel is at parity
+
+`kernels/mega_moe.mojo` (`f900bbb`), one launch per token over the 40 layers,
+head on the launch path. `BARO_DUMP` compare identical over 64 tokens x 80
+slots on p09; teacher-forced agreement 64/64 on 20/20 prompts against a
+build of `38ee0b7`; fail word 0 on every run; run-tests 104 PASS, ci-checks
+0. Receipts and the two defects the gate found in
+`exchange/lane-R6-report.md`. Speed was not gated at this stage.
+
+## R6.2: speed of the persistent MoE kernel (preregistered 2026-09-16, before any timed A/B)
+
+### Receipts in hand (instrument readings, not results)
+
+Per-run device receipt (`a2xxxxx`, "mega barrier gen"): launch arm gen 0 and
+727.0 launches per token; persistent arm gen 470 per token and 8.0 launches
+per token (embed, head norm, head GEMM split-K, reduce, argmax, and the
+dump copies), rocprofv3 difference method, `.work/r6/lc-*.log`.
+
+Phase stamps, last token of p09, `BARO_PROFILE=5` (`.work/r6/prof5-persist.log`),
+kernel span **8391 us**; per-token sums in us:
+
+| phase (30 SSM layers) | us | phase (10 attention layers) | us |
+|---|---|---|---|
+| rms + barrier | 75 | rms | 25 |
+| projections (qkv 17.8 MB, gate 8.9 MB, alpha/beta f32) | 1529 | q/k/v projections (about 20 MB) | 307 |
+| gates + conv | 110 | heads (norm, rope, append) | 33 |
+| l2 | 54 | attention | 116 |
+| delta | 457 | gate multiply | 13 |
+| gated out | 66 | out projection (8.9 MB) | 201 |
+| ssm_out (8.9 MB) | 672 | | |
+| ffn rms | 76 | ffn rms | 24 |
+| router | 112 | router | 36 |
+| top-8 + sigmoid | 268 | top-8 + sigmoid | 89 |
+| gate+up (routed 9.4 MB + shared) | 1379 | gate+up | 456 |
+| down (routed 4.7 MB + shared) | 1689 | down | 586 |
+
+The q8 projection phases (SSM 1529 + 672, attention 307 + 201 = 2709 us
+for about 1.09 GB) run at about 400 GB/s where the launch kernels for the
+same bytes measured 950 GB/s (the HEAD timeline): the persistent grid is one
+block of 8 waves per CU (2 waves per SIMD), and `q8_0_row_dot` issues one
+load group per iteration with no unroll, so those phases are
+latency-bound, not byte-bound. Expert down is 1.19x the launch kernels'
+sum, gate+up about equal, delta 1.4x.
+
+Disclosed: the identity runs of R6.1 are forced runs of a single binary
+and were not a timed A/B, but they carry a reading: reference (launch path,
+greedy) median 111.29 tok/s_gen against candidate (persistent, forced)
+108.07, ratio 0.971. Teacher forcing syncs the host once per token
+(host_enqueue_s equals gpu_total_s on the candidate logs), so the reading
+is biased against the candidate by an unknown amount; it says the kernel
+as landed is not faster, and the phase table says why.
+
+### Levers, in order
+
+1. **Occupancy (no arithmetic change):** the grid size becomes a build-time
+   knob `BARO_MOE_G` (96, 192, 288). Residency at 256 VGPRs, wave32, 8
+   waves per block is 3 blocks per CU, so 288 is the ceiling with zero
+   slack (`persistent-kernel-gfx11`: probe upward with the bounded barrier,
+   fail word read on every run; a NOT-RESIDENT exit voids that G). Work
+   distribution is block/wave-strided, so any G computes the same values.
+   Sweep on 3 prompts (exploration), freeze the chosen G by commit, then
+   the confirmation A/B.
+2. **Latency hiding in the persistent kernel's dots (bit-exact by
+   construction):** `q8_0_row_dot` and `q4k_dot_blocks` variants that issue
+   the loads of UNROLL block-iterations before consuming them, keeping the
+   per-lane fma chain in the same block order and the same `warp.sum` of
+   `acc.reduce_add()`, so every partial is the launch kernel's. The gate 1
+   dump compare and the 20-prompt identity are re-run on the changed
+   kernel before its A/B.
+3. Not in this round: the 256 spills / 940 B scratch (a whole-kernel
+   allocator question, `kernel-parity` rule 10), the expert-dot lane
+   utilisation at K = 512 (16 of 32 lanes idle in `q4k_dot_blocks`), the
+   head fold. Each is its own preregistered step if R6.2 lands.
+
+### Predictions, frozen
+
+- Lever 1 alone: kernel span 8391 -> 7000 to 7600 us (the q8 phases gain
+  most from 2 -> 4 or 6 waves per SIMD; the expert phases some). Token
+  (20-prompt median) 111.9 champion vs about 115 to 122 persistent.
+- Levers 1 + 2: q8 phases 2709 -> 1400 to 1700 us (800 to 950 GB/s), expert
+  and delta phases -300 to -600 us; kernel span **8391 -> 6000 to 6800 us**;
+  token about 6.9 to 7.7 ms including the launch-path head (0.7 ms) and
+  gaps on the 8 remaining launches; **20-prompt median 130 to 145
+  tok/s_gen, ratio 1.16 to 1.30 over the champion's same-stint arm.**
+- Kill line, as the round preregistered: **below +5% (ratio under 1.05)
+  the default stays BARO_MEGA=0 on the MoE profile** and the kernel stays
+  in the tree as an opt-in; identity 20/20 and fail word 0 on all 40 runs
+  are preconditions, not part of the ratio. Default flips only on a pass.
+- Falsifier of the mechanism: if G = 192 does not move the q8 projection
+  phases by at least 20% in the stamp profile, the phases are not
+  occupancy-bound and lever 2's prediction is void before it is built.
+
+### Procedure
+
+Same binary both arms (`BARO_MEGA=0` vs `BARO_MEGA=1`), `bench/ab-prompts.sh`
+under `bench/clock-probe.sh`, 20 prompts, alternating per prompt as the
+script does, power cap and voltage offset read back (P1), per-run device
+receipt (gen 0 vs 470 per token) and fail word in `results.txt`, identity
+column PASS on 20/20, `isa-loops` fingerprint of the timed kernel recorded
+in the report, `run-tests.sh` and `tools/ci-checks.sh` green at the commit
+that carries the default flip.
