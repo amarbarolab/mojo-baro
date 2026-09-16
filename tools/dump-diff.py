@@ -28,7 +28,7 @@ found = False
 for t in range(n):
     for k in range(S):
         d = b[t, k] - a[t, k]
-        if np.abs(d).max() > 0:
+        if np.abs(d).max() > 0 or np.isnan(d).any():
             l, half = k // 2, ("after-ffn" if k % 2 else "after-sub-block")
             kind = "attn" if (l + 1) % 4 == 0 else "ssm"
             ratio = np.divide(b[t, k], a[t, k], out=np.ones_like(a[t, k]), where=a[t, k] != 0)
