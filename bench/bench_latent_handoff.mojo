@@ -27,12 +27,13 @@ from max.gpu.host import DeviceContext, DeviceBuffer
 
 from registry import *
 from window import *
-from latent_harness import load_pack, alloc_bufs, Pack
+from harness import load_pack, alloc_bufs, Pack
 from realign import realign_expected_embedding, final_norm_hidden
 from tokenizer import Tokenizer
 from prefix import Chain, prefix_hash
 from latent import mint_kv_latent, ingest_kv_latent, mint_chain_slot, ingest_into_chain
 from e13_projector import load_projector, apply_projector_k
+from serve_proto import default_sample_params
 from identity import EngineIdentity, compute_engine_identity
 import latentos.proto as proto
 import latentos.sys as latentos_sys
@@ -274,8 +275,9 @@ def make_cfg(pack_q4: Bool, q4_off: Int, e: Int, pf_rows: Int, pf_tail: Int, n_p
     return WindowCfg(
         pack_q4=pack_q4, draft_q4=False, q4_off=q4_off, e=e, kcfg=2,
         spec=False, expert_trace=False, spec_dbg=False, serve=False, req_id=0, prof=False, pf2=False, pf3=False, pf4=False,
-        dump=False, mega=True, att_split=n_total, mega_win=False, dot3=False, pf_chunk=CP,
+        dump=False, dump4=False, dump_layer=0, mega=True, att_split=n_total, mega_win=False, dot3=False, pf_chunk=CP,
         pf_rows=pf_rows, pf_tail=pf_tail, n_total=n_total, fr_k=0, fr_off=0, fr_ids_off=0, n_prompt=n_prompt,
+        sample=default_sample_params(),
     )
 
 
@@ -807,7 +809,7 @@ def main() raises:
                         scored = strip_for_math(text)
                     var t_ctx = tokens.copy()
                     extend_ids(t_ctx, cot_ids)
-                    var t_extra = String(",\"handoff_pos\":") + String(len(t_ctx)) + ",\"handoff_hash\":\"" + String(prefix_hash(t_ctx, len(t_ctx))) + "\""
+                    var t_extra = String(",\"handoff_pos\":") + String(len(t_ctx)) + ",\"handoff_hash\":\"" + String(prefix_hash(List[UInt8](), t_ctx, len(t_ctx))) + "\""
                     out += arm_json(arm, rA.elapsed_s, rB.elapsed_s, rB.ids, text, scored, sv, "", t_extra)
 
                 elif arm == "L8-raw" or arm == "L8-soft" or arm == "L32-soft":
@@ -918,7 +920,7 @@ def main() raises:
                     var hand_pos = len(a_ctx)
                     if wstA.pos != hand_pos:
                         raise Error("KV: producer at pos " + String(wstA.pos) + ", handoff at " + String(hand_pos))
-                    var hand_hash = prefix_hash(a_ctx, hand_pos)
+                    var hand_hash = prefix_hash(List[UInt8](), a_ctx, hand_pos)
                     # KV pool is page-major (kernels/attn.mojo kv_off), so pages
                     # [0, ceil(hand_pos/128)) hold exactly the prefix.
                     var kv_pages = (hand_pos + KVPAGE - 1) // KVPAGE
