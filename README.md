@@ -2,8 +2,9 @@
 
 An LLM inference engine for AMD RDNA3 GPUs, with every GPU kernel written in
 [Mojo](https://www.modular.com/mojo). It serves chat over an OpenAI-compatible
-HTTP API and decodes at roughly 0.9x llama.cpp's speed on the same model file,
-on a single RX 7900 XTX.
+HTTP API on a single RX 7900 XTX. On matched weights it decodes ahead of
+llama.cpp on the dense 9B (Q4_0) and level with it on the 35B MoE; on q8 and
+on packs built from Q4_K_M it is still behind.
 
 The point of the project is the kernels. Consumer RDNA3 cards are where most
 people actually have 24 GB of VRAM, and they are not what the vendor libraries
@@ -21,7 +22,7 @@ minutes, no model weights needed.
 | Qwythos-9B | `qwen35` (hybrid SSM + attention, MTP head) | main engine: chat server, speculative decode, prefix checkpoints, RULER at 32k |
 | Ornith-1.5-9B | `qwen35` | same engine, packed from a Q4_K GGUF; 98.4% teacher-forced agreement with llama.cpp |
 | Spark-X2.5-4B | `spark2_5` (gated sliding-window attention) | its own engine, `serve/spark.mojo` |
-| RegesCore-35B | `qwen35moe` (256 experts, top 8) | decodes and serves; 53.20/64 mean teacher-forced agreement with llama.cpp over 20 prompts, above the dense path's own 51.90 on a quant-matched arm. Decode 93.46 tok/s_gen (20-prompt median, `bench/moe-perf-protocol.md`, 2026-09-15) against llama.cpp's 109.4 on the same GGUF, up from 42.88 that morning. |
+| RegesCore-35B | `qwen35moe` (256 experts, top 8) | decodes and serves; 53.20/64 mean teacher-forced agreement with llama.cpp over 20 prompts, above the dense path's own 51.90 on a quant-matched arm. Decode **111.89 tok/s_gen** (20-prompt median, 727 launches per token, `bench/moe-persist-protocol.md`, 2026-09-15) against llama.cpp's 109.92 on the same GGUF, up from 42.88 at the start of that day. The two numbers come from different stints; in llama.cpp's own stint the previous champion read 0.973x. An experimental expert tier runs it with the routed experts in host RAM (2.68 GB of VRAM instead of 21 GB, output identical on 20/20 prompts) at 39 tok/s, bound by host round trips (`exchange/lane-B4-stage2b-report.md`). |
 
 ### Dense families on the Spark path
 
@@ -84,6 +85,12 @@ tok/s on the same twenty prompts (`bench/attn-protocol.md` Round A/C A/B), so
 the current ratio is higher than 1.19x, but the llama.cpp bar has not been
 re-measured since, and a ratio is only worth quoting when both sides were
 measured in the same stint.
+
+Sampling runs in the decode loop and composes with speculation
+([`bench/spec-sample-protocol.md`](bench/spec-sample-protocol.md), dense q4,
+k=2, one stint): T=0.7 top_p 0.9 decodes at 147.15 tok/s_gen with speculation
+and 109.19 without, against 134.97 greedy without. The sampler itself costs
+about 19% of decode at this 248,320-token vocabulary.
 
 Speculative decode with the model's own MTP head is on by default
 (`BARO_SPEC=0` turns it off) and output-identical to plain greedy decode on
@@ -156,17 +163,25 @@ until proven otherwise.**
 
 `baro-serve` (Rust, `serve/src/`) keeps one engine process alive and speaks
 the OpenAI API: `/v1/chat/completions` and `/v1/completions` with SSE
-streaming, `/v1/models`, `/v1/cancel`, `/tokenize`, `/detokenize`, `/health`.
+streaming, `/v1/models`, `/v1/cancel`, `/v1/fork`, `/tokenize`, `/detokenize`,
+`/health`.
 
 - Stop sequences and EOS are handled inside the engine; a request can be
   cancelled mid-generation.
 - Each message boundary in a conversation is checkpointed, so a follow-up turn
   prefills only the new message (2.7 to 8.3x faster than a grid-only cache on
   the same multi-turn replay).
-- Sampling parameters (`temperature`, `top_p`, `top_k`, `min_p`, `seed`,
-  penalties, `logprobs`) are parsed and carried to the engine. The device
-  sampler kernels exist and are distribution-tested; they are not yet in the
-  decode loop, so generation is greedy today.
+- Sampling (`temperature`, `top_p`, `top_k`, `min_p`, `seed`) runs on the
+  device inside the decode loop of the `qwen35` and `qwen35moe` engine,
+  speculation included. `serve/spark.mojo` still decodes greedy.
+- `tools` calls come back in the OpenAI `tool_calls` shape, and
+  `chat_template_kwargs` reaches the chat template (for example
+  `enable_thinking: false`). `response_format` is validated and refused with
+  HTTP 400 rather than silently ignored: the grammar engine compiles the
+  schema, but the device mask is not in the decode loop yet.
+- `/v1/fork` branches a conversation from its checkpoint: restore takes 2 to
+  4 ms at any prefix length, 2.6x to 3.9x faster wall clock than re-prefilling
+  at 1k to 32k tokens.
 - One request decodes at a time. Batching is the next design round.
 
 Contract between server and engine: [`serve/PROTOCOL.md`](serve/PROTOCOL.md).
@@ -187,7 +202,7 @@ uv sync            # repo-local .venv with the pinned Mojo/MAX toolchain
 Serving a model (after packing a GGUF with `tools/engine-pack.py`):
 
 ```sh
-./.venv/bin/mojo build serve/engine.mojo -I kernels -o .work/engine
+./.venv/bin/mojo build serve/engine.mojo -I . -I kernels -o .work/engine
 (cd serve && cargo build --release)
 ./serve/target/release/baro-serve --engine .work/engine --pack .work/engine-pack-q4 --port 8080
 ```
@@ -198,7 +213,7 @@ Serving a model (after packing a GGUF with `tools/engine-pack.py`):
 
 | | |
 |---|---|
-| `kernels/` | Mojo GPU kernels and their parity tests (`docs/KERNELS.md` lists all 93, generated) |
+| `kernels/` | Mojo GPU kernels and their parity tests (`docs/KERNELS.md` lists all 100, generated) |
 | `serve/` | the engines (`engine.mojo`, `spark.mojo`), tokenizer, prefix cache, and the Rust server |
 | `bench/` | benchmark harnesses and the frozen protocols |
 | `shim/` | C++ hipBLASLt shim behind a C ABI, the vendor reference arm |
