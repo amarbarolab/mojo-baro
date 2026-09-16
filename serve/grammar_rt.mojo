@@ -7,12 +7,9 @@ Matcher per request, and tracks the `</think>` reasoning boundary so
 reasoning tokens are never fed to the matcher
 (grammar/test_reasoning_boundary.mojo's own contract).
 
-briefs/2026-09-16-json-enforcement-lane.md items 1-2. T=0 (masked greedy)
-and spec composition (item 3) are gated on a kernel change requested from
-the coordinator (kernels/sample.mojo `sample_row_body`'s temperature<=0
-branch does not thread the mask) -- `serve/engine.mojo` refuses
-response_format at temperature<=0 loudly until that lands, rather than
-silently decoding unconstrained.
+briefs/2026-09-16-json-enforcement-lane.md items 1-2. Grammar requests run
+with speculation and the megakernel off (serve/engine.mojo); the masked
+kernel covers temperature > 0 and masked greedy at temperature <= 0.
 """
 from std.memory import ArcPointer
 from grammar.automaton import Automaton, Bitset

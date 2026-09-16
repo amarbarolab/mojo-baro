@@ -215,8 +215,8 @@ comptime argmax_d = amar_argmax_pos[type_of(vm_layout), type_of(dtok_layout)]
 # buffers, same as reusing hmax_d for Prob.
 comptime sample_row_k = amar_sample_row[type_of(vm_layout), type_of(dtok_layout), type_of(dtok_layout)]
 # JSON-enforcement item 1 (briefs/2026-09-16-json-enforcement-lane.md): same
-# instantiation, masked. m == 1 only this round (T=0 masked greedy is a
-# separate kernel gap, KERNEL request open) -- vrow_layout would also work
+# instantiation, masked, both temperature > 0 and masked greedy at <= 0.
+# m == 1 only (grammar requests run with spec off) -- vrow_layout would also work
 # for m == 1, but reusing vm_layout keeps one alias for both the plain and
 # masked call sites at the window.mojo sampling branch.
 comptime sample_row_masked_k = amar_sample_row_masked[type_of(vm_layout), type_of(dtok_layout), type_of(dtok_layout)]

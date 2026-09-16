@@ -439,9 +439,6 @@ def main() raises:
             wst.grammar_accepted = 0
             var schema_raw = parse_schema_field(line_in.value())
             if schema_raw != "":
-                if sample.temperature <= 0:
-                    print(err_line(req_id, "response_format needs temperature > 0 this round: the T<=0 masked-greedy kernel has not landed yet (kernels/sample.mojo, KERNEL request open, briefs/2026-09-16-json-enforcement-lane.md) -- pass temperature > 0"))
-                    continue
                 # Interim (see window.mojo item 1 comment): the masked kernel
                 # filters after truncation today, so a schema request that
                 # also truncates could draw outside the allowed set. Dropped
@@ -601,7 +598,8 @@ def main() raises:
         # megakernel and speculation off for the rest of THIS request instead
         # of letting the parameter fall through unused.
         var want_extra = sample.presence_penalty != 0 or sample.frequency_penalty != 0 or sample.top_logprobs > 0
-        if want_extra:
+        var want_grammar = wst.grammar.__bool__()
+        if want_extra or want_grammar:
             spec = False
         # The megakernel bakes greedy argmax into its own launch (mega_token_*
         # kernels take no sampler params); a sampling request always runs the
@@ -610,13 +608,13 @@ def main() raises:
         # amar_sample_row is argmax-equivalent at temperature<=0 (P-K2), so
         # routing it there instead of the megakernel is what lets penalties
         # apply before that equivalent draw.
-        var mega_req = mega and sample.temperature <= 0 and not want_extra
+        var mega_req = mega and sample.temperature <= 0 and not want_extra and not want_grammar
         # A1: the megakernel WINDOW writes the window's tokens itself, so it
         # cannot host the speculative sampling rule (which needs the target's
         # full probability rows, not its argmax). Sampling therefore stays on
         # the launch path for the window too, exactly as it already does for
         # the single-token megakernel above.
-        var mega_win_req = mega_win and sample.temperature <= 0 and not want_extra
+        var mega_win_req = mega_win and sample.temperature <= 0 and not want_extra and not want_grammar
         var dump_pen = want_extra and dump_pen_dir != ""
         var cfg = WindowCfg(pack_q4=pack_q4, draft_q4=draft_q4, q4_off=q4_off, e=e, kcfg=kcfg, spec=spec, spec_dbg=spec_dbg, expert_trace=expert_trace, serve=serve, req_id=req_id, prof=prof, pf2=pf2, pf3=pf3, pf4=pf4, dump=dump, dump4=dump4, dump_layer=dump_layer, mega=mega_req, att_split=att_split, mega_win=mega_win_req, dot3=dot3, pf_chunk=pf_chunk, pf_rows=pf_rows, pf_tail=pf_tail, n_total=n_total, fr_k=fr_k, fr_off=fr_off, fr_ids_off=fr_ids_off, n_prompt=len(prompt), sample=sample.copy(), dump_pen=dump_pen)
         if len(force) > 0 and cfg.spec:
