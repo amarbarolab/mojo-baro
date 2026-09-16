@@ -86,6 +86,36 @@ same call site, same signature); this run is the empirical proof it is
 behavior-preserving, on top of R6.0/R6.0b/R6.1/R6.2's own already-recorded
 20/20 identity receipts against the same commit (`docs/BASELINE.md`).
 
+**End-to-end seed check, coordinator-requested addendum.** The seed
+reproducibility claim above was on fixed logits inside the kernel test plus
+the synthetic VS=64 P-K4 check, not through the full HTTP/engine path. Three
+real `POST /v1/chat/completions` requests, same open-ended prompt (107
+prompt tokens, well over 48), `temperature=0.9`, `max_tokens=30`, seeds
+7, 7, 8:
+
+```
+prompt: "Write a short story that begins as follows and continue it in your
+own words, describing what she finds: In the depths of an ancient forest,
+where sunlight rarely touched the ground, a young explorer named Elara
+discovered a hidden path that seemed to shimmer with an otherworldly light,
+and she wondered where it might lead her next."
+
+seed 7: [8160, 579, 264, 7047, 1817, 25, 271, 16, 13, 220, 2972, 2014, 53983,
+         2570, 5396, 64700, 198, 256, 471, 2972, 36282, 64700, 10382, 3255,
+         593, 25637, 198, 256, 471, 2972]
+seed 7: [8160, 579, 264, 7047, 1817, 25, 271, 16, 13, 220, 2972, 2014, 53983,
+         2570, 5396, 64700, 198, 256, 471, 2972, 36282, 64700, 10382, 3255,
+         593, 25637, 198, 256, 471, 2972]
+seed 8: [8160, 579, 264, 7047, 1817, 25, 271, 16, 13, 220, 2972, 2014, 53983,
+         2570, 5396, 64700, 198, 256, 471, 2972, 52782, 64700, 9357, 264,
+         2716, 3255, 6941, 440, 279, 3766]
+```
+
+The two seed=7 runs are byte-identical (30/30 tokens); seed=8 matches the
+shared prefix through token 20, then diverges at token 21 (`36282` vs
+`52782`) and every token after. Real end-to-end reproduce/diverge, not just
+the kernel-level receipt.
+
 **Item 1: all gates PASS. Named check for each sub-claim above; nothing
 here is UNVERIFIED.**
 
