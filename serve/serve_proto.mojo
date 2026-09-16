@@ -282,3 +282,92 @@ def parse_request(
             return "top_logprobs must be a non-negative integer"
         sample.top_logprobs = iv3
     return ""
+
+
+def json_value_span(line: String, start: Int) -> Int:
+    # `start` points at the first byte of a JSON value. Returns the index
+    # one past the value's last byte, or -1 if malformed/truncated. Handles
+    # nested objects/arrays and quoted strings (with escapes) so a whole
+    # schema object can be sliced out verbatim without a real JSON parser on
+    # this side (grammar.json_value.parse_json_bytes does the real parse,
+    # once the sliced text reaches it).
+    var b = line.as_bytes()
+    var n = len(b)
+    if start >= n:
+        return -1
+    var c = b[start]
+    if c == 34:  # string
+        var i = start + 1
+        while i < n:
+            if b[i] == 92:
+                i += 2
+                continue
+            if b[i] == 34:
+                return i + 1
+            i += 1
+        return -1
+    if c == 123 or c == 91:  # object / array
+        var close: UInt8 = 125 if c == 123 else 93
+        var depth = 0
+        var i = start
+        var in_str = False
+        while i < n:
+            var ch = b[i]
+            if in_str:
+                if ch == 92:
+                    i += 2
+                    continue
+                if ch == 34:
+                    in_str = False
+                i += 1
+                continue
+            if ch == 34:
+                in_str = True
+            elif ch == c:
+                depth += 1
+            elif ch == close:
+                depth -= 1
+                if depth == 0:
+                    return i + 1
+            i += 1
+        return -1
+    # number / true / false / null: scan to the next structural byte.
+    var i = start
+    while i < n and b[i] != 44 and b[i] != 125 and b[i] != 93 and b[i] != 32 and b[i] != 9:
+        i += 1
+    return i
+
+
+def parse_schema_field(line: String) -> String:
+    # A5/JSON-enforcement item 1: {"schema": {...}} carries
+    # response_format.json_schema.schema verbatim from main.rs. Returns the
+    # raw JSON text of the object, or "" when the field is absent or
+    # malformed (absent is the normal case: only a response_format request
+    # sends it). A separate function, not a parse_request field, so every
+    # existing call site (engine.mojo, spark.mojo) is unaffected until each
+    # opts in.
+    var i = json_key(line, "schema")
+    if i < 0:
+        return ""
+    var b = line.as_bytes()
+    if i >= len(b) or b[i] != 123:
+        return ""
+    var end = json_value_span(line, i)
+    if end < 0:
+        return ""
+    return String(line[byte=i:end])
+
+
+def parse_reasoning_field(line: String) -> Bool:
+    # JSON-enforcement item 2: {"reasoning": BOOL}, main.rs's own read of
+    # chat_template_kwargs.enable_thinking (default true, matching Qwythos's
+    # template: reasoning is on unless the caller explicitly turns it off).
+    # Only meaningful alongside "schema" -- the reasoning-boundary scan is
+    # skipped entirely when there is no grammar to gate.
+    var i = json_key(line, "reasoning")
+    if i < 0:
+        return True
+    var b = line.as_bytes()
+    if i < len(b) and b[i] == 102:
+        return False
+    return True

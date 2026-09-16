@@ -38,5 +38,10 @@ mkdir -p .work/katt
 ./.venv/bin/mojo build kernels/test_latent.mojo -I . -I kernels -I serve -o .work/test_latent
 ./.work/test_latent
 
+# JSON-enforcement lane item 1 prep: the request-line schema slice
+# (briefs/2026-09-16-json-enforcement-lane.md), pure string handling.
+./.venv/bin/mojo build serve/test_serve_proto.mojo -I . -I serve -o .work/test_serve_proto
+./.work/test_serve_proto
+
 ./.venv/bin/mojo build tools/kernel-census.mojo -o .work/kernel-census
 ./.work/kernel-census --check
