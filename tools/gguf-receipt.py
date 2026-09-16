@@ -131,7 +131,7 @@ def main():
     # Keep every other baro.* key: only the ledger changes here, so the drop
     # list is the ledger key alone and the rest are carried through as-is.
     keep = [(k, v.decode("utf-8") if isinstance(v, bytes) else v)
-            for k, v in kv.items() if k.startswith("baro.") and k != KEY]
+            for k, v in kv.items() if k.startswith("baro.") and k not in (KEY, embed.PAD_KEY)]
     added, dropped = embed.rewrite(str(model), str(dst),
                                    keep + [(KEY, json.dumps(merged))])
     print(f"wrote {dst} with {len(merged)} receipt(s) in {KEY} "

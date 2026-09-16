@@ -19,6 +19,7 @@ the closure walk above stays harness-free:
   --run-pack-flags='--q4 ...'      how tools/engine-pack.py builds this model's pack
   --run-pack-tool=tools/engine-pack.py  the pack builder itself, so run mode needs no checkout
 """
+import fcntl
 import hashlib
 import os
 import re
@@ -28,6 +29,9 @@ import sys
 from pathlib import Path
 
 ALIGN = 32
+BLOCK = 4096
+FICLONERANGE = 0x4020940D
+PAD_KEY = "baro.pad"
 
 
 def w_str(out, s):
@@ -46,13 +50,21 @@ def src_key(k):
     return k.name if rel.startswith(("kernels/", "serve/")) else rel
 
 
-def rewrite(src, dst, new_kv, drop=("baro.kernel.", "baro.hw.", "baro.run.")):
+def rewrite(src, dst, new_kv, drop=("baro.kernel.", "baro.hw.", "baro.run.", PAD_KEY)):
     """Write dst = src with every KV whose key starts with one of `drop`
     replaced by `new_kv` (a list of (key, string value) pairs), tensor infos
     and tensor data copied byte for byte.
 
     Factored out of main() so tools/gguf-receipt.py can extend one KV without
     a second copy of the container format. Returns (added, dropped).
+
+    Aligned bake (2026-09-16): a `baro.pad` KV is sized so dst's data region
+    starts at the same offset mod 4096 as src's, and the tensor data is then
+    cloned with FICLONERANGE instead of copied. On btrfs the bake shares every
+    tensor extent with its source and costs only its header on disk; before
+    this, every bake landed at a different in-block offset and no two copies
+    could share a block. Any filesystem without clone support falls back to a
+    plain copy with the same bytes.
     """
     f = open(src, "rb")
     magic, version = struct.unpack("<4sI", f.read(8))
@@ -84,7 +96,7 @@ def rewrite(src, dst, new_kv, drop=("baro.kernel.", "baro.hw.", "baro.run.")):
 
     out = open(dst, "wb")
     out.write(struct.pack("<4sI", b"GGUF", 3))
-    out.write(struct.pack("<QQ", n_tensors, len(keep) + len(new_kv)))
+    out.write(struct.pack("<QQ", n_tensors, len(keep) + len(new_kv) + 1))
     for a, b in keep:
         f.seek(a)
         out.write(f.read(b - a))
@@ -93,16 +105,28 @@ def rewrite(src, dst, new_kv, drop=("baro.kernel.", "baro.hw.", "baro.run.")):
         out.write(struct.pack("<I", 8))
         w_str(out, val)
     f.seek(kv_end)
-    out.write(f.read(info_end - kv_end))
+    infos_blob = f.read(info_end - kv_end)
+    fixed = 8 + len(PAD_KEY) + 4 + 8
+    n_pad = (data_start - (out.tell() + fixed + len(infos_blob))) % BLOCK
+    w_str(out, PAD_KEY)
+    out.write(struct.pack("<I", 8))
+    w_str(out, " " * n_pad)
+    out.write(infos_blob)
+    assert out.tell() % ALIGN == 0 and out.tell() % BLOCK == data_start % BLOCK
 
-    pad = (ALIGN - out.tell() % ALIGN) % ALIGN
-    out.write(b"\x00" * pad)
+    size = os.fstat(f.fileno()).st_size
+    head = min((BLOCK - data_start % BLOCK) % BLOCK, size - data_start)
     f.seek(data_start)
-    while True:
-        chunk = f.read(1 << 24)
-        if not chunk:
-            break
-        out.write(chunk)
+    out.write(f.read(head))
+    out.flush()
+    s_off, d_off = data_start + head, out.tell()
+    try:
+        fcntl.ioctl(out.fileno(), FICLONERANGE, struct.pack("<qQQQ", f.fileno(), s_off, 0, d_off))
+        out.seek(0, 2)
+    except OSError:
+        f.seek(s_off)
+        while chunk := f.read(1 << 24):
+            out.write(chunk)
     out.close()
     return len(new_kv), n_kv - len(keep)
 
