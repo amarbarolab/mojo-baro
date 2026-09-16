@@ -90,16 +90,17 @@ verify)
   #    either way its numbers describe an engine nobody can review.
   esha=$(kvget baro.run.harness.sha)
   if [ -n "$esha" ]; then
-    git -C "$here" cat-file -e "$commit:serve/engine.mojo" 2>/dev/null \
-      || die "commit $commit is not in this checkout, so the harness cannot be checked"
-    gsha=$(git -C "$here" show "$commit:serve/engine.mojo" | sha256sum | cut -d' ' -f1)
+    hpath=$(kvget baro.run.harness.path); hpath=${hpath:-serve/engine.mojo}
+    git -C "$here" cat-file -e "$commit:$hpath" 2>/dev/null \
+      || die "commit $commit is not in this checkout, so the harness ($hpath) cannot be checked"
+    gsha=$(git -C "$here" show "$commit:$hpath" | sha256sum | cut -d' ' -f1)
     if [ "$esha" != "$gsha" ]; then
       echo "HARNESS MISMATCH" >&2
       echo "  embedded baro.run.harness.sha: $esha" >&2
-      echo "  git $commit:serve/engine.mojo:  $gsha" >&2
+      echo "  git $commit:$hpath:  $gsha" >&2
       die "the file carries a harness that is not the one at its own commit; its numbers are not verifiable"
     fi
-    echo "harness: embedded copy is byte-identical to serve/engine.mojo at $commit ($gsha)"
+    echo "harness: embedded copy is byte-identical to $hpath at $commit ($gsha)"
   else
     echo "harness: file carries no baro.run.src.engine.mojo (pre-B1 bake); verify uses git only"
   fi
