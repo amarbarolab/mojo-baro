@@ -202,7 +202,30 @@ uv sync            # repo-local .venv with the pinned Mojo/MAX toolchain
 ./bench/run.py     # correctness gate, then throughput
 ```
 
-Serving a model (after packing a GGUF with `tools/engine-pack.py`):
+Serving a model, one command, any supported GGUF (self-describing `-BARO-*.gguf`
+bakes; `~/Models/library/INDEX.md` lists the verified ones):
+
+```sh
+tools/baro serve MODEL.gguf [--port 8080] [--rebuild]
+```
+
+Resolves a structural id from the GGUF's own header (`tools/model-id.py`:
+architecture, every dimension the engine compiles in, layer pattern, expert
+count -- never the weights), builds the engine binary and weight pack only on
+a cache miss, and reuses them on every later `baro serve` of a same-shape
+checkpoint. Cache: `~/.cache/baro/<id>/{engine,manifest.json,packs/<gguf-sha256>/}`
+(override with `$BARO_CACHE`); packs are keyed by id + the checkpoint's own
+sha256, since weights differ per checkpoint even at one shape. Eviction is
+manual: `rm -rf ~/.cache/baro/<id>` drops an engine and every pack under it,
+`rm -rf ~/.cache/baro/<id>/packs/<sha>` drops one pack. `--rebuild` forces a
+fresh engine and pack even on a hit. Engine selection: qwen35/qwen35moe get
+`serve/engine.mojo` with `-D BARO_MODEL=<arch>`; llama/qwen2/granite/spark2_5
+get `serve/spark.mojo` with a profile read straight from the checkpoint. An
+unsupported architecture or tokenizer refuses with the exact missing piece
+before any build starts.
+
+Manual build (no cache, one specific engine/pack pair, after packing a GGUF
+with `tools/engine-pack.py`):
 
 ```sh
 ./.venv/bin/mojo build serve/engine.mojo -I . -I kernels -o .work/engine
