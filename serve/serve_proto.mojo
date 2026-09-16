@@ -75,6 +75,25 @@ def json_key(line: String, key: String) -> Int:
     return i
 
 
+def json_str(line: String, mut i: Int, mut v: String) -> Bool:
+    # Plain JSON string at i: no escapes other than \\ and \" (paths never
+    # need more). False when i is not at an opening quote or unterminated.
+    var b = line.as_bytes()
+    if i >= len(b) or b[i] != 34:
+        return False
+    i += 1
+    var out = List[UInt8]()
+    while i < len(b) and b[i] != 34:
+        if b[i] == 92 and i + 1 < len(b):
+            i += 1
+        out.append(b[i])
+        i += 1
+    if i >= len(b):
+        return False
+    v = String(StringSlice(unsafe_from_utf8=Span(out)))
+    return True
+
+
 def json_int(line: String, mut i: Int, mut v: Int) -> Bool:
     var b = line.as_bytes()
     var neg = False
@@ -146,7 +165,8 @@ def default_sample_params() -> SampleParams:
 
 
 def parse_request(
-    line: String, mut id: Int, mut prompt: List[Int], mut n: Int, mut spec: Bool, mut has_spec: Bool, mut stop: List[List[Int]], mut ckpt: List[Int], mut sample: SampleParams
+    line: String, mut id: Int, mut prompt: List[Int], mut n: Int, mut spec: Bool, mut has_spec: Bool, mut stop: List[List[Int]], mut ckpt: List[Int], mut sample: SampleParams,
+    mut state_save: String, mut state_load: String,
 ) -> String:
     # {"id":INT,"prompt":[INT,...],"n":INT,"spec":BOOL,"stop":[[INT,...],...],
     #  "ckpt":[INT,...],"temperature":FLOAT,"top_p":FLOAT,"top_k":INT,
@@ -233,6 +253,16 @@ def parse_request(
             if not json_int(line, ci, v3) or v3 < 0:
                 return "ckpt must hold non-negative integers"
             ckpt.append(v3)
+    # Checkpoint API (LatentOS plan 10 sec 8): per-request state file paths,
+    # the same BAROST01 files BARO_STATE_SAVE / BARO_STATE_LOAD write and read.
+    state_save = ""
+    state_load = ""
+    var ssi = json_key(line, "state_save")
+    if ssi >= 0 and not json_str(line, ssi, state_save):
+        return "state_save must be a string"
+    var sli = json_key(line, "state_load")
+    if sli >= 0 and not json_str(line, sli, state_load):
+        return "state_load must be a string"
     var fi = json_key(line, "temperature")
     if fi >= 0:
         var fv: Float64 = 0

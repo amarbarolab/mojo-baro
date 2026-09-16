@@ -325,7 +325,9 @@ def main() raises:
             var req_spec = False
             var req_has_spec = False
             var ckpt_hints = List[Int]()
-            var perr = parse_request(line_in.value(), req_id, prompt, req_n, req_spec, req_has_spec, stop_seqs, ckpt_hints, sample)
+            var sp_state_save = String("")
+            var sp_state_load = String("")
+            var perr = parse_request(line_in.value(), req_id, prompt, req_n, req_spec, req_has_spec, stop_seqs, ckpt_hints, sample, sp_state_save, sp_state_load)
             if perr == "" and len(prompt) < 1:
                 perr = "empty prompt"
             if perr == "" and req_n < 1:

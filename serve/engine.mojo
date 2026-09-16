@@ -40,8 +40,13 @@ from grammar.automaton import Bitset
 # --- engine state file (LatentOS use 2: a saved prefix survives the process) --
 # BAROST01 | int64 pos, conv_n, ssm_n, kv_n | pack salt (32 B) | int32 tokens[pos]
 # | f32 conv[conv_n] | f32 ssm[ssm_n] | f32 K[kv_n] | f32 V[kv_n]
+# BAROST02 | same header | f32 conv[conv_n] | f32 ssm[ssm_n]
+# | f32 Kscale[kv_n/KVHSTR] | int8 K[kv_n] | f32 Vscale[kv_n/KVHSTR] | int8 V[kv_n]
 # K/V are the first ceil(pos/KVPAGE) pages of the page-major pool, so every
 # position below pos is included; the checkpoint is the one saved at pos.
+# BAROST02 quantizes one KVHSTR block (one page, one attention layer, one kv
+# head; KVPAD included but always 0 today) per scale, matching the memory
+# layout's own addressing unit exactly, so dequant needs no reshaping.
 def _put_i64(mut out: List[UInt8], v: Int):
     for b in range(8):
         out.append(UInt8((v >> (8 * b)) & 0xFF))
@@ -71,8 +76,9 @@ def save_state(
     ctx.enqueue_copy(dst_buf=kh, src_buf=DeviceBuffer[KVT](ctx, kc_d.unsafe_ptr(), kvn, owning=False))
     ctx.enqueue_copy(dst_buf=vh, src_buf=DeviceBuffer[KVT](ctx, vc_d.unsafe_ptr(), kvn, owning=False))
     ctx.synchronize()
+    var int8 = getenv("BARO_STATE_INT8", "0") == "1"
     var head = List[UInt8]()
-    var magic = String("BAROST01")
+    var magic = String("BAROST02" if int8 else "BAROST01")
     for i in range(8):
         head.append(magic.as_bytes()[i])
     _put_i64(head, pos)
@@ -88,9 +94,51 @@ def save_state(
         f.write_bytes(Span(head))
         f.write_bytes(Span[UInt8](unsafe_ptr=chain.items[idx].conv_h.unsafe_ptr().unsafe_bitcast[UInt8](), length=CONV_SLOT * 4))
         f.write_bytes(Span[UInt8](unsafe_ptr=chain.items[idx].ssm_h.unsafe_ptr().unsafe_bitcast[UInt8](), length=SSM_SLOT * 4))
-        f.write_bytes(Span[UInt8](unsafe_ptr=kh.unsafe_ptr().unsafe_bitcast[UInt8](), length=kvn * 4))
-        f.write_bytes(Span[UInt8](unsafe_ptr=vh.unsafe_ptr().unsafe_bitcast[UInt8](), length=kvn * 4))
-    print("state saved:", path, " pos", pos, " kv pages", ceildiv(pos, KVPAGE))
+        if int8:
+            var ngroups = kvn // KVHSTR
+            var kscale = List[Scalar[f32]](unsafe_uninit_length=ngroups)
+            var kq = List[Scalar[i8]](unsafe_uninit_length=kvn)
+            _quantize_kv_int8(kh, kvn, kscale, kq)
+            var vscale = List[Scalar[f32]](unsafe_uninit_length=ngroups)
+            var vq = List[Scalar[i8]](unsafe_uninit_length=kvn)
+            _quantize_kv_int8(vh, kvn, vscale, vq)
+            f.write_bytes(Span[UInt8](unsafe_ptr=kscale.unsafe_ptr().unsafe_bitcast[UInt8](), length=ngroups * 4))
+            f.write_bytes(Span[UInt8](unsafe_ptr=kq.unsafe_ptr().unsafe_bitcast[UInt8](), length=kvn))
+            f.write_bytes(Span[UInt8](unsafe_ptr=vscale.unsafe_ptr().unsafe_bitcast[UInt8](), length=ngroups * 4))
+            f.write_bytes(Span[UInt8](unsafe_ptr=vq.unsafe_ptr().unsafe_bitcast[UInt8](), length=kvn))
+        else:
+            f.write_bytes(Span[UInt8](unsafe_ptr=kh.unsafe_ptr().unsafe_bitcast[UInt8](), length=kvn * 4))
+            f.write_bytes(Span[UInt8](unsafe_ptr=vh.unsafe_ptr().unsafe_bitcast[UInt8](), length=kvn * 4))
+    print("state saved:", path, " pos", pos, " kv pages", ceildiv(pos, KVPAGE), " format", magic)
+
+
+def _quantize_kv_int8(hb: HostBuffer[KVT], kvn: Int, mut scales: List[Scalar[f32]], mut qdata: List[Scalar[i8]]):
+    var ngroups = kvn // KVHSTR
+    for g in range(ngroups):
+        var base = g * KVHSTR
+        var amax = Scalar[f32](0)
+        for i in range(KVHSTR):
+            var v = abs(hb[base + i])
+            if v > amax:
+                amax = v
+        var scale = amax / 127 if amax > 0 else Scalar[f32](1)
+        var inv = Scalar[f32](127) / amax if amax > 0 else Scalar[f32](0)
+        scales[g] = scale
+        for i in range(KVHSTR):
+            var qf = round(hb[base + i] * inv)
+            qf = min(max(qf, Scalar[f32](-127)), Scalar[f32](127))
+            qdata[base + i] = qf.cast[i8]()
+
+
+def _dequantize_kv_int8(mut hb: HostBuffer[KVT], data: List[UInt8], scale_off: Int, q_off: Int, kvn: Int):
+    var scales = data.unsafe_ptr().unsafe_offset(scale_off).unsafe_bitcast[Scalar[f32]]()
+    var qdata = data.unsafe_ptr().unsafe_offset(q_off).unsafe_bitcast[Scalar[i8]]()
+    var ngroups = kvn // KVHSTR
+    for g in range(ngroups):
+        var scale = scales[g]
+        var base = g * KVHSTR
+        for i in range(KVHSTR):
+            hb[base + i] = qdata[base + i].cast[f32]() * scale
 
 
 def load_state(
@@ -101,12 +149,18 @@ def load_state(
     var data: List[UInt8]
     with open(path, "r") as f:
         data = f.read_bytes()
-    var magic = String("BAROST01")
     if len(data) < 72:
         raise Error("BARO_STATE_LOAD: file too short")
+    var m2 = String("BAROST02")
+    var is_v2 = True
     for i in range(8):
-        if data[i] != magic.as_bytes()[i]:
-            raise Error("BARO_STATE_LOAD: not a BAROST01 state file")
+        if data[i] != m2.as_bytes()[i]:
+            is_v2 = False
+    if not is_v2:
+        var m1 = String("BAROST01")
+        for i in range(8):
+            if data[i] != m1.as_bytes()[i]:
+                raise Error("BARO_STATE_LOAD: not a BAROST01/BAROST02 state file")
     var pos = _get_i64(data, 8)
     var kvn = _get_i64(data, 32)
     if _get_i64(data, 16) != CONV_SLOT or _get_i64(data, 24) != SSM_SLOT:
@@ -124,7 +178,9 @@ def load_state(
             v |= Int(data[off + 4 * t + b]) << (8 * b)
         tokens.append(v)
     off += 4 * pos
-    if len(data) != off + (CONV_SLOT + SSM_SLOT + 2 * kvn) * 4:
+    var ngroups = kvn // KVHSTR
+    var kv_bytes = 2 * kvn * 4 if not is_v2 else 2 * (ngroups * 4 + kvn)
+    if len(data) != off + (CONV_SLOT + SSM_SLOT) * 4 + kv_bytes:
         raise Error("BARO_STATE_LOAD: payload length mismatch")
     if chain.cap == 0:
         raise Error("BARO_STATE_LOAD: needs a checkpoint slot")
@@ -148,8 +204,16 @@ def load_state(
     var kh = ctx.enqueue_create_host_buffer[KVT](kvn)
     var vh = ctx.enqueue_create_host_buffer[KVT](kvn)
     ctx.synchronize()
-    unsafe_memcpy(dest=kh.unsafe_ptr().unsafe_bitcast[UInt8](), src=data.unsafe_ptr().unsafe_offset(off), count=kvn * 4)
-    unsafe_memcpy(dest=vh.unsafe_ptr().unsafe_bitcast[UInt8](), src=data.unsafe_ptr().unsafe_offset(off + kvn * 4), count=kvn * 4)
+    if is_v2:
+        var k_scale_off = off
+        var k_q_off = off + ngroups * 4
+        var v_scale_off = k_q_off + kvn
+        var v_q_off = v_scale_off + ngroups * 4
+        _dequantize_kv_int8(kh, data, k_scale_off, k_q_off, kvn)
+        _dequantize_kv_int8(vh, data, v_scale_off, v_q_off, kvn)
+    else:
+        unsafe_memcpy(dest=kh.unsafe_ptr().unsafe_bitcast[UInt8](), src=data.unsafe_ptr().unsafe_offset(off), count=kvn * 4)
+        unsafe_memcpy(dest=vh.unsafe_ptr().unsafe_bitcast[UInt8](), src=data.unsafe_ptr().unsafe_offset(off + kvn * 4), count=kvn * 4)
     ctx.enqueue_copy(dst_buf=DeviceBuffer[KVT](ctx, kc_d.unsafe_ptr(), kvn, owning=False), src_buf=kh)
     ctx.enqueue_copy(dst_buf=DeviceBuffer[KVT](ctx, vc_d.unsafe_ptr(), kvn, owning=False), src_buf=vh)
     ctx.synchronize()
@@ -389,6 +453,8 @@ def main() raises:
         var stop_seqs = List[List[Int]]()
         var ckpt_hints = List[Int]()
         var sample = default_sample_params()
+        var req_state_save = String("")
+        var req_state_load = String("")
         if serve:
             var line_in = Optional[String](None)
             if len(pending) > 0:
@@ -400,7 +466,7 @@ def main() raises:
             var req_n = 0
             var req_spec = False
             var req_has_spec = False
-            var perr = parse_request(line_in.value(), req_id, prompt, req_n, req_spec, req_has_spec, stop_seqs, ckpt_hints, sample)
+            var perr = parse_request(line_in.value(), req_id, prompt, req_n, req_spec, req_has_spec, stop_seqs, ckpt_hints, sample, req_state_save, req_state_load)
             if perr == "" and len(prompt) < 1:
                 perr = "empty prompt"
             if perr == "" and req_n < 1:
@@ -491,6 +557,21 @@ def main() raises:
             # exactly as on the cold path. A miss is today's path.
             # spec mode replays at least one prompt row so the draft head's
             # hidden rows (hn_d) are fresh: the checkpoint at len-1 is skipped.
+            if req_state_load != "":
+                # Checkpoint API: bring the named state file into the chain
+                # before the lookup; the lookup then finds it by prefix hash.
+                # A refusal (different pack, bad file) is this request's
+                # error, never the engine's death.
+                var load_err = String("")
+                try:
+                    var t_ld = perf_counter_ns()
+                    var lpos = load_state(ctx, chain, bufs.kc_d, bufs.vc_d, req_state_load, tmax)
+                    print("state loaded:", req_state_load, " pos", lpos, " in", Float64(perf_counter_ns() - t_ld) / 1e9, "s")
+                except e:
+                    load_err = String(e)
+                if load_err != "":
+                    print(err_line(req_id, load_err))
+                    continue
             ckpt_idx = chain.lookup(prompt, len(prompt) - 1 if spec else len(prompt))
             cached = chain.pos_of(ckpt_idx)
             chain.invalidate_above(cached)
@@ -754,6 +835,10 @@ def main() raises:
             print("latent: exported", exported, "checkpoints, chain gen", latent_gen)
         if state_save != "":
             save_state(ctx, chain, bufs.kc_d, bufs.vc_d, state_save, prompt, len(prompt) - 1)
+        if req_state_save != "":
+            var t_sv = perf_counter_ns()
+            save_state(ctx, chain, bufs.kc_d, bufs.vc_d, req_state_save, prompt, len(prompt) - 1)
+            print("state saved:", req_state_save, " pos", len(prompt) - 1, " in", Float64(perf_counter_ns() - t_sv) / 1e9, "s")
         var dt = Float64(perf_counter_ns() - t0) / 1e9
         print("host_enqueue_s:", t_host, " gpu_total_s:", dt)
         var flw = ctx.enqueue_create_host_buffer[DType.uint32](3)
