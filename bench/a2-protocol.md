@@ -23,7 +23,8 @@ table is an identity map today; its value is A3 (N requests share the pool) and 
 - Every kernel that touches KV takes the table as one more pointer argument; every launch site passes
   `b.kvtab_d`. The MoE megakernel and the spark profile get the same argument and an identity table
   (one rule, no special cases). Kernel files stay comment-free.
-- Host: `serve/kvpage.mojo`, a `PageTable` (free list over the pool's physical pages, `alloc(n)`,
+- Host: a new `kvpage.mojo` under `serve/` (named this way until the lane lands, for the
+  dangling-reference check), a `PageTable` (free list over the pool's physical pages, `alloc(n)`,
   `free`, `identity()`, `reverse()`, `upload(ctx)`), owned by the engine's window state; `kvtab_d`
   (`int32[tpages]`) in `WindowBufs`. `BARO_KVTAB=identity|reverse` selects the mapping at start-up
   and is echoed (P1). State save gathers logical pages through the table; state load resets the table
