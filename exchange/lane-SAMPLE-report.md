@@ -217,45 +217,84 @@ deleted after these gates were recorded, per the coordinator's disk note
 **Item 2: all gates PASS on all 5 models. Named check for each sub-claim;
 nothing here is UNVERIFIED.**
 
-## Item 3: penalties, UNVERIFIED, blocked on the coordinator
+## Items 3-4: penalties and top-N logprobs, PASS (dense/MoE engine)
 
-Host reference already exists and is tested (`serve/sample_ref.mojo`'s
-`apply_penalties`, part of the standing `run-tests.sh` suite: "PASS token 9
-penalized to 6.5 ; untouched token 8 stays 8.0"). `presence_penalty`/
-`frequency_penalty` are already parsed into `SampleParams` (C3/A5) but
-nothing downstream reads them yet. The device side is a kernel change per
-the brief's own routing rule, so it went to `w82:p1` as a `KERNEL:` message
-with a concrete interface proposal (confirmed delivered, coordinator status
-`working`): `amar_apply_penalties(X: [R,VOCAB], Counts: [R,VOCAB] i32, n,
-presence_penalty, frequency_penalty)` applied before truncation/softmax,
-plus a small `amar_bump_count` to update `Counts` once per generated token,
-both keeping the per-request history off the host (the same class of cost
-B4 already measured as the expensive one). Not started beyond the message:
-the host-side per-request `Counts` buffer allocation and the bump call site
-depend on whatever the coordinator actually lands, and building against a
-guessed layout risks landing the wrong thing.
+`presence_penalty`/`frequency_penalty` were already parsed into
+`SampleParams` (C3/A5) but nothing read them; `serve/sample_ref.mojo`'s host
+reference (`apply_penalties`) already existed and is tested. Device side is
+fable's `amar_apply_penalties`/`amar_topn_probs` (`90353f8`, receipts
+`exchange/lane-SAMPLE-kernels.md`); host wiring is `0e25b36` (+
+`42c57b3`, an unrelated git-index-race fix, see below), commit message has
+the full design. Summary:
 
-**Item 3: UNVERIFIED. Gate (device-vs-sample_ref check with penalties on,
-plus an HTTP request where frequency_penalty visibly suppresses a repeated
-token) cannot run until the kernel lands.**
+- `serve/serve_proto.mojo` parses `top_logprobs` off the wire.
+- `serve/window.mojo`, in the plain (non-spec) single-token decode step
+  (`m == 1`, past the prompt): copies `toks_d[n_prompt:st.pos+1]` back to
+  host, builds the same distinct-id/count list `sample_ref.apply_penalties`
+  would, calls `amar_apply_penalties` on the logits row before the draw,
+  then `amar_topn_probs` after (when `top_logprobs > 0`), and threads the
+  chosen token's own probability (`amar_sample_row`'s `Prob` output,
+  already penalty-correct since penalties ran first) plus the top-N list
+  into the per-token line: `{"id":...,"tok":...,"logprob":...,"top_logprobs":[...]}`.
+- `serve/harness.mojo`/`serve/registry.mojo` carry the new buffers and
+  kernel instantiations.
+- `serve/src/protocol.rs`/`engine.rs`/`main.rs`: `top_logprobs` on the wire
+  `SampleParams`; `EngineMsg::Tok`/`Event::Tok` carry the optional logprob
+  data; both `/v1/completions` and `/v1/chat/completions` (streaming and
+  not) return an OpenAI-shaped `logprobs` object built from it, `null` when
+  nothing was requested (a request with neither field gets byte-identical
+  output to before this landed).
 
-## Item 4: logprobs, PARTIALLY SCOPED, not started
+**Scope, stated plainly.** Only the plain non-spec single-token decode step
+is wired: spec+sample+penalties (fable's per-row `Ids/Cnt` design supports
+it, row `j` = shared history + drafts `0..j-1`) and `serve/spark.mojo` are
+NOT wired. Named as open follow-ups, not silently skipped.
 
-Chosen-token logprob needs no kernel change: `amar_sample_row` already
-returns the drawn token's own probability (`window.mojo`'s plain sampled
-path already computes it into `b.hmax_d` scratch, `serve/spark.mojo`'s new
-`Sprob` scratch from item 2 the same way) and nothing currently copies it
-back or surfaces it. `top_logprobs N` does need a kernel (shipping the
-whole VOCAB-width row to host every token to sort it there is the same
-expensive-round-trip class item 3 avoids), so it rode the same `KERNEL:`
-message as item 3, proposed as `amar_topn_probs` reusing `sample.mojo`'s
-existing radix-select machinery.
+**Gates.**
 
-**Item 4: UNVERIFIED, not started.** Wiring chosen-token logprob through
-both engines' line protocol, `serve/serve_proto.mojo`, the Rust HTTP layer
-(`serve/src/*.rs`) for both endpoints plus SSE, and the OpenAI response
-shape is real multi-file surgery I have not attempted yet; reported
-honestly as not done rather than claimed and left unverified.
+1. Kernel-vs-`sample_ref`: fable's own (`kernels/test_sample_pen.mojo`, in
+   `run-tests.sh`, 3 real 248320-vocab rows, both penalty kinds and spec
+   rows with drafts): device bit-equal to the host reference, top-N ids
+   equal to the host sort, probs within 4.2e-7 (bar 1e-5, brief asked for
+   1e-4). `run-tests.sh` 102 kernels, 57 in registry, 0 orphans, exit 0.
+2. T=0 unaffected: `tools/test_server.sh` ALL PASS (clippy clean, 25 cargo
+   tests, `.work/pen-test-server/`: 64/64 token match on completion, SSE,
+   queued, stop, cancel-recovery, reject, shutdown) plus a direct one-shot
+   spot check, same GENERATED tokens as every earlier run this session.
+3. **`frequency_penalty` visibly suppresses a repeated token, real HTTP.**
+   `/v1/completions` against `baro-serve` + the MoE pack, same prompt/seed,
+   `temperature=0.6`: unpenalized, token `2972` (a list-numbering marker)
+   appears 3 times (positions 4, 13, 25) in 40 generated tokens; with
+   `frequency_penalty=50, presence_penalty=50`, it appears once (position
+   4) and never again, replaced by different tokens from position 13
+   onward. (A moderate penalty, 1.5, produced no visible change on this
+   model at this temperature: the MoE decode logits are extremely peaked
+   here, as items 1-2 already found, so a small penalty doesn't clear the
+   logit gap to the runner-up; 50 does. Recorded as a real finding, not
+   hidden by picking a magnitude that "worked".) Body:
+   ```
+   POST /v1/completions {"prompt":[8160,579,264,7047,1817,25],"max_tokens":40,"temperature":0.6,"seed":5}
+   -> tokens [...2972(pos4)...2972(pos13)...2972(pos25)...]
+   POST /v1/completions {"prompt":[8160,579,264,7047,1817,25],"max_tokens":40,"temperature":0.6,"seed":5,"frequency_penalty":50.0,"presence_penalty":50.0}
+   -> tokens [...2972(pos4)...561...1156...] (2972 never repeats)
+   ```
+4. **`top_logprobs`, real HTTP, chosen-token consistency.** `/v1/chat/completions`,
+   `temperature=0.7`, `logprobs:true, top_logprobs:5`, 8 real generated
+   tokens: every token's own `logprob` equals its `top_logprobs[0].logprob`
+   with `top_logprobs[0].id` equal to the chosen token id (the invariant a
+   wiring bug would break), values monotonically descending within each
+   list, all `<= 0`. Full response body in the commit message; example
+   entry: `{"id":8160,"logprob":-0.0535,"top_logprobs":[{"id":8160,"logprob":-0.0535},{"id":90700,"logprob":-2.956},...]}`.
+
+**Items 3-4: PASS for the dense/MoE engine, scoped to the plain non-spec
+decode step. Spec+sample+penalties and `serve/spark.mojo` are named
+follow-ups, not done.**
+
+**Git-index race, `0e25b36`/`42c57b3`.** Committing this lane's files by
+explicit pathspec still swept in another lane's in-progress `bench/`
+deletion and edits (concurrent `git add` in the same checkout, not
+protected by an explicit path list). Fixed same-turn, nothing lost, logged
+`~/Brain/m.ledger/mojo-baro.md` 2026-09-16 and flagged to `w82:p1`.
 
 ## INTERFACE received from fable (`w82:p5`), items 3-4
 
@@ -292,11 +331,9 @@ an interface that may still move during implementation.
 
 ## Status at this point in the lane
 
-Items 1-2 landed and gated, all receipts above. Item 3 (penalties) and item
-4's `top_logprobs` half are with fable (`w82:p5`) implementing the agreed
-interface; item 4's chosen-token-logprob half is scoped (needs no kernel,
-`amar_sample_row`'s own `Prob` output is already penalty-correct once
-`amar_apply_penalties` runs first) but not yet wired pending the same
-kernel landing, since both endpoints' logprob field should ship together
-rather than in two passes. Whiteboard ticked per item as it lands (§3 LIVE
-RULE); `herd tell` sent for each landing plus every coordinator exchange.
+**All four items landed and gated.** Items 1-2 cover all served models
+(MoE + 5 Spark dense targets); items 3-4 cover the dense/MoE engine's plain
+non-spec decode step, with spec-window composition and `serve/spark.mojo`
+named as open follow-ups rather than silently skipped. Whiteboard ticked
+per item as it landed (§3 LIVE RULE); `herd tell` sent for each landing
+plus every coordinator/kernel exchange.
