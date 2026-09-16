@@ -242,7 +242,7 @@ struct Tokenizer(Movable):
             raise Error("gguf: tokenizer.ggml.scores missing or mismatched for SPM model")
         if not saw_add_space_prefix_key:
             self.add_space_prefix = self.is_spm
-        self.ignore_merges = self.pre == "llama3" or self.pre == "llama-bpe"
+        self.ignore_merges = self.pre == "llama3" or self.pre == "llama-bpe" or self.pre == "minicpm5"
         if not saw_add_bos_key and self.ignore_merges:
             self.add_bos = True
 
@@ -259,6 +259,9 @@ struct Tokenizer(Movable):
             self.patterns.append(Pattern(r"[一-龥぀-ゟ゠-ヿ]+"))
             self.patterns.append(Pattern(r"[!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+| ?[\p{P}\p{S}]+|[\r\n]|\s+(?!\S)|\s+"))
             self.patterns.append(Pattern(r"\p{N}"))
+        elif self.pre == "minicpm5":
+            self.patterns.append(Pattern(r"\p{N}{1,3}"))
+            self.patterns.append(Pattern(CONTR + r"|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}+| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"))
         elif self.pre == "gpt-2" or self.pre == "default" or self.pre == "granite-docling":
             self.patterns.append(Pattern(r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"))
         else:
