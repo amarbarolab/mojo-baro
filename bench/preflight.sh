@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # CPU preflight before any GPU job (PROTOCOL-RULES P15).
-#   bench/preflight.sh          run everything below, write .work/preflight.ok for this exact tree
+#   bench/preflight.sh          run everything below, write .work/preflight.ok keyed to the content of every tracked and untracked (non-ignored) file
 #   bench/preflight.sh --check  exit 1 unless .work/preflight.ok matches the current tree (gate scripts call this)
 # Checks: tools/ci-checks.sh (docs, py/sh syntax, census, every bench/*.mojo builds), every run-tests.sh test
 # binary builds, dense and MoE engines build, baro-serve builds and its unit tests pass.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-stamp() { printf '%s %s\n' "$(git rev-parse HEAD)" "$( (git diff HEAD; git ls-files -o --exclude-standard | xargs -r cat) | sha256sum | cut -c1-16)"; }
+stamp() { git ls-files -co --exclude-standard -z | xargs -0 sha256sum 2>/dev/null | sha256sum | cut -c1-32; }
 if [ "${1:-}" = --check ]; then
   [ "$(cat .work/preflight.ok 2>/dev/null)" = "$(stamp)" ] && exit 0
-  echo "FAIL preflight: no passing bench/preflight.sh for this tree (HEAD $(git rev-parse --short HEAD) + working changes); run it first" >&2
+  echo "FAIL preflight: no passing bench/preflight.sh for the current file contents; run it first" >&2
   exit 1
 fi
 rm -f .work/preflight.ok; mkdir -p .work/preflight
