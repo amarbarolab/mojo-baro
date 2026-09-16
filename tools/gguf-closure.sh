@@ -40,6 +40,31 @@ fi
 [ -n "$ref" ] || { [ -s "$out/ref-embedded.txt" ] && ref="$out/ref-embedded.txt"; } || true
 [ -n "${BARO_PROMPT:-}" ] || { [ -s "$out/prompt.tokens" ] && export BARO_PROMPT="$out/prompt.tokens"; } || true
 export MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_SIZE_PERCENT=10
+
+# Build a pack for $model into $out/pack from the pack tool the file itself
+# carries (baro.run.pack.tool names it, baro.run.src.<that name> is its
+# source, baro.run.pack.flags its flags). Used by both the spark branch and
+# the dense qwen35 split-layout branch below -- both used to assume a
+# pack already sat at a fixed local path (.work/spark/pack-q8,
+# .work/engine-pack-q4) and crashed or silently used someone else's model's
+# pack when it did not (2026-09-16, ornith/qwythos-v2 first bakes: the
+# split-layout branch opened .work/engine-pack-q4/index.txt unconditionally,
+# a path that happens to hold Qwythos's own weights and nothing else's).
+# Not applied to the qwen35moe branch above: a 35B pack takes real time to
+# build and that branch's local-pack reuse is deliberate, not a gap.
+build_pack_from_file() {
+  local packtool packflags
+  packtool=$(jq -r '.["baro.run.pack.tool"] // empty' "$out/meta.json")
+  [ -n "$packtool" ] || { echo "no baro.run.pack.tool: file carries no pack builder, cannot build a pack from itself"; exit 1; }
+  jq -er --arg k "baro.run.src.$packtool" '.[$k]' "$out/meta.json" > "$out/$packtool" 2>/dev/null \
+    || { echo "no baro.run.src.$packtool embedded"; exit 1; }
+  jq -er '.["baro.run.src.gguf-extract.py"]' "$out/meta.json" > "$out/gguf-extract.py" 2>/dev/null \
+    || cp tools/gguf-extract.py "$out/gguf-extract.py"
+  packflags=$(jq -r '.["baro.run.pack.flags"] // empty' "$out/meta.json")
+  # shellcheck disable=SC2086
+  ./.venv/bin/python3 "$out/$packtool" "$model" "$out/pack" $packflags > "$out/pack.log" 2>&1 \
+    || { tail -20 "$out/pack.log"; echo "pack build FAILED, see $out/pack.log"; exit 1; }
+}
 # vendor arm: if the gguf carries the hipBLASLt shim sources, build them too
 if [ -f "$out/shim/CMakeLists.txt" ]; then
   cmake -S "$out/shim" -B "$out/shim-build" -DCMAKE_BUILD_TYPE=Release >/dev/null && cmake --build "$out/shim-build" -j"$(nproc)" >/dev/null \
@@ -112,16 +137,7 @@ if grep -qx spark_kernels.mojo "$out/FILES"; then
   [ -f "$out/profile.mojo" ] || { echo "no profile.mojo embedded (baro.kernel.src.profile.mojo missing; re-bake with BARO_PROFILE set)"; exit 1; }
   ./.venv/bin/mojo build "$out/harness.mojo" -I "$out" -o .work/engine-closure 2>&1 | grep -E "error" -A3 && exit 1 || true
   [ -x .work/engine-closure ] || { echo "closure build FAILED (no binary)"; exit 1; }
-  packtool=$(jq -r '.["baro.run.pack.tool"] // empty' "$out/meta.json")
-  [ -n "$packtool" ] || { echo "no baro.run.pack.tool: file carries no pack builder, cannot build a pack from itself"; exit 1; }
-  jq -er --arg k "baro.run.src.$packtool" '.[$k]' "$out/meta.json" > "$out/$packtool" 2>/dev/null \
-    || { echo "no baro.run.src.$packtool embedded"; exit 1; }
-  jq -er '.["baro.run.src.gguf-extract.py"]' "$out/meta.json" > "$out/gguf-extract.py" 2>/dev/null \
-    || cp tools/gguf-extract.py "$out/gguf-extract.py"
-  packflags=$(jq -r '.["baro.run.pack.flags"] // empty' "$out/meta.json")
-  # shellcheck disable=SC2086
-  ./.venv/bin/python3 "$out/$packtool" "$model" "$out/pack" $packflags > "$out/pack.log" 2>&1 \
-    || { tail -20 "$out/pack.log"; echo "pack build FAILED, see $out/pack.log"; exit 1; }
+  build_pack_from_file
   [ -s "$out/prompt.tokens" ] || { echo "no prompt (baro.run.prompt.tokens missing)"; exit 1; }
   [ -n "$ref" ] || { echo "no reference tokens (baro.run.ref.tokens missing and none given)"; exit 1; }
   BARO_PACK="$out/pack" BARO_PROMPT="$out/prompt.tokens" BARO_GEN=64 ./.work/engine-closure > "$out/run.log" 2>&1 \
@@ -130,7 +146,6 @@ if grep -qx spark_kernels.mojo "$out/FILES"; then
   sed 's/^generated:/GENERATED:/' "$out/run.log" | tools/check-tokens.sh "$ref" /dev/stdin
   exit
 fi
-ref=${ref:-.work/engine-pack-q4/ref-tokens-64.txt}
 if [ -f "$out/window.mojo" ] && ! grep -q '^def main' "$out/engine.mojo" 2>/dev/null; then
   kcommit=$(jq -r '.["baro.kernel.commit"]' "$out/meta.json")
   git show "$kcommit:serve/engine.mojo" > "$out/closure_main.mojo" || { echo "no serve/engine.mojo at gguf commit $kcommit"; exit 1; }
@@ -141,6 +156,16 @@ if [ -f "$out/window.mojo" ] && ! grep -q '^def main' "$out/engine.mojo" 2>/dev/
 fi
 ./.venv/bin/mojo build "$entry" -I "$out" -o .work/engine-closure 2>&1 | grep -E "error" -A3 && exit 1 || true
 [ -x .work/engine-closure ] || { echo "closure build FAILED (no binary)"; exit 1; }
+# This branch used to run with whatever BARO_PACK happened to be set, or the
+# engine's own hardcoded default (.work/engine-pack-q4) otherwise -- a path
+# that holds one specific model's weights, silently wrong for any other
+# gguf verified on this box (2026-09-16: ornith and qwythos-v2's first
+# bakes both opened Qwythos's own pack and either crashed on a missing
+# tensor or, worse, would have "verified" against the wrong model's output
+# if the shapes had happened to line up). Build this file's own pack unless
+# the caller pinned BARO_PACK explicitly.
+[ -n "${BARO_PACK:-}" ] || { build_pack_from_file; export BARO_PACK="$out/pack"; }
+[ -n "$ref" ] || { echo "no reference tokens (baro.run.ref.tokens missing and none given)"; exit 1; }
 ./.work/engine-closure > "$out/run.log"
 grep -E "tok/s|host_enqueue" "$out/run.log"
 tools/check-tokens.sh "$ref" "$out/run.log"
