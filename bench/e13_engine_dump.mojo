@@ -21,6 +21,7 @@ from max.gpu.host import DeviceContext, HostBuffer
 
 from registry import H, f32
 from window import WindowBufs, WindowState
+from grammar.automaton import Bitset
 from harness import load_pack, alloc_bufs, Pack
 from bench_latent_handoff import (
     collect_latent_raw,
@@ -176,6 +177,7 @@ def run_full_dump(
     var f32_path = out_dir + "/train-k32.bin"
     var n_written = 0
     var n_skipped = 0
+    var skip_k32 = getenv("E13_SKIP_K32", "0") == "1"
     with open(f8_path, "w") as f8:
         with open(f32_path, "w") as f32f:
             for line in raw.split("\n"):
@@ -206,8 +208,9 @@ def run_full_dump(
 
                 var h8 = dump_item_latents(ctx, b, wst, pack_q4, q4_off, e, tokens, tmax, K8)
                 write_dump_record(f8, item_id, answer, tokens, h8, K8)
-                var h32 = dump_item_latents(ctx, b, wst, pack_q4, q4_off, e, tokens, tmax, K32)
-                write_dump_record(f32f, item_id, answer, tokens, h32, K32)
+                if not skip_k32:
+                    var h32 = dump_item_latents(ctx, b, wst, pack_q4, q4_off, e, tokens, tmax, K32)
+                    write_dump_record(f32f, item_id, answer, tokens, h32, K32)
                 n_written += 1
                 if limit > 0 and n_written >= limit:
                     break
@@ -242,7 +245,7 @@ def main() raises:
     var pack_q4 = pack.pack_q4
     var q4_off = pack.q4_off
     var e = pack.e
-    var wst = WindowState(pos=0, pos_prev=0, ring=0, n_drafted=0, n_accepted=0, n_spec_windows=0, n_dumped=0, tp=0, tq=0, pf_att=0, pf_ssm=0, pf_ffn=0, pf_head=0, pf_proc=0, pf_draft=0, fc=[0, 0, 0, 0, 0, 0], pc=[0, 0, 0, 0, 0, 0, 0, 0], p3=[0, 0, 0, 0], pfx=[0, 0, 0, 0])
+    var wst = WindowState(pos=0, pos_prev=0, ring=0, n_drafted=0, n_accepted=0, n_spec_windows=0, n_dumped=0, tp=0, tq=0, pf_att=0, pf_ssm=0, pf_ffn=0, pf_head=0, pf_proc=0, pf_draft=0, fc=[0, 0, 0, 0, 0, 0], pc=[0, 0, 0, 0, 0, 0, 0, 0], p3=[0, 0, 0, 0], pfx=[0, 0, 0, 0], grammar=None, grammar_mask=Bitset(1), grammar_pending_think=False, grammar_think_buf=List[UInt8](), grammar_stop=False, grammar_masked_draws=0, grammar_accepted=0)
 
     if mode == "dump":
         var gsm_path = getenv("E8_GSM8K_TRAIN", getenv("HOME", "") + "/Models/datasets/gsm8k/main/train.jsonl")

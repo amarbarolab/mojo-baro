@@ -274,7 +274,7 @@ def greedy_tok[
     mrow: Int,
 ) -> Int32:
     var best_v = Float32(-3.4e38)
-    var best_i: Int32 = 0
+    var best_i: Int32 = NO_IDX if MASK else 0
     var g = tid * 4
     while g < N:
         var g2 = g + 4 * SAMP_THREADS
@@ -819,8 +819,12 @@ def sample_row_body[
     if temperature <= 0:
         var g = greedy_tok[MASK](X, redf, redi, base, N, tid, mask, mrow)
         if tid == 0:
-            Out[row] = rebind[Out.ElementType](g)
-            Prob[row] = rebind[Prob.ElementType](Float32(1))
+            if g == NO_IDX:
+                Out[row] = rebind[Out.ElementType](Int32(-1))
+                Prob[row] = rebind[Prob.ElementType](Float32(0))
+            else:
+                Out[row] = rebind[Out.ElementType](g)
+                Prob[row] = rebind[Prob.ElementType](Float32(1))
         return
 
     var hist = stack_allocation[u64, address_space = AddressSpace.SHARED](row_major[256]())

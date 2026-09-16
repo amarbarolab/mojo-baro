@@ -29,7 +29,10 @@ from latentos.ipc import connect_unix_socket
 from serve_proto import (
     read_line, cancel_pending, json_key, json_int, json_float,
     SampleParams, default_sample_params, parse_request,
+    parse_schema_field, parse_reasoning_field,
 )
+from grammar_rt import GrammarRuntime, compile_schema_matcher
+from grammar.automaton import Bitset
 
 
 
@@ -37,8 +40,13 @@ from serve_proto import (
 # --- engine state file (LatentOS use 2: a saved prefix survives the process) --
 # BAROST01 | int64 pos, conv_n, ssm_n, kv_n | pack salt (32 B) | int32 tokens[pos]
 # | f32 conv[conv_n] | f32 ssm[ssm_n] | f32 K[kv_n] | f32 V[kv_n]
+# BAROST02 | same header | f32 conv[conv_n] | f32 ssm[ssm_n]
+# | f32 Kscale[kv_n/KVHSTR] | int8 K[kv_n] | f32 Vscale[kv_n/KVHSTR] | int8 V[kv_n]
 # K/V are the first ceil(pos/KVPAGE) pages of the page-major pool, so every
 # position below pos is included; the checkpoint is the one saved at pos.
+# BAROST02 quantizes one KVHSTR block (one page, one attention layer, one kv
+# head; KVPAD included but always 0 today) per scale, matching the memory
+# layout's own addressing unit exactly, so dequant needs no reshaping.
 def _put_i64(mut out: List[UInt8], v: Int):
     for b in range(8):
         out.append(UInt8((v >> (8 * b)) & 0xFF))
@@ -68,8 +76,9 @@ def save_state(
     ctx.enqueue_copy(dst_buf=kh, src_buf=DeviceBuffer[KVT](ctx, kc_d.unsafe_ptr(), kvn, owning=False))
     ctx.enqueue_copy(dst_buf=vh, src_buf=DeviceBuffer[KVT](ctx, vc_d.unsafe_ptr(), kvn, owning=False))
     ctx.synchronize()
+    var int8 = getenv("BARO_STATE_INT8", "0") == "1"
     var head = List[UInt8]()
-    var magic = String("BAROST01")
+    var magic = String("BAROST02" if int8 else "BAROST01")
     for i in range(8):
         head.append(magic.as_bytes()[i])
     _put_i64(head, pos)
@@ -85,9 +94,51 @@ def save_state(
         f.write_bytes(Span(head))
         f.write_bytes(Span[UInt8](unsafe_ptr=chain.items[idx].conv_h.unsafe_ptr().unsafe_bitcast[UInt8](), length=CONV_SLOT * 4))
         f.write_bytes(Span[UInt8](unsafe_ptr=chain.items[idx].ssm_h.unsafe_ptr().unsafe_bitcast[UInt8](), length=SSM_SLOT * 4))
-        f.write_bytes(Span[UInt8](unsafe_ptr=kh.unsafe_ptr().unsafe_bitcast[UInt8](), length=kvn * 4))
-        f.write_bytes(Span[UInt8](unsafe_ptr=vh.unsafe_ptr().unsafe_bitcast[UInt8](), length=kvn * 4))
-    print("state saved:", path, " pos", pos, " kv pages", ceildiv(pos, KVPAGE))
+        if int8:
+            var ngroups = kvn // KVHSTR
+            var kscale = List[Scalar[f32]](unsafe_uninit_length=ngroups)
+            var kq = List[Scalar[i8]](unsafe_uninit_length=kvn)
+            _quantize_kv_int8(kh, kvn, kscale, kq)
+            var vscale = List[Scalar[f32]](unsafe_uninit_length=ngroups)
+            var vq = List[Scalar[i8]](unsafe_uninit_length=kvn)
+            _quantize_kv_int8(vh, kvn, vscale, vq)
+            f.write_bytes(Span[UInt8](unsafe_ptr=kscale.unsafe_ptr().unsafe_bitcast[UInt8](), length=ngroups * 4))
+            f.write_bytes(Span[UInt8](unsafe_ptr=kq.unsafe_ptr().unsafe_bitcast[UInt8](), length=kvn))
+            f.write_bytes(Span[UInt8](unsafe_ptr=vscale.unsafe_ptr().unsafe_bitcast[UInt8](), length=ngroups * 4))
+            f.write_bytes(Span[UInt8](unsafe_ptr=vq.unsafe_ptr().unsafe_bitcast[UInt8](), length=kvn))
+        else:
+            f.write_bytes(Span[UInt8](unsafe_ptr=kh.unsafe_ptr().unsafe_bitcast[UInt8](), length=kvn * 4))
+            f.write_bytes(Span[UInt8](unsafe_ptr=vh.unsafe_ptr().unsafe_bitcast[UInt8](), length=kvn * 4))
+    print("state saved:", path, " pos", pos, " kv pages", ceildiv(pos, KVPAGE), " format", magic)
+
+
+def _quantize_kv_int8(hb: HostBuffer[KVT], kvn: Int, mut scales: List[Scalar[f32]], mut qdata: List[Scalar[i8]]):
+    var ngroups = kvn // KVHSTR
+    for g in range(ngroups):
+        var base = g * KVHSTR
+        var amax = Scalar[f32](0)
+        for i in range(KVHSTR):
+            var v = abs(hb[base + i])
+            if v > amax:
+                amax = v
+        var scale = amax / 127 if amax > 0 else Scalar[f32](1)
+        var inv = Scalar[f32](127) / amax if amax > 0 else Scalar[f32](0)
+        scales[g] = scale
+        for i in range(KVHSTR):
+            var qf = round(hb[base + i] * inv)
+            qf = min(max(qf, Scalar[f32](-127)), Scalar[f32](127))
+            qdata[base + i] = qf.cast[i8]()
+
+
+def _dequantize_kv_int8(mut hb: HostBuffer[KVT], data: List[UInt8], scale_off: Int, q_off: Int, kvn: Int):
+    var scales = data.unsafe_ptr().unsafe_offset(scale_off).unsafe_bitcast[Scalar[f32]]()
+    var qdata = data.unsafe_ptr().unsafe_offset(q_off).unsafe_bitcast[Scalar[i8]]()
+    var ngroups = kvn // KVHSTR
+    for g in range(ngroups):
+        var scale = scales[g]
+        var base = g * KVHSTR
+        for i in range(KVHSTR):
+            hb[base + i] = qdata[base + i].cast[f32]() * scale
 
 
 def load_state(
@@ -98,12 +149,18 @@ def load_state(
     var data: List[UInt8]
     with open(path, "r") as f:
         data = f.read_bytes()
-    var magic = String("BAROST01")
     if len(data) < 72:
         raise Error("BARO_STATE_LOAD: file too short")
+    var m2 = String("BAROST02")
+    var is_v2 = True
     for i in range(8):
-        if data[i] != magic.as_bytes()[i]:
-            raise Error("BARO_STATE_LOAD: not a BAROST01 state file")
+        if data[i] != m2.as_bytes()[i]:
+            is_v2 = False
+    if not is_v2:
+        var m1 = String("BAROST01")
+        for i in range(8):
+            if data[i] != m1.as_bytes()[i]:
+                raise Error("BARO_STATE_LOAD: not a BAROST01/BAROST02 state file")
     var pos = _get_i64(data, 8)
     var kvn = _get_i64(data, 32)
     if _get_i64(data, 16) != CONV_SLOT or _get_i64(data, 24) != SSM_SLOT:
@@ -121,7 +178,9 @@ def load_state(
             v |= Int(data[off + 4 * t + b]) << (8 * b)
         tokens.append(v)
     off += 4 * pos
-    if len(data) != off + (CONV_SLOT + SSM_SLOT + 2 * kvn) * 4:
+    var ngroups = kvn // KVHSTR
+    var kv_bytes = 2 * kvn * 4 if not is_v2 else 2 * (ngroups * 4 + kvn)
+    if len(data) != off + (CONV_SLOT + SSM_SLOT) * 4 + kv_bytes:
         raise Error("BARO_STATE_LOAD: payload length mismatch")
     if chain.cap == 0:
         raise Error("BARO_STATE_LOAD: needs a checkpoint slot")
@@ -145,8 +204,16 @@ def load_state(
     var kh = ctx.enqueue_create_host_buffer[KVT](kvn)
     var vh = ctx.enqueue_create_host_buffer[KVT](kvn)
     ctx.synchronize()
-    unsafe_memcpy(dest=kh.unsafe_ptr().unsafe_bitcast[UInt8](), src=data.unsafe_ptr().unsafe_offset(off), count=kvn * 4)
-    unsafe_memcpy(dest=vh.unsafe_ptr().unsafe_bitcast[UInt8](), src=data.unsafe_ptr().unsafe_offset(off + kvn * 4), count=kvn * 4)
+    if is_v2:
+        var k_scale_off = off
+        var k_q_off = off + ngroups * 4
+        var v_scale_off = k_q_off + kvn
+        var v_q_off = v_scale_off + ngroups * 4
+        _dequantize_kv_int8(kh, data, k_scale_off, k_q_off, kvn)
+        _dequantize_kv_int8(vh, data, v_scale_off, v_q_off, kvn)
+    else:
+        unsafe_memcpy(dest=kh.unsafe_ptr().unsafe_bitcast[UInt8](), src=data.unsafe_ptr().unsafe_offset(off), count=kvn * 4)
+        unsafe_memcpy(dest=vh.unsafe_ptr().unsafe_bitcast[UInt8](), src=data.unsafe_ptr().unsafe_offset(off + kvn * 4), count=kvn * 4)
     ctx.enqueue_copy(dst_buf=DeviceBuffer[KVT](ctx, kc_d.unsafe_ptr(), kvn, owning=False), src_buf=kh)
     ctx.enqueue_copy(dst_buf=DeviceBuffer[KVT](ctx, vc_d.unsafe_ptr(), kvn, owning=False), src_buf=vh)
     ctx.synchronize()
@@ -186,6 +253,10 @@ def main() raises:
     var dump = dump_path != ""
     var dump4 = getenv("BARO_DUMP4", "0") == "1"
     var dump_layer = atol(getenv("BARO_DUMP_LAYER", "0"))
+    # Item 4 verification (coordinator review, 2026-09-16): per-step raw-row
+    # + history dump for an independent host comparison, read once here (the
+    # harness), never in window.mojo. Off by default.
+    var dump_pen_dir = getenv("BARO_DUMP_LOGITS_DIR", "")
 
     var serve = getenv("BARO_SERVE", "0") == "1"
     print("BARO_SERVE:", serve)
@@ -331,7 +402,7 @@ def main() raises:
         ctx.synchronize()
     var toks_d = bufs.toks_d
 
-    var wst = WindowState(pos=0, pos_prev=0, ring=0, n_drafted=0, n_accepted=0, n_spec_windows=0, n_dumped=0, tp=0, tq=0, pf_att=0, pf_ssm=0, pf_ffn=0, pf_head=0, pf_proc=0, pf_draft=0, fc=[0, 0, 0, 0, 0, 0], pc=[0, 0, 0, 0, 0, 0, 0, 0], p3=[0, 0, 0, 0], pfx=[0, 0, 0, 0])
+    var wst = WindowState(pos=0, pos_prev=0, ring=0, n_drafted=0, n_accepted=0, n_spec_windows=0, n_dumped=0, tp=0, tq=0, pf_att=0, pf_ssm=0, pf_ffn=0, pf_head=0, pf_proc=0, pf_draft=0, fc=[0, 0, 0, 0, 0, 0], pc=[0, 0, 0, 0, 0, 0, 0, 0], p3=[0, 0, 0, 0], pfx=[0, 0, 0, 0], grammar=None, grammar_mask=Bitset(1), grammar_pending_think=False, grammar_think_buf=List[UInt8](), grammar_stop=False, grammar_masked_draws=0, grammar_accepted=0)
     var ckpt_cap = atol(getenv("BARO_CKPT", "8")) if serve else 0
     if ckpt_cap < 0:
         ckpt_cap = 0
@@ -361,6 +432,11 @@ def main() raises:
     # Requests read off fd 0 by the cancel probe mid-generation, in arrival
     # order; the request loop drains these before touching fd 0 again.
     var pending = List[String]()
+    # JSON-enforcement item 1 (briefs/2026-09-16-json-enforcement-lane.md):
+    # the grammar vocab/trie, built once on the first response_format
+    # request (not at startup -- every existing run that never sets it pays
+    # nothing, not even the trie build).
+    var grt: Optional[GrammarRuntime] = None
     if serve:
         print("{\"ready\":true,\"tmax\":" + String(tmax) + ",\"mrows\":" + String(MROWS) + ",\"kmax\":" + String(KMAX) + ",\"spec_k\":" + String(kcfg) + ",\"kv\":\"" + String(KVT) + "\",\"pack\":\"" + packdir + "\"}")
 
@@ -377,6 +453,8 @@ def main() raises:
         var stop_seqs = List[List[Int]]()
         var ckpt_hints = List[Int]()
         var sample = default_sample_params()
+        var req_state_save = String("")
+        var req_state_load = String("")
         if serve:
             var line_in = Optional[String](None)
             if len(pending) > 0:
@@ -388,7 +466,7 @@ def main() raises:
             var req_n = 0
             var req_spec = False
             var req_has_spec = False
-            var perr = parse_request(line_in.value(), req_id, prompt, req_n, req_spec, req_has_spec, stop_seqs, ckpt_hints, sample)
+            var perr = parse_request(line_in.value(), req_id, prompt, req_n, req_spec, req_has_spec, stop_seqs, ckpt_hints, sample, req_state_save, req_state_load)
             if perr == "" and len(prompt) < 1:
                 perr = "empty prompt"
             if perr == "" and req_n < 1:
@@ -416,6 +494,42 @@ def main() raises:
             # runs the real rule instead (accept with min(1, p/q) on the
             # truncated distributions, residual draw on the first rejection,
             # bonus token from p), so sampling and speculation compose.
+            # JSON-enforcement item 1/2: reset every request, schema or not
+            # -- wst is reused across requests, so a prior request's matcher
+            # must never leak into one that never asked for response_format.
+            wst.grammar = None
+            wst.grammar_pending_think = False
+            wst.grammar_think_buf = List[UInt8]()
+            wst.grammar_stop = False
+            wst.grammar_masked_draws = 0
+            wst.grammar_accepted = 0
+            var schema_raw = parse_schema_field(line_in.value())
+            if schema_raw != "":
+                # Interim (see window.mojo item 1 comment): the masked kernel
+                # filters after truncation today, so a schema request that
+                # also truncates could draw outside the allowed set. Dropped
+                # once the masked-first kernel lands.
+                sample.top_p = 1.0
+                sample.top_k = 0
+                sample.min_p = 0.0
+                spec = False
+                if not grt:
+                    try:
+                        grt = Optional(GrammarRuntime(packdir))
+                    except e:
+                        print(err_line(req_id, "response_format: grammar runtime failed to load: " + String(e)))
+                        continue
+                if grt.value().vocab_size != VOCAB:
+                    print(err_line(req_id, "response_format: grammar vocab_size " + String(grt.value().vocab_size) + " != engine VOCAB " + String(VOCAB) + " (stale pack?)"))
+                    continue
+                try:
+                    wst.grammar = Optional(compile_schema_matcher(grt.value(), schema_raw))
+                except e:
+                    print(err_line(req_id, "response_format schema: " + String(e)))
+                    continue
+                wst.grammar_pending_think = parse_reasoning_field(line_in.value())
+                wst.grammar_mask = Bitset(VOCAB)
+                print("response_format: schema compiled, reasoning wait:", wst.grammar_pending_think)
             print("prompt tokens:", len(prompt), " n:", gen_n, " spec:", spec, " temperature:", sample.temperature)
             # Per-request teacher forcing. BARO_FORCE is read once at startup,
             # so a forced run used to need one process per prompt: 20 pack
@@ -443,6 +557,21 @@ def main() raises:
             # exactly as on the cold path. A miss is today's path.
             # spec mode replays at least one prompt row so the draft head's
             # hidden rows (hn_d) are fresh: the checkpoint at len-1 is skipped.
+            if req_state_load != "":
+                # Checkpoint API: bring the named state file into the chain
+                # before the lookup; the lookup then finds it by prefix hash.
+                # A refusal (different pack, bad file) is this request's
+                # error, never the engine's death.
+                var load_err = String("")
+                try:
+                    var t_ld = perf_counter_ns()
+                    var lpos = load_state(ctx, chain, bufs.kc_d, bufs.vc_d, req_state_load, tmax)
+                    print("state loaded:", req_state_load, " pos", lpos, " in", Float64(perf_counter_ns() - t_ld) / 1e9, "s")
+                except e:
+                    load_err = String(e)
+                if load_err != "":
+                    print(err_line(req_id, load_err))
+                    continue
             ckpt_idx = chain.lookup(prompt, len(prompt) - 1 if spec else len(prompt))
             cached = chain.pos_of(ckpt_idx)
             chain.invalidate_above(cached)
@@ -542,17 +671,33 @@ def main() raises:
         # stage sum exceeds the unsynchronized sub-block time; compare stages
         # within an arm and the same stage across m, never add these into a budget.
         var pf4 = getenv("BARO_PROFILE", "0") == "4"
+        # Items 3-4 (briefs/2026-09-16-sampling-all-models-lane.md), fix for
+        # the coordinator's P1 inert-parameter finding: penalties/top_logprobs
+        # are only applied on window.mojo's plain (non-spec) single-token
+        # decode step, so a default request (spec ON by default, temperature
+        # possibly 0) could silently never reach it. Force both the
+        # megakernel and speculation off for the rest of THIS request instead
+        # of letting the parameter fall through unused.
+        var want_extra = sample.presence_penalty != 0 or sample.frequency_penalty != 0 or sample.top_logprobs > 0
+        var want_grammar = wst.grammar.__bool__()
+        if want_extra or want_grammar:
+            spec = False
         # The megakernel bakes greedy argmax into its own launch (mega_token_*
         # kernels take no sampler params); a sampling request always runs the
-        # launch path, which is where the sampler is wired below.
-        var mega_req = mega and sample.temperature <= 0
+        # launch path, which is where the sampler is wired below. Same for a
+        # T<=0 request carrying penalties/top_logprobs: the launch path's
+        # amar_sample_row is argmax-equivalent at temperature<=0 (P-K2), so
+        # routing it there instead of the megakernel is what lets penalties
+        # apply before that equivalent draw.
+        var mega_req = mega and sample.temperature <= 0 and not want_extra and not want_grammar
         # A1: the megakernel WINDOW writes the window's tokens itself, so it
         # cannot host the speculative sampling rule (which needs the target's
         # full probability rows, not its argmax). Sampling therefore stays on
         # the launch path for the window too, exactly as it already does for
         # the single-token megakernel above.
-        var mega_win_req = mega_win and sample.temperature <= 0
-        var cfg = WindowCfg(pack_q4=pack_q4, draft_q4=draft_q4, q4_off=q4_off, e=e, kcfg=kcfg, spec=spec, spec_dbg=spec_dbg, expert_trace=expert_trace, serve=serve, req_id=req_id, prof=prof, pf2=pf2, pf3=pf3, pf4=pf4, dump=dump, dump4=dump4, dump_layer=dump_layer, mega=mega_req, att_split=att_split, mega_win=mega_win_req, dot3=dot3, pf_chunk=pf_chunk, pf_rows=pf_rows, pf_tail=pf_tail, n_total=n_total, fr_k=fr_k, fr_off=fr_off, fr_ids_off=fr_ids_off, n_prompt=len(prompt), sample=sample.copy())
+        var mega_win_req = mega_win and sample.temperature <= 0 and not want_extra and not want_grammar
+        var dump_pen = want_extra and dump_pen_dir != ""
+        var cfg = WindowCfg(pack_q4=pack_q4, draft_q4=draft_q4, q4_off=q4_off, e=e, kcfg=kcfg, spec=spec, spec_dbg=spec_dbg, expert_trace=expert_trace, serve=serve, req_id=req_id, prof=prof, pf2=pf2, pf3=pf3, pf4=pf4, dump=dump, dump4=dump4, dump_layer=dump_layer, mega=mega_req, att_split=att_split, mega_win=mega_win_req, dot3=dot3, pf_chunk=pf_chunk, pf_rows=pf_rows, pf_tail=pf_tail, n_total=n_total, fr_k=fr_k, fr_off=fr_off, fr_ids_off=fr_ids_off, n_prompt=len(prompt), sample=sample.copy(), dump_pen=dump_pen)
         if len(force) > 0 and cfg.spec:
             raise Error("BARO_FORCE requires BARO_SPEC=0 (teacher forcing is a no-spec identity gate)")
         wst.reset(t0)
@@ -577,6 +722,28 @@ def main() raises:
                 step_window(ctx, bufs, step_cfg, wst)
             else:
                 step_window(ctx, bufs, cfg, wst)
+            # Item 4 verification (coordinator review, 2026-09-16): the sync
+            # and file write live here, in the harness, never in
+            # window.mojo. bufs.dump_row_h and bufs.pen_hist_h were staged
+            # by window.mojo's own enqueue_copy calls (cfg.dump_pen /
+            # penalties-or-logprobs), synchronized here for the first time.
+            if cfg.dump_pen and wst.pos == pos_before + 1 and pos_before + 1 >= len(prompt):
+                ctx.synchronize()
+                var step = pos_before + 1 - len(prompt)
+                with open(dump_pen_dir + "/row-" + String(step) + ".bin", "w") as f:
+                    var p = bufs.dump_row_h.unsafe_ptr().unsafe_bitcast[UInt8]()
+                    f.write_bytes(Span[UInt8](unsafe_ptr=p, length=VOCAB * 4))
+                with open(dump_pen_dir + "/row-" + String(step) + ".json", "w") as jf:
+                    var js = String("{\"temperature\":") + String(sample.temperature) + ",\"top_k\":" + String(sample.top_k)
+                    js += ",\"top_p\":" + String(sample.top_p) + ",\"min_p\":" + String(sample.min_p)
+                    js += ",\"presence_penalty\":" + String(sample.presence_penalty) + ",\"frequency_penalty\":" + String(sample.frequency_penalty)
+                    js += ",\"top_logprobs\":" + String(sample.top_logprobs) + ",\"history\":["
+                    for i in range(step):
+                        if i > 0:
+                            js += ","
+                        js += String(Int(bufs.pen_hist_h[i]))
+                    js += "]}"
+                    jf.write_bytes(js.as_bytes())
             if len(force) > 0 and pos_before >= len(prompt) - 1:
                 if wst.pos != pos_before + 1:
                     raise Error("BARO_FORCE: step advanced by more than one position (spec/prefill batching) -- void arm")
@@ -623,6 +790,12 @@ def main() raises:
             if serve and cancel_pending(0, req_id, pending):
                 cancelled = True
                 break
+            if wst.grammar_stop:
+                # JSON-enforcement item 1: the matcher reached an accepting
+                # state with no further legal byte -- same "stop" finish as
+                # a stop sequence, no new wire value.
+                stopped = True
+                break
             if len(stop_seqs) > 0 and wst.pos >= len(prompt):
                 ctx.synchronize()
                 ctx.enqueue_copy(dst_buf=toks_h, src_buf=toks_d)
@@ -662,12 +835,21 @@ def main() raises:
             print("latent: exported", exported, "checkpoints, chain gen", latent_gen)
         if state_save != "":
             save_state(ctx, chain, bufs.kc_d, bufs.vc_d, state_save, prompt, len(prompt) - 1)
+        if req_state_save != "":
+            var t_sv = perf_counter_ns()
+            save_state(ctx, chain, bufs.kc_d, bufs.vc_d, req_state_save, prompt, len(prompt) - 1)
+            print("state saved:", req_state_save, " pos", len(prompt) - 1, " in", Float64(perf_counter_ns() - t_sv) / 1e9, "s")
         var dt = Float64(perf_counter_ns() - t0) / 1e9
         print("host_enqueue_s:", t_host, " gpu_total_s:", dt)
         var flw = ctx.enqueue_create_host_buffer[DType.uint32](3)
         ctx.enqueue_copy(dst_buf=flw, src_buf=bufs.ctr_d)
         ctx.synchronize()
         print("mega fail word:", flw[2], "" if flw[2] == 0 else " NOT-RESIDENT: a grid barrier timed out, tokens after it are invalid")
+        if wst.grammar.__bool__():
+            # Gate 4 (bench/grammar-protocol.md): masked_draws must equal
+            # accepted every time -- read on every grammar-constrained run,
+            # not just when something looks wrong.
+            print("grammar masked draws:", wst.grammar_masked_draws, " accepted:", wst.grammar_accepted, " terminated:", wst.grammar_stop, "" if wst.grammar_masked_draws == wst.grammar_accepted else " MISMATCH: masked draw and accept counts desynced")
         # P1 receipt from the device, not from the env echo: the grid-barrier
         # generation counter is written only by a persistent kernel's barriers
         # (the launch path never touches ctr_d), so gen = 0 means no persistent

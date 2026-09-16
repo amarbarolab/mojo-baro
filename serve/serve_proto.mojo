@@ -75,6 +75,25 @@ def json_key(line: String, key: String) -> Int:
     return i
 
 
+def json_str(line: String, mut i: Int, mut v: String) -> Bool:
+    # Plain JSON string at i: no escapes other than \\ and \" (paths never
+    # need more). False when i is not at an opening quote or unterminated.
+    var b = line.as_bytes()
+    if i >= len(b) or b[i] != 34:
+        return False
+    i += 1
+    var out = List[UInt8]()
+    while i < len(b) and b[i] != 34:
+        if b[i] == 92 and i + 1 < len(b):
+            i += 1
+        out.append(b[i])
+        i += 1
+    if i >= len(b):
+        return False
+    v = String(StringSlice(unsafe_from_utf8=Span(out)))
+    return True
+
+
 def json_int(line: String, mut i: Int, mut v: Int) -> Bool:
     var b = line.as_bytes()
     var neg = False
@@ -146,7 +165,8 @@ def default_sample_params() -> SampleParams:
 
 
 def parse_request(
-    line: String, mut id: Int, mut prompt: List[Int], mut n: Int, mut spec: Bool, mut has_spec: Bool, mut stop: List[List[Int]], mut ckpt: List[Int], mut sample: SampleParams
+    line: String, mut id: Int, mut prompt: List[Int], mut n: Int, mut spec: Bool, mut has_spec: Bool, mut stop: List[List[Int]], mut ckpt: List[Int], mut sample: SampleParams,
+    mut state_save: String, mut state_load: String,
 ) -> String:
     # {"id":INT,"prompt":[INT,...],"n":INT,"spec":BOOL,"stop":[[INT,...],...],
     #  "ckpt":[INT,...],"temperature":FLOAT,"top_p":FLOAT,"top_k":INT,
@@ -233,6 +253,16 @@ def parse_request(
             if not json_int(line, ci, v3) or v3 < 0:
                 return "ckpt must hold non-negative integers"
             ckpt.append(v3)
+    # Checkpoint API (LatentOS plan 10 sec 8): per-request state file paths,
+    # the same BAROST01 files BARO_STATE_SAVE / BARO_STATE_LOAD write and read.
+    state_save = ""
+    state_load = ""
+    var ssi = json_key(line, "state_save")
+    if ssi >= 0 and not json_str(line, ssi, state_save):
+        return "state_save must be a string"
+    var sli = json_key(line, "state_load")
+    if sli >= 0 and not json_str(line, sli, state_load):
+        return "state_load must be a string"
     var fi = json_key(line, "temperature")
     if fi >= 0:
         var fv: Float64 = 0
@@ -282,3 +312,92 @@ def parse_request(
             return "top_logprobs must be a non-negative integer"
         sample.top_logprobs = iv3
     return ""
+
+
+def json_value_span(line: String, start: Int) -> Int:
+    # `start` points at the first byte of a JSON value. Returns the index
+    # one past the value's last byte, or -1 if malformed/truncated. Handles
+    # nested objects/arrays and quoted strings (with escapes) so a whole
+    # schema object can be sliced out verbatim without a real JSON parser on
+    # this side (grammar.json_value.parse_json_bytes does the real parse,
+    # once the sliced text reaches it).
+    var b = line.as_bytes()
+    var n = len(b)
+    if start >= n:
+        return -1
+    var c = b[start]
+    if c == 34:  # string
+        var i = start + 1
+        while i < n:
+            if b[i] == 92:
+                i += 2
+                continue
+            if b[i] == 34:
+                return i + 1
+            i += 1
+        return -1
+    if c == 123 or c == 91:  # object / array
+        var close: UInt8 = 125 if c == 123 else 93
+        var depth = 0
+        var i = start
+        var in_str = False
+        while i < n:
+            var ch = b[i]
+            if in_str:
+                if ch == 92:
+                    i += 2
+                    continue
+                if ch == 34:
+                    in_str = False
+                i += 1
+                continue
+            if ch == 34:
+                in_str = True
+            elif ch == c:
+                depth += 1
+            elif ch == close:
+                depth -= 1
+                if depth == 0:
+                    return i + 1
+            i += 1
+        return -1
+    # number / true / false / null: scan to the next structural byte.
+    var i = start
+    while i < n and b[i] != 44 and b[i] != 125 and b[i] != 93 and b[i] != 32 and b[i] != 9:
+        i += 1
+    return i
+
+
+def parse_schema_field(line: String) -> String:
+    # A5/JSON-enforcement item 1: {"schema": {...}} carries
+    # response_format.json_schema.schema verbatim from main.rs. Returns the
+    # raw JSON text of the object, or "" when the field is absent or
+    # malformed (absent is the normal case: only a response_format request
+    # sends it). A separate function, not a parse_request field, so every
+    # existing call site (engine.mojo, spark.mojo) is unaffected until each
+    # opts in.
+    var i = json_key(line, "schema")
+    if i < 0:
+        return ""
+    var b = line.as_bytes()
+    if i >= len(b) or b[i] != 123:
+        return ""
+    var end = json_value_span(line, i)
+    if end < 0:
+        return ""
+    return String(line[byte=i:end])
+
+
+def parse_reasoning_field(line: String) -> Bool:
+    # JSON-enforcement item 2: {"reasoning": BOOL}, main.rs's own read of
+    # chat_template_kwargs.enable_thinking (default true, matching Qwythos's
+    # template: reasoning is on unless the caller explicitly turns it off).
+    # Only meaningful alongside "schema" -- the reasoning-boundary scan is
+    # skipped entirely when there is no grammar to gate.
+    var i = json_key(line, "reasoning")
+    if i < 0:
+        return True
+    var b = line.as_bytes()
+    if i < len(b) and b[i] == 102:
+        return False
+    return True

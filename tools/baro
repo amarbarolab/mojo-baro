@@ -4,8 +4,23 @@
 #   tools/baro run     MODEL.gguf [--port N] [--pack DIR] [--work DIR] [--no-serve]
 #   tools/baro verify  MODEL.gguf [--append] [--work DIR]
 #   tools/baro receipts MODEL.gguf
+#   tools/baro serve   MODEL.gguf [--port N] [--rebuild]
 #
-# TWO MODES, and the difference between them is the whole point.
+# THREE MODES.
+#
+# serve mode is run mode plus a persistent cache (item 4, briefs/2026-09-16-
+# baro-serve-cache-lane.md): the engine binary and weight pack are built once
+# per structural id (tools/model-id.py hashes exactly what serve/engine.mojo
+# or serve/spark.mojo compiles in for this checkpoint's shape, read from the
+# GGUF header only) and reused by every later `baro serve` of a same-shape
+# checkpoint, at $BARO_CACHE (default ~/.cache/baro)/<id>/{engine,manifest.json,
+# packs/<gguf-sha256>/}. Packs are keyed by id + the GGUF's own sha256 (never
+# just id) because weights differ per checkpoint even at one shape. Eviction
+# is manual, not automatic: `rm -rf ~/.cache/baro/<id>` drops an engine and
+# every pack built under it; `rm -rf ~/.cache/baro/<id>/packs/<sha>` drops one
+# pack and keeps the compiled engine.
+#
+# run/verify: TWO MODES, and the difference between them is the whole point.
 #
 # run mode extracts the sources the file carries, builds the engine with the
 # harness the file carries (baro.run.src.engine.mojo), builds the weight pack
@@ -32,12 +47,12 @@ die() { echo "baro: $*" >&2; exit 1; }
 kvget() { jq -r --arg k "$1" '.[$k] // empty' "$meta"; }
 
 cmd=${1:-}; shift || true
-[ -n "$cmd" ] || die "usage: baro {run|verify|receipts} MODEL.gguf [options]"
+[ -n "$cmd" ] || die "usage: baro {serve|run|verify|receipts} MODEL.gguf [options]"
 model=${1:-}; shift || true
 [ -n "$model" ] && [ -f "$model" ] || die "no such model file: ${model:-<none>}"
 model=$(readlink -f "$model")
 
-port=8080; pack=""; work=""; append=0; serve=1
+port=8080; pack=""; work=""; append=0; serve=1; rebuild=0
 while [ $# -gt 0 ]; do
   case $1 in
     --port) port=$2; shift 2;;
@@ -45,6 +60,7 @@ while [ $# -gt 0 ]; do
     --work) work=$2; shift 2;;
     --append) append=1; shift;;
     --no-serve) serve=0; shift;;
+    --rebuild) rebuild=1; shift;;
     *) die "unknown option $1";;
   esac
 done
@@ -113,6 +129,143 @@ verify)
         driver:$driver, power_cap_w:($cap_w|tonumber), tok_s_gen_one_prompt:$tok_s_gen,
         date:$date, host:$host}')"
   fi
+  ;;
+
+serve)
+  t0=$(date +%s)
+  idjson=$("$py" "$here/tools/model-id.py" "$model" --json 2>"$work/model-id.err") || die "$(cat "$work/model-id.err")"
+  echo "$idjson" > "$work/model-id.json"
+  id=$(jq -r .id <<<"$idjson")
+  cache=${BARO_CACHE:-$HOME/.cache/baro}/$id
+  mkdir -p "$cache"
+  echo "id: $id"
+
+  hpath=$(kvget baro.run.harness.path); hpath=${hpath:-serve/engine.mojo}
+  hname=$(basename "$hpath")
+
+  built=0
+  if [ "$rebuild" = 1 ] || [ ! -x "$cache/engine" ]; then
+    built=1
+    ebuild0=$(date +%s)
+    src=$cache/src
+    rm -rf "$src"; mkdir -p "$src"
+    jq -r '.["baro.kernel.files"]' "$meta" | tr ',' '\n' > "$src/FILES"
+    while read -r fname; do
+      [ -n "$fname" ] || continue
+      mkdir -p "$src/$(dirname "$fname")"
+      jq -r --arg k "baro.kernel.src.$fname" '.[$k]' "$meta" > "$src/$fname"
+    done < "$src/FILES"
+    # The harness itself, named from baro.run.harness.path -- engine.mojo for
+    # qwen35/qwen35moe, spark.mojo for llama/qwen2/granite/spark2_5 (item 3).
+    # `tools/baro run` hardcodes baro.run.src.engine.mojo and so cannot build
+    # a spark-harness bake self-contained; this reads the file's own name
+    # instead, since it is written right alongside the source (tools/gguf-
+    # embed.py --run-harness).
+    harness=$(jq -r --arg k "baro.run.src.$hname" '.[$k] // empty' "$meta")
+    [ -n "$harness" ] || die "this file carries no baro.run.src.$hname (harness path $hpath); re-bake with --run-harness=$hpath or use: baro verify $model"
+    printf '%s' "$harness" > "$src/$hname"
+    for k in $(jq -r 'keys[] | select(startswith("baro.run.src.")) | select(endswith(".mojo"))' "$meta"); do
+      n=${k#baro.run.src.}
+      [ "$n" = "$hname" ] && continue
+      jq -r --arg k "$k" '.[$k]' "$meta" > "$src/$n"
+    done
+
+    mojo=$here/.venv/bin/mojo
+    [ -x "$mojo" ] || die "no $mojo; run 'uv sync' in the checkout first (the pinned toolchain is max[all]==26.5.0)"
+    dflag=""
+    [ "$hname" = "engine.mojo" ] && [ -n "$kmodel" ] && dflag="-D BARO_MODEL=$kmodel"
+    echo "building engine ($hpath${dflag:+, $dflag}) ..."
+    # shellcheck disable=SC2086
+    "$mojo" build "$src/$hname" -I "$src" $dflag -o "$cache/engine.new" > "$cache/build.log" 2>&1
+    [ -x "$cache/engine.new" ] || { grep -m3 error "$cache/build.log"; die "engine build FAILED, see $cache/build.log"; }
+    mv -f "$cache/engine.new" "$cache/engine"
+    ebuild_s=$(( $(date +%s) - ebuild0 ))
+    echo "engine: built in ${ebuild_s}s -> $cache/engine"
+    "$py" - "$work/model-id.json" "$model" "$commit" "$hpath" "${dflag:-none}" "$ebuild_s" <<'PYEOF' > "$cache/manifest.json"
+import json, sys, time
+idjson_path, model, commit, harness, flags, secs = sys.argv[1:7]
+idjson = json.load(open(idjson_path))
+json.dump({
+    "id": idjson["id"], "arch": idjson["arch"], "engine_family": idjson["engine"],
+    "id_fields": idjson["fields"], "harness": harness, "build_flags": flags,
+    "mojo_baro_commit": commit, "built_from": model,
+    "built_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    "build_seconds": int(secs),
+}, sys.stdout, indent=1)
+PYEOF
+  fi
+  echo "engine: $([ $built = 1 ] && echo miss || echo hit) $cache/engine"
+
+  # GGUF sha (item 2: packs keyed by id + the checkpoint's own weights, never
+  # just id), cached by (path, size, mtime) so a warm `baro serve` never
+  # re-hashes a multi-GB file it already hashed this box.
+  shacache=${BARO_CACHE:-$HOME/.cache/baro}/sha-cache.tsv
+  touch "$shacache"
+  statkey=$(stat -c '%s %Y' "$model")
+  gsha=$(awk -v m="$model" -v k="$statkey" '$1==m && ($2 FS $3)==k {print $4}' "$shacache" | tail -1)
+  if [ -z "$gsha" ]; then
+    gsha=$(sha256sum "$model" | cut -d' ' -f1)
+    echo "$model $statkey $gsha" >> "$shacache"
+  fi
+  packdir=$cache/packs/$gsha
+  pbuilt=0
+  if [ "$rebuild" = 1 ] || [ ! -s "$packdir/index.txt" ]; then
+    pbuilt=1
+    pbuild0=$(date +%s)
+    packtool=$(kvget baro.run.pack.tool); packtool=${packtool:-engine-pack.py}
+    packflags=$(kvget baro.run.pack.flags)
+    packsrc=$cache/pack-src; mkdir -p "$packsrc"
+    jq -er --arg k "baro.run.src.$packtool" '.[$k]' "$meta" > "$packsrc/$packtool" 2>/dev/null \
+      || { echo "pack tool: file carries no baro.run.src.$packtool, using the checkout's tools/$packtool"; cp "$here/tools/$packtool" "$packsrc/$packtool"; }
+    jq -er '.["baro.run.src.gguf-extract.py"]' "$meta" > "$packsrc/gguf-extract.py" 2>/dev/null \
+      || cp "$here/tools/gguf-extract.py" "$packsrc/gguf-extract.py"
+    rm -rf "$packdir.new"; mkdir -p "$packdir.new"
+    echo "building pack ($packtool ${packflags:-<no flags>}) ..."
+    # shellcheck disable=SC2086
+    "$py" "$packsrc/$packtool" "$model" "$packdir.new" $packflags > "$cache/pack.log" 2>&1 \
+      || { tail -5 "$cache/pack.log"; die "pack build FAILED, see $cache/pack.log"; }
+    rm -rf "$packdir"; mv "$packdir.new" "$packdir"
+    pbuild_s=$(( $(date +%s) - pbuild0 ))
+    echo "pack: built in ${pbuild_s}s -> $packdir ($(wc -l < "$packdir/index.txt") tensors)"
+  fi
+  echo "pack: $([ $pbuilt = 1 ] && echo miss || echo hit) $packdir ($(wc -l < "$packdir/index.txt") tensors)"
+
+  # Text endpoints need tokenizer.json + tokenizer-meta.json in the pack. Built
+  # from the GGUF by tools/gguf-tokenizer-json.mojo (byte-level BPE); for any
+  # other tokenizer (SPM, spark2_5) the meta is still written and a shipped
+  # hf/tokenizer.json next to the model is copied in.
+  if [ ! -s "$packdir/tokenizer.json" ] || [ ! -s "$packdir/tokenizer-meta.json" ]; then
+    tj=$here/.work/gguf-tokenizer-json
+    [ -x "$tj" ] || "$here/.venv/bin/mojo" build "$here/tools/gguf-tokenizer-json.mojo" -I "$here" -I "$here/serve" -o "$tj" > "$work/tokjson-build.log" 2>&1 \
+      || die "tokenizer tool build FAILED, see $work/tokjson-build.log"
+    if ! "$tj" "$model" "$packdir" > "$work/tokjson.log" 2>&1; then
+      shipped=$(dirname "$model")/hf/tokenizer.json
+      if [ -s "$shipped" ]; then
+        cp "$shipped" "$packdir/tokenizer.json"
+        echo "tokenizer: $(head -1 "$work/tokjson.log"); copied $shipped"
+      else
+        echo "tokenizer: none ($(head -1 "$work/tokjson.log")); text endpoints will return 503, token-id requests work"
+      fi
+    fi
+  fi
+  [ -s "$packdir/tokenizer.json" ] && echo "tokenizer: $packdir/tokenizer.json"
+
+  total_s=$(( $(date +%s) - t0 ))
+  echo "receipt: id=$id engine=$([ $built = 1 ] && echo miss || echo hit) pack=$([ $pbuilt = 1 ] && echo miss || echo hit) elapsed_s=$total_s"
+
+  [ $serve = 1 ] || { echo "--no-serve: stopping after build"; exit 0; }
+  bs=$here/serve/target/release/baro-serve
+  if [ ! -x "$bs" ]; then
+    echo "baro-serve is not built; building it (needs cargo) ..."
+    cargo build --release --manifest-path "$here/serve/Cargo.toml" > "$work/cargo.log" 2>&1 \
+      || die "cargo build FAILED, see $work/cargo.log"
+  fi
+  renv=$(kvget baro.run.env)
+  [ -z "$renv" ] || echo "env from the file: $renv"
+  echo "self-reported: every tok/s this server prints came from the harness the"
+  echo "self-reported: model file carries, not from a harness a verifier chose."
+  # shellcheck disable=SC2086
+  exec env $renv "$bs" --engine "$cache/engine" --pack "$packdir" --port "$port"
   ;;
 
 run)
@@ -202,6 +355,6 @@ run)
   ;;
 
 *)
-  die "unknown command $cmd (run, verify, receipts)"
+  die "unknown command $cmd (serve, run, verify, receipts)"
   ;;
 esac

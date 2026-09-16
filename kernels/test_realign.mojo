@@ -302,6 +302,7 @@ def main() raises:
         pos=0, pos_prev=0, ring=0, n_drafted=0, n_accepted=0, n_spec_windows=0, n_dumped=0,
         tp=0, tq=0, pf_att=0, pf_ssm=0, pf_ffn=0, pf_head=0, pf_proc=0, pf_draft=0,
         fc=[0, 0, 0, 0, 0, 0], pc=[0, 0, 0, 0, 0, 0, 0, 0], p3=[0, 0, 0, 0], pfx=[0, 0, 0, 0],
+        grammar=None, grammar_mask=Bitset(1), grammar_pending_think=False, grammar_think_buf=List[UInt8](), grammar_stop=False, grammar_masked_draws=0, grammar_accepted=0,
     )
 
     var prompt_names = List[String]()
@@ -332,7 +333,7 @@ def main() raises:
             spec=False, expert_trace=False, spec_dbg=False, serve=False, req_id=0, prof=False, pf2=False, pf3=False, pf4=False,
             dump=False, dump4=False, dump_layer=-1, mega=True, att_split=TMAX, mega_win=False,
             dot3=False, pf_chunk=1024, pf_rows=0, pf_tail=0, n_total=plen, fr_k=0, fr_off=0,
-            fr_ids_off=0, n_prompt=plen, sample=default_sample_params(),
+            fr_ids_off=0, n_prompt=plen, sample=default_sample_params(), dump_pen=False,
         )
         wst.reset(perf_counter_ns())
         while wst.pos < plen:

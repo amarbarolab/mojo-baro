@@ -8,6 +8,7 @@
 //! (branches from one shared prompt, B5), POST /tokenize, POST /detokenize.
 //! One request runs at a time; the rest queue.
 
+mod checkpoints;
 mod engine;
 mod protocol;
 mod text;
@@ -36,6 +37,9 @@ struct App {
     engine: EnginePool,
     text: Option<Text>,
     model: String,
+    /// Checkpoint API registry (LatentOS plan 10 sec 8).
+    ckpts: checkpoints::Registry,
+    identity: checkpoints::Identity,
 }
 
 type Shared = Arc<App>;
@@ -117,7 +121,10 @@ async fn main() {
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "mojo-baro".into());
-    let app = Arc::new(App { engine, text, model });
+    let identity = checkpoints::Identity::compute(&opts.pack, &tok_path);
+    let ckpts = checkpoints::Registry::from_env();
+    eprintln!("checkpoints: dir {} cap {} identity {:?}", ckpts.dir.display(), ckpts.cap, identity);
+    let app = Arc::new(App { engine, text, model, ckpts, identity });
 
     let router = Router::new()
         .route("/health", get(health))
@@ -125,6 +132,9 @@ async fn main() {
         .route("/v1/completions", post(completions))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/fork", post(fork))
+        .route("/v1/checkpoints", post(checkpoints::create).get(checkpoints::list))
+        .route("/v1/checkpoints/{id}", get(checkpoints::get_one).delete(checkpoints::delete))
+        .route("/v1/checkpoints/{id}/fork", post(checkpoints::fork))
         .route("/v1/cancel", post(cancel))
         .route("/tokenize", post(tokenize))
         .route("/detokenize", post(detokenize))
@@ -155,6 +165,8 @@ async fn main() {
 enum ApiError {
     Plain(StatusCode, String),
     Exceed { n_prompt_tokens: u64, n_ctx: u64 },
+    /// Checkpoint API: the checkpoint's identity and this server's differ in `field`.
+    Mismatch(String),
 }
 
 impl ApiError {
@@ -171,6 +183,11 @@ impl IntoResponse for ApiError {
             ApiError::Plain(code, msg) => {
                 let body = json!({"error": {"message": msg, "type": "invalid_request_error", "code": code.as_u16()}});
                 (code, Json(body)).into_response()
+            }
+            ApiError::Mismatch(field) => {
+                let body = json!({"error": {"code": 409, "message": "IDENTITY_MISMATCH",
+                    "type": "identity_mismatch", "field": field}});
+                (StatusCode::CONFLICT, Json(body)).into_response()
             }
             ApiError::Exceed { n_prompt_tokens, n_ctx } => {
                 let body = json!({"error": {
@@ -259,8 +276,17 @@ struct Gen {
     /// M1b role-boundary checkpoint hints (`Text::role_boundaries`); empty
     /// for `/v1/completions`, which has no message list.
     ckpt: Vec<u32>,
+    /// Checkpoint API: (state_save, state_load) file paths for the engine.
+    state: (Option<String>, Option<String>),
     /// C3 control block (parsed here, not yet acted on by the engine).
     sample: protocol::SampleParams,
+    /// JSON-enforcement item 1: `response_format.json_schema.schema`,
+    /// verbatim. `None` for every request that does not set
+    /// `response_format` -- every endpoint but `/v1/chat/completions`
+    /// today (spark's own 400 stays unconditional; see chat_completions).
+    schema: Option<Value>,
+    /// Item 2: `chat_template_kwargs.enable_thinking`, default true.
+    reasoning: Option<bool>,
 }
 
 /// OpenAI's `stop`: a single string or an array of strings.
@@ -308,7 +334,7 @@ fn check_and_submit(app: &App, g: &Gen) -> Result<(u64, mpsc::UnboundedReceiver<
         return Err(ApiError::exceed_context(g.prompt.len() as u64, tmax as u64));
     }
     app.engine
-        .submit(g.prompt.clone(), g.n, g.spec, g.stop.clone(), g.ckpt.clone(), g.sample.clone())
+        .submit(g.prompt.clone(), g.n, g.spec, g.stop.clone(), g.ckpt.clone(), g.sample.clone(), g.schema.clone(), g.reasoning, g.state.clone())
         .map_err(|e| ApiError::Plain(StatusCode::SERVICE_UNAVAILABLE, e))
 }
 
@@ -417,6 +443,11 @@ async fn collect(app: &App, mut rx: mpsc::UnboundedReceiver<Event>) -> Result<(A
                 stats = stats_json(&s);
                 break;
             }
+            // serve/PROTOCOL.md: an {"id","error"} line means the request
+            // was "rejected before any GPU work" -- true exactly when no Tok
+            // arrived first, which is the client-error (400) case; an error
+            // after generation started is a mid-request engine failure (502).
+            Event::Error(e) if acc.tokens.is_empty() => return Err(ApiError::Plain(StatusCode::BAD_REQUEST, format!("engine: {e}"))),
             Event::Error(e) => return Err(ApiError::Plain(StatusCode::BAD_GATEWAY, format!("engine: {e}"))),
         }
     }
@@ -589,7 +620,10 @@ async fn completions(State(app): State<Shared>, Json(r): Json<CompletionReq>) ->
         stream: r.stream,
         stop: compute_stop(&app, r.stop),
         ckpt: vec![],
+        state: (None, None),
         sample: r.sampler.to_sample_params(r.logprobs),
+        schema: None,
+        reasoning: None,
     };
     let model = r.model.unwrap_or_else(|| app.model.clone());
     let (req_id, rx) = check_and_submit(&app, &g)?;
@@ -669,10 +703,13 @@ async fn fork(State(app): State<Shared>, Json(r): Json<ForkReq>) -> Result<Respo
             stream: false,
             stop: compute_stop(&app, b.stop),
             ckpt: vec![],
+            state: (None, None),
             // logprobs not supported on /v1/fork branches yet (not in
             // serve/PROTOCOL.md's branch shape); item 4 scoped to the two
             // completion endpoints.
             sample: b.sampler.to_sample_params(None),
+            schema: None,
+            reasoning: None,
         };
         let n_prompt = g.prompt.len();
         let (req_id, rx) = check_and_submit(&app, &g)?;
@@ -806,21 +843,16 @@ fn content_text(v: &Value) -> Result<String, ApiError> {
     }
 }
 
-/// A5: response_format is accepted and validated, never silently ignored
-/// (bench/PROTOCOL-RULES.md P1's silently-inert parameter), but not
-/// enforced. Evidence, not a placeholder: the engine's decode loop has no
-/// point where the host sees a step's logits or can steer which token gets
-/// chosen before it is written -- `serve/engine.mojo`'s only per-step host
-/// visibility is the already-generated token id (used for stop-sequence
-/// matching), after the device has committed to it. True enforcement needs
-/// either the device mask (kernels/sample.mojo, mask before Gumbel -- the
-/// device half of A5, never edited by this lane) or a synchronous
-/// per-token host round trip that would itself be a decode-loop
-/// architecture change, out of an API-wiring lane's scope. `grammar/
-/// json_schema.mojo` compiling a `response_format`-shaped schema is proven
-/// offline (see the report), which is as far as "enforce it on the host"
-/// goes without one of those two.
-fn check_response_format(rf: &Value) -> Result<(), ApiError> {
+/// A5/JSON-enforcement item 1 (briefs/2026-09-16-json-enforcement-lane.md):
+/// validates `response_format` shape and returns the schema object itself
+/// (never silently ignored, bench/PROTOCOL-RULES.md P1). Enforcement is the
+/// caller's job (`chat_completions`): the dense/MoE engine now takes the
+/// schema per request and masks the device draw against it
+/// (`serve/grammar_rt.mojo`, `kernels/sample.mojo` amar_sample_row_masked);
+/// `serve/spark.mojo`'s engine has no such wiring, so the caller 400s
+/// before ever reaching this function's Ok path for that family (item 4 --
+/// gated on `app.engine.limits.kmax`, spark's ready line always reports 0).
+fn check_response_format(rf: &Value) -> Result<Value, ApiError> {
     let obj = rf.as_object().ok_or_else(|| bad("response_format must be an object"))?;
     let kind = obj.get("type").and_then(Value::as_str).ok_or_else(|| bad("response_format.type is required"))?;
     if kind != "json_schema" {
@@ -830,16 +862,8 @@ fn check_response_format(rf: &Value) -> Result<(), ApiError> {
         .get("json_schema")
         .and_then(Value::as_object)
         .ok_or_else(|| bad("response_format.json_schema is required for type \"json_schema\""))?;
-    if !schema_obj.contains_key("schema") {
-        return Err(bad("response_format.json_schema.schema is required"));
-    }
-    Err(bad(
-        "response_format is not enforced yet: no host-side point exists to apply a token mask \
-         without either kernels/sample.mojo (mask before Gumbel, the device half of A5) or a \
-         per-token host round trip that is itself a decode-loop architecture change; both are out \
-         of this lane's scope (briefs/2026-09-15-p2-a5-grammar-api.md). grammar/json_schema.mojo \
-         compiling this shape of schema is proven offline, see exchange/2026-09-15-p2-a5-report.md",
-    ))
+    let schema = schema_obj.get("schema").ok_or_else(|| bad("response_format.json_schema.schema is required"))?;
+    Ok(schema.clone())
 }
 
 /// A5: Qwythos's own tool-call wire format (from its `tokenizer.chat_template`,
@@ -922,9 +946,29 @@ async fn chat_completions(State(app): State<Shared>, Json(r): Json<ChatReq>) -> 
     if r.messages.is_empty() {
         return Err(bad("messages is empty"));
     }
-    if let Some(rf) = &r.response_format {
-        check_response_format(rf)?;
-    }
+    // JSON-enforcement item 4/5 (briefs/2026-09-16-json-enforcement-lane.md):
+    // `serve/spark.mojo`'s engine has no grammar wiring, so it keeps the
+    // 400 unconditionally; the dense/MoE engine (serve/engine.mojo) is
+    // told apart by its `ready` line's kmax, which spark's always reports
+    // as 0 (serve/PROTOCOL.md) and the dense/MoE engine never does.
+    let schema = match &r.response_format {
+        Some(rf) if app.engine.limits.kmax == 0 => {
+            return Err(bad("response_format is not supported on this engine (no draft head / grammar wiring); dense and MoE only"));
+        }
+        Some(rf) => Some(check_response_format(rf)?),
+        None => None,
+    };
+    // Item 2: reasoning is on unless the caller explicitly turned it off
+    // the same way Qwythos's own chat template does
+    // (`{%- if enable_thinking is defined and enable_thinking is false %}`).
+    // Only meaningful when a schema is set; None otherwise so the wire
+    // line omits it, matching every request before this lane.
+    let reasoning = schema.as_ref().map(|_| {
+        !matches!(
+            r.chat_template_kwargs.as_ref().and_then(|k| k.get("enable_thinking")),
+            Some(Value::Bool(false))
+        )
+    });
     let msgs = r
         .messages
         .iter()
@@ -952,7 +996,10 @@ async fn chat_completions(State(app): State<Shared>, Json(r): Json<ChatReq>) -> 
         stream: r.stream,
         stop: compute_stop(&app, r.stop),
         ckpt,
+        state: (None, None),
         sample: r.sampler.to_sample_params(if r.logprobs == Some(true) { Some(r.top_logprobs.unwrap_or(1)) } else { r.top_logprobs }),
+        schema,
+        reasoning,
     };
     let model = r.model.unwrap_or_else(|| app.model.clone());
     let (req_id, rx) = check_and_submit(&app, &g)?;
@@ -1071,12 +1118,20 @@ mod a5_tests {
     }
 
     #[test]
-    fn response_format_400s_a_well_formed_json_schema_shape_as_not_enforced() {
-        let err = check_response_format(&json!({"type": "json_schema", "json_schema": {"name": "x", "schema": {"type": "object"}}})).unwrap_err();
+    fn response_format_returns_the_schema_object_on_a_well_formed_shape() {
+        match check_response_format(&json!({"type": "json_schema", "json_schema": {"name": "x", "schema": {"type": "object"}}})) {
+            Ok(schema) => assert_eq!(schema, json!({"type": "object"})),
+            Err(_) => panic!("expected Ok"),
+        }
+    }
+
+    #[test]
+    fn response_format_requires_the_schema_key() {
+        let err = check_response_format(&json!({"type": "json_schema", "json_schema": {"name": "x"}})).unwrap_err();
         match err {
             ApiError::Plain(code, msg) => {
                 assert_eq!(code, StatusCode::BAD_REQUEST);
-                assert!(msg.contains("not enforced"), "{msg}");
+                assert!(msg.contains("schema"), "{msg}");
             }
             _ => panic!("expected ApiError::Plain"),
         }

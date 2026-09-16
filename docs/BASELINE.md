@@ -471,3 +471,26 @@ or any identity failure, refutes this row.
   `aa3f147` bakes needed `~/AMDHQ/src` and are superseded).
   `tools/gguf-verify.sh MODEL.gguf` is the contributor's one-command check
   (`docs/amd-family.md`).
+
+## Quality vs llama.cpp (2026-09-16, `bench/quality-protocol.md`)
+
+Same GGUF both arms. Perplexity: WikiText-2 test, 8 x 512-token chunks, llama-perplexity's second-half
+scoring window (2,040 tokens), one token stream from llama.cpp's tokenizer. Task: `bench/data/e8_tasks.json`
+(100 GSM8K math + 20 JSON), thinking off, T=0, identical token ids to both arms, exact match. Ours = the
+engine and pack `tools/baro serve` caches.
+
+| model | engine | PPL ours / llama.cpp (ratio) | task ours / llama.cpp | delta | verdict |
+|---|---|---|---|---|---|
+| Llama-3.2-1B-Instruct-Q4_K_M | spark | pending (spark logprobs landed after this sweep) | 22/120 / 24/120 | -1.7 pp | task PASS |
+| lily-cybersecurity-7b-v0.2-Q6_K | spark | pending (spark logprobs landed after this sweep) | 13/120 / 15/120 | -1.7 pp | task PASS |
+| Qwen2.5-7B-Instruct-Q4_K_M | spark | pending (spark logprobs landed after this sweep) | 46/120 / 46/120 | +0.0 pp | task PASS |
+| Qwen2.5-Coder-7B-Instruct-Q4_K_M | spark | pending (spark logprobs landed after this sweep) | 21/120 / 20/120 | +0.8 pp | task PASS |
+| Qwythos-9B-Claude-Mythos-5-1M-MTP-BF16 | dense | 9.301 / 8.410 (1.106) | 70/120 / 80/120 | -8.3 pp | PASS |
+| RegesCore-1.0-35B-UD-Q4_K_S | moe | 6.233 / 6.242 (0.999) | 11/120 / 12/120 | -0.8 pp | PASS |
+
+- The Qwythos row compares our q4 pack (`baro.run.pack.flags = --q4`, what the 136 tok/s champion runs)
+  against llama.cpp on the BF16 file: the 1.106 PPL ratio and -8.3 pp are mostly 4-bit quantization, not
+  engine parity (the q4-both-sides rows land at 0.999 and within 2 pp).
+- Not run this round: Ornith-1.5-9B, Qwythos-9B-v2, Spark-X2.5-4B (cut for time), Granite-4.2-3B (harness
+  script edited mid-run, row void). Spark-family perplexity waits on a rerun now that `serve/spark.mojo`
+  has logprobs.

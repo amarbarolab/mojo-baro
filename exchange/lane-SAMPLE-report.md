@@ -290,6 +290,85 @@ NOT wired. Named as open follow-ups, not silently skipped.
 decode step. Spec+sample+penalties and `serve/spark.mojo` are named
 follow-ups, not done.**
 
+## Coordinator review: NOT accepted, inert-parameter defect (P1) -- fixed, `02cab13`
+
+The gates above were real, but they didn't prove the parameter wasn't
+inert on a **default** request: my MoE-engine tests never hit the bug
+because the MoE profile has no draft head (`spec` never engages) and no
+megakernel head-fold (`comptime if not MEGA_ALLOWED: head_folded = False`
+unconditionally), so both bypass paths below simply don't exist there.
+Reading `window.mojo` again, on the **dense** engine (`MEGA_ALLOWED=True`,
+where the champion actually runs): `BARO_SPEC` defaults to `1` and A1 lets
+sampling compose with speculation, so a default request runs the `win_spec`
+branch, which never reaches my penalty/logprob code at all; `BARO_MEGA`
+also defaults to `1`, and `mega_req = mega and temperature <= 0` meant a
+`T=0` request with penalties went through the megakernel, whose dispatch is
+`if head_folded: pass` -- skips the entire win_spec/argmax/sample chain,
+including mine. A client setting `frequency_penalty` on a default request
+would have gotten it silently ignored: exactly the class `bench/PROTOCOL-RULES.md`
+P1 exists to forbid (the decode-race `speculative.n_max` and hipBLASLt
+precedents it cites are the same shape).
+
+**Fix, `02cab13`.** `serve/engine.mojo`: a new `want_extra` flag
+(`presence_penalty != 0 or frequency_penalty != 0 or top_logprobs > 0`)
+forces `spec = False` and folds into `mega_req`/`mega_win_req`, so a
+request carrying either now always lands on the plain launch path.
+`serve/window.mojo`: the `T <= 0` branch now also checks `want_extra` and
+routes into the sample path instead of `argmax_k` when set --
+`amar_sample_row` is argmax-equivalent at `temperature <= 0` (P-K2), so
+"penalize then draw" resolves to the penalized argmax rather than ignoring
+the penalty. `serve/spark.mojo`: refuses `presence_penalty`/
+`frequency_penalty`/`top_logprobs` with a named error (not wired there
+yet) instead of silently accepting and dropping them. `serve/src/main.rs`:
+fixed the error-to-HTTP-status mapping (no `Tok` received yet = 400, a
+pre-GPU-work rejection per `serve/PROTOCOL.md`; after generation started =
+502, a real mid-stream failure) so spark's new refusal is an actual 400,
+not the 502 every earlier refusal in this codebase produced.
+
+**Gates, all against the DENSE engine (`.work/engine-pack-q4`) with default
+env (`BARO_SPEC`/`BARO_MEGA` both unset = `1`), the exact scenario that was
+broken:**
+
+- **Default spec + `frequency_penalty` visibly suppresses.** No-penalty
+  request degenerates into a 6x repeat loop (`9338 13 198 760 6511 314`
+  repeating); the identical request with `frequency_penalty=50,
+  presence_penalty=50` has no repeat anywhere in 40 tokens, and its `done`
+  line carries no `drafted`/`accepted`/`k` (spec correctly disengaged,
+  confirmed from the field's absence, not inferred).
+- **`T=0` + penalty behaves as chosen (penalize-then-argmax).** `T=0`
+  without penalty vs `T=0` with `frequency_penalty=50,presence_penalty=50`
+  on the same prompt/seed: identical through token 2, diverge from token 3
+  onward.
+- **`T=0`, no penalty: unaffected.** `tools/test_server.sh` ALL PASS
+  (`.work/pen-test-server2/`), 64/64 token match on completion/SSE/queued/
+  stop/cancel-recovery, identical to every earlier run this session.
+- **spark refuses, real 400.** `/v1/completions` with `frequency_penalty`:
+  `{"error":{"code":400,...}}`, `HTTP_STATUS:400`. `/v1/chat/completions`
+  with `logprobs:true,top_logprobs:3`: same. A plain request on the same
+  server: `HTTP_STATUS:200`.
+- **Item 4's frozen gate, done properly: real host comparison, not
+  internal consistency.** One live 25-token decode (`temperature=0.8,
+  top_k=40,top_p=0.95,presence_penalty=0.6,frequency_penalty=0.4,
+  top_logprobs=8`), each step's raw pre-penalty row + exact history dumped
+  via a new `BARO_DUMP_LOGITS_DIR` hook in `window.mojo` (off by default).
+  Independent numpy oracle (`.work/pen-verify/compare.py`, built the same
+  way `tools/sample-nucleus-oracle.py` already is) applies penalties in
+  `sample_ref.apply_penalties`'s own float form, computes the nucleus
+  distribution, compares to the device's actual chosen-token logprob and
+  top-8 list. **20/20 tokens PASS, max diff 5.89e-07 against the 1e-4
+  bar.**
+
+`run-tests.sh` 102 kernels, 57 in registry, 0 orphans, exit 0 (retried
+under `gpu-wait` after an OOM collision with a concurrent lane's job, not a
+regression); `ci-checks.sh` 0; `tools/test_server.sh` ALL PASS.
+
+**Items 3-4: PASS, dense/MoE engine, default request shape included.**
+Still scoped to the plain non-spec decode step (a request now correctly
+FORCES that path rather than silently skipping penalties within it); a
+future round could instead honor the caller's `spec:true` by filling
+fable's per-row `Ids/Cnt` design for spec windows, named as the real next
+step rather than done today. `serve/spark.mojo` refuses loudly until wired.
+
 **Git-index race, `0e25b36`/`42c57b3`.** Committing this lane's files by
 explicit pathspec still swept in another lane's in-progress `bench/`
 deletion and edits (concurrent `git add` in the same checkout, not
