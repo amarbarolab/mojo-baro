@@ -949,6 +949,26 @@ def main() raises:
             print(done_line + "}")
             continue
 
+        # briefs/2026-09-16-sampling-all-models-lane.md item 1: the draft-head
+        # receipt below is dense-only (MEGA_ALLOWED gates it off for
+        # qwen35moe), so it never captures a real logits row for the MoE
+        # sampler gates. This dumps the last decode step's target row
+        # (b.logits_d row 0, the same buffer argmax_k/sample_row_k read from
+        # in window.mojo) on either profile. Off by default, unconditional
+        # on the profile, no effect on any existing path.
+        var dump_logits_path = getenv("BARO_DUMP_LOGITS", "")
+        if dump_logits_path != "":
+            var lg_h = ctx.enqueue_create_host_buffer[f32](VOCAB)
+            ctx.enqueue_copy(
+                dst_buf=lg_h,
+                src_buf=DeviceBuffer[f32](ctx, bufs.logits_d.unsafe_ptr(), VOCAB, owning=False),
+            )
+            ctx.synchronize()
+            with open(dump_logits_path, "w") as f:
+                var p = lg_h.unsafe_ptr().unsafe_bitcast[UInt8]()
+                f.write_bytes(Span[UInt8](unsafe_ptr=p, length=VOCAB * 4))
+            print("dumped final logits row to", dump_logits_path)
+
         if not MEGA_ALLOWED:
             return
 
