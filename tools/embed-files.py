@@ -80,4 +80,11 @@ if __name__ == "__main__":
         if f not in files:
             files.append(f)
     assert "serve/engine.mojo" not in files
+    # serve/spark.mojo does `from profile import ...`; the closure walk above
+    # never finds it because it is generated per-model (tools/gen-profile.mojo)
+    # and does not exist as a repo file. --profile PATH adds the one this bake
+    # needs; gguf-embed.py's src_key() keys it "profile.mojo" regardless of
+    # where PATH lives.
+    if "--profile" in sys.argv:
+        files.append(sys.argv[sys.argv.index("--profile") + 1])
     print("\n".join(files) if "-1" in sys.argv else " ".join(files))

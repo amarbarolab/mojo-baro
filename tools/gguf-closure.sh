@@ -2,9 +2,12 @@
 # Strict identity closure: build the engine FROM the sources embedded in a BARO
 # gguf (baro.kernel.src.* KVs), run it on .work/engine-pack/, gate on ref tokens.
 # usage: tools/gguf-closure.sh MODEL-BARO.gguf [ref-tokens-file] [outdir]
-# Spark ggufs (spark_kernels.mojo in the file list): harness = serve/spark.mojo at the
-# gguf commit, run on .work/spark/pack-q8 with the gguf itself as tokenizer source,
-# ref default .work/spark/ref/ref-tokens-64.txt. Run under gpu-wait.
+# Spark-harness ggufs (spark_kernels.mojo in the file list -- spark2_5 itself and
+# the profile-driven dense families llama/qwen2/granite all use serve/spark.mojo):
+# harness = serve/spark.mojo at the gguf commit, profile/prompt/pack/reference all
+# from the file itself (baro.kernel.src.profile.mojo, baro.run.prompt.tokens,
+# baro.run.pack.tool + baro.run.src.<tool> + baro.run.pack.flags, baro.run.ref.tokens).
+# Run under gpu-wait.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 model=$1; ref=${2:-}; out=${3:-.work/gguf-src}
@@ -80,12 +83,39 @@ if grep -qx moe.mojo "$out/FILES" && ! grep -qx window.mojo "$out/FILES"; then
   exit
 fi
 if grep -qx spark_kernels.mojo "$out/FILES"; then
+  # serve/spark.mojo is its own harness (baked from git at the gguf's commit,
+  # same rule as every other arch: the file cannot carry its own clock), but
+  # unlike qwythos/qwen35moe it needs three more things the file must carry,
+  # because before this there was no local .work/spark/ fixture on this box
+  # and the closure could not run at all (2026-09-16, coordinator diagnosis):
+  # a profile.mojo (dims/rope/activation read from THIS gguf by
+  # tools/gen-profile.mojo, extracted automatically above since it rides in
+  # baro.kernel.files like any other source), a prompt (baro.run.prompt.tokens,
+  # extracted above into $out/prompt.tokens), and a pack, built fresh from the
+  # embedded pack tool (baro.run.pack.tool names which of engine-pack.py /
+  # spark-pack.py; baro.run.src.<that name> is its source, baro.run.pack.flags
+  # its flags) rather than reused from a local directory.
   kcommit=$(jq -r '.["baro.kernel.commit"]' "$out/meta.json")
   git show "$kcommit:serve/spark.mojo" > "$out/harness.mojo" || { echo "no serve/spark.mojo at gguf commit $kcommit"; exit 1; }
+  [ -f "$out/profile.mojo" ] || { echo "no profile.mojo embedded (baro.kernel.src.profile.mojo missing; re-bake with BARO_PROFILE set)"; exit 1; }
   ./.venv/bin/mojo build "$out/harness.mojo" -I "$out" -o .work/engine-closure 2>&1 | grep -E "error" -A3 && exit 1 || true
-  BARO_PROMPT_TEXT=.work/spark/prompt.txt BARO_GGUF="$model" BARO_PACK=.work/spark/pack-q8 BARO_GEN=64 ./.work/engine-closure > "$out/run.log"
+  [ -x .work/engine-closure ] || { echo "closure build FAILED (no binary)"; exit 1; }
+  packtool=$(jq -r '.["baro.run.pack.tool"] // empty' "$out/meta.json")
+  [ -n "$packtool" ] || { echo "no baro.run.pack.tool: file carries no pack builder, cannot build a pack from itself"; exit 1; }
+  jq -er --arg k "baro.run.src.$packtool" '.[$k]' "$out/meta.json" > "$out/$packtool" 2>/dev/null \
+    || { echo "no baro.run.src.$packtool embedded"; exit 1; }
+  jq -er '.["baro.run.src.gguf-extract.py"]' "$out/meta.json" > "$out/gguf-extract.py" 2>/dev/null \
+    || cp tools/gguf-extract.py "$out/gguf-extract.py"
+  packflags=$(jq -r '.["baro.run.pack.flags"] // empty' "$out/meta.json")
+  # shellcheck disable=SC2086
+  ./.venv/bin/python3 "$out/$packtool" "$model" "$out/pack" $packflags > "$out/pack.log" 2>&1 \
+    || { tail -20 "$out/pack.log"; echo "pack build FAILED, see $out/pack.log"; exit 1; }
+  [ -s "$out/prompt.tokens" ] || { echo "no prompt (baro.run.prompt.tokens missing)"; exit 1; }
+  [ -n "$ref" ] || { echo "no reference tokens (baro.run.ref.tokens missing and none given)"; exit 1; }
+  BARO_PACK="$out/pack" BARO_PROMPT="$out/prompt.tokens" BARO_GEN=64 ./.work/engine-closure > "$out/run.log" 2>&1 \
+    || { tail -20 "$out/run.log"; echo "closure engine FAILED"; exit 1; }
   grep -E "tok/s" "$out/run.log"
-  sed 's/^generated:/GENERATED:/' "$out/run.log" | tools/check-tokens.sh "${ref:-.work/spark/ref/ref-tokens-64.txt}" /dev/stdin
+  sed 's/^generated:/GENERATED:/' "$out/run.log" | tools/check-tokens.sh "$ref" /dev/stdin
   exit
 fi
 ref=${ref:-.work/engine-pack-q4/ref-tokens-64.txt}

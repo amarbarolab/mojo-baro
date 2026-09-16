@@ -44,6 +44,12 @@ def src_key(k):
     """Kernel/engine sources are keyed by basename (engine imports them flat);
     anything else keeps its repo-relative path so the closure can rebuild it."""
     root = Path(__file__).resolve().parent.parent
+    if k.name == "profile.mojo":
+        # serve/spark.mojo does `from profile import ...` flatly. A profile is
+        # generated per-model (tools/gen-profile.mojo) and lives outside the
+        # repo by construction (it is a function of the gguf, not source), so
+        # it never has a kernels/ or serve/ prefix to key by; key it as itself.
+        return "profile.mojo"
     if not k.resolve().is_relative_to(root):
         return f"{k.resolve().parent.name}/{k.name}"  # external package: <pkg>/<file>
     rel = k.resolve().relative_to(root).as_posix()
@@ -242,6 +248,11 @@ def main():
         # FileNotFoundError for a sibling that only exists in a checkout.
         for tool in (run_pack_tool, run_pack_tool.parent / "gguf-extract.py"):
             new_kv.append((f"baro.run.src.{tool.name}", tool.read_text()))
+        # Named separately from baro.run.src.<name> so a reader (tools/gguf-closure.sh's
+        # spark branch) knows which embedded file is the pack builder without
+        # guessing between engine-pack.py (llama/qwen2/granite dense path) and
+        # spark-pack.py (spark2_5's per-head attention gate needs the other).
+        new_kv.append(("baro.run.pack.tool", run_pack_tool.name))
 
     # Existing KVs are copied except any earlier baro.kernel.*/baro.hw.*/baro.run.*
     # set: re-embedding from a BARO file replaces its sources and its scoreboard,
