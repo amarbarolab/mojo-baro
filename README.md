@@ -172,8 +172,8 @@ streaming, `/v1/models`, `/v1/cancel`, `/v1/fork`, `/tokenize`, `/detokenize`,
   prefills only the new message (2.7 to 8.3x faster than a grid-only cache on
   the same multi-turn replay).
 - Sampling (`temperature`, `top_p`, `top_k`, `min_p`, `seed`) runs on the
-  device inside the decode loop of the `qwen35` and `qwen35moe` engine,
-  speculation included. `serve/spark.mojo` still decodes greedy.
+  device inside the decode loop of `serve/engine.mojo`, speculation included;
+  measured on the dense `qwen35` pack. `serve/spark.mojo` still decodes greedy.
 - `tools` calls come back in the OpenAI `tool_calls` shape, and
   `chat_template_kwargs` reaches the chat template (for example
   `enable_thinking: false`). `response_format` is validated and refused with

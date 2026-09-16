@@ -13,7 +13,7 @@ fp16 variant (halves B traffic, doubles its roof).
 ## Gap inventory vs llama.cpp
 
 **The "nothing" column below is the 2026-09-01 state and is now historical.**
-Current state is in the right-hand column, updated 2026-09-12.
+Current state is in the right-hand column, updated 2026-09-16.
 
 | Layer | llama.cpp | mojo-baro 2026-09-01 | mojo-baro today |
 |---|---|---|---|
@@ -21,13 +21,13 @@ Current state is in the right-hand column, updated 2026-09-12.
 | Tokenizer | own BPE/SPM impl | nothing | `serve/tokenizer.mojo`, bit-equal to llama.cpp on the same GGUF, default path since 2026-09-08 (`docs/TOKENIZER.md`) |
 | Elementwise kernels | RMSNorm, RoPE, SwiGLU, softmax | nothing | all present in `kernels/elementwise.mojo`, <=1e-6 vs fp64 host refs |
 | Attention | flash-decode style, GQA | nothing | GQA decode path + hybrid SSM sub-block (`attn.mojo`, `ssm.mojo`) |
-| KV cache | paged, quantized cache | nothing | contiguous f16 cache + (k+1)-slot ring for MTP rollback; not paged, not quantized |
+| KV cache | paged, quantized cache | nothing | contiguous cache sized by `BARO_TMAX` with split-K decode attention above T = 1088 (lane-dattn `3824e20`) + (k+1)-slot ring for MTP rollback; not paged, not quantized |
 | Forward pass | graph per arch family | nothing | six architectures: `qwen35` dense (token-identical to llama.cpp 64/64), `qwen35moe` 256-expert MoE, and `spark2_5` plus `llama`, `qwen2`, `granite` on the profile-driven dense engine (`serve/spark.mojo`, recipe read from the GGUF by `tools/gen-profile.mojo`; now wired to the HTTP front too, `serve/PROTOCOL.md`, verified end to end for Qwen2.5-7B and granite-4.2-3b) |
-| Sampling | full menu | nothing | device sampler kernels exist and are distribution-tested, but are not in the decode loop; generation is greedy today |
-| Server | OpenAI-compatible HTTP | empty `serve/src` | `baro-serve` (Rust, axum/tokio): chat + completions with SSE, models, cancel, tokenize, detokenize, health (`serve/PROTOCOL.md`) |
+| Sampling | full menu | nothing | device sampler in the `serve/engine.mojo` decode loop at `temperature > 0` (top_p, top_k, min_p, seed), composed with MTP speculation (`bench/spec-sample-protocol.md`); penalties and logprobs parsed, not acted on; `serve/spark.mojo` still greedy |
+| Server | OpenAI-compatible HTTP | empty `serve/src` | `baro-serve` (Rust, axum/tokio): chat + completions with SSE, models, cancel, fork, tokenize, detokenize, health; `tools` and `chat_template_kwargs` in chat; `response_format` refused with 400 until the grammar mask is in the decode loop (`serve/PROTOCOL.md`) |
 | Prefill | batched, causal-mask | n/a | batched and chunked, WMMA flash attention + one-wave SSM scan; within ~1.3x of llama.cpp at 8k to 32k (`docs/prefill-long-ctx-2026-09-11.md`) |
 | GEMM decode M=8 | ~roofline via quants | **1.49x over vendor fp32** | q8 wave-per-row `amar_matmul_skinny_q8row`, 855 GB/s |
-| Decode tok/s | 74.1 no-spec / 123.5 MTP (20-prompt, q8) | 25.5 | q8: 68.8 no-spec / 100.7 MTP. **q4, the current champion: 136.72 no-spec / 150.96 with spec** (20-prompt medians) |
+| Decode tok/s | 74.1 no-spec / 123.5 MTP (20-prompt, q8) | 25.5 | q8: 68.8 no-spec / 100.7 MTP. **q4, the current champion: 136.37 no-spec / 150.96 with spec** (20-prompt medians). qwen35moe: 111.89 no-spec against llama.cpp 109.92 (`bench/moe-persist-protocol.md`) |
 
 Note the fp32/fp16 framing in the section above is several quantisations out of
 date. The engine went q8-only at `c3752e7`, and the default pack is **q4**

@@ -5,7 +5,8 @@ is reproducible with the command given. If you are an agent picking up a kernel
 task, this is your starting point: **do not re-derive it, and do not trust a
 number that is not in this file or produced by `bench/run.py`.**
 
-Last verified: 2026-09-12 for the long-context prefill rows only
+Last verified: 2026-09-15 for the qwen35moe decode row (`bench/moe-persist-protocol.md`,
+main-tree re-gate), 2026-09-12 for the long-context prefill rows
 (`docs/prefill-long-ctx-2026-09-11.md`), and 2026-09-02 for the fp16 WMMA rows
 (`bench/wmma-fp16-protocol.md` Round 3). Rows not named here were not re-measured
 on those dates: check the protocol each one cites before trusting it.
@@ -402,9 +403,26 @@ allocator, and only the real-pack A/B settles it. `rocdl.waves_per_eu`
 cannot be set through `@__llvm_metadata` (six spellings rejected).
 
 
-## qwen35moe decode (2026-09-15, `bench/moe-perf-protocol.md`)
+## qwen35moe decode
 
-RegesCore-35B, pack `.work/moe-w1/pack` (Q4_K experts, Q8_0 projections, Q6_K
+**Champion (2026-09-15, R6.0b `38ee0b7`, `bench/moe-persist-protocol.md`):
+111.89 tok/s_gen, 20-prompt median** (spread 1.2%), launch path
+(`BARO_MEGA=0`), no spec, 727 launches per token. Up from 107.28 (R6.0
+`1e270b5`, 857 launches) and 94.79 (R4 `7145b71`, 1117 launches), all
+bit-identical to the previous engine on 20/20 prompts, fail word 0. R6.0 and
+R6.0b fold per-layer elementwise chains into fewer launches; R6.0b landed at
+1.043x, below the preregistered +5% kill line, on the maintainer's recorded override.
+llama.cpp on the same GGUF: **109.92** (20-prompt median, 109.49 to 110.01).
+The same-stint ratio is only for R6.0 (106.95, 0.973x); 111.89 was measured in
+a different stint, so the 1.018x it implies is not a same-stint receipt.
+Receipts: `.work/moe-perf/lc-r60b-main.log`, `ab-r60b-main.log`.
+
+R6.1 (`f900bbb`, 2026-09-16): a one-launch-per-token MoE kernel
+(`kernels/mega_moe.mojo`, `BARO_MEGA=1`, default off) is at parity (per-layer
+dump identical, forced identity 20/20 at 64/64 against `38ee0b7`). Its speed
+is not measured yet (R6.2, `exchange/lane-R6-report.md`).
+
+**History, round 1 (2026-09-15, `bench/moe-perf-protocol.md`).** RegesCore-35B, pack `.work/moe-w1/pack` (Q4_K experts, Q8_0 projections, Q6_K
 head), launch path (`BARO_MEGA=0`), no spec. **93.46 tok/s_gen, 20-prompt
 median** (was 42.88), three landed arms in one session: vectorized Q4_K
 expert dot (`8130f65`), vectorized Q8_0 row dot (`d49bfc3`), one-wave router
