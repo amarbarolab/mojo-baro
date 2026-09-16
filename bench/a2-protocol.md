@@ -57,3 +57,24 @@ Any identity miss under the identity table is a bug and is fixed before anything
 dattn span base per page and re-run; below 97% after that, step 1 is not merged as written and the
 report says why. Receipts on every timed run: engine sha256, `BARO_KVTAB:` echo, `TMAX:`, `kv pages`,
 `bench/clock-probe.sh` line, arm parameters from the running engine.
+
+## Result (2026-09-17, change `09a8cd9`, merged tree `d3a0bf0`, engine `367ab62323748a3a`)
+
+Receipts `.work/a2/gates/`, `.work/a2/gates2/`, `.work/a2/gates/postmerge-quick/`, ISA `.work/a2/isa/`;
+report `exchange/2026-09-17-A2-step1-report.md`. Preflight PASS before every job.
+- P-A2a PASS: identity table 60/60 at 100.0%, 59/60 restored, decode after 32k **100.67** (main
+  101.56, 99.1%, bar 100.5). `BARO_KVTAB: identity kv pages: 256`.
+- P-A2b PASS: reverse table 60/60 at 100.0%, 59/60 restored, decode after 32k **100.71**. The
+  kernels read the table.
+- P-A2c PASS: main 136.95 vs paged 136.07 tok/s_gen, ratio 0.994, identity 20/20.
+- P-A2d PASS: first-request prefills equal within one request's noise (8064 ids 3.06 s on both).
+- P-A2e PASS with one pre-existing red: run-tests exit 0 (103 kernels, 0 orphans), ci-checks exit 0,
+  MoE and spark engines build; `test_mega_block` m=1 arms bit-identical, its m=3 window-kernel parity
+  arm FAILS identically on main's kernels (958/12288 residual mismatches, max 0.0078; G=192 residency
+  probe aborts): pre-existing, behind `BARO_MEGA_WIN=0`, recorded on the board, not chased.
+  `test_attn_block` compiles but has no fixture on any tree (needs `tools/attn-ref.py` dumps): not run.
+- P-A2f PASS: save under reverse (pos 12, 1 page), load under identity, forced agreement 64/64.
+- ISA: q4 token megakernel dual 124/79/79/59, 0 spills (unchanged); dattn split 165/0; prefill WMMA
+  spills 28 -> 25.
+- Post-merge (main's MoE stage 3 merged into the lane): quick gate 3/3 at 100.0%, decode after 32k
+  101.05. Kill line not reached.

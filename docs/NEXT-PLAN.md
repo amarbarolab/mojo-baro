@@ -68,6 +68,8 @@ unaffected. This lane is also LatentOS C2 (compressed checkpoints).
 
 **Harness landed first (2026-09-16, fable): `bench/a2-prompts.sh` (three shared-document sets, 8k/16k/32k, 20 prompts each, prefixes of one another) and `bench/a2-gate.sh` (both engines resident, per-request `force` and `ckpt`, reference ids cached the P17 way, `QUICK=N` iteration subset, `MIN_PCT` bar). Verified on two builds that must agree: 60/60 prompts at 100%, 59/60 restored a prefix checkpoint, full gate 91 s wall with the reference cached, quick subset 65 s cold; decode after 32k 101.56 tok/s, the bar above. The 64k and 128k RULER subsets stay a once-per-merge-candidate run.**
 
+**Step 1 (paging) LANDED 2026-09-17 (`09a8cd9`, `exchange/2026-09-17-A2-step1-report.md`): block table through every KV kernel, identity and reverse tables both 60/60, decode after 32k 100.7 vs 101.6, `serve/kvpage.mojo` allocator. Step 2 (int8 KV) next.**
+
 ### A3. Continuous batching (XL; plan first, sonnet on the scheduler, fable on the m>1 GEMV)
 
 Orca (OSDI 2022): iteration-level scheduling and selective batching, i.e.

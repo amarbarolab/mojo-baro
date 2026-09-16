@@ -393,6 +393,13 @@ the q4 window megakernel (`BARO_MEGA_WIN=1`, now correctly instantiated for
 the q4 pack) measured 0.761x of it on k=2 spec (115.39 vs 151.68, A6.4), worse
 than the q8 record (W2/W3). Report `exchange/2026-09-16-A6-report.md`.
 
+**KV cache paged through a block table since 2026-09-17 (lane-A2 step 1, `09a8cd9`,
+`bench/a2-protocol.md`).** 128-token pages; every KV kernel reads the physical page from a device
+table (`kvtab_d`, identity for a single request, `BARO_KVTAB=reverse` is the gate arm that proves
+the indirection is live). Forced agreement 60/60 at 8k/16k/32k under both tables
+(`bench/a2-gate.sh`), decode after 32k 100.7 vs 101.6 unpaged, short context 0.994x, state files
+saved in logical page order. `serve/kvpage.mojo` holds the allocator A3 will use.
+
 **q4 m=1 champion since 2026-09-11 (`3824e20`, merge of lane-dattn): 136.37
 tok/s_gen no-spec, 20-prompt median** (was 133.9). Post-merge A/B against
 pre-merge main (`.work/engine-premerge`, same pack and env): 127.98 -> 136.37
