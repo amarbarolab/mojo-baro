@@ -159,3 +159,10 @@ same_len, no drafts in either arm): grammar 8.371 ms/token (119.46 tok/s) vs pla
 megakernel (T=0, no penalties), the grammar arm is forced onto the launch path, so the ratio mixes
 the megakernel's own advantage with the mask cost. Diagnostic (not a gate): same script against a
 server started with `BARO_MEGA=0`, isolating the host mask fill and upload.
+
+**Gate 5 diagnostic** (server `BARO_MEGA=0`, read back in the engine log as `BARO_MEGA: False`),
+same script: grammar 8.392 ms/token vs plain 8.287 ms/token, **1.013x**. The mask fill, upload and
+matcher advance cost 1.3% per token, inside the < 1% to 5% band the prediction was about; the
+remaining 1.24x of the frozen comparison is the megakernel, which a grammar request cannot use (its
+token launch bakes an unmasked argmax). Closing the gap needs a masked megakernel head or spec
+composition (item 3), neither built this round.

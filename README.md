@@ -179,9 +179,13 @@ streaming, `/v1/models`, `/v1/cancel`, `/v1/fork`, `/tokenize`, `/detokenize`,
   models (distribution, seed and HTTP gates, `exchange/lane-SAMPLE-report.md`).
 - `tools` calls come back in the OpenAI `tool_calls` shape, and
   `chat_template_kwargs` reaches the chat template (for example
-  `enable_thinking: false`). `response_format` is validated and refused with
-  HTTP 400 rather than silently ignored: the grammar engine compiles the
-  schema, but the device mask is not in the decode loop yet.
+  `enable_thinking: false`). `response_format` with a JSON schema is enforced on
+  the qwen35 dense and MoE engines by a device token mask: every output over
+  the 32-schema corpus is valid JSON for its schema at T=0 and T=0.7, with
+  reasoning models masked only after `</think>`. Those requests run without
+  speculation or the megakernel (about 1.25x slower per token); the
+  `serve/spark.mojo` families still refuse it with HTTP 400
+  (`bench/grammar-protocol.md`).
 - `/v1/fork` branches a conversation from its checkpoint: restore takes 2 to
   4 ms at any prefix length, 2.6x to 3.9x faster wall clock than re-prefilling
   at 1k to 32k tokens.
