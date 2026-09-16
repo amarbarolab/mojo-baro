@@ -23,8 +23,20 @@ jq -r '"commit: " + .["baro.kernel.commit"] + "  arch: " + .["baro.kernel.arch"]
 # MoE bake.
 jq -er '.["baro.run.prompt.tokens"]' "$out/meta.json" > "$out/prompt.tokens" 2>/dev/null \
   && echo "prompt: from the file ($(wc -w < "$out/prompt.tokens") ids)" || rm -f "$out/prompt.tokens"
-jq -er '.["baro.run.ref.tokens"]' "$out/meta.json" > "$out/ref-embedded.txt" 2>/dev/null \
-  && echo "reference: from the file ($(wc -w < "$out/ref-embedded.txt") ids)" || rm -f "$out/ref-embedded.txt"
+# tools/check-tokens.sh reads its ref file with `mapfile` (one id per line);
+# baro.run.ref.tokens is a single space-separated KV string (bake.sh joins it
+# that way so it round-trips through GGUF's string type), so it is reflowed
+# to one-per-line here rather than in every branch that reads $ref (the MoE
+# branch below used to do this itself; a spark bake hit the same mismatch --
+# "expected <all 64 ids>, got <first id>" -- the day this comment was added).
+# `// empty` (not `-e`) so a missing/null key yields a truly empty file, not
+# the literal text "null" surviving through tr/grep as a false "from the file".
+jq -r '.["baro.run.ref.tokens"] // empty' "$out/meta.json" 2>/dev/null | tr -s ' ' '\n' | grep -v '^$' > "$out/ref-embedded.txt"
+if [ -s "$out/ref-embedded.txt" ]; then
+  echo "reference: from the file ($(wc -l < "$out/ref-embedded.txt") ids)"
+else
+  rm -f "$out/ref-embedded.txt"
+fi
 [ -n "$ref" ] || { [ -s "$out/ref-embedded.txt" ] && ref="$out/ref-embedded.txt"; } || true
 [ -n "${BARO_PROMPT:-}" ] || { [ -s "$out/prompt.tokens" ] && export BARO_PROMPT="$out/prompt.tokens"; } || true
 export MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_SIZE_PERCENT=10
