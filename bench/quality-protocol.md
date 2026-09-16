@@ -263,3 +263,13 @@ VOIDed at the dump step):
    hours per model.
 
 Bands, verdict rule, models and the spark perplexity deferral are unchanged.
+
+## Amendment 3 (2026-09-16 eve, after the Ornith pilot's ours task arm, before any task score was read)
+
+The pilot's ours arm hit the 300-token cap on 104 of 120 items: Ornith reasons in `<think>` and is cut
+off before answering, so the task score would measure the cap, not the model, and each arm took about
+7.5 min. Task prompts are now rendered with `chat_template_kwargs: {enable_thinking: false}` (E8 round
+5's no-think setting; templates without the variable ignore it), max_tokens stays 300. The llama.cpp arm
+runs 8 parallel slots (`-np 8`, `-c 16384`, so 2,048 context per slot); every item is still one
+independent T=0 request with the same ids. The Ornith pilot's task arm is discarded and rerun under this
+amendment. Its perplexity numbers stand (ours 9.6124, llama.cpp 9.1251).

@@ -53,7 +53,7 @@ ok prep "$(tail -1 "$OUT/task.log")"
 ok ours "$(tail -1 "$OUT/task.log")"
 
 GPUP=8199
-"$LB/llama-server" -m "$llama_gguf" -c 4096 -ngl 99 -fa on -ctk f16 -ctv f16 -t 8 --host 127.0.0.1 --port $GPUP > "$OUT/llama-server.log" 2>&1 &
+"$LB/llama-server" -m "$llama_gguf" -c 16384 -np 8 -ngl 99 -fa on -ctk f16 -ctv f16 -t 8 --host 127.0.0.1 --port $GPUP > "$OUT/llama-server.log" 2>&1 &
 GPUPID=$!
 for _ in $(seq 600); do curl -sf localhost:$GPUP/health >/dev/null 2>&1 && break; kill -0 $GPUPID 2>/dev/null || die llama "gpu server exited"; sleep 1; done
 "$PY" bench/quality-task-ids.py llama --url http://127.0.0.1:$GPUP --out "$OUT/task" >> "$OUT/task.log" 2>&1 || die llama "$(tail -3 "$OUT/task.log")"

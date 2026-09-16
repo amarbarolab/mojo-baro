@@ -41,7 +41,7 @@ def prep(a):
     items = []
     for t in tasks:
         msgs = [{"role": "system", "content": sys_by_type[t["type"]]}, {"role": "user", "content": t["prompt_text"]}]
-        prompt = post(a.tok_url, "/apply-template", {"messages": msgs})["prompt"]
+        prompt = post(a.tok_url, "/apply-template", {"messages": msgs, "chat_template_kwargs": {"enable_thinking": False}})["prompt"]
         ids = post(a.tok_url, "/tokenize", {"content": prompt, "add_special": True, "parse_special": True})["tokens"]
         items.append({"id": t["id"], "prompt_ids": ids})
     props = requests.get(a.tok_url.rstrip("/") + "/props", timeout=60).json()
@@ -53,7 +53,7 @@ def prep(a):
     Path(a.out).mkdir(parents=True, exist_ok=True)
     (Path(a.out) / "prompts.json").write_text(json.dumps({"eog": sorted(eog), "items": items,
                                                           "chat_template_head": str(props.get("chat_template", ""))[:200]}))
-    print(f"prep: {len(items)} prompts, first prompt {len(items[0]['prompt_ids'])} ids, eog {sorted(eog)}")
+    print(f"prep: thinking off, {len(items)} prompts, first prompt {len(items[0]['prompt_ids'])} ids, eog {sorted(eog)}")
 
 
 def ours(a):
@@ -101,12 +101,16 @@ def ours(a):
 
 def llama(a):
     p = json.loads((Path(a.out) / "prompts.json").read_text())
-    out = []
-    for it in p["items"]:
+    from concurrent.futures import ThreadPoolExecutor
+
+    def one(it):
         d = post(a.url, "/completion", {"prompt": it["prompt_ids"], "n_predict": MAX_TOKENS, "temperature": 0,
                                         "cache_prompt": False, "return_tokens": True, "samplers": ["top_k"], "top_k": 1})
-        out.append({"id": it["id"], "tokens": d.get("tokens", []), "stop_type": d.get("stop_type"),
-                    "tokens_evaluated": d.get("tokens_evaluated")})
+        return {"id": it["id"], "tokens": d.get("tokens", []), "stop_type": d.get("stop_type"),
+                "tokens_evaluated": d.get("tokens_evaluated")}
+
+    with ThreadPoolExecutor(8) as ex:
+        out = list(ex.map(one, p["items"]))
     (Path(a.out) / "llama-ids.json").write_text(json.dumps({"items": out}))
     print(f"llama: {len(out)} items, first tokens_evaluated {out[0]['tokens_evaluated']} vs prompt {len(p['items'][0]['prompt_ids'])}")
 
