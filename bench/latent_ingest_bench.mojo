@@ -11,7 +11,7 @@ from max.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
 
 import latentos.ipc as ipc
 import latentos.sys as sys
-from registry import CONV_SLOT, SSM_SLOT
+from registry import CONV_SLOT, SSM_SLOT, KVT
 from prefix import Chain, f32
 from latent import mint_kv_latent, ingest_kv_latent, mint_chain_slot, ingest_into_chain, PGSTR
 
@@ -31,10 +31,10 @@ def main() raises:
     ]
     var ctx = DeviceContext()
     var n = PAGES * PGSTR
-    var kA = ctx.enqueue_create_buffer[f32](n)
-    var vA = ctx.enqueue_create_buffer[f32](n)
-    var kB = ctx.enqueue_create_buffer[f32](n)
-    var vB = ctx.enqueue_create_buffer[f32](n)
+    var kA = ctx.enqueue_create_buffer[KVT](n)
+    var vA = ctx.enqueue_create_buffer[KVT](n)
+    var kB = ctx.enqueue_create_buffer[KVT](n)
+    var vB = ctx.enqueue_create_buffer[KVT](n)
     var cA = ctx.enqueue_create_buffer[f32](CONV_SLOT)
     var sA = ctx.enqueue_create_buffer[f32](SSM_SLOT)
     var cB = ctx.enqueue_create_buffer[f32](CONV_SLOT)
@@ -81,8 +81,8 @@ def main() raises:
         dt.append(Float64(perf_counter_ns() - t) / 1e6)
 
         t = perf_counter_ns()
-        var h1 = ctx.enqueue_create_host_buffer[f32](n)
-        var h2 = ctx.enqueue_create_host_buffer[f32](n)
+        var h1 = ctx.enqueue_create_host_buffer[KVT](n)
+        var h2 = ctx.enqueue_create_host_buffer[KVT](n)
         ctx.synchronize()
         dt.append(Float64(perf_counter_ns() - t) / 1e6)
         t = perf_counter_ns()
@@ -120,8 +120,8 @@ def main() raises:
 
     # PCIe link DPM probe: the same 40 MiB H2D back to back. If the first copies are
     # slow and the later ones reach E6's ~28 GB/s, the cost is link ramp-up, not the path.
-    var hk = ctx.enqueue_create_host_buffer[f32](n)
-    var hv = ctx.enqueue_create_host_buffer[f32](n)
+    var hk = ctx.enqueue_create_host_buffer[KVT](n)
+    var hv = ctx.enqueue_create_host_buffer[KVT](n)
     ctx.synchronize()
     print("back-to-back H2D 40 MiB: copy | ms | GB/s")
     for r in range(12):

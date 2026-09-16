@@ -10,7 +10,7 @@ import latentos.sys as sys
 import latentos.proto as proto
 import latentos.ipc as ipc
 
-from registry import CONV_SLOT, SSM_SLOT, N_ATT, NKVH, KVPAGE, KVHSTR
+from registry import CONV_SLOT, SSM_SLOT, N_ATT, NKVH, KVPAGE, KVHSTR, KVQ, KVT
 from prefix import Checkpoint, Chain, CKPT_BYTES, f32
 
 comptime BytePtr = Pointer[UInt8, MutUntrackedOrigin]
@@ -255,8 +255,8 @@ def ingest_kv_page_host(
 
 def mint_kv_latent(
     ctx: DeviceContext,
-    kc_d: DeviceBuffer[f32],
-    vc_d: DeviceBuffer[f32],
+    kc_d: DeviceBuffer[KVT],
+    vc_d: DeviceBuffer[KVT],
     page_idx: Int,
     num_pages: Int = 1,
     prefix_hash: UInt64 = 0,
@@ -265,13 +265,15 @@ def mint_kv_latent(
     runtime_sha: InlineArray[UInt8, 32] = InlineArray[UInt8, 32](fill=0),
     tokenizer_sha: InlineArray[UInt8, 32] = InlineArray[UInt8, 32](fill=0),
 ) raises -> Tuple[proto.LatentHeader, Int32]:
+    comptime if KVT != DType.float32:
+        raise Error("LatentOS KV pages carry f32 KV; this engine has BARO_KVQ=" + KVQ)
     """Extracts KV cache pages from device memory into a sealed LatentOS memfd."""
     var total_floats = num_pages * PGSTR
-    var host_k = ctx.enqueue_create_host_buffer[f32](total_floats)
-    var host_v = ctx.enqueue_create_host_buffer[f32](total_floats)
+    var host_k = ctx.enqueue_create_host_buffer[KVT](total_floats)
+    var host_v = ctx.enqueue_create_host_buffer[KVT](total_floats)
 
-    var kc_slice = DeviceBuffer[f32](ctx, kc_d.unsafe_ptr().unsafe_offset(page_idx * PGSTR), total_floats, owning=False)
-    var vc_slice = DeviceBuffer[f32](ctx, vc_d.unsafe_ptr().unsafe_offset(page_idx * PGSTR), total_floats, owning=False)
+    var kc_slice = DeviceBuffer[KVT](ctx, kc_d.unsafe_ptr().unsafe_offset(page_idx * PGSTR), total_floats, owning=False)
+    var vc_slice = DeviceBuffer[KVT](ctx, vc_d.unsafe_ptr().unsafe_offset(page_idx * PGSTR), total_floats, owning=False)
 
     ctx.enqueue_copy(dst_buf=host_k, src_buf=kc_slice)
     ctx.enqueue_copy(dst_buf=host_v, src_buf=vc_slice)
@@ -287,11 +289,13 @@ def mint_kv_latent(
 
 def ingest_kv_latent(
     ctx: DeviceContext,
-    mut kc_d: DeviceBuffer[f32],
-    mut vc_d: DeviceBuffer[f32],
+    mut kc_d: DeviceBuffer[KVT],
+    mut vc_d: DeviceBuffer[KVT],
     header: proto.LatentHeader,
     fd: Int32,
 ) raises:
+    comptime if KVT != DType.float32:
+        raise Error("LatentOS KV pages carry f32 KV; this engine has BARO_KVQ=" + KVQ)
     """Ingests a sealed LatentOS KV page memfd directly into GPU attention KV cache."""
     if not header.is_valid() or header.kind != UInt8(proto.KIND_KV_PAGES):
         if fd >= 0:
@@ -302,16 +306,16 @@ def ingest_kv_latent(
     var num_pages = (Int(header.pos_hi) - Int(header.pos_lo)) // KVPAGE
     var total_floats = num_pages * PGSTR
 
-    var host_k = ctx.enqueue_create_host_buffer[f32](total_floats)
-    var host_v = ctx.enqueue_create_host_buffer[f32](total_floats)
+    var host_k = ctx.enqueue_create_host_buffer[KVT](total_floats)
+    var host_v = ctx.enqueue_create_host_buffer[KVT](total_floats)
 
     var dst_k = host_k.unsafe_ptr().unsafe_bitcast[UInt8]()
     var dst_v = host_v.unsafe_ptr().unsafe_bitcast[UInt8]()
 
     ingest_kv_page_host(header, fd, dst_k, dst_v)
 
-    var kc_slice = DeviceBuffer[f32](ctx, kc_d.unsafe_ptr().unsafe_offset(page_idx * PGSTR), total_floats, owning=False)
-    var vc_slice = DeviceBuffer[f32](ctx, vc_d.unsafe_ptr().unsafe_offset(page_idx * PGSTR), total_floats, owning=False)
+    var kc_slice = DeviceBuffer[KVT](ctx, kc_d.unsafe_ptr().unsafe_offset(page_idx * PGSTR), total_floats, owning=False)
+    var vc_slice = DeviceBuffer[KVT](ctx, vc_d.unsafe_ptr().unsafe_offset(page_idx * PGSTR), total_floats, owning=False)
 
     ctx.enqueue_copy(dst_buf=kc_slice, src_buf=host_k)
     ctx.enqueue_copy(dst_buf=vc_slice, src_buf=host_v)
@@ -431,8 +435,8 @@ struct EngineLatentClient:
     def export_kv_pages(
         self,
         ctx: DeviceContext,
-        kc_d: DeviceBuffer[f32],
-        vc_d: DeviceBuffer[f32],
+        kc_d: DeviceBuffer[KVT],
+        vc_d: DeviceBuffer[KVT],
         page_idx: Int,
         num_pages: Int = 1,
         prefix_hash: UInt64 = 0,
@@ -448,8 +452,8 @@ struct EngineLatentClient:
     def import_kv_pages(
         self,
         ctx: DeviceContext,
-        mut kc_d: DeviceBuffer[f32],
-        mut vc_d: DeviceBuffer[f32],
+        mut kc_d: DeviceBuffer[KVT],
+        mut vc_d: DeviceBuffer[KVT],
     ) raises -> Bool:
         """Receives KV pages from latentos-agent and ingests them into GPU KV cache."""
         var res = ipc.recv_handle(self.agent_sock)

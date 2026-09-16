@@ -64,78 +64,80 @@ def save_state(
     ctx: DeviceContext, chain: Chain, kc_d: DeviceBuffer[KVT], vc_d: DeviceBuffer[KVT], kvtab_h: HostBuffer[DType.int32],
     path: String, prompt: List[Int], pos: Int,
 ) raises:
-    comptime assert KVT == DType.float32, "state file stores f32 KV"
-    var idx = -1
-    for i in range(len(chain.items)):
-        if chain.items[i].valid and chain.items[i].pos == pos:
-            idx = i
-    if idx < 0:
-        raise Error("BARO_STATE_SAVE: no committed checkpoint at pos " + String(pos))
-    var kvn = ceildiv(pos, KVPAGE) * N_ATT * NKVH * KVHSTR
-    var kh = ctx.enqueue_create_host_buffer[KVT](kvn)
-    var vh = ctx.enqueue_create_host_buffer[KVT](kvn)
-    # logical page order through the block table, so the file never depends on the mapping
-    comptime PAGE_ELEMS = N_ATT * NKVH * KVHSTR
-    for p in range(ceildiv(pos, KVPAGE)):
-        var pp = Int(kvtab_h[p])
-        ctx.enqueue_copy(dst_buf=kh.create_sub_buffer[KVT](p * PAGE_ELEMS, PAGE_ELEMS), src_buf=DeviceBuffer[KVT](ctx, kc_d.unsafe_ptr().unsafe_offset(pp * PAGE_ELEMS), PAGE_ELEMS, owning=False))
-        ctx.enqueue_copy(dst_buf=vh.create_sub_buffer[KVT](p * PAGE_ELEMS, PAGE_ELEMS), src_buf=DeviceBuffer[KVT](ctx, vc_d.unsafe_ptr().unsafe_offset(pp * PAGE_ELEMS), PAGE_ELEMS, owning=False))
-    ctx.synchronize()
-    var int8 = getenv("BARO_STATE_INT8", "0") == "1"
-    var head = List[UInt8]()
-    var magic = String("BAROST02" if int8 else "BAROST01")
-    for i in range(8):
-        head.append(magic.as_bytes()[i])
-    _put_i64(head, pos)
-    _put_i64(head, CONV_SLOT)
-    _put_i64(head, SSM_SLOT)
-    _put_i64(head, kvn)
-    for b in chain.salt:
-        head.append(b)
-    for t in range(pos):
-        for b in range(4):
-            head.append(UInt8((prompt[t] >> (8 * b)) & 0xFF))
-    with open(path, "w") as f:
-        f.write_bytes(Span(head))
-        f.write_bytes(Span[UInt8](unsafe_ptr=chain.items[idx].conv_h.unsafe_ptr().unsafe_bitcast[UInt8](), length=CONV_SLOT * 4))
-        f.write_bytes(Span[UInt8](unsafe_ptr=chain.items[idx].ssm_h.unsafe_ptr().unsafe_bitcast[UInt8](), length=SSM_SLOT * 4))
-        if int8:
-            var ngroups = kvn // KVHSTR
-            var kscale = List[Scalar[f32]](unsafe_uninit_length=ngroups)
-            var kq = List[Scalar[i8]](unsafe_uninit_length=kvn)
-            _quantize_kv_int8(kh, kvn, kscale, kq)
-            var vscale = List[Scalar[f32]](unsafe_uninit_length=ngroups)
-            var vq = List[Scalar[i8]](unsafe_uninit_length=kvn)
-            _quantize_kv_int8(vh, kvn, vscale, vq)
-            f.write_bytes(Span[UInt8](unsafe_ptr=kscale.unsafe_ptr().unsafe_bitcast[UInt8](), length=ngroups * 4))
-            f.write_bytes(Span[UInt8](unsafe_ptr=kq.unsafe_ptr().unsafe_bitcast[UInt8](), length=kvn))
-            f.write_bytes(Span[UInt8](unsafe_ptr=vscale.unsafe_ptr().unsafe_bitcast[UInt8](), length=ngroups * 4))
-            f.write_bytes(Span[UInt8](unsafe_ptr=vq.unsafe_ptr().unsafe_bitcast[UInt8](), length=kvn))
-        else:
-            f.write_bytes(Span[UInt8](unsafe_ptr=kh.unsafe_ptr().unsafe_bitcast[UInt8](), length=kvn * 4))
-            f.write_bytes(Span[UInt8](unsafe_ptr=vh.unsafe_ptr().unsafe_bitcast[UInt8](), length=kvn * 4))
-    print("state saved:", path, " pos", pos, " kv pages", ceildiv(pos, KVPAGE), " format", magic)
+    comptime if KVT != DType.float32:
+        raise Error("BARO_STATE_SAVE: state files store f32 KV; this engine has BARO_KVQ=" + KVQ + " (quantized KV state is A2 step 3)")
+    else:
+        var idx = -1
+        for i in range(len(chain.items)):
+            if chain.items[i].valid and chain.items[i].pos == pos:
+                idx = i
+        if idx < 0:
+            raise Error("BARO_STATE_SAVE: no committed checkpoint at pos " + String(pos))
+        var kvn = ceildiv(pos, KVPAGE) * N_ATT * NKVH * KVHSTR
+        var kh = ctx.enqueue_create_host_buffer[KVT](kvn)
+        var vh = ctx.enqueue_create_host_buffer[KVT](kvn)
+        # logical page order through the block table, so the file never depends on the mapping
+        comptime PAGE_ELEMS = N_ATT * NKVH * KVHSTR
+        for p in range(ceildiv(pos, KVPAGE)):
+            var pp = Int(kvtab_h[p])
+            ctx.enqueue_copy(dst_buf=kh.create_sub_buffer[KVT](p * PAGE_ELEMS, PAGE_ELEMS), src_buf=DeviceBuffer[KVT](ctx, kc_d.unsafe_ptr().unsafe_offset(pp * PAGE_ELEMS), PAGE_ELEMS, owning=False))
+            ctx.enqueue_copy(dst_buf=vh.create_sub_buffer[KVT](p * PAGE_ELEMS, PAGE_ELEMS), src_buf=DeviceBuffer[KVT](ctx, vc_d.unsafe_ptr().unsafe_offset(pp * PAGE_ELEMS), PAGE_ELEMS, owning=False))
+        ctx.synchronize()
+        var int8 = getenv("BARO_STATE_INT8", "0") == "1"
+        var head = List[UInt8]()
+        var magic = String("BAROST02" if int8 else "BAROST01")
+        for i in range(8):
+            head.append(magic.as_bytes()[i])
+        _put_i64(head, pos)
+        _put_i64(head, CONV_SLOT)
+        _put_i64(head, SSM_SLOT)
+        _put_i64(head, kvn)
+        for b in chain.salt:
+            head.append(b)
+        for t in range(pos):
+            for b in range(4):
+                head.append(UInt8((prompt[t] >> (8 * b)) & 0xFF))
+        with open(path, "w") as f:
+            f.write_bytes(Span(head))
+            f.write_bytes(Span[UInt8](unsafe_ptr=chain.items[idx].conv_h.unsafe_ptr().unsafe_bitcast[UInt8](), length=CONV_SLOT * 4))
+            f.write_bytes(Span[UInt8](unsafe_ptr=chain.items[idx].ssm_h.unsafe_ptr().unsafe_bitcast[UInt8](), length=SSM_SLOT * 4))
+            if int8:
+                var ngroups = kvn // KVHSTR
+                var kscale = List[Scalar[f32]](unsafe_uninit_length=ngroups)
+                var kq = List[Scalar[i8]](unsafe_uninit_length=kvn)
+                _quantize_kv_int8(kh, kvn, kscale, kq)
+                var vscale = List[Scalar[f32]](unsafe_uninit_length=ngroups)
+                var vq = List[Scalar[i8]](unsafe_uninit_length=kvn)
+                _quantize_kv_int8(vh, kvn, vscale, vq)
+                f.write_bytes(Span[UInt8](unsafe_ptr=kscale.unsafe_ptr().unsafe_bitcast[UInt8](), length=ngroups * 4))
+                f.write_bytes(Span[UInt8](unsafe_ptr=kq.unsafe_ptr().unsafe_bitcast[UInt8](), length=kvn))
+                f.write_bytes(Span[UInt8](unsafe_ptr=vscale.unsafe_ptr().unsafe_bitcast[UInt8](), length=ngroups * 4))
+                f.write_bytes(Span[UInt8](unsafe_ptr=vq.unsafe_ptr().unsafe_bitcast[UInt8](), length=kvn))
+            else:
+                f.write_bytes(Span[UInt8](unsafe_ptr=kh.unsafe_ptr().unsafe_bitcast[UInt8](), length=kvn * 4))
+                f.write_bytes(Span[UInt8](unsafe_ptr=vh.unsafe_ptr().unsafe_bitcast[UInt8](), length=kvn * 4))
+        print("state saved:", path, " pos", pos, " kv pages", ceildiv(pos, KVPAGE), " format", magic)
 
 
-def _quantize_kv_int8(hb: HostBuffer[KVT], kvn: Int, mut scales: List[Scalar[f32]], mut qdata: List[Scalar[i8]]):
+def _quantize_kv_int8[T: DType](hb: HostBuffer[T], kvn: Int, mut scales: List[Scalar[f32]], mut qdata: List[Scalar[i8]]):
     var ngroups = kvn // KVHSTR
     for g in range(ngroups):
         var base = g * KVHSTR
         var amax = Scalar[f32](0)
         for i in range(KVHSTR):
-            var v = abs(hb[base + i])
+            var v = abs(hb[base + i].cast[f32]())
             if v > amax:
                 amax = v
         var scale = amax / 127 if amax > 0 else Scalar[f32](1)
         var inv = Scalar[f32](127) / amax if amax > 0 else Scalar[f32](0)
         scales[g] = scale
         for i in range(KVHSTR):
-            var qf = round(hb[base + i] * inv)
+            var qf = round(hb[base + i].cast[f32]() * inv)
             qf = min(max(qf, Scalar[f32](-127)), Scalar[f32](127))
             qdata[base + i] = qf.cast[i8]()
 
 
-def _dequantize_kv_int8(mut hb: HostBuffer[KVT], data: List[UInt8], scale_off: Int, q_off: Int, kvn: Int):
+def _dequantize_kv_int8[T: DType](mut hb: HostBuffer[T], data: List[UInt8], scale_off: Int, q_off: Int, kvn: Int):
     var scales = data.unsafe_ptr().unsafe_offset(scale_off).unsafe_bitcast[Scalar[f32]]()
     var qdata = data.unsafe_ptr().unsafe_offset(q_off).unsafe_bitcast[Scalar[i8]]()
     var ngroups = kvn // KVHSTR
@@ -143,7 +145,7 @@ def _dequantize_kv_int8(mut hb: HostBuffer[KVT], data: List[UInt8], scale_off: I
         var scale = scales[g]
         var base = g * KVHSTR
         for i in range(KVHSTR):
-            hb[base + i] = qdata[base + i].cast[f32]() * scale
+            hb[base + i] = (qdata[base + i].cast[f32]() * scale).cast[T]()
 
 
 def load_state(
@@ -151,83 +153,85 @@ def load_state(
     kvtab_h: HostBuffer[DType.int32], mut kvtab_d: DeviceBuffer[DType.int32], tpages: Int,
     path: String, tmax: Int,
 ) raises -> Int:
-    comptime assert KVT == DType.float32, "state file stores f32 KV"
-    var data: List[UInt8]
-    with open(path, "r") as f:
-        data = f.read_bytes()
-    if len(data) < 72:
-        raise Error("BARO_STATE_LOAD: file too short")
-    var m2 = String("BAROST02")
-    var is_v2 = True
-    for i in range(8):
-        if data[i] != m2.as_bytes()[i]:
-            is_v2 = False
-    if not is_v2:
-        var m1 = String("BAROST01")
-        for i in range(8):
-            if data[i] != m1.as_bytes()[i]:
-                raise Error("BARO_STATE_LOAD: not a BAROST01/BAROST02 state file")
-    var pos = _get_i64(data, 8)
-    var kvn = _get_i64(data, 32)
-    if _get_i64(data, 16) != CONV_SLOT or _get_i64(data, 24) != SSM_SLOT:
-        raise Error("BARO_STATE_LOAD: slot sizes differ from this engine build")
-    for i in range(32):
-        if data[40 + i] != chain.salt[i]:
-            raise Error("BARO_STATE_LOAD: saved from a different pack")
-    if pos < 1 or pos >= tmax or kvn != ceildiv(pos, KVPAGE) * N_ATT * NKVH * KVHSTR:
-        raise Error("BARO_STATE_LOAD: bad pos/kv size for TMAX " + String(tmax))
-    var off = 72
-    var tokens = List[Int](capacity=pos)
-    for t in range(pos):
-        var v = 0
-        for b in range(4):
-            v |= Int(data[off + 4 * t + b]) << (8 * b)
-        tokens.append(v)
-    off += 4 * pos
-    var ngroups = kvn // KVHSTR
-    var kv_bytes = 2 * kvn * 4 if not is_v2 else 2 * (ngroups * 4 + kvn)
-    if len(data) != off + (CONV_SLOT + SSM_SLOT) * 4 + kv_bytes:
-        raise Error("BARO_STATE_LOAD: payload length mismatch")
-    if chain.cap == 0:
-        raise Error("BARO_STATE_LOAD: needs a checkpoint slot")
-    var idx = 0
-    for i in range(len(chain.items)):
-        if not chain.items[i].valid:
-            idx = i
-            break
-    chain.gen += 1
-    chain.items[idx].pos = pos
-    chain.items[idx].hash = prefix_hash(chain.salt, tokens, pos)
-    chain.items[idx].gen = chain.gen
-    chain.items[idx].valid = True
-    chain.items[idx].pending = False
-    chain.items[idx].pinned = True
-    chain.items[idx].boundary = True
-    unsafe_memcpy(dest=chain.items[idx].conv_h.unsafe_ptr().unsafe_bitcast[UInt8](), src=data.unsafe_ptr().unsafe_offset(off), count=CONV_SLOT * 4)
-    off += CONV_SLOT * 4
-    unsafe_memcpy(dest=chain.items[idx].ssm_h.unsafe_ptr().unsafe_bitcast[UInt8](), src=data.unsafe_ptr().unsafe_offset(off), count=SSM_SLOT * 4)
-    off += SSM_SLOT * 4
-    var kh = ctx.enqueue_create_host_buffer[KVT](kvn)
-    var vh = ctx.enqueue_create_host_buffer[KVT](kvn)
-    ctx.synchronize()
-    if is_v2:
-        var k_scale_off = off
-        var k_q_off = off + ngroups * 4
-        var v_scale_off = k_q_off + kvn
-        var v_q_off = v_scale_off + ngroups * 4
-        _dequantize_kv_int8(kh, data, k_scale_off, k_q_off, kvn)
-        _dequantize_kv_int8(vh, data, v_scale_off, v_q_off, kvn)
+    comptime if KVT != DType.float32:
+        raise Error("BARO_STATE_LOAD: state files store f32 KV; this engine has BARO_KVQ=" + KVQ + " (quantized KV state is A2 step 3)")
     else:
-        unsafe_memcpy(dest=kh.unsafe_ptr().unsafe_bitcast[UInt8](), src=data.unsafe_ptr().unsafe_offset(off), count=kvn * 4)
-        unsafe_memcpy(dest=vh.unsafe_ptr().unsafe_bitcast[UInt8](), src=data.unsafe_ptr().unsafe_offset(off + kvn * 4), count=kvn * 4)
-    ctx.enqueue_copy(dst_buf=DeviceBuffer[KVT](ctx, kc_d.unsafe_ptr(), kvn, owning=False), src_buf=kh)
-    ctx.enqueue_copy(dst_buf=DeviceBuffer[KVT](ctx, vc_d.unsafe_ptr(), kvn, owning=False), src_buf=vh)
-    # the file holds logical pages 0..n-1 contiguously, so the table is the identity after a load
-    for i in range(tpages):
-        kvtab_h[i] = Int32(i)
-    ctx.enqueue_copy(dst_buf=kvtab_d, src_buf=kvtab_h)
-    ctx.synchronize()
-    return pos
+        var data: List[UInt8]
+        with open(path, "r") as f:
+            data = f.read_bytes()
+        if len(data) < 72:
+            raise Error("BARO_STATE_LOAD: file too short")
+        var m2 = String("BAROST02")
+        var is_v2 = True
+        for i in range(8):
+            if data[i] != m2.as_bytes()[i]:
+                is_v2 = False
+        if not is_v2:
+            var m1 = String("BAROST01")
+            for i in range(8):
+                if data[i] != m1.as_bytes()[i]:
+                    raise Error("BARO_STATE_LOAD: not a BAROST01/BAROST02 state file")
+        var pos = _get_i64(data, 8)
+        var kvn = _get_i64(data, 32)
+        if _get_i64(data, 16) != CONV_SLOT or _get_i64(data, 24) != SSM_SLOT:
+            raise Error("BARO_STATE_LOAD: slot sizes differ from this engine build")
+        for i in range(32):
+            if data[40 + i] != chain.salt[i]:
+                raise Error("BARO_STATE_LOAD: saved from a different pack")
+        if pos < 1 or pos >= tmax or kvn != ceildiv(pos, KVPAGE) * N_ATT * NKVH * KVHSTR:
+            raise Error("BARO_STATE_LOAD: bad pos/kv size for TMAX " + String(tmax))
+        var off = 72
+        var tokens = List[Int](capacity=pos)
+        for t in range(pos):
+            var v = 0
+            for b in range(4):
+                v |= Int(data[off + 4 * t + b]) << (8 * b)
+            tokens.append(v)
+        off += 4 * pos
+        var ngroups = kvn // KVHSTR
+        var kv_bytes = 2 * kvn * 4 if not is_v2 else 2 * (ngroups * 4 + kvn)
+        if len(data) != off + (CONV_SLOT + SSM_SLOT) * 4 + kv_bytes:
+            raise Error("BARO_STATE_LOAD: payload length mismatch")
+        if chain.cap == 0:
+            raise Error("BARO_STATE_LOAD: needs a checkpoint slot")
+        var idx = 0
+        for i in range(len(chain.items)):
+            if not chain.items[i].valid:
+                idx = i
+                break
+        chain.gen += 1
+        chain.items[idx].pos = pos
+        chain.items[idx].hash = prefix_hash(chain.salt, tokens, pos)
+        chain.items[idx].gen = chain.gen
+        chain.items[idx].valid = True
+        chain.items[idx].pending = False
+        chain.items[idx].pinned = True
+        chain.items[idx].boundary = True
+        unsafe_memcpy(dest=chain.items[idx].conv_h.unsafe_ptr().unsafe_bitcast[UInt8](), src=data.unsafe_ptr().unsafe_offset(off), count=CONV_SLOT * 4)
+        off += CONV_SLOT * 4
+        unsafe_memcpy(dest=chain.items[idx].ssm_h.unsafe_ptr().unsafe_bitcast[UInt8](), src=data.unsafe_ptr().unsafe_offset(off), count=SSM_SLOT * 4)
+        off += SSM_SLOT * 4
+        var kh = ctx.enqueue_create_host_buffer[KVT](kvn)
+        var vh = ctx.enqueue_create_host_buffer[KVT](kvn)
+        ctx.synchronize()
+        if is_v2:
+            var k_scale_off = off
+            var k_q_off = off + ngroups * 4
+            var v_scale_off = k_q_off + kvn
+            var v_q_off = v_scale_off + ngroups * 4
+            _dequantize_kv_int8(kh, data, k_scale_off, k_q_off, kvn)
+            _dequantize_kv_int8(vh, data, v_scale_off, v_q_off, kvn)
+        else:
+            unsafe_memcpy(dest=kh.unsafe_ptr().unsafe_bitcast[UInt8](), src=data.unsafe_ptr().unsafe_offset(off), count=kvn * 4)
+            unsafe_memcpy(dest=vh.unsafe_ptr().unsafe_bitcast[UInt8](), src=data.unsafe_ptr().unsafe_offset(off + kvn * 4), count=kvn * 4)
+        ctx.enqueue_copy(dst_buf=DeviceBuffer[KVT](ctx, kc_d.unsafe_ptr(), kvn, owning=False), src_buf=kh)
+        ctx.enqueue_copy(dst_buf=DeviceBuffer[KVT](ctx, vc_d.unsafe_ptr(), kvn, owning=False), src_buf=vh)
+        # the file holds logical pages 0..n-1 contiguously, so the table is the identity after a load
+        for i in range(tpages):
+            kvtab_h[i] = Int32(i)
+        ctx.enqueue_copy(dst_buf=kvtab_d, src_buf=kvtab_h)
+        ctx.synchronize()
+        return pos
 
 
 def main() raises:
@@ -369,6 +373,10 @@ def main() raises:
         raise Error("BARO_KVTAB must be identity or reverse")
     kvtab.upload(ctx, bufs.kvtab_h, bufs.kvtab_d)
     print("BARO_KVTAB:", kvtab_mode, " kv pages:", bufs.tpages)
+    comptime if IS_MOE and KVT != DType.float32:
+        raise Error("BARO_KVQ=" + KVQ + " is the dense qwen35 profile only; the MoE megakernel writes f32 KV")
+    comptime KVB = 1 if KVT == DType.int8 else (2 if KVT == DType.bfloat16 else 4)
+    print("BARO_KVQ:", KVQ, " kv dtype:", String(KVT), " kv pool bytes:", 2 * bufs.kvpool * KVB, " kv bytes/token:", 2 * bufs.kvpool * KVB // (bufs.tpages * KVPAGE))
     # The dense path consumes Pack.off's historical order.  The MoE pack is
     # lexical by tensor name, so build a per-block semantic order by name;
     # the offsets remain byte offsets into the same Pack.wbuf blob.
