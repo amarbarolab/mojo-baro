@@ -3,6 +3,8 @@
 Shape and rules come from the conference's round 2 (three sonnet framings, all three retracted the
 "transfer is 0.33%" arithmetic once the denominator was corrected, and converged on item 0 first).
 
+**Lane item `MOE3` = items 0, 1 and 2 below, built and committed in that order on one branch.**
+
 Builder: sonnet, host code only (`serve/expert_tier.mojo`, `serve/window.mojo`, `bench/`). Any edit
 under `kernels/` is a request to the coordinator (fable), written to the report, not built here.
 Conference: `exchange/conference/moe-stage3/` (19-builder, 12-engineer, 18-skeptic, 00-coordinator).
