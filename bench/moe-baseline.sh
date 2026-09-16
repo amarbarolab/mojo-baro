@@ -5,7 +5,7 @@ cd "$(dirname "$0")/.."
 out=${1:?output directory required}
 port=${2:-18080}
 mkdir -p "$out"
-model=$HOME/Models/RegesCore-1.0-35/RegesCore-1.0-35B-UD-Q4_K_S-BARO.gguf
+model=$HOME/Models/RegesCore-1.0-35/RegesCore-1.0-35B-UD-Q4_K_S-BARO-e340ee1.gguf
 server=$HOME/llama.cpp/build/bin/llama-server
 
 sha256sum "$model" | cut -c1-16 > "$out/model.sha256.prefix"
