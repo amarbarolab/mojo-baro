@@ -163,7 +163,7 @@ def make_cfg(pack_q4: Bool, q4_off: Int, e: Int, pf_rows: Int, pf_tail: Int, n_p
         spec=False, spec_dbg=False, expert_trace=False, serve=False, req_id=0, prof=False, pf2=False, pf3=False, pf4=False,
         dump=False, dump4=False, dump_layer=0, mega=True, att_split=n_total, mega_win=False, dot3=False,
         pf_chunk=CP, pf_rows=pf_rows, pf_tail=pf_tail, n_total=n_total, n_prompt=n_prompt,
-        sample=default_sample_params(),
+        sample=default_sample_params(), dump_pen=False,
     )
 
 

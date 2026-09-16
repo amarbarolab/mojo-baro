@@ -9,7 +9,6 @@ t0, t_prefill_end or dt from here (exchange/scorer-integrity-report.md, P-A).
 """
 from std.collections import Dict
 from std.math import ceildiv, log
-from std.os import getenv
 from std.time import perf_counter_ns
 
 from max.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
@@ -616,6 +615,11 @@ struct WindowBufs(Copyable, Movable):
     # source for the response's chosen-token logprob, since the drawn token
     # is not always top-1 of the top-N list.
     var samp_prob_h: HostBuffer[f32]
+    # Item 4 verification staging (coordinator review, 2026-09-16): the raw
+    # pre-penalty row, VOCAB-wide, written by an enqueue_copy in
+    # window.mojo when cfg.dump_pen; read and written to disk only by
+    # serve/engine.mojo, the harness.
+    var dump_row_h: HostBuffer[f32]
 
 
 @fieldwise_init
@@ -656,6 +660,10 @@ struct WindowCfg(Copyable, Movable):
     var n_total: Int
     var n_prompt: Int
     var sample: SampleParams
+    # Item 4 verification (coordinator review, 2026-09-16): stage the raw
+    # pre-penalty row into b.dump_row_h when set; serve/engine.mojo (the
+    # harness) does the sync and file write, never this file.
+    var dump_pen: Bool
 
 
 @fieldwise_init
@@ -1526,33 +1534,20 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                             src_buf=DeviceBuffer[DType.int32](ctx, b.toks_d.unsafe_ptr().unsafe_offset(cfg.n_prompt), hn, owning=False),
                         )
                         ctx.synchronize()
-                    # Item 4 verification (coordinator review, 2026-09-16):
-                    # a per-step raw-row + history dump for an independent
-                    # host comparison, since the wiring needs its own check
-                    # against sample_ref rather than resting on the kernel
-                    # test alone. Off by default (BARO_DUMP_LOGITS_DIR unset).
-                    var dump_dir = getenv("BARO_DUMP_LOGITS_DIR", "")
-                    if dump_dir != "":
-                        var row_h = ctx.enqueue_create_host_buffer[f32](VOCAB)
+                    # Item 4 verification staging only (coordinator review,
+                    # 2026-09-16): the sync and file write for this stay in
+                    # serve/engine.mojo (the harness, never embedded) --
+                    # window.mojo is the self-optimising loop's candidate
+                    # file, where host syncs and file writes are banned at
+                    # scope even behind an env gate. This is one more
+                    # enqueue_copy into a pre-allocated buffer, same class as
+                    # the pen_hist_h copy just above, nothing blocking and
+                    # nothing touching disk.
+                    if cfg.dump_pen:
                         ctx.enqueue_copy(
-                            dst_buf=row_h,
+                            dst_buf=b.dump_row_h,
                             src_buf=DeviceBuffer[f32](ctx, b.logits_d.unsafe_ptr(), VOCAB, owning=False),
                         )
-                        ctx.synchronize()
-                        with open(dump_dir + "/row-" + String(hn) + ".bin", "w") as f:
-                            var p = row_h.unsafe_ptr().unsafe_bitcast[UInt8]()
-                            f.write_bytes(Span[UInt8](unsafe_ptr=p, length=VOCAB * 4))
-                        with open(dump_dir + "/row-" + String(hn) + ".json", "w") as jf:
-                            var js = String("{\"temperature\":") + String(cfg.sample.temperature) + ",\"top_k\":" + String(cfg.sample.top_k)
-                            js += ",\"top_p\":" + String(cfg.sample.top_p) + ",\"min_p\":" + String(cfg.sample.min_p)
-                            js += ",\"presence_penalty\":" + String(cfg.sample.presence_penalty) + ",\"frequency_penalty\":" + String(cfg.sample.frequency_penalty)
-                            js += ",\"top_logprobs\":" + String(cfg.sample.top_logprobs) + ",\"history\":["
-                            for i in range(hn):
-                                if i > 0:
-                                    js += ","
-                                js += String(Int(b.pen_hist_h[i]))
-                            js += "]}"
-                            jf.write_bytes(js.as_bytes())
                     var npen = 0
                     if want_pen:
                         var seen = Dict[Int, Int]()
