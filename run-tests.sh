@@ -24,6 +24,11 @@ cmake --build "$S" -j"$(nproc)" >/dev/null
 ./.venv/bin/mojo build kernels/test_sample_pen.mojo -o .work/test_sample_pen -I . -I kernels -I serve
 ./.work/test_sample_pen
 
+# Grammar-masked sampling: mask before truncation, masked argmax at T = 0,
+# masked probs rows (briefs/2026-09-16-fable-masked-sampler.md).
+./.venv/bin/mojo build kernels/test_sample_mask.mojo -o .work/test_sample_mask -I kernels -I serve
+./.work/test_sample_mask
+
 # KATT head-dimension parity: the Spark attention path at HD 64/128/256,
 # judged by the numpy float64 oracle (bench/dense-protocol.md, KATT).
 ./.venv/bin/mojo build kernels/test_spark_attn.mojo -o .work/test_spark_attn -I kernels -I serve
