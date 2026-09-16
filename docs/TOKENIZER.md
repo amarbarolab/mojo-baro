@@ -1,6 +1,6 @@
 # Tokenizer — text in, text out, bit-equal to llama.cpp
 
-> **Default path since 2026-09-08: the Mojo tokenizer** (`serve/tokenizer.mojo`, CLI `tools/baro-tokenize.mojo`, gate `tools/test_tokenizer_mojo.py`) — see the last section. Everything referring to `tools/retired/*` below is the retired Python path, kept as oracle material.
+> **Default path since 2026-09-08: the Mojo tokenizer** (`serve/tokenizer.mojo`, CLI `tools/baro-tokenize.mojo`, gate `tools/test_tokenizer_mojo.py`) — see the last section. The Python builder and gate that preceded it were deleted 2026-09-16 (git history has them); the Python CLI below stays for `--chat`.
 
 The engine reads token ids and prints token ids. This layer turns text into
 those ids and back, built from nothing but the GGUF's own metadata, and is
@@ -8,9 +8,9 @@ gated on producing exactly the ids llama.cpp produces on the same file.
 
 | | |
 |---|---|
-| builder | `tools/retired/gguf-tokenizer.py MODEL.gguf OUTDIR [OUTDIR ...]` |
-| gate | `.venv/bin/python tools/retired/test_tokenizer.py [--pack DIR] [--gguf FILE]` |
-| CLI | `tools/retired/baro-tokenize.py encode\|decode\|prompt\|info` |
+| builder | `tools/gguf-tokenizer-json.mojo MODEL.gguf OUTDIR` (called by `tools/baro serve`) |
+| gate | `tools/test_tokenizer_mojo.py`, `tools/test_gguf_tokenizer_json.py` |
+| CLI | `tools/baro-tokenize.mojo encode\|decode\|count\|info`; `tools/retired/baro-tokenize.py` for `--chat` |
 | runtime | HF `tokenizers` (Python dev dep; the Rust crate for the server) |
 
 ## Files next to a pack
@@ -71,7 +71,7 @@ Only `tokenizer.ggml.model == "gpt2"` (byte-level BPE) is supported:
 ## Gate
 
 ```
-.venv/bin/python tools/retired/test_tokenizer.py            # default --pack .work/engine-pack-q4
+.venv/bin/python tools/test_tokenizer_mojo.py              # same cases, reference llama-tokenize
 ```
 
 1. every `bench/mtp-prompts/*.txt` (checked equal to `prompts.json`) encodes

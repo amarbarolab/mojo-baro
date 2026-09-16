@@ -7,6 +7,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 OUT=$(readlink -f "${1:-.work/e13-mini}")
 if [ -z "${GPU_WAITING_ROOM_JOB:-}" ]; then
+  bench/preflight.sh --check
   mkdir -p "$OUT"
   ./.venv/bin/mojo build bench/e13_engine_dump.mojo -o .work/e13/e13_engine_dump -I . -I kernels -I serve -I bench > "$OUT/build-dump.log" 2>&1
   ./.venv/bin/mojo build bench/bench_latent_handoff.mojo -o .work/bench_latent_handoff -I . -I kernels -I serve -I bench > "$OUT/build-eval.log" 2>&1

@@ -309,6 +309,6 @@ If a smaller change (fewer lines, fewer files, fewer processes) meets the same g
 larger one, and the replaced code is deleted in the same commit, not left beside it. Duplicate harness
 copies are not kept "for reference"; the reference is git history.
 
-Why: `bench/latent_harness.mojo` was a hand copy of `serve/harness.mojo` that fell 23 fields behind and
-broke the E13 tools; `bench/quality-task-eval.py` survived as a second eval path after
+Why: a hand copy named latent_harness.mojo (since deleted) was a copy of `serve/harness.mojo` that fell 23 fields behind and
+broke the E13 tools; the old quality-task-eval.py script survived as a second eval path after
 `quality-task-ids.py` replaced it.

@@ -6,10 +6,10 @@
   llama --url GPU_LLAMA --out DIR           llama-server /completion, same ids
   score --tok-url CPU_LLAMA --out DIR       detokenize both arms, score, print
 
-Scoring reuses bench/quality-task-eval.py's strip_for_scoring/score_one (which
-import bench/e8_score.py), so what counts as correct is unchanged.
+Scoring uses bench/e8_score.py's exact-match functions, unchanged from the first sweep.
 """
 import argparse
+import re
 import json
 import os
 import subprocess
@@ -19,11 +19,38 @@ from pathlib import Path
 import requests
 
 sys.path.insert(0, str(Path(__file__).parent))
-import importlib.util  # noqa: E402
+from e8_score import extract_last_int, parse_json_obj, subset_match  # noqa: E402
 
-_spec = importlib.util.spec_from_file_location("qte", Path(__file__).parent / "quality-task-eval.py")
-qte = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(qte)
+THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+FENCE_RE = re.compile(r"^```[a-zA-Z]*\n(.*)\n```$", re.DOTALL)
+OBJ_RE = re.compile(r"\{.*\}", re.DOTALL)
+
+
+def sys_prompts(tasks):
+    out = {}
+    for t in tasks:
+        m = re.search(r"<\|im_start\|>system\n(.*?)<\|im_end\|>", t["full_prompt"], re.DOTALL)
+        if m and t["type"] not in out:
+            out[t["type"]] = m.group(1)
+    return out
+
+
+def score_one(task, text):
+    t = THINK_RE.sub("", text).strip()
+    m = FENCE_RE.match(t)
+    if m:
+        t = m.group(1).strip()
+    if task["type"] == "math":
+        got = extract_last_int(t)
+        ok = got is not None and got == task["expected"]
+        return ok, ok, "" if ok else f"got {got} want {task['expected']}"
+    m2 = OBJ_RE.search(t)
+    parsed = parse_json_obj(m2.group(0) if m2 else t)
+    if parsed is None:
+        return False, False, "did not parse as JSON"
+    exact = parsed == task["expected"]
+    return exact, subset_match(parsed, task["expected"]), "" if exact else f"parsed {parsed!r} vs {task['expected']!r}"
+
 
 EOG_STRINGS = ["<|im_end|>", "<|eot_id|>", "<|endoftext|>", "<|end_of_text|>", "</s>", "<|end|>"]
 MAX_TOKENS = 300
@@ -37,7 +64,9 @@ def post(url, path, body, timeout=600):
 
 def prep(a):
     tasks = json.loads(Path(a.tasks).read_text())
-    sys_by_type = qte.sys_prompts(tasks)
+    if a.limit > 0:
+        tasks = tasks[:a.limit]
+    sys_by_type = sys_prompts(tasks)
     items = []
     for t in tasks:
         msgs = [{"role": "system", "content": sys_by_type[t["type"]]}, {"role": "user", "content": t["prompt_text"]}]
@@ -76,7 +105,7 @@ def ours(a):
     out = []
     for i, it in enumerate(p["items"]):
         rid = i + 1
-        proc.stdin.write(json.dumps({"id": rid, "prompt": it["prompt_ids"], "n": MAX_TOKENS, "spec": False, "stop": stop}) + "\n")
+        proc.stdin.write(json.dumps({"id": rid, "prompt": it["prompt_ids"], "n": MAX_TOKENS, "spec": bool(a.spec), "stop": stop}) + "\n")
         proc.stdin.flush()
         toks, done = [], None
         while done is None:
@@ -99,7 +128,7 @@ def ours(a):
     proc.stdin.close()
     proc.wait(timeout=60)
     (Path(a.out) / "ours-ids.json").write_text(json.dumps({"ready": ready, "items": out}))
-    print(f"ours: {len(out)} items, errors {sum(1 for o in out if 'error' in (o['done'] or {}))}")
+    print(f"ours: spec={bool(a.spec)} {len(out)} items, errors {sum(1 for o in out if 'error' in (o['done'] or {}))}")
 
 
 def llama(a):
@@ -133,7 +162,7 @@ def score(a):
             toks = toks[:cut]
             text = post(a.tok_url, "/detokenize", {"tokens": toks})["content"] if toks else ""
             t = tasks[it["id"]]
-            ok, sub, reason = qte.score_one(t, text)
+            ok, sub, reason = score_one(t, text)
             exact += ok
             subset += sub
             items.append({"id": it["id"], "type": t["type"], "n_tokens": len(toks), "text": text,
@@ -157,6 +186,8 @@ def main():
     ap.add_argument("--pack")
     ap.add_argument("--env", default="", help="the bake's baro.run.env, applied like tools/baro serve does")
     ap.add_argument("--tasks", default="bench/data/e8_tasks.json")
+    ap.add_argument("--spec", type=int, default=0, help="1: our arm decodes with MTP spec (T=0 ids identical by the accept rule)")
+    ap.add_argument("--limit", type=int, default=0, help="first N tasks only (quick gate)")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
     {"prep": prep, "ours": ours, "llama": llama, "score": score}[a.cmd](a)

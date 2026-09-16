@@ -7,8 +7,7 @@ tokenizer-meta.json (bos/eos ids, add_bos, chat template) is always written.
 tokenizer.json is written for byte-level BPE with a single pre-tokenizer
 regex (qwen2, qwen35, llama-bpe/llama3, gpt-2/default); any other tokenizer
 (SPM, multi-pattern spark2_5) exits 2 after the meta, so the caller can fall
-back to a shipped tokenizer.json. Replaces tools/retired/gguf-tokenizer.py
-for baro serve.
+back to a shipped tokenizer.json. Used by tools/baro serve.
 """
 from std.sys import argv
 from tokenizer import Tokenizer, T_CONTROL, T_USER

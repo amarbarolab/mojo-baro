@@ -115,7 +115,7 @@ per model from the agreement basis column above.
 defined and reused unmodified from `bench/e8_score.py`
 (`extract_last_int`/`parse_json_obj`/`subset_match`): math scores on the
 last integer in the (stripped) response, json on an exact dict match against
-`expected`. `bench/quality-task-eval.py` imports these functions directly
+`expected`. `bench/quality-task-ids.py` imports these functions directly
 rather than redefining them, so the two eval paths (E8's raw-dump harness,
 this one's live HTTP harness) never diverge on what "correct" means.
 
@@ -133,7 +133,7 @@ on the first task of a model is read back and logged as a receipt, not
 assumed away.
 
 **Scoring pre-processing** (before `e8_score.py`'s functions, python,
-`bench/quality-task-eval.py`): strip `<think>...</think>`, strip a single
+`bench/quality-task-ids.py`): strip `<think>...</think>`, strip a single
 outer triple-backtick fence keeping its contents; for `json` tasks, extract
 the first balanced `{...}` object. Same function, same order, both arms.
 

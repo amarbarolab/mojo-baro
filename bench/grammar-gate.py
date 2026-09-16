@@ -2,7 +2,7 @@
 running baro-serve. Python is the oracle here: `json` parses, `jsonschema`
 validates; neither shares code with grammar/.
 
-  bench/grammar-gate.py URL SERVE_LOG OUT_DIR
+  bench/grammar-gate.py URL SERVE_LOG OUT_DIR       QUICK=N: first N schemas at T=0 and 0.7 + one reasoning case
 
 Requests go one at a time, so the Nth "grammar masked draws:" receipt in
 SERVE_LOG (the engine's stdout as forwarded by baro-serve) belongs to the
@@ -31,9 +31,9 @@ def receipts():
     return re.findall(r"grammar masked draws: (\d+)\s+accepted: (\d+)\s+terminated: (\w+)(.*)", serve_log.read_text(errors="replace"))
 
 
-cases = [] if __import__("os").environ.get("GATE_THINK_ONLY") else [(n, t, False) for t in (0.0, 0.7) for n in names]
-cases.append((names[0], 0.7, True))
-cases.append((names[20], 0.0, True))
+quick = int(__import__("os").environ.get("QUICK", "0"))
+cases = [(n, t, False) for t in (0.0, 0.7) for n in (names[:quick] if quick else names)]
+cases += [(names[0], 0.7, True)] + ([] if quick else [(names[20], 0.0, True)])
 rows, fails = [], 0
 for name, temp, think in cases:
     schema = json.loads((corpus / name).read_text())
