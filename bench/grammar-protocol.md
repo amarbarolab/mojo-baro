@@ -96,9 +96,41 @@ per window instead of once; at k=2 that is 3x30us = 90us against a window
 that already amortizes over up to 3 tokens, so the per-token cost is the
 same order -- same <5% prediction, not separately re-derived.
 
+## Amendment 2026-09-16, before any gate run (lane taken over after the 14:33 OOM kill)
+
+Scope as built, frozen here before the gates run:
+
+- **Temperature.** `amar_sample_row_masked` now threads the mask through its
+  temperature <= 0 branch (masked argmax, -1 on an empty mask, `f6c3767`), so
+  gate 1 runs at T=0 and T=0.7 as written.
+- **Speculation (item 3) is NOT built this round.** A grammar request runs
+  with spec, the megakernel and the megakernel window forced off, exactly like
+  a penalties request (`2a96e4b`). Server default spec stays on for every
+  other request. Gate 1's "default spec on" therefore means: the server runs
+  with its default spec setting and the engine turns spec off per grammar
+  request; no per-row window masks or matcher rollback are claimed.
+- **Truncation.** Grammar requests force top_p=1, top_k=0, min_p=0 (the mask
+  is applied after truncation in the kernel).
+- **Gate 1 prompts.** One chat request per schema: "Reply with one JSON value
+  that matches this JSON schema, filled with realistic data: <schema>",
+  `enable_thinking: false`, max_tokens 400, seed 7. Plus two reasoning-on
+  requests (schemas 01 at T=0.7 and 21 at T=0, max_tokens 1024) for item 2.
+  Oracle: Python `json` + `jsonschema` (`bench/grammar-gate.py`). A request
+  that hits max_tokens before the document closes counts as a FAIL.
+- **Gate 4** is read per request from the engine log: masked draws ==
+  accepted, and masked draws == completion_tokens (reasoning off) or
+  0 < masked draws <= completion_tokens (reasoning on).
+- **Gate 3** runs `tools/test_server.sh` (64/64 T=0 against
+  `ref-tokens-64`) plus the 20-prompt forced identity of the new engine build
+  against the champion build, no `response_format` in any request.
+- **Gate 5 prediction unchanged:** no-spec cost < 1% per token, fail above
+  5%. The spec-on comparison is replaced by the cost a grammar request pays
+  for losing spec: predicted equal to the spec speedup itself (~1.1x at k=2),
+  reported, not gated.
+
 ## Status
 
-Not yet run. `serve/serve_proto.mojo`'s `parse_schema_field` (request-line
+Gates not yet run at the amendment commit. `serve/serve_proto.mojo`'s `parse_schema_field` (request-line
 schema slice) and `serve/test_serve_proto.mojo` land ahead of the
 engine.mojo/window.mojo change, which needs the coordinator's go
 (`briefs/2026-09-16-json-enforcement-lane.md` file-ownership rule:
