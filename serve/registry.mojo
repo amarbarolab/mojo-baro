@@ -24,7 +24,7 @@ from matmul_prefill import (
 )
 from matmul_prefill_lds import amar_matmul_prefill_lds, LDS_THREADS
 from mega import amar_mega_token, amar_mega_window, MEGA_G, MEGA_G_WIN, DATT_NLD
-from mega_moe import amar_mega_moe_token, W_ATT as MOE_W_ATT, W_SSM as MOE_W_SSM
+from mega_moe import amar_mega_moe_token, MOE_BARRIERS, W_ATT as MOE_W_ATT, W_SSM as MOE_W_SSM
 from sample import amar_sample_row, amar_sample_probs, amar_spec_accept, SAMP_THREADS
 from dattn import amar_dattn_split, amar_dattn_combine, dattn_nsplit
 from attn import (

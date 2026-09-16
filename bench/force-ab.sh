@@ -14,7 +14,7 @@ if [ "$ha" = "$hb" ]; then
   echo "REFUSED: ref and cand are the same binary ($ha)" >&2; exit 2
 fi
 echo "ref=$ref cand=$cand shaRef=$ha shaCand=$hb env='$envx' envCand='$envc'" | tee "$out/arm.txt"
-echo "prompt agree checked pct" > "$out/results.txt"
+echo "prompt agree checked pct ref_gen cand_gen" > "$out/results.txt"
 for tf in bench/mtp-prompts/p*.tokens; do
   p=$(basename "$tf" .tokens)
   env BARO_PROMPT="$tf" BARO_SPEC=0 $envx "$ref" > "$out/$p.ref.log" 2>&1
@@ -24,7 +24,8 @@ for tf in bench/mtp-prompts/p*.tokens; do
   fa=$(grep -oE 'forced agreement: [0-9]+ / [0-9]+' "$out/$p.cand.log" | grep -oE '[0-9]+' | tr '\n' ' ')
   set -- $fa
   if [ -z "${1:-}" ] || [ "${2:-0}" = 0 ]; then echo "$p 0 0 VOID(cand)" >> "$out/results.txt"; continue; fi
-  echo "$p $1 $2 $(python3 -c "print(f'{100*$1/$2:.1f}')")" >> "$out/results.txt"
+  gr=$(grep -oE 'mega barrier gen: [0-9]+' "$out/$p.ref.log" | grep -oE '[0-9]+$'); gc=$(grep -oE 'mega barrier gen: [0-9]+' "$out/$p.cand.log" | grep -oE '[0-9]+$')
+  echo "$p $1 $2 $(python3 -c "print(f'{100*$1/$2:.1f}')") ${gr:--} ${gc:--}" >> "$out/results.txt"
 done
 column -t "$out/results.txt"
 python3 - "$out/results.txt" <<'PY'

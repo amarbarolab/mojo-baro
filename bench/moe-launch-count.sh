@@ -14,11 +14,11 @@
 # knowledge of which kernel names belong to which phase.
 set -uo pipefail
 cd "$(dirname "$0")/.."
-eng=$1; out=$2; n2=${3:-32}
+eng=$1; out=$2; n2=${3:-32}; lcenv=${LC_ENV:-BARO_MEGA=0}
 n1=$(( n2 / 2 ))
 mkdir -p "$out"
 command -v rocprofv3 >/dev/null || { echo "no rocprofv3 on PATH" >&2; exit 2; }
-echo "engine=$eng sha=$(sha256sum "$eng" | cut -c1-16) tokens=$n1,$n2" | tee "$out/arm.txt"
+echo "engine=$eng sha=$(sha256sum "$eng" | cut -c1-16) tokens=$n1,$n2 env=$lcenv" | tee "$out/arm.txt"
 
 count_for() {
   local n=$1 d="$out/gen$1"
@@ -29,7 +29,7 @@ count_for() {
   local p
   p=$(tr -s ' \n' ',' < bench/mtp-prompts/p01-water.tokens | sed 's/,$//')
   echo "{\"id\":1,\"prompt\":[$p],\"n\":$n,\"spec\":false}" > "$d/request.jsonl"
-  env BARO_SERVE=1 BARO_SPEC=0 BARO_MEGA=0 BARO_PACK=.work/moe-w1/pack \
+  env BARO_SERVE=1 BARO_SPEC=0 $lcenv BARO_PACK=.work/moe-w1/pack \
       rocprofv3 --kernel-trace -f csv -d "$d" -o trace -- "$eng" \
       < "$d/request.jsonl" > "$d/stdout.txt" 2> "$d/stderr.txt"
   grep -q '"done"' "$d/stdout.txt" || { echo "run at n=$n did not finish, see $d/stderr.txt" >&2; return 1; }

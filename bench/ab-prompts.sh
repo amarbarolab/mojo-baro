@@ -17,7 +17,7 @@ if [ "$ha" = "$hb" ] && [ "$envA" = "$envB" ]; then
 fi
 echo "engA=$eng engB=$engB shaA=$ha shaB=$hb" | tee "$out/arm.txt"
 echo "power_cap_uW=$(cat /sys/class/drm/card1/device/hwmon/hwmon*/power1_cap) vddgfx=$(grep -A1 OD_VDDGFX_OFFSET /sys/class/drm/card1/device/pp_od_clk_voltage | tail -1) armA='$envA' armB='$envB'" | tee -a "$out/arm.txt"
-echo "prompt n_prompt ${la}_tok_s ${lb}_tok_s identity" > "$out/results.txt"
+echo "prompt n_prompt ${la}_tok_s ${lb}_tok_s identity ${la}_gen ${lb}_gen ${la}_fail ${lb}_fail" > "$out/results.txt"
 for tf in bench/mtp-prompts/p*.tokens; do
   p=$(basename "$tf" .tokens); n=$(wc -w < "$tf")
   env BARO_PROMPT="$tf" $envA "$eng" > "$out/$p.$la.log" 2>&1
@@ -25,7 +25,9 @@ for tf in bench/mtp-prompts/p*.tokens; do
   ga=$(grep '^GENERATED' "$out/$p.$la.log"); gb=$(grep '^GENERATED' "$out/$p.$lb.log")
   ta=$(grep -oE 'tok/s_gen: [0-9.]+' "$out/$p.$la.log" | cut -d' ' -f2); tb=$(grep -oE 'tok/s_gen: [0-9.]+' "$out/$p.$lb.log" | cut -d' ' -f2)
   [ -n "$gb" ] && [ "$ga" = "$gb" ] && id=PASS || id=FAIL
-  echo "$p $n ${ta:-nan} ${tb:-nan} $id" >> "$out/results.txt"
+  ga_=$(grep -oE 'mega barrier gen: [0-9]+' "$out/$p.$la.log" | grep -oE '[0-9]+$'); gb_=$(grep -oE 'mega barrier gen: [0-9]+' "$out/$p.$lb.log" | grep -oE '[0-9]+$')
+  fa_=$(grep -oE 'mega fail word: [0-9]+' "$out/$p.$la.log" | grep -oE '[0-9]+$'); fb_=$(grep -oE 'mega fail word: [0-9]+' "$out/$p.$lb.log" | grep -oE '[0-9]+$')
+  echo "$p $n ${ta:-nan} ${tb:-nan} $id ${ga_:--} ${gb_:--} ${fa_:--} ${fb_:--}" >> "$out/results.txt"
 done
 column -t "$out/results.txt"
 python3 - "$out/results.txt" "$la" "$lb" <<'PY'

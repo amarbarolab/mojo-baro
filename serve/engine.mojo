@@ -668,6 +668,15 @@ def main() raises:
         ctx.enqueue_copy(dst_buf=flw, src_buf=bufs.ctr_d)
         ctx.synchronize()
         print("mega fail word:", flw[2], "" if flw[2] == 0 else " NOT-RESIDENT: a grid barrier timed out, tokens after it are invalid")
+        # P1 receipt from the device, not from the env echo: the grid-barrier
+        # generation counter is written only by a persistent kernel's barriers
+        # (the launch path never touches ctr_d), so gen = 0 means no persistent
+        # kernel ran this process, and on the MoE profile gen / MOE_BARRIERS is
+        # the number of tokens the MoE kernel produced.
+        comptime if not MEGA_ALLOWED:
+            print("mega barrier gen:", flw[1], " MoE kernel tokens:", Int(flw[1]) // MOE_BARRIERS, "(", MOE_BARRIERS, "barriers per token )")
+        else:
+            print("mega barrier gen:", flw[1])
         if dump:
             ctx.synchronize()
             with open(dump_path, "w") as f:
@@ -806,6 +815,33 @@ def main() raises:
             for i in range(3):
                 head_s += " " + String(Int(Float64(ph[16 * N_LAYERS + i + 1] - ph[16 * N_LAYERS + i]) / 100.0))
             print(head_s)
+            comptime if not MEGA_ALLOWED:
+                # kernels/mega_moe.mojo stamps 0..12 per layer (attention layers
+                # skip 6) and NPROF * N_LAYERS at the end; per-phase sums over
+                # the layers of each kind, last token, us.
+                var mssm_seq: List[Int] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+                var matt_seq: List[Int] = [0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12]
+                var mssm = InlineArray[Float64, 12](fill=0.0)
+                var matt = InlineArray[Float64, 11](fill=0.0)
+                var mtot = 0.0
+                for layer in range(N_LAYERS):
+                    var b = 16 * layer
+                    if is_attn(layer):
+                        for i in range(11):
+                            matt[i] += Float64(ph[b + matt_seq[i + 1]] - ph[b + matt_seq[i]]) / 100.0
+                    else:
+                        for i in range(12):
+                            mssm[i] += Float64(ph[b + mssm_seq[i + 1]] - ph[b + mssm_seq[i]]) / 100.0
+                    mtot += Float64(ph[b + 12] - ph[b]) / 100.0
+                var ms = String("moe phases ssm (30 layers, us, stamps 0>1>2>3>4>5>6>7>8>9>10>11>12 = rms|proj|gates+conv|l2|delta|gated|ssm_out|rms|router|top8|gate_up|down):")
+                for i in range(12):
+                    ms += " " + String(Int(mssm[i]))
+                print(ms)
+                var ma = String("moe phases attn (10 layers, us, stamps 0>1>2>3>4>5>7>8>9>10>11>12 = rms|proj|heads|attn|gmul|out|rms|router|top8|gate_up|down):")
+                for i in range(11):
+                    ma += " " + String(Int(matt[i]))
+                print(ma)
+                print("moe kernel layers total us:", Int(mtot), " kernel span us:", Int(Float64(ph[16 * N_LAYERS] - ph[0]) / 100.0))
         if prof:
             var tot = Float64(wst.pf_att + wst.pf_ssm + wst.pf_ffn + wst.pf_head)
             print("profile: attn", Float64(wst.pf_att) / 1e9, Float64(wst.pf_att) / tot)

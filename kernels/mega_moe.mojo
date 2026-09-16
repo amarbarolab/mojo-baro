@@ -38,6 +38,7 @@ comptime W_ATT = 16
 comptime W_SSM = 19
 comptime NPROF = 16
 comptime PATT = SPLITK * SM * FFN
+comptime MOE_BARRIERS = 12 * 30 + 11 * 10
 
 
 @always_inline
