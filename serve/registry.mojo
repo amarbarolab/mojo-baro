@@ -26,7 +26,7 @@ from matmul_prefill import (
 from matmul_prefill_lds import amar_matmul_prefill_lds, LDS_THREADS
 from mega import amar_mega_token, amar_mega_window, MEGA_G, MEGA_G_WIN, DATT_NLD
 from mega_moe import amar_mega_moe_token, MOE_BARRIERS, W_ATT as MOE_W_ATT, W_SSM as MOE_W_SSM
-from sample import amar_sample_row, amar_sample_probs, amar_spec_accept, SAMP_THREADS
+from sample import amar_sample_row, amar_sample_probs, amar_spec_accept, amar_apply_penalties, amar_topn_probs, SAMP_THREADS, SAMP_CAP
 from dattn import amar_dattn_split, amar_dattn_combine, dattn_nsplit
 from attn import (
     amar_head_rmsnorm_rope, amar_kv_append2,
@@ -105,6 +105,16 @@ comptime emb_layout = row_major[VOCAB, H]()
 comptime vrow_layout = row_major[1, VOCAB]()
 comptime toks_layout = row_major[TCAP]()
 comptime dtok_layout = row_major[KMAX + 1]()
+# Item 3-4, briefs/2026-09-16-sampling-all-models-lane.md: sparse per-row
+# penalty lists (distinct generated ids + counts, kernels/sample.mojo's
+# amar_apply_penalties) and the top-N probability row (amar_topn_probs).
+# One row per window position, so a later spec+sample+penalties round can
+# fill rows 1..MROWS-1 with drafts 0..j-1 without a layout change; only
+# row 0 is filled today (plain non-spec sampled decode).
+comptime pen_ids_layout = row_major[MROWS, SAMP_CAP]()
+comptime pen_npen_layout = row_major[MROWS]()
+comptime NTOPLP = 20
+comptime topn_layout = row_major[MROWS, NTOPLP]()
 
 comptime w_h_qf = row_major[H, QF]()
 comptime w_h_h = row_major[H, H]()
@@ -215,6 +225,8 @@ comptime sample_probs_k = amar_sample_probs[type_of(vm_layout), type_of(vm_layou
 comptime sample_probs_1 = amar_sample_probs[type_of(vrow_layout), type_of(vrow_layout)]
 comptime sample_row_1 = amar_sample_row[type_of(vrow_layout), type_of(dtok_layout), type_of(dtok_layout)]
 comptime spec_accept_k = amar_spec_accept[type_of(vm_layout), type_of(dtok_layout)]
+comptime apply_penalties_k = amar_apply_penalties[type_of(vm_layout), type_of(pen_ids_layout), type_of(pen_ids_layout), type_of(pen_npen_layout)]
+comptime topn_probs_k = amar_topn_probs[type_of(vm_layout), type_of(topn_layout), type_of(topn_layout), CAP=SAMP_CAP]
 comptime embed1_k = amar_embed_lookup_pos[type_of(emb_layout), type_of(h2_layout), type_of(dtok_layout)]
 comptime rms_m = amar_rmsnorm[type_of(xm_layout), type_of(h_layout), type_of(xm_layout)]
 comptime rms_h2 = amar_rmsnorm[type_of(h2_layout), type_of(h_layout), type_of(h2_layout)]

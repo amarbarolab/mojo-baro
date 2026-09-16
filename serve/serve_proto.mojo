@@ -135,10 +135,14 @@ struct SampleParams(Copyable, Movable):
     var seed: UInt64
     var presence_penalty: Float64
     var frequency_penalty: Float64
+    # Item 4, briefs/2026-09-16-sampling-all-models-lane.md: 0 means "off",
+    # matching every other field's convention here. Bounded to
+    # kernels/sample.mojo's amar_topn_probs CAP (<= 20) by the caller.
+    var top_logprobs: Int
 
 
 def default_sample_params() -> SampleParams:
-    return SampleParams(temperature=0, top_p=1.0, top_k=0, min_p=0, seed=0, presence_penalty=0, frequency_penalty=0)
+    return SampleParams(temperature=0, top_p=1.0, top_k=0, min_p=0, seed=0, presence_penalty=0, frequency_penalty=0, top_logprobs=0)
 
 
 def parse_request(
@@ -147,7 +151,8 @@ def parse_request(
     # {"id":INT,"prompt":[INT,...],"n":INT,"spec":BOOL,"stop":[[INT,...],...],
     #  "ckpt":[INT,...],"temperature":FLOAT,"top_p":FLOAT,"top_k":INT,
     #  "min_p":FLOAT,"seed":INT,"presence_penalty":FLOAT,
-    #  "frequency_penalty":FLOAT}; everything past prompt/n optional. Returns
+    #  "frequency_penalty":FLOAT,"top_logprobs":INT}; everything past prompt/n
+    #  optional. Returns
     # "" on success, else the error text (id is set when it parsed).
     id = 0
     var i = json_key(line, "id")
@@ -270,4 +275,10 @@ def parse_request(
         if not json_float(line, fi, fv5):
             return "frequency_penalty must be a number"
         sample.frequency_penalty = fv5
+    fi = json_key(line, "top_logprobs")
+    if fi >= 0:
+        var iv3 = 0
+        if not json_int(line, fi, iv3) or iv3 < 0:
+            return "top_logprobs must be a non-negative integer"
+        sample.top_logprobs = iv3
     return ""

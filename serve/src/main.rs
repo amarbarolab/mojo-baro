@@ -325,11 +325,21 @@ async fn cancel(State(app): State<Shared>, Json(r): Json<CancelReq>) -> Result<J
     Ok(Json(json!({"cancelled": app.engine.cancel(id).await})))
 }
 
+/// One token's logprob data (item 4, briefs/2026-09-16-sampling-all-models-lane.md),
+/// present only for tokens the engine actually sampled with `top_logprobs > 0`.
+#[derive(Debug, Clone)]
+struct LogprobEntry {
+    token: u32,
+    logprob: f64,
+    top_logprobs: Vec<(u32, f64)>,
+}
+
 /// Streaming state shared by both SSE shapes.
 struct Acc {
     detok: Detok,
     stopped: bool,
     tokens: Vec<u32>,
+    logprobs: Vec<LogprobEntry>,
 }
 
 impl Acc {
@@ -338,12 +348,16 @@ impl Acc {
             detok: Detok::new(),
             stopped: false,
             tokens: Vec::new(),
+            logprobs: Vec::new(),
         }
     }
 
     /// Text delta for one token, or None once a stop token was seen.
-    fn take(&mut self, text: Option<&Text>, tok: u32) -> Option<String> {
+    fn take(&mut self, text: Option<&Text>, tok: u32, logprob: Option<f64>, top_logprobs: Vec<(u32, f64)>) -> Option<String> {
         self.tokens.push(tok);
+        if let Some(lp) = logprob {
+            self.logprobs.push(LogprobEntry { token: tok, logprob: lp, top_logprobs });
+        }
         if self.stopped {
             return None;
         }
@@ -394,8 +408,8 @@ async fn collect(app: &App, mut rx: mpsc::UnboundedReceiver<Event>) -> Result<(A
     let mut stats = Value::Null;
     while let Some(ev) = rx.recv().await {
         match ev {
-            Event::Tok(t) => {
-                if let Some(d) = acc.take(app.text.as_ref(), t) {
+            Event::Tok { tok, logprob, top_logprobs } => {
+                if let Some(d) = acc.take(app.text.as_ref(), tok, logprob, top_logprobs) {
                     text_out.push_str(&d);
                 }
             }
@@ -422,9 +436,10 @@ fn sse_stream(
                 return None;
             }
             let v = match ev {
-                Event::Tok(t) => {
-                    let delta = acc.take(app.text.as_ref(), t)?;
-                    chunk(&app, ChunkKind::Delta { text: delta, token: t })
+                Event::Tok { tok, logprob, top_logprobs } => {
+                    let lp = logprob.map(|l| (tok, l, top_logprobs.clone()));
+                    let delta = acc.take(app.text.as_ref(), tok, logprob, top_logprobs)?;
+                    chunk(&app, ChunkKind::Delta { text: delta, token: tok, logprob: lp })
                 }
                 Event::Done(s) => {
                     ended = true;
@@ -442,9 +457,42 @@ fn sse_stream(
     Sse::new(body).keep_alive(KeepAlive::default())
 }
 
+/// `(token, logprob, top_logprobs)` for one sampled token.
+type TokLogprob = (u32, f64, Vec<(u32, f64)>);
+
 enum ChunkKind {
-    Delta { text: String, token: u32 },
+    Delta { text: String, token: u32, logprob: Option<TokLogprob> },
     Finish { reason: String, stats: Value, tokens: Vec<u32> },
+}
+
+/// `{"id": token_id, "logprob": ...}` list, OpenAI-shaped per token.
+fn top_logprobs_json(top: &[(u32, f64)]) -> Value {
+    Value::Array(top.iter().map(|(id, lp)| json!({"id": id, "logprob": lp})).collect())
+}
+
+/// `/v1/completions`' `logprobs` object (OpenAI shape, ids not text since
+/// this engine is token-id native): `null` when nothing was requested, so a
+/// request with no `logprobs` field gets exactly the pre-item-4 response.
+fn completion_logprobs_json(entries: &[LogprobEntry]) -> Value {
+    if entries.is_empty() {
+        return Value::Null;
+    }
+    json!({
+        "tokens": entries.iter().map(|e| e.token).collect::<Vec<_>>(),
+        "token_logprobs": entries.iter().map(|e| e.logprob).collect::<Vec<_>>(),
+        "top_logprobs": entries.iter().map(|e| top_logprobs_json(&e.top_logprobs)).collect::<Vec<_>>(),
+    })
+}
+
+/// `/v1/chat/completions`' `logprobs.content[]` (OpenAI shape, ids not
+/// text). `null` when nothing was requested.
+fn chat_logprobs_json(entries: &[LogprobEntry]) -> Value {
+    if entries.is_empty() {
+        return Value::Null;
+    }
+    json!({"content": entries.iter().map(|e| json!({
+        "id": e.token, "logprob": e.logprob, "top_logprobs": top_logprobs_json(&e.top_logprobs),
+    })).collect::<Vec<_>>()})
 }
 
 fn spec_default(app: &App, req_spec: Option<bool>) -> bool {
@@ -454,10 +502,10 @@ fn spec_default(app: &App, req_spec: Option<bool>) -> bool {
 // ---- C3 sampler fields (shared by both completion endpoints) ------------------
 
 /// `temperature`/`top_p`/`top_k`/`min_p`/`seed`/`presence_penalty`/
-/// `frequency_penalty`/`logprobs`: parsed and carried in the request's
-/// control block (C3), not yet acted on by the engine -- `logprobs` has no
-/// live sampling path to fall out of yet, so it is parsed and otherwise
-/// unused (bench/chat-protocol.md C3 scope note).
+/// `frequency_penalty`: parsed and carried in the request's control block
+/// (C3), acted on by the engine at `temperature > 0` (items 3-4,
+/// briefs/2026-09-16-sampling-all-models-lane.md). `logprobs`/`top_logprobs`
+/// are not here: their shape differs per endpoint, see `to_sample_params`.
 #[derive(Deserialize, Default)]
 struct SamplerFields {
     #[serde(default)]
@@ -474,13 +522,15 @@ struct SamplerFields {
     presence_penalty: Option<f32>,
     #[serde(default)]
     frequency_penalty: Option<f32>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    logprobs: Option<bool>,
 }
 
 impl SamplerFields {
-    fn to_sample_params(&self) -> protocol::SampleParams {
+    /// `logprobs` is not one of `SamplerFields`' own fields: `/v1/completions`
+    /// spells it as a plain integer count and `/v1/chat/completions` as
+    /// `logprobs: bool` + `top_logprobs: int`, incompatible shapes for the
+    /// same JSON key, so each request struct parses its own and resolves it
+    /// to the wire's single `top_logprobs: u32` (0 = off) before calling this.
+    fn to_sample_params(&self, top_logprobs: Option<u32>) -> protocol::SampleParams {
         protocol::SampleParams {
             temperature: self.temperature,
             top_p: self.top_p,
@@ -489,6 +539,7 @@ impl SamplerFields {
             seed: self.seed,
             presence_penalty: self.presence_penalty,
             frequency_penalty: self.frequency_penalty,
+            top_logprobs: top_logprobs.filter(|&n| n > 0),
         }
     }
 }
@@ -509,6 +560,9 @@ struct CompletionReq {
     spec: Option<bool>,
     #[serde(default)]
     stop: Option<StopParam>,
+    /// OpenAI: the count of top logprobs to return per token (0/absent = off).
+    #[serde(default)]
+    logprobs: Option<u32>,
     #[serde(flatten)]
     sampler: SamplerFields,
 }
@@ -535,7 +589,7 @@ async fn completions(State(app): State<Shared>, Json(r): Json<CompletionReq>) ->
         stream: r.stream,
         stop: compute_stop(&app, r.stop),
         ckpt: vec![],
-        sample: r.sampler.to_sample_params(),
+        sample: r.sampler.to_sample_params(r.logprobs),
     };
     let model = r.model.unwrap_or_else(|| app.model.clone());
     let (req_id, rx) = check_and_submit(&app, &g)?;
@@ -544,9 +598,10 @@ async fn completions(State(app): State<Shared>, Json(r): Json<CompletionReq>) ->
     if g.stream {
         let created = now();
         let sse = sse_stream(app.clone(), rx, move |_, kind| match kind {
-            ChunkKind::Delta { text, token } => json!({
+            ChunkKind::Delta { text, token, logprob } => json!({
                 "id": id, "object": "text_completion", "created": created, "model": model,
-                "choices": [{"index": 0, "text": text, "tokens": [token], "finish_reason": null}]}),
+                "choices": [{"index": 0, "text": text, "tokens": [token], "finish_reason": null,
+                    "logprobs": logprob.map(|(_, lp, top)| json!({"tokens": [token], "token_logprobs": [lp], "top_logprobs": [top_logprobs_json(&top)]}))}]}),
             ChunkKind::Finish { reason, stats, tokens } => json!({
                 "id": id, "object": "text_completion", "created": created, "model": model,
                 "choices": [{"index": 0, "text": "", "finish_reason": reason}],
@@ -559,7 +614,7 @@ async fn completions(State(app): State<Shared>, Json(r): Json<CompletionReq>) ->
     let reason = acc.finish_reason(stats.get("finish").and_then(Value::as_str));
     Ok(Json(json!({
         "id": id, "object": "text_completion", "created": now(), "model": model,
-        "choices": [{"index": 0, "text": text_out, "tokens": acc.tokens, "finish_reason": reason, "logprobs": null}],
+        "choices": [{"index": 0, "text": text_out, "tokens": acc.tokens, "finish_reason": reason, "logprobs": completion_logprobs_json(&acc.logprobs)}],
         "usage": usage_json(n_prompt, acc.tokens.len(), &stats),
         "timings": stats,
     }))
@@ -614,7 +669,10 @@ async fn fork(State(app): State<Shared>, Json(r): Json<ForkReq>) -> Result<Respo
             stream: false,
             stop: compute_stop(&app, b.stop),
             ckpt: vec![],
-            sample: b.sampler.to_sample_params(),
+            // logprobs not supported on /v1/fork branches yet (not in
+            // serve/PROTOCOL.md's branch shape); item 4 scoped to the two
+            // completion endpoints.
+            sample: b.sampler.to_sample_params(None),
         };
         let n_prompt = g.prompt.len();
         let (req_id, rx) = check_and_submit(&app, &g)?;
@@ -669,6 +727,14 @@ struct ChatReq {
     /// see `check_response_format`.
     #[serde(default)]
     response_format: Option<Value>,
+    /// OpenAI: whether to return logprobs at all.
+    #[serde(default)]
+    logprobs: Option<bool>,
+    /// OpenAI: how many top logprobs per token (0-20); meaningful only with
+    /// `logprobs: true`. `logprobs: true` alone still returns the chosen
+    /// token's own logprob (resolved to `top_logprobs: 1` below).
+    #[serde(default)]
+    top_logprobs: Option<u32>,
     #[serde(flatten)]
     sampler: SamplerFields,
 }
@@ -886,7 +952,7 @@ async fn chat_completions(State(app): State<Shared>, Json(r): Json<ChatReq>) -> 
         stream: r.stream,
         stop: compute_stop(&app, r.stop),
         ckpt,
-        sample: r.sampler.to_sample_params(),
+        sample: r.sampler.to_sample_params(if r.logprobs == Some(true) { Some(r.top_logprobs.unwrap_or(1)) } else { r.top_logprobs }),
     };
     let model = r.model.unwrap_or_else(|| app.model.clone());
     let (req_id, rx) = check_and_submit(&app, &g)?;
@@ -896,14 +962,15 @@ async fn chat_completions(State(app): State<Shared>, Json(r): Json<ChatReq>) -> 
         let created = now();
         let mut first = true;
         let sse = sse_stream(app.clone(), rx, move |_, kind| match kind {
-            ChunkKind::Delta { text, token } => {
+            ChunkKind::Delta { text, token, logprob } => {
                 let mut delta = json!({"content": text});
                 if first {
                     first = false;
                     delta["role"] = json!("assistant");
                 }
+                let lp = logprob.map(|(_, l, top)| json!({"content": [{"id": token, "logprob": l, "top_logprobs": top_logprobs_json(&top)}]}));
                 json!({"id": id, "object": "chat.completion.chunk", "created": created, "model": model,
-                       "choices": [{"index": 0, "delta": delta, "tokens": [token], "finish_reason": null}]})
+                       "choices": [{"index": 0, "delta": delta, "tokens": [token], "finish_reason": null, "logprobs": lp}]})
             }
             ChunkKind::Finish { reason, stats, tokens } => json!({
                 "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
@@ -927,7 +994,7 @@ async fn chat_completions(State(app): State<Shared>, Json(r): Json<ChatReq>) -> 
     }
     Ok(Json(json!({
         "id": id, "object": "chat.completion", "created": now(), "model": model,
-        "choices": [{"index": 0, "message": message, "tokens": acc.tokens, "finish_reason": reason}],
+        "choices": [{"index": 0, "message": message, "tokens": acc.tokens, "finish_reason": reason, "logprobs": chat_logprobs_json(&acc.logprobs)}],
         "usage": usage_json(n_prompt, acc.tokens.len(), &stats),
         "timings": stats,
     }))

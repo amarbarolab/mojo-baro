@@ -7,7 +7,8 @@ self-optimising loop may edit. The stopwatch, the prints and the fixtures
 live in serve/engine.mojo, which is not embedded: a candidate cannot reach
 t0, t_prefill_end or dt from here (exchange/scorer-integrity-report.md, P-A).
 """
-from std.math import ceildiv
+from std.collections import Dict
+from std.math import ceildiv, log
 from std.time import perf_counter_ns
 
 from max.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
@@ -334,6 +335,16 @@ def tok_line(id: Int, tok: Int) -> String:
     return String("{\"id\":") + String(id) + ",\"tok\":" + String(tok) + "}"
 
 
+def tok_line_lp(id: Int, tok: Int, logprob: Float64, top_ids: List[Int], top_lp: List[Float64]) -> String:
+    var s = String("{\"id\":") + String(id) + ",\"tok\":" + String(tok) + ",\"logprob\":" + String(logprob) + ",\"top_logprobs\":["
+    for i in range(len(top_ids)):
+        if i > 0:
+            s += ","
+        s += "{\"id\":" + String(top_ids[i]) + ",\"logprob\":" + String(top_lp[i]) + "}"
+    s += "]}"
+    return s
+
+
 def err_line(id: Int, msg: String) -> String:
     return String("{\"id\":") + String(id) + ",\"error\":\"" + msg + "\"}"
 
@@ -582,6 +593,28 @@ struct WindowBufs(Copyable, Movable):
     var sacc_d: DeviceBuffer[DType.int32]
     var sout_h: HostBuffer[DType.int32]
     var sacc_h: HostBuffer[DType.int32]
+    # Item 3-4, briefs/2026-09-16-sampling-all-models-lane.md: sparse penalty
+    # lists and the top-N probability row (kernels/sample.mojo). pen_hist_h
+    # mirrors this request's generated tokens (toks_d[n_prompt:st.pos+1])
+    # back to host once per applicable window, small (bounded by tmax, not
+    # VOCAB), so the distinct-id/count list can be built the same way
+    # serve/sample_ref.mojo's apply_penalties already does.
+    var pen_hist_h: HostBuffer[DType.int32]
+    var pen_ids_h: HostBuffer[DType.int32]
+    var pen_ids_d: DeviceBuffer[DType.int32]
+    var pen_cnt_h: HostBuffer[DType.int32]
+    var pen_cnt_d: DeviceBuffer[DType.int32]
+    var pen_npen_h: HostBuffer[DType.int32]
+    var pen_npen_d: DeviceBuffer[DType.int32]
+    var topn_ids_d: DeviceBuffer[DType.int32]
+    var topn_ids_h: HostBuffer[DType.int32]
+    var topn_probs_d: DeviceBuffer[f32]
+    var topn_probs_h: HostBuffer[f32]
+    # The chosen token's own probability (amar_sample_row's Prob output,
+    # already penalty-correct since apply_penalties ran first): the right
+    # source for the response's chosen-token logprob, since the drawn token
+    # is not always top-1 of the top-N list.
+    var samp_prob_h: HostBuffer[f32]
 
 
 @fieldwise_init
@@ -797,6 +830,11 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
     else:
         var m = 1
         var win_spec = False
+        # Item 3-4, briefs/2026-09-16-sampling-all-models-lane.md: set when
+        # the plain (non-spec) sampled branch below actually ran, so the
+        # print block downstream knows a valid Prob/top-N sits in
+        # b.hmax_d[0]/b.topn_*_h[0, :].
+        var did_sample_lp = False
         comptime if MEGA_ALLOWED:
             if st.pos + 1 < cfg.n_prompt:
                 m = min(MROWS, cfg.n_prompt - 1 - st.pos)
@@ -1464,6 +1502,55 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                 # place the result at the real position.
                 var SampTok = TileTensor(b.dtok_d, dtok_layout)
                 var SampProb = TileTensor(b.hmax_d, dtok_layout)
+                # Item 3-4, briefs/2026-09-16-sampling-all-models-lane.md:
+                # penalties (applied to Logitsm in place, before the draw)
+                # and top-N logprobs (of the same penalized/truncated row
+                # amar_sample_row draws from). Scoped to m == 1 past the
+                # prompt: every call here except MEGA_ALLOWED's batched
+                # prompt-tail replay (m > 1, not real generation, where
+                # penalties/logprobs are skipped rather than guessed).
+                var want_pen = cfg.sample.presence_penalty != 0 or cfg.sample.frequency_penalty != 0
+                var want_lp = cfg.sample.top_logprobs > 0
+                if m == 1 and st.pos + 1 >= cfg.n_prompt and (want_pen or want_lp):
+                    var hn = st.pos + 1 - cfg.n_prompt
+                    if hn > 0:
+                        ctx.enqueue_copy(
+                            dst_buf=b.pen_hist_h.create_sub_buffer[DType.int32](0, hn),
+                            src_buf=DeviceBuffer[DType.int32](ctx, b.toks_d.unsafe_ptr().unsafe_offset(cfg.n_prompt), hn, owning=False),
+                        )
+                        ctx.synchronize()
+                    var npen = 0
+                    if want_pen:
+                        var seen = Dict[Int, Int]()
+                        for i in range(hn):
+                            var t = Int(b.pen_hist_h[i])
+                            seen[t] = seen.get(t, 0) + 1
+                        for entry in seen.items():
+                            if npen >= SAMP_CAP:
+                                break
+                            b.pen_ids_h[npen] = Int32(entry.key)
+                            b.pen_cnt_h[npen] = Int32(entry.value)
+                            npen += 1
+                        b.pen_npen_h[0] = Int32(npen)
+                        ctx.enqueue_copy(dst_buf=b.pen_npen_d.create_sub_buffer[DType.int32](0, 1), src_buf=b.pen_npen_h.create_sub_buffer[DType.int32](0, 1))
+                        if npen > 0:
+                            ctx.enqueue_copy(dst_buf=b.pen_ids_d.create_sub_buffer[DType.int32](0, npen), src_buf=b.pen_ids_h.create_sub_buffer[DType.int32](0, npen))
+                            ctx.enqueue_copy(dst_buf=b.pen_cnt_d.create_sub_buffer[DType.int32](0, npen), src_buf=b.pen_cnt_h.create_sub_buffer[DType.int32](0, npen))
+                            ctx.enqueue_function[apply_penalties_k](
+                                Logitsm, TileTensor(b.pen_ids_d, pen_ids_layout), TileTensor(b.pen_cnt_d, pen_ids_layout), TileTensor(b.pen_npen_d, pen_npen_layout),
+                                Int32(VOCAB), Float32(cfg.sample.presence_penalty), Float32(cfg.sample.frequency_penalty), grid_dim=1, block_dim=256,
+                            )
+                    if want_lp:
+                        ctx.enqueue_function[topn_probs_k](
+                            Logitsm, TileTensor(b.topn_ids_d, topn_layout), TileTensor(b.topn_probs_d, topn_layout),
+                            Int32(VOCAB), Int32(min(cfg.sample.top_logprobs, NTOPLP)),
+                            Float32(cfg.sample.temperature), Int32(cfg.sample.top_k), Float32(cfg.sample.top_p), Float32(cfg.sample.min_p),
+                            grid_dim=1, block_dim=SAMP_THREADS,
+                        )
+                        ctx.enqueue_copy(dst_buf=b.topn_ids_h.create_sub_buffer[DType.int32](0, NTOPLP), src_buf=DeviceBuffer[DType.int32](ctx, b.topn_ids_d.unsafe_ptr(), NTOPLP, owning=False))
+                        ctx.enqueue_copy(dst_buf=b.topn_probs_h.create_sub_buffer[f32](0, NTOPLP), src_buf=DeviceBuffer[f32](ctx, b.topn_probs_d.unsafe_ptr(), NTOPLP, owning=False))
+                        ctx.synchronize()
+                    did_sample_lp = want_lp
                 ctx.enqueue_function[sample_row_k](
                     Logitsm, SampTok, SampProb, Int32(VOCAB),
                     Float32(cfg.sample.temperature), Int32(cfg.sample.top_k),
@@ -1486,9 +1573,28 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                     print(tok_line(cfg.req_id, Int(b.dtok_h[m - 1])))
                 else:
                     ctx.enqueue_copy(dst_buf=b.stream_h.create_sub_buffer[DType.int32](0, m), src_buf=DeviceBuffer[DType.int32](ctx, b.toks_d.unsafe_ptr().unsafe_offset(st.pos + 1), m, owning=False))
+                    if did_sample_lp:
+                        ctx.enqueue_copy(
+                            dst_buf=b.samp_prob_h.create_sub_buffer[f32](0, 1),
+                            src_buf=DeviceBuffer[f32](ctx, b.hmax_d.unsafe_ptr(), 1, owning=False),
+                        )
                     ctx.synchronize()
-                    for i in range(m):
-                        print(tok_line(cfg.req_id, Int(b.stream_h[i])))
+                    if did_sample_lp:
+                        var chosen = Int(b.stream_h[0])
+                        var lp = log(Float64(b.samp_prob_h[0])) if b.samp_prob_h[0] > 0 else -1e30
+                        var top_ids = List[Int]()
+                        var top_lp = List[Float64]()
+                        for i in range(min(Int(cfg.sample.top_logprobs), NTOPLP)):
+                            var tid = Int(b.topn_ids_h[i])
+                            if tid < 0:
+                                break
+                            top_ids.append(tid)
+                            var p = b.topn_probs_h[i]
+                            top_lp.append(log(Float64(p)) if p > 0 else -1e30)
+                        print(tok_line_lp(cfg.req_id, chosen, lp, top_ids, top_lp))
+                    else:
+                        for i in range(m):
+                            print(tok_line(cfg.req_id, Int(b.stream_h[i])))
             if cfg.prof:
                 ctx.synchronize()
                 st.pf_head += Int(perf_counter_ns() - st.tp)

@@ -19,7 +19,7 @@ use crate::protocol::{cancel_line, parse_line, DoneStats, EngineMsg, Request, Sa
 /// exactly one `Done` or `Error`.
 #[derive(Debug, Clone)]
 pub enum Event {
-    Tok(u32),
+    Tok { tok: u32, logprob: Option<f64>, top_logprobs: Vec<(u32, f64)> },
     Done(DoneStats),
     Error(String),
 }
@@ -339,8 +339,8 @@ async fn run_one(
             }
         };
         match parse_line(&line) {
-            EngineMsg::Tok { id: rid, tok } if rid == id => {
-                let _ = job.out.send(Event::Tok(tok));
+            EngineMsg::Tok { id: rid, tok, logprob, top_logprobs } if rid == id => {
+                let _ = job.out.send(Event::Tok { tok, logprob, top_logprobs });
             }
             EngineMsg::Done { id: rid, stats } if rid == id => {
                 let _ = job.out.send(Event::Done(stats));

@@ -28,6 +28,8 @@ pub struct SampleParams {
     pub presence_penalty: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub frequency_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_logprobs: Option<u32>,
 }
 
 /// One request line, serialised exactly as the engine's parser expects.
@@ -93,7 +95,11 @@ pub enum EngineMsg {
         pack: String,
     },
     /// One generated token id for request `id`, in generation order.
-    Tok { id: u64, tok: u32 },
+    /// `logprob`/`top_logprobs` are present only when the engine actually
+    /// sampled with `top_logprobs > 0` for this token (item 4,
+    /// briefs/2026-09-16-sampling-all-models-lane.md); absent on every
+    /// other line, including every line before this feature existed.
+    Tok { id: u64, tok: u32, logprob: Option<f64>, top_logprobs: Vec<(u32, f64)> },
     /// Request `id` finished; no more `Tok` lines follow for it.
     Done { id: u64, stats: DoneStats },
     /// Request `id` was rejected before any token was produced.
@@ -181,7 +187,17 @@ pub fn parse_line(line: &str) -> EngineMsg {
         return EngineMsg::Log(raw.to_string());
     }
     if let Some(tok) = get_u32(&v, "tok") {
-        return EngineMsg::Tok { id, tok };
+        let logprob = get_f64(&v, "logprob");
+        let top_logprobs = v
+            .get("top_logprobs")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|e| Some((get_u32(e, "id")?, get_f64(e, "logprob")?)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        return EngineMsg::Tok { id, tok, logprob, top_logprobs };
     }
     EngineMsg::Log(raw.to_string())
 }
@@ -255,6 +271,7 @@ mod tests {
                 seed: Some(42),
                 presence_penalty: None,
                 frequency_penalty: None,
+                top_logprobs: None,
             },
         };
         assert_eq!(
@@ -287,7 +304,7 @@ mod tests {
 
     #[test]
     fn tok_and_done_lines() {
-        assert_eq!(parse_line("{\"id\":3,\"tok\":11751}"), EngineMsg::Tok { id: 3, tok: 11751 });
+        assert_eq!(parse_line("{\"id\":3,\"tok\":11751}"), EngineMsg::Tok { id: 3, tok: 11751, logprob: None, top_logprobs: vec![] });
         let m = parse_line(
             "{\"id\":3,\"done\":true,\"n\":64,\"prefill_s\":0.01,\"decode_s\":0.5,\"tok_s\":126.0,\"drafted\":40,\"accepted\":28,\"k\":2,\"cached\":7913,\"prefill_rows\":41,\"restore_s\":0.002}",
         );
@@ -367,7 +384,7 @@ mod tests {
     fn extra_fields_are_ignored() {
         assert_eq!(
             parse_line("{\"id\":1,\"tok\":2,\"extra\":{\"x\":[1]}}"),
-            EngineMsg::Tok { id: 1, tok: 2 }
+            EngineMsg::Tok { id: 1, tok: 2, logprob: None, top_logprobs: vec![] }
         );
     }
 }
