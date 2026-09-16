@@ -189,6 +189,10 @@ def main() raises:
     var dump = dump_path != ""
     var dump4 = getenv("BARO_DUMP4", "0") == "1"
     var dump_layer = atol(getenv("BARO_DUMP_LAYER", "0"))
+    # Item 4 verification (coordinator review, 2026-09-16): per-step raw-row
+    # + history dump for an independent host comparison, read once here (the
+    # harness), never in window.mojo. Off by default.
+    var dump_pen_dir = getenv("BARO_DUMP_LOGITS_DIR", "")
 
     var serve = getenv("BARO_SERVE", "0") == "1"
     print("BARO_SERVE:", serve)
@@ -589,17 +593,32 @@ def main() raises:
         # stage sum exceeds the unsynchronized sub-block time; compare stages
         # within an arm and the same stage across m, never add these into a budget.
         var pf4 = getenv("BARO_PROFILE", "0") == "4"
+        # Items 3-4 (briefs/2026-09-16-sampling-all-models-lane.md), fix for
+        # the coordinator's P1 inert-parameter finding: penalties/top_logprobs
+        # are only applied on window.mojo's plain (non-spec) single-token
+        # decode step, so a default request (spec ON by default, temperature
+        # possibly 0) could silently never reach it. Force both the
+        # megakernel and speculation off for the rest of THIS request instead
+        # of letting the parameter fall through unused.
+        var want_extra = sample.presence_penalty != 0 or sample.frequency_penalty != 0 or sample.top_logprobs > 0
+        if want_extra:
+            spec = False
         # The megakernel bakes greedy argmax into its own launch (mega_token_*
         # kernels take no sampler params); a sampling request always runs the
-        # launch path, which is where the sampler is wired below.
-        var mega_req = mega and sample.temperature <= 0
+        # launch path, which is where the sampler is wired below. Same for a
+        # T<=0 request carrying penalties/top_logprobs: the launch path's
+        # amar_sample_row is argmax-equivalent at temperature<=0 (P-K2), so
+        # routing it there instead of the megakernel is what lets penalties
+        # apply before that equivalent draw.
+        var mega_req = mega and sample.temperature <= 0 and not want_extra
         # A1: the megakernel WINDOW writes the window's tokens itself, so it
         # cannot host the speculative sampling rule (which needs the target's
         # full probability rows, not its argmax). Sampling therefore stays on
         # the launch path for the window too, exactly as it already does for
         # the single-token megakernel above.
-        var mega_win_req = mega_win and sample.temperature <= 0
-        var cfg = WindowCfg(pack_q4=pack_q4, draft_q4=draft_q4, q4_off=q4_off, e=e, kcfg=kcfg, spec=spec, spec_dbg=spec_dbg, expert_trace=expert_trace, serve=serve, req_id=req_id, prof=prof, pf2=pf2, pf3=pf3, pf4=pf4, dump=dump, dump4=dump4, dump_layer=dump_layer, mega=mega_req, att_split=att_split, mega_win=mega_win_req, dot3=dot3, pf_chunk=pf_chunk, pf_rows=pf_rows, pf_tail=pf_tail, n_total=n_total, fr_k=fr_k, fr_off=fr_off, fr_ids_off=fr_ids_off, n_prompt=len(prompt), sample=sample.copy())
+        var mega_win_req = mega_win and sample.temperature <= 0 and not want_extra
+        var dump_pen = want_extra and dump_pen_dir != ""
+        var cfg = WindowCfg(pack_q4=pack_q4, draft_q4=draft_q4, q4_off=q4_off, e=e, kcfg=kcfg, spec=spec, spec_dbg=spec_dbg, expert_trace=expert_trace, serve=serve, req_id=req_id, prof=prof, pf2=pf2, pf3=pf3, pf4=pf4, dump=dump, dump4=dump4, dump_layer=dump_layer, mega=mega_req, att_split=att_split, mega_win=mega_win_req, dot3=dot3, pf_chunk=pf_chunk, pf_rows=pf_rows, pf_tail=pf_tail, n_total=n_total, fr_k=fr_k, fr_off=fr_off, fr_ids_off=fr_ids_off, n_prompt=len(prompt), sample=sample.copy(), dump_pen=dump_pen)
         if len(force) > 0 and cfg.spec:
             raise Error("BARO_FORCE requires BARO_SPEC=0 (teacher forcing is a no-spec identity gate)")
         wst.reset(t0)
@@ -624,6 +643,28 @@ def main() raises:
                 step_window(ctx, bufs, step_cfg, wst)
             else:
                 step_window(ctx, bufs, cfg, wst)
+            # Item 4 verification (coordinator review, 2026-09-16): the sync
+            # and file write live here, in the harness, never in
+            # window.mojo. bufs.dump_row_h and bufs.pen_hist_h were staged
+            # by window.mojo's own enqueue_copy calls (cfg.dump_pen /
+            # penalties-or-logprobs), synchronized here for the first time.
+            if cfg.dump_pen and wst.pos == pos_before + 1 and pos_before + 1 >= len(prompt):
+                ctx.synchronize()
+                var step = pos_before + 1 - len(prompt)
+                with open(dump_pen_dir + "/row-" + String(step) + ".bin", "w") as f:
+                    var p = bufs.dump_row_h.unsafe_ptr().unsafe_bitcast[UInt8]()
+                    f.write_bytes(Span[UInt8](unsafe_ptr=p, length=VOCAB * 4))
+                with open(dump_pen_dir + "/row-" + String(step) + ".json", "w") as jf:
+                    var js = String("{\"temperature\":") + String(sample.temperature) + ",\"top_k\":" + String(sample.top_k)
+                    js += ",\"top_p\":" + String(sample.top_p) + ",\"min_p\":" + String(sample.min_p)
+                    js += ",\"presence_penalty\":" + String(sample.presence_penalty) + ",\"frequency_penalty\":" + String(sample.frequency_penalty)
+                    js += ",\"top_logprobs\":" + String(sample.top_logprobs) + ",\"history\":["
+                    for i in range(step):
+                        if i > 0:
+                            js += ","
+                        js += String(Int(bufs.pen_hist_h[i]))
+                    js += "]}"
+                    jf.write_bytes(js.as_bytes())
             if len(force) > 0 and pos_before >= len(prompt) - 1:
                 if wst.pos != pos_before + 1:
                     raise Error("BARO_FORCE: step advanced by more than one position (spec/prefill batching) -- void arm")

@@ -620,10 +620,14 @@ struct WindowBufs(Copyable, Movable):
     var samp_prob_h: HostBuffer[f32]
     # JSON-enforcement item 1 (briefs/2026-09-16-json-enforcement-lane.md):
     # one grammar mask row, VOCAB bits. m == 1 only this round, so one row
-    # is enough -- a spec window's per-row masks are item 3, gated on a
-    # kernel change (KERNEL request open with the coordinator).
+    # is enough while grammar requests run with spec off.
     var gmask_h: HostBuffer[DType.uint64]
     var gmask_d: DeviceBuffer[DType.uint64]
+    # Item 4 verification staging (coordinator review, 2026-09-16): the raw
+    # pre-penalty row, VOCAB-wide, written by an enqueue_copy in
+    # window.mojo when cfg.dump_pen; read and written to disk only by
+    # serve/engine.mojo, the harness.
+    var dump_row_h: HostBuffer[f32]
 
 
 @fieldwise_init
@@ -664,6 +668,10 @@ struct WindowCfg(Copyable, Movable):
     var n_total: Int
     var n_prompt: Int
     var sample: SampleParams
+    # Item 4 verification (coordinator review, 2026-09-16): stage the raw
+    # pre-penalty row into b.dump_row_h when set; serve/engine.mojo (the
+    # harness) does the sync and file write, never this file.
+    var dump_pen: Bool
 
 
 @fieldwise_init
@@ -1525,14 +1533,20 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                     ctx.synchronize()
                     st.p3[3] += Int(perf_counter_ns() - t_acc)
                 m = n_acc + 1
-            elif cfg.sample.temperature <= 0:
+            elif cfg.sample.temperature <= 0 and cfg.sample.presence_penalty == 0 and cfg.sample.frequency_penalty == 0 and cfg.sample.top_logprobs <= 0 and not st.grammar.__bool__():
                 ctx.enqueue_function[argmax_k](Logitsm, Toks, Int32(VOCAB), Int32(st.pos + 1), grid_dim=m, block_dim=256)
             else:
-                # Sampling (M5): spec and the megakernel are both forced off
-                # whenever temperature > 0 (engine.mojo), so dtok_d and
-                # hmax_d are free scratch here -- sample into them, 0-based,
-                # then reuse the same tokcp_k the spec path already uses to
-                # place the result at the real position.
+                # Sampling (M5). engine.mojo forces spec and the megakernel
+                # off whenever temperature > 0, OR temperature <= 0 with
+                # penalties/top_logprobs requested (items 3-4,
+                # briefs/2026-09-16-sampling-all-models-lane.md) -- the
+                # latter case still lands here rather than argmax_k because
+                # amar_sample_row is argmax-equivalent at temperature <= 0
+                # (P-K2), which is what lets a penalized row still resolve
+                # to the penalized argmax. dtok_d and hmax_d are free scratch
+                # here -- sample into them, 0-based, then reuse the same
+                # tokcp_k the spec path already uses to place the result at
+                # the real position.
                 var SampTok = TileTensor(b.dtok_d, dtok_layout)
                 var SampProb = TileTensor(b.hmax_d, dtok_layout)
                 # Item 3-4, briefs/2026-09-16-sampling-all-models-lane.md:
@@ -1552,6 +1566,20 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                             src_buf=DeviceBuffer[DType.int32](ctx, b.toks_d.unsafe_ptr().unsafe_offset(cfg.n_prompt), hn, owning=False),
                         )
                         ctx.synchronize()
+                    # Item 4 verification staging only (coordinator review,
+                    # 2026-09-16): the sync and file write for this stay in
+                    # serve/engine.mojo (the harness, never embedded) --
+                    # window.mojo is the self-optimising loop's candidate
+                    # file, where host syncs and file writes are banned at
+                    # scope even behind an env gate. This is one more
+                    # enqueue_copy into a pre-allocated buffer, same class as
+                    # the pen_hist_h copy just above, nothing blocking and
+                    # nothing touching disk.
+                    if cfg.dump_pen:
+                        ctx.enqueue_copy(
+                            dst_buf=b.dump_row_h,
+                            src_buf=DeviceBuffer[f32](ctx, b.logits_d.unsafe_ptr(), VOCAB, owning=False),
+                        )
                     var npen = 0
                     if want_pen:
                         var seen = Dict[Int, Int]()
@@ -1587,15 +1615,13 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                 # JSON-enforcement item 1 (briefs/2026-09-16-json-enforcement-lane.md):
                 # m == 1, matching the penalties/logprobs scope above -- a
                 # grammar governs one generated token at a time, never the
-                # MEGA_ALLOWED batched prompt-tail replay. engine.mojo already
-                # refuses response_format at temperature <= 0 (the kernel's
-                # T<=0 branch does not thread the mask yet) and forces
-                # top_p=1/top_k=0/min_p=0 for a grammar request (interim:
-                # amar_sample_row_masked filters the mask AFTER truncation
-                # today, so an unmasked-but-truncated draw could land outside
-                # the allowed set and return -1; safe to drop once the
-                # masked-first kernel lands, KERNEL request open).
-                var grammar_here = m == 1 and st.grammar.__bool__() and not st.grammar_pending_think
+                # MEGA_ALLOWED batched prompt-tail replay. At temperature <= 0
+                # the masked kernel is a masked argmax. engine.mojo forces
+                # spec and the megakernel off and top_p=1/top_k=0/min_p=0 for
+                # a grammar request: amar_sample_row_masked applies the mask
+                # AFTER truncation, so a truncated draw could land outside
+                # the allowed set and return -1.
+                var grammar_here = m == 1 and st.pos + 1 >= cfg.n_prompt and st.grammar.__bool__() and not st.grammar_pending_think
                 if grammar_here:
                     st.grammar_masked_draws += 1
                     ref mm = st.grammar.value()
@@ -1640,7 +1666,7 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                             src_buf=DeviceBuffer[f32](ctx, b.hmax_d.unsafe_ptr(), 1, owning=False),
                         )
                     ctx.synchronize()
-                    if m == 1 and st.grammar.__bool__():
+                    if m == 1 and st.pos + 1 >= cfg.n_prompt and st.grammar.__bool__():
                         # Item 1/2: advance the reasoning-boundary scan while
                         # waiting for "</think>", or the matcher once past
                         # it. Reasoning tokens are never accept()ed -- the
@@ -1648,7 +1674,9 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                         # boundary (grammar/test_reasoning_boundary.mojo).
                         var chosen_tok = Int(b.stream_h[0])
                         ref mm2 = st.grammar.value()
-                        if st.grammar_pending_think:
+                        if chosen_tok < 0:
+                            st.grammar_stop = True
+                        elif st.grammar_pending_think:
                             if reasoning_boundary_observe(st.grammar_think_buf, mm2.vocab[].token_bytes[chosen_tok]):
                                 st.grammar_pending_think = False
                         else:
