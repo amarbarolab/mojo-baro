@@ -21,6 +21,7 @@ from max.gpu.host import DeviceContext, HostBuffer
 
 from registry import H, f32
 from window import WindowBufs, WindowState
+from grammar.automaton import Bitset
 from harness import load_pack, alloc_bufs, Pack
 from bench_latent_handoff import (
     collect_latent_raw,
@@ -176,6 +177,7 @@ def run_full_dump(
     var f32_path = out_dir + "/train-k32.bin"
     var n_written = 0
     var n_skipped = 0
+    var skip_k32 = getenv("E13_SKIP_K32", "0") == "1"
     with open(f8_path, "w") as f8:
         with open(f32_path, "w") as f32f:
             for line in raw.split("\n"):
@@ -206,8 +208,9 @@ def run_full_dump(
 
                 var h8 = dump_item_latents(ctx, b, wst, pack_q4, q4_off, e, tokens, tmax, K8)
                 write_dump_record(f8, item_id, answer, tokens, h8, K8)
-                var h32 = dump_item_latents(ctx, b, wst, pack_q4, q4_off, e, tokens, tmax, K32)
-                write_dump_record(f32f, item_id, answer, tokens, h32, K32)
+                if not skip_k32:
+                    var h32 = dump_item_latents(ctx, b, wst, pack_q4, q4_off, e, tokens, tmax, K32)
+                    write_dump_record(f32f, item_id, answer, tokens, h32, K32)
                 n_written += 1
                 if limit > 0 and n_written >= limit:
                     break

@@ -30,7 +30,7 @@ echo "building e13_engine_dump..."
   -I . -I kernels -I serve -I bench
 
 fwd_env=()
-for v in BARO_PACK BARO_E8_GGUF BARO_E8_TMAX E13_DUMP_LIMIT E13_MIN_STEPS E8_GSM8K_TRAIN E13_DUMP_DIR E13_WORK_DIR; do
+for v in BARO_PACK BARO_E8_GGUF BARO_E8_TMAX E13_DUMP_LIMIT E13_SKIP_K32 E13_MIN_STEPS E8_GSM8K_TRAIN E13_DUMP_DIR E13_WORK_DIR; do
   [ -n "${!v-}" ] && fwd_env+=("$v=${!v}")
 done
 

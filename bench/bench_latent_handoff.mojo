@@ -692,8 +692,8 @@ def main() raises:
     for j in range(len(arms)):
         if String(arms[j]) == "KV":
             kv_cap = 1
-    var chainA = Chain(ctx, kv_cap)
-    var chainB = Chain(ctx, kv_cap)
+    var chainA = Chain(ctx, kv_cap, packdir)
+    var chainB = Chain(ctx, kv_cap, packdir)
 
     var doc = parse_json_file(getenv("BARO_E8_TASKS", "bench/data/e8_tasks.json"))
     var root = doc.get(doc.root)
@@ -926,10 +926,10 @@ def main() raises:
                     var kv_pages = (hand_pos + KVPAGE - 1) // KVPAGE
                     var zero32 = InlineArray[UInt8, 32](fill=0)
                     var t0m = perf_counter_ns()
-                    var kv = mint_kv_latent(ctx, bufsA.kc_d, bufsA.vc_d, 0, kv_pages, hand_hash, receiver_identity.weights_uuid, zero32, receiver_identity.runtime, receiver_identity.tokenizer_sha)
+                    var kv = mint_kv_latent(ctx, bufsA.kc_d, bufsA.vc_d, 0, kv_pages, UInt64(hand_pos), receiver_identity.weights_uuid, zero32, receiver_identity.runtime, receiver_identity.tokenizer_sha)
                     var kv_header = kv[0].copy()
                     var kv_fd = kv[1]
-                    chainA.save(ctx, bufsA.convstate_d, bufsA.sstate_d, wstA.ring, hand_pos, a_ctx)
+                    chainA.save(ctx, bufsA.convstate_d, bufsA.sstate_d, wstA.ring, hand_pos, a_ctx, True, True)
                     ctx.synchronize()
                     chainA.commit()
                     if not chainA.items[0].valid or chainA.items[0].pos != hand_pos:
