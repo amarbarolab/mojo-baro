@@ -57,8 +57,9 @@ them; Llama-3.2 is gated on HF and needs an accepted-license token).
 
 Two gaps the four checkpoints did not exercise: Granite's embedding/residual
 scale folding at pack time (both multipliers are 1.0 in the only Granite
-checkpoint available), and sampling (`temperature`/`top_p`/... are parsed and
-carried, not yet acted on -- spark always decodes greedy, same as `qwen35`).
+checkpoint available), while sampling is now covered: at `temperature > 0` all five Spark-path models
+draw with the device sampler, with T=0 output unchanged
+(`exchange/lane-SAMPLE-report.md` item 2).
 
 Model weights are not distributed with this repo.
 
@@ -173,7 +174,8 @@ streaming, `/v1/models`, `/v1/cancel`, `/v1/fork`, `/tokenize`, `/detokenize`,
   the same multi-turn replay).
 - Sampling (`temperature`, `top_p`, `top_k`, `min_p`, `seed`) runs on the
   device inside the decode loop of `serve/engine.mojo`, speculation included;
-  measured on the dense `qwen35` pack. `serve/spark.mojo` still decodes greedy.
+  measured on the dense `qwen35` pack, the MoE, and all five `serve/spark.mojo`
+  models (distribution, seed and HTTP gates, `exchange/lane-SAMPLE-report.md`).
 - `tools` calls come back in the OpenAI `tool_calls` shape, and
   `chat_template_kwargs` reaches the chat template (for example
   `enable_thinking: false`). `response_format` is validated and refused with
