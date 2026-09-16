@@ -1,6 +1,6 @@
 # Protocol rules
 
-Rules that bind every protocol in this directory. A protocol may add
+Rules that bind every protocol in this directory. P15 to P20 (GPU time, loud failure, minimal code); the plan to apply them to existing scripts is `docs/design/gpu-efficiency.md`. A protocol may add
 constraints; it may not relax these. Cited by `coldcache-protocol.md`,
 `decode-race-protocol.md`, `mtp-protocol.md`, `ssm-occupancy-protocol.md`.
 
@@ -255,3 +255,60 @@ worse than its neighbours and was localised as the break. It is not: that
 layer subtracts two vectors of RMS 0.85 into a result of RMS 0.095, and
 llama does the same, 8.9x, with our magnitudes matching to three decimals.
 The relative error is amplified cancellation of a constant input error.
+
+## P15. Preflight on the CPU; a GPU job never discovers a harness error
+
+Before any `gpu-wait run`, every binary the gate uses is built from the current tree and the gate runs
+once on its smallest input (one item, smallest model) outside the queue where possible. A GPU job that
+fails on a build error, a bad flag, an unread config field or an over-length request is a process defect,
+logged as one.
+
+Why: on 2026-09-16, 34 of 135 GPU jobs failed (25%). The traced causes were all CPU-discoverable:
+`run-tests.sh` red for 5 hours after a merge nobody rebuilt the tests for, `max_tokens` + prompt over TMAX,
+a bake's `baro.run.env` ignored so the engine refused to start, an eval tool that no longer built.
+
+## P16. Failures are loud and stop the run
+
+Every gate script runs with `set -euo pipefail`. A failing step prints `FAIL <step>: <reason>` with the
+log path and exits non-zero. A sweep may continue past one failed item only to finish the others; it then
+ends with `FAIL k/N: <names>` and a non-zero exit. A skip is never exit 0. No `|| true` on a step whose
+output a later step reads. A script is never edited while a job is executing it (bash reads it as it runs).
+Every job has a wall budget; exceeding it kills the job and says so.
+
+Why: `bench/quality-sweep.sh` printed `FAILED ... continuing to next model` and exited 0, so the background
+notification read as success while RegesCore's task arm had failed. Granite's row went void because
+`quality-run.sh` was edited mid-sweep. A `torch.compile` arm held the GPU 32 minutes with no step done.
+
+## P17. Cache the reference arm, never ours
+
+A reference arm (llama.cpp, a frozen champion binary) whose output is a pure function of its inputs is
+computed once and stored under a key of every input that can change it: model file sha256, reference
+binary commit or sha, sampler parameters, input ids. The receipt prints `refcache hit|miss key=...`.
+Any key change is a miss. The arm under test is never cached.
+
+Why: the 2026-09-16 quality sweep regenerated llama.cpp's T=0 answers for every model, about half of each
+row's GPU time, although nothing on the llama.cpp side had changed.
+
+## P18. Iterate on the quick gate, claim on the full gate
+
+Each gate has a named quick subset (fixed items, under 2 GPU minutes) for iteration and the full set for
+the merge candidate. Commit messages, reports and the board cite only full-gate numbers, and say which
+commit the full gate ran on.
+
+## P19. Spend GPU only on the question
+
+The GPU is held only while GPU work runs: CPU servers, scoring and report writing happen outside the job,
+one resident engine per model serves all of a session's gates, and the next known job is queued before
+the current result is read. Eval generation stops at the answer (stop strings identical on both arms),
+shared prompt prefixes use `ckpt` hints, and our arm runs spec on at T=0 once identity with spec off is
+on record for that eval.
+
+## P20. The shorter implementation wins
+
+If a smaller change (fewer lines, fewer files, fewer processes) meets the same gate, it replaces the
+larger one, and the replaced code is deleted in the same commit, not left beside it. Duplicate harness
+copies are not kept "for reference"; the reference is git history.
+
+Why: `bench/latent_harness.mojo` was a hand copy of `serve/harness.mojo` that fell 23 fields behind and
+broke the E13 tools; `bench/quality-task-eval.py` survived as a second eval path after
+`quality-task-ids.py` replaced it.
