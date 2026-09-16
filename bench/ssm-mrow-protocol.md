@@ -203,3 +203,63 @@ and `S_delta` both moved <1%, but a contaminated baseline biasing toward the
 conclusion is the failure mode P1 exists to catch, and it was caught by
 re-running rather than by the spread gate — both contaminated arms passed
 their spread gates comfortably.
+
+## Round 2: row scaling at m = 1, 2, 4, 8 (preregistered 2026-09-16, before any GPU run)
+
+Brief `~/Brain/mojo/mojo-baro/briefs/2026-09-16-fable-delta-row-scaling.md`; `docs/A3-PLAN.md`
+"the throughput gate, corrected" asked for exactly this receipt before any batching target N.
+
+### Instrument
+
+Same engine binary, rebuilt in the run script and sha256-printed in the same command as every
+arm (P1); pack `.work/engine-pack-q4`; prompt `bench/mtp-prompts/p14-history.tokens` (7 tokens,
+so the one prompt-replay window of 6 rows is under 2% of the windows counted); 64 generated
+tokens. Arms by `BARO_SPEC_K`: m = 1 is `BARO_SPEC=0`; m = 2, 4, 8 are `BARO_SPEC=1` with
+k = 1, 3, 7 (the verify window is m = k + 1 rows on every decode step; `delta_dispatch`
+instantiates `amar_ssm_delta_step[m]` for every m up to 8, the same kernel). Read-backs
+per run from stdout: `BARO_SPEC`, `spec k`, `mtp: drafted D accepted A k K`, `tokens`,
+`prompt tokens`, the engine sha. Windows per run: m = 1 has 63; m > 1 has D / K.
+
+Three profile modes, each its own run because each synchronises differently:
+`BARO_PROFILE=2` (the seven SSM stages, as round 1), `BARO_PROFILE=4` (the six FFN stages),
+`BARO_PROFILE=1` (sub-block totals attn, ssm, ffn, head). Per stage: milliseconds per window
+= printed seconds / windows. 3 repeats per (m, mode), first dropped, median of the remaining
+two, spread of those two reported; spread over 5% on the delta stage voids that arm. The
+serialized sums are compared within a mode across m, never quoted as tok/s (round 1's rule).
+Cross-check on the quantity under test: one `rocprofv3 --kernel-trace` run per m, device
+time per launch of `amar_ssm_delta_step` as the median over its launches (24 per window).
+
+Round 1's m = 2 row is reproduced first: delta B/A must land in 1.46 +/- 5% (1.39 to 1.53)
+on the clean-GPU receipt, else the lane stops and reports.
+
+### Predictions, frozen (linear model c(m) = a + b m fitted to round 1's clean m = 1 and 2, ms per window)
+
+| stage | m = 1 (r1) | m = 2 (r1) | m = 4 predicted | m = 8 predicted | band |
+|---|---|---|---|---|---|
+| delta | 0.707 | 1.033 | 1.69 (2.4x) | 2.99 (4.2x) | +/- 25% |
+| gemm4+reduce2 | 3.043 | 3.435 | 4.22 (1.4x) | 5.79 (1.9x) | +/- 25% |
+| conv | 0.456 | 0.482 | 0.53 | 0.64 | +/- 25% |
+| l2 | 0.440 | 0.465 | 0.51 | 0.61 | +/- 25% |
+| gated | 0.447 | 0.469 | 0.51 | 0.60 | +/- 25% |
+| out_gemm+add | 1.137 | 1.189 | 1.29 | 1.50 | +/- 25% |
+| rgates (one wave, launch-bound) | 0.672 | 0.890 | 1.32 | 2.20 | +/- 50% |
+| SSM serialized total | 6.90 | 7.96 | 10.1 (1.46x) | 14.3 (2.07x) | derived |
+
+Per-row efficiency of the SSM sub-block (m / cost ratio): 1.74 at m = 2, 2.7 at m = 4, 3.9 at
+m = 8. Whole decode step from the mode-1 totals: T(2)/T(1) 1.15 to 1.30, T(4)/T(1) 1.5 to 1.8,
+T(8)/T(1) 2.2 to 3.0, so the aggregate tokens-per-step ceiling relative to single-stream is
+1.5 to 1.7x at m = 2, 2.2 to 2.7x at m = 4, 2.7 to 3.6x at m = 8. FFN stages: the GEMMs
+scale like gemm4 (weights dominate), the elementwise ones like conv.
+
+### Decision rule, frozen
+
+- **A2 + A3 as planned** if delta at m = 4 is at most 2.6x its m = 1 cost AND delta's share of
+  the serialized SSM sub-block at m = 8 is at most 0.30.
+- **Delta kernel round precedes A3** if either bound is crossed: the recurrence then dominates
+  the batch and its per-row cost is what A3's target N would be paying for.
+- Falsifier of the model itself: any row-parallel stage (not delta, not rgates) more than 1.3x
+  its linear prediction at m = 4 means the linear extrapolation is wrong and the aggregate
+  ceiling above is withdrawn rather than corrected after the fact.
+
+Measurement only: no kernel changes in this lane. GPU budget: 36 profiled runs plus 4 traced
+runs, about 3 s each on the q4 pack, under 3 GPU minutes.
