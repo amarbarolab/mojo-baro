@@ -1886,3 +1886,17 @@ grammar requests keep the launch path (unchanged). T<=0 is untouched:
 - Kill line: no-spec T=0.7 below 95% of the same-stint greedy. Then the
   next round is `fold_head = 3` in `kernels/mega.mojo` (write the logit row
   from the folded head instead of reducing it), not a sampler change.
+
+**A6.2 result (2026-09-16, engine `d5021bb6c385b0b5` built from `54fb4bb`,
+`.work/a6/gates/`, 290 W cap, -100 mV, sclk median 2920 MHz, queue empty,
+`BARO_MEGA: True` echoed).** P-A6a PASS: `force-ab.sh` 20/20 at 100.0%
+against `643593062a0a9018`, no voids, `mega barrier gen` 17984 on both
+arms. P-A6b PASS: `test_sample` and `test_sample_device` exit 0 (64 PASS
+rows at real vocab), `run-tests.sh` exit 0 (103 kernels, 0 orphans),
+`ci-checks.sh` exit 0 inside the passing preflight. P-A6c PASS, inside its
+band: no-spec T=0.7 **132.30** (131.91-132.75) against no-spec T=0 134.65
+(134.24-134.96) in the same process, 98.3%, up from 108.32 (1.221x); the
+residual 0.13 ms per token is the launch-path head plus sampler against the
+folded head. P-A6d PASS: T=0.7 spec 146.61 (was 146.89 / 147.15), T=0 spec
+149.37, acceptance 0.691 / 0.660 unchanged. Kill line not reached; the
+`fold_head = 3` round is not needed for the 5% target and stays a lever.
