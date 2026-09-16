@@ -144,3 +144,18 @@ T=0 and T=0.7, valid JSON, receipt masked draws == accepted == completion_tokens
 reasoning-on requests returned HTTP 400 before reaching the engine: prompt + max_tokens 1024
 exceeds TMAX 1088. That is a defect in the gate script, not in the enforcement; reasoning-on
 max_tokens lowered to 800 and those two cases rerun alone (`GATE_THINK_ONLY=1`).
+
+**Gate 1 reasoning-on rerun:** 2/2 PASS (schema 01 T=0.7: 292 tokens, 11 masked draws; schema 21
+T=0: 460 tokens, 11 masked draws; the think tokens were unmasked, the JSON after `</think>`
+validated). Gate 1 total 66/66.
+
+**Gate 3:** `bench/ab-prompts.sh` main build (`engine-main`, sha 230fb7bf) vs lane build (sha
+e768a477), server defaults (spec on, megakernel on), power cap 290 W, vddgfx -100 mV: identity 20/20
+PASS, medians 151.16 vs 151.24 tok/s_gen (ratio 1.001), fail word 0 on every run.
+
+**Gate 5, as frozen: FAIL.** `bench/grammar-cost.py`, 20 schemas, equal decode length (all
+same_len, no drafts in either arm): grammar 8.371 ms/token (119.46 tok/s) vs plain 6.682 ms/token
+(149.65 tok/s), **cost 1.253x** against the < 5% line. The prediction missed: the plain arm runs the
+megakernel (T=0, no penalties), the grammar arm is forced onto the launch path, so the ratio mixes
+the megakernel's own advantage with the mask cost. Diagnostic (not a gate): same script against a
+server started with `BARO_MEGA=0`, isolating the host mask fill and upload.
