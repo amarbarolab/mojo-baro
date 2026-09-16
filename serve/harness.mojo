@@ -302,11 +302,11 @@ def alloc_bufs(ctx: DeviceContext, pack: Pack, tmax: Int) raises -> WindowBufs:
     ctx.enqueue_memset(kc32_d, 0)
     ctx.enqueue_memset(vc32_d, 0)
     ctx.synchronize()
-    var off_h = ctx.enqueue_create_host_buffer[DType.int64](512)
+    var off_h = ctx.enqueue_create_host_buffer[DType.int64](OFF_CAP)
     ctx.synchronize()
-    for i in range(512):
+    for i in range(OFF_CAP):
         off_h[i] = Int64(off[i]) if i < len(off) else 0
-    var off_d = ctx.enqueue_create_buffer[DType.int64](512)
+    var off_d = ctx.enqueue_create_buffer[DType.int64](OFF_CAP)
     ctx.enqueue_copy(dst_buf=off_d, src_buf=off_h)
     var araw_d = ctx.enqueue_create_buffer[f32](MROWS * NH_V)
     var braw_d = ctx.enqueue_create_buffer[f32](MROWS * NH_V)

@@ -869,54 +869,70 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
         var att_i = 0
         var use_mega = cfg.mega and m == 1 and not win_spec and st.pos + 1 >= cfg.n_prompt
         var use_mega_win = cfg.mega_win and win_spec and m == MEGA_MR
-        if use_mega or use_mega_win:
-            var Hnm0 = TileTensor(b.hn_d, xm_layout)
-            var Dtok0 = TileTensor(b.dtok_d, dtok_layout)
-            if use_mega and cfg.pack_q4:
-                ctx.enqueue_function[mega_token_q4_k](
-                    b.wbuf.unsafe_ptr(), TileTensor(b.off_d, off_layout), Xm, CurBm,
-                    TileTensor(b.resb_d, xm_layout), TileTensor(b.qkv_d, qfm_layout), TileTensor(b.z_d, xm_layout),
-                    TileTensor(b.araw_d, g32m_layout), TileTensor(b.braw_d, g32m_layout),
-                    TileTensor(b.eg_d, g32m_layout), TileTensor(b.beta_d, g32m_layout),
-                    TileTensor(b.conv_d, convm_layout), TileTensor(b.so_d, om_layout), ConvStateAll, SStateAll,
-                    TileTensor(b.qf_d, qfm_layout), TileTensor(b.k_d, kvm_flat), TileTensor(b.v_d, kvm_flat),
-                    TileTensor(b.q_d, qm_layout), TileTensor(b.gate_d, xflat_layout), TileTensor(b.ao_d, qm_layout),
-                    b.kc_d.unsafe_ptr(), b.vc_d.unsafe_ptr(),
-                    TileTensor(b.p_ffn_d, pf_sm), TileTensor(b.p_ffn2_d, pf_sm), TileTensor(b.fgb_d, ffnm_layout),
-                    TileTensor(b.ctr_d, ctr_layout), b.prof_d.unsafe_ptr(), b.dbg_d.unsafe_ptr(),
-                    Toks, Dtok0, Hnm0, b.hmax_d.unsafe_ptr(), b.hidx_d.unsafe_ptr(),
-                    Int32(st.ring), Int32(SLOTS), Int32(st.pos), Int32(1), Int32(1 if cfg.dump else 0), Int32(1), Int32(cfg.att_split), grid_dim=MEGA_G, block_dim=ROW_THREADS,
+        comptime if not MEGA_ALLOWED:
+            use_mega_win = False
+            if use_mega:
+                ctx.enqueue_function[mega_moe_k](
+                    b.wbuf.unsafe_ptr(), b.off_d.unsafe_ptr(), b.x_d.unsafe_ptr(), b.curb_d.unsafe_ptr(),
+                    b.logits_d.unsafe_ptr(), b.p_h_d.unsafe_ptr(), b.qkv_d.unsafe_ptr(), moe_z_d.unsafe_ptr(),
+                    b.araw_d.unsafe_ptr(), b.braw_d.unsafe_ptr(), b.eg_d.unsafe_ptr(), b.beta_d.unsafe_ptr(),
+                    b.conv_d.unsafe_ptr(), b.so_d.unsafe_ptr(), moe_res_d.unsafe_ptr(), ConvStateAll, SStateAll,
+                    b.qf_d.unsafe_ptr(), b.k_d.unsafe_ptr(), b.v_d.unsafe_ptr(), b.q_d.unsafe_ptr(), b.gate_d.unsafe_ptr(),
+                    b.ao_d.unsafe_ptr(), b.resb_d.unsafe_ptr(), b.kc_d.unsafe_ptr(), b.vc_d.unsafe_ptr(), b.p_ffn_d.unsafe_ptr(),
+                    b.hidx_d.unsafe_ptr(), b.hmax_d.unsafe_ptr(), b.p_v_d.unsafe_ptr(), b.fgb_d.unsafe_ptr(), b.fgbp_d.unsafe_ptr(),
+                    b.ctr_d.unsafe_ptr(), b.prof_d.unsafe_ptr(), b.dbg_d.unsafe_ptr(),
+                    Int32(st.ring), Int32(SLOTS), Int32(st.pos), Int32(1 if cfg.dump else 0), Int32(cfg.att_split),
+                    grid_dim=MEGA_G, block_dim=ROW_THREADS,
                 )
-            elif use_mega:
-                ctx.enqueue_function[mega_token_k](
-                    b.wbuf.unsafe_ptr(), TileTensor(b.off_d, off_layout), Xm, CurBm,
-                    TileTensor(b.resb_d, xm_layout), TileTensor(b.qkv_d, qfm_layout), TileTensor(b.z_d, xm_layout),
-                    TileTensor(b.araw_d, g32m_layout), TileTensor(b.braw_d, g32m_layout),
-                    TileTensor(b.eg_d, g32m_layout), TileTensor(b.beta_d, g32m_layout),
-                    TileTensor(b.conv_d, convm_layout), TileTensor(b.so_d, om_layout), ConvStateAll, SStateAll,
-                    TileTensor(b.qf_d, qfm_layout), TileTensor(b.k_d, kvm_flat), TileTensor(b.v_d, kvm_flat),
-                    TileTensor(b.q_d, qm_layout), TileTensor(b.gate_d, xflat_layout), TileTensor(b.ao_d, qm_layout),
-                    b.kc_d.unsafe_ptr(), b.vc_d.unsafe_ptr(),
-                    TileTensor(b.p_ffn_d, pf_sm), TileTensor(b.p_ffn2_d, pf_sm), TileTensor(b.fgb_d, ffnm_layout),
-                    TileTensor(b.ctr_d, ctr_layout), b.prof_d.unsafe_ptr(), b.dbg_d.unsafe_ptr(),
-                    Toks, Dtok0, Hnm0, b.hmax_d.unsafe_ptr(), b.hidx_d.unsafe_ptr(),
-                    Int32(st.ring), Int32(SLOTS), Int32(st.pos), Int32(1), Int32(1 if cfg.dump else 0), Int32(1), Int32(cfg.att_split), grid_dim=MEGA_G, block_dim=ROW_THREADS,
-                )
-            else:
-                ctx.enqueue_function[mega_win_k](
-                    b.wbuf.unsafe_ptr(), TileTensor(b.off_d, off_layout), Xm, CurBm,
-                    TileTensor(b.resb_d, xm_layout), TileTensor(b.qkv_d, qfm_layout), TileTensor(b.z_d, xm_layout),
-                    TileTensor(b.araw_d, g32m_layout), TileTensor(b.braw_d, g32m_layout),
-                    TileTensor(b.eg_d, g32m_layout), TileTensor(b.beta_d, g32m_layout),
-                    TileTensor(b.conv_d, convm_layout), TileTensor(b.so_d, om_layout), ConvStateAll, SStateAll,
-                    TileTensor(b.qf_d, qfm_layout), TileTensor(b.k_d, kvm_flat), TileTensor(b.v_d, kvm_flat),
-                    TileTensor(b.q_d, qm_layout), TileTensor(b.gate_d, xflat_layout), TileTensor(b.ao_d, qm_layout),
-                    b.kc_d.unsafe_ptr(), b.vc_d.unsafe_ptr(),
-                    TileTensor(b.p_ffn_d, pf_sm), TileTensor(b.p_ffn2_d, pf_sm), TileTensor(b.fgb_d, ffnm_layout),
-                    TileTensor(b.ctr_d, ctr_layout), b.prof_d.unsafe_ptr(), b.dbg_d.unsafe_ptr(),
-                    Toks, Dtok0, Hnm0, b.hmax_d.unsafe_ptr(), b.hidx_d.unsafe_ptr(),
-                    Int32(st.ring), Int32(SLOTS), Int32(st.pos), Int32(m), Int32(0), Int32(0), Int32(cfg.att_split), grid_dim=MEGA_G_WIN, block_dim=ROW_THREADS,
-                )
+        else:
+            if use_mega or use_mega_win:
+                var Hnm0 = TileTensor(b.hn_d, xm_layout)
+                var Dtok0 = TileTensor(b.dtok_d, dtok_layout)
+                if use_mega and cfg.pack_q4:
+                    ctx.enqueue_function[mega_token_q4_k](
+                        b.wbuf.unsafe_ptr(), TileTensor(b.off_d, off_layout), Xm, CurBm,
+                        TileTensor(b.resb_d, xm_layout), TileTensor(b.qkv_d, qfm_layout), TileTensor(b.z_d, xm_layout),
+                        TileTensor(b.araw_d, g32m_layout), TileTensor(b.braw_d, g32m_layout),
+                        TileTensor(b.eg_d, g32m_layout), TileTensor(b.beta_d, g32m_layout),
+                        TileTensor(b.conv_d, convm_layout), TileTensor(b.so_d, om_layout), ConvStateAll, SStateAll,
+                        TileTensor(b.qf_d, qfm_layout), TileTensor(b.k_d, kvm_flat), TileTensor(b.v_d, kvm_flat),
+                        TileTensor(b.q_d, qm_layout), TileTensor(b.gate_d, xflat_layout), TileTensor(b.ao_d, qm_layout),
+                        b.kc_d.unsafe_ptr(), b.vc_d.unsafe_ptr(),
+                        TileTensor(b.p_ffn_d, pf_sm), TileTensor(b.p_ffn2_d, pf_sm), TileTensor(b.fgb_d, ffnm_layout),
+                        TileTensor(b.ctr_d, ctr_layout), b.prof_d.unsafe_ptr(), b.dbg_d.unsafe_ptr(),
+                        Toks, Dtok0, Hnm0, b.hmax_d.unsafe_ptr(), b.hidx_d.unsafe_ptr(),
+                        Int32(st.ring), Int32(SLOTS), Int32(st.pos), Int32(1), Int32(1 if cfg.dump else 0), Int32(1), Int32(cfg.att_split), grid_dim=MEGA_G, block_dim=ROW_THREADS,
+                    )
+                elif use_mega:
+                    ctx.enqueue_function[mega_token_k](
+                        b.wbuf.unsafe_ptr(), TileTensor(b.off_d, off_layout), Xm, CurBm,
+                        TileTensor(b.resb_d, xm_layout), TileTensor(b.qkv_d, qfm_layout), TileTensor(b.z_d, xm_layout),
+                        TileTensor(b.araw_d, g32m_layout), TileTensor(b.braw_d, g32m_layout),
+                        TileTensor(b.eg_d, g32m_layout), TileTensor(b.beta_d, g32m_layout),
+                        TileTensor(b.conv_d, convm_layout), TileTensor(b.so_d, om_layout), ConvStateAll, SStateAll,
+                        TileTensor(b.qf_d, qfm_layout), TileTensor(b.k_d, kvm_flat), TileTensor(b.v_d, kvm_flat),
+                        TileTensor(b.q_d, qm_layout), TileTensor(b.gate_d, xflat_layout), TileTensor(b.ao_d, qm_layout),
+                        b.kc_d.unsafe_ptr(), b.vc_d.unsafe_ptr(),
+                        TileTensor(b.p_ffn_d, pf_sm), TileTensor(b.p_ffn2_d, pf_sm), TileTensor(b.fgb_d, ffnm_layout),
+                        TileTensor(b.ctr_d, ctr_layout), b.prof_d.unsafe_ptr(), b.dbg_d.unsafe_ptr(),
+                        Toks, Dtok0, Hnm0, b.hmax_d.unsafe_ptr(), b.hidx_d.unsafe_ptr(),
+                        Int32(st.ring), Int32(SLOTS), Int32(st.pos), Int32(1), Int32(1 if cfg.dump else 0), Int32(1), Int32(cfg.att_split), grid_dim=MEGA_G, block_dim=ROW_THREADS,
+                    )
+                else:
+                    ctx.enqueue_function[mega_win_k](
+                        b.wbuf.unsafe_ptr(), TileTensor(b.off_d, off_layout), Xm, CurBm,
+                        TileTensor(b.resb_d, xm_layout), TileTensor(b.qkv_d, qfm_layout), TileTensor(b.z_d, xm_layout),
+                        TileTensor(b.araw_d, g32m_layout), TileTensor(b.braw_d, g32m_layout),
+                        TileTensor(b.eg_d, g32m_layout), TileTensor(b.beta_d, g32m_layout),
+                        TileTensor(b.conv_d, convm_layout), TileTensor(b.so_d, om_layout), ConvStateAll, SStateAll,
+                        TileTensor(b.qf_d, qfm_layout), TileTensor(b.k_d, kvm_flat), TileTensor(b.v_d, kvm_flat),
+                        TileTensor(b.q_d, qm_layout), TileTensor(b.gate_d, xflat_layout), TileTensor(b.ao_d, qm_layout),
+                        b.kc_d.unsafe_ptr(), b.vc_d.unsafe_ptr(),
+                        TileTensor(b.p_ffn_d, pf_sm), TileTensor(b.p_ffn2_d, pf_sm), TileTensor(b.fgb_d, ffnm_layout),
+                        TileTensor(b.ctr_d, ctr_layout), b.prof_d.unsafe_ptr(), b.dbg_d.unsafe_ptr(),
+                        Toks, Dtok0, Hnm0, b.hmax_d.unsafe_ptr(), b.hidx_d.unsafe_ptr(),
+                        Int32(st.ring), Int32(SLOTS), Int32(st.pos), Int32(m), Int32(0), Int32(0), Int32(cfg.att_split), grid_dim=MEGA_G_WIN, block_dim=ROW_THREADS,
+                    )
         for layer in range(0 if (use_mega or use_mega_win) else N_LAYERS):
             if cfg.prof:
                 ctx.synchronize()
@@ -1258,7 +1274,7 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                 quant_rows(ctx, CurBm, AqH, AsH, m, H)
                 gemm_q8dot(ctx, AqH, AsH, Wfgq, Wfgs, Pg, m, FFN, H)
             else:
-                if MEGA_ALLOWED or cfg.mega:
+                comptime if MEGA_ALLOWED:
                     gemm_w[FFN, H](ctx, CurBm, b.wbuf, b.off[w + 1], cfg.pack_q4, Pg, m)
             if cfg.pf4:
                 ctx.synchronize()
@@ -1268,14 +1284,14 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
             if use_dot:
                 gemm_q8dot(ctx, AqH, AsH, Wfuq, Wfus, Pu, m, FFN, H)
             else:
-                if MEGA_ALLOWED or cfg.mega:
+                comptime if MEGA_ALLOWED:
                     gemm_w[FFN, H](ctx, CurBm, b.wbuf, b.off[w + 2], cfg.pack_q4, Pu, m)
             if cfg.pf4:
                 ctx.synchronize()
                 var nw = perf_counter_ns()
                 st.fc[2] += Int(nw - st.tq)
                 st.tq = nw
-            if MEGA_ALLOWED or cfg.mega:
+            comptime if MEGA_ALLOWED:
                 ctx.enqueue_function[r_swiglu](Pg, Pu, FgBm, Int32(m), Int32(FFN), grid_dim=ceildiv(m * FFN, 256), block_dim=256)
             if cfg.pf4:
                 ctx.synchronize()
@@ -1288,14 +1304,14 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                 quant_rows(ctx, FgBm, AqF, AsF, m, FFN)
                 gemm_q8dot(ctx, AqF, AsF, Wfdq, Wfds, Ph2, m, H, FFN)
             else:
-                if MEGA_ALLOWED or cfg.mega:
+                comptime if MEGA_ALLOWED:
                     gemm_w[H, FFN](ctx, FgBm, b.wbuf, b.off[w + 3], cfg.pack_q4, Ph2, m)
             if cfg.pf4:
                 ctx.synchronize()
                 var nw = perf_counter_ns()
                 st.fc[4] += Int(nw - st.tq)
                 st.tq = nw
-            if MEGA_ALLOWED or cfg.mega:
+            comptime if MEGA_ALLOWED:
                 ctx.enqueue_function[r_add](Ph2, Xm, Int32(m), Int32(H), grid_dim=ceildiv(m * H, 256), block_dim=256)
             if cfg.pf4:
                 ctx.synchronize()
@@ -1318,10 +1334,15 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                 st.pf_ffn += Int(now - st.tp)
                 st.tp = now
 
+        var head_folded = use_mega
         comptime if not MEGA_ALLOWED:
+            head_folded = False
             w = moe_w
-        if use_mega or use_mega_win:
-            w = 1 + N_SSM * 10 + N_ATT * 7 + N_LAYERS * 4
+            if use_mega:
+                w = 1 + N_SSM * MOE_W_SSM + N_ATT * MOE_W_ATT
+        else:
+            if use_mega or use_mega_win:
+                w = 1 + N_SSM * 10 + N_ATT * 7 + N_LAYERS * 4
         if cfg.dump and m == 1 and st.pos + 1 >= cfg.n_prompt and st.n_dumped < GEN_N:
             ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dump_h.unsafe_ptr().unsafe_offset(st.n_dumped * 2 * N_LAYERS * H), 2 * N_LAYERS * H, owning=False), src_buf=b.dbg_d)
             st.n_dumped += 1
@@ -1332,7 +1353,7 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
         # f32 copy of the post-final-norm hidden state (pre-LM-head): row r is
         # h(st.pos + r), what the MTP draft head pairs with token st.pos + r + 1.
         var Hnm = TileTensor(b.hn_d, xm_layout)
-        if not use_mega:
+        if not head_folded:
             ctx.enqueue_function[rms_m](
                 Xm, tens_f32(ctx, b.wbuf, b.off[w], H, h_layout), Hnm,
                 Int32(H), Float32(1e-6), grid_dim=m, block_dim=256,
@@ -1340,7 +1361,7 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
         if cfg.dump4 and cfg.dump and m == 1 and st.pos + 1 >= cfg.n_prompt:
             ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr().unsafe_offset(3 * H), H, owning=False), src_buf=DeviceBuffer[f32](ctx, b.hn_d.unsafe_ptr(), H, owning=False))
         if st.pos + m >= cfg.n_prompt:
-            if not use_mega:
+            if not head_folded:
                 ctx.enqueue_function[rmsc_k](
                     Xm, tens_f32(ctx, b.wbuf, b.off[w], H, h_layout), CurBm,
                     Int32(H), Float32(1e-6), grid_dim=m, block_dim=256,
@@ -1349,7 +1370,7 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                 var Wheads = tens_q8s(ctx, b.wbuf, b.off[w + 1], H * VOCAB, s_h_v)
                 gemm_w[VOCAB, H](ctx, CurBm, b.wbuf, b.off[w + 1], cfg.pack_q4, Pv, m)
                 ctx.enqueue_function[r_head](Pv, Logitsm, Int32(m), Int32(VOCAB), grid_dim=ceildiv(m * VOCAB, 256), block_dim=256)
-            if use_mega:
+            if head_folded:
                 pass
             elif win_spec and cfg.sample.temperature > 0:
                 # A1: speculative SAMPLING. Truncate the target's rows into p,

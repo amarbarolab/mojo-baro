@@ -156,9 +156,11 @@ def load_state(
 def main() raises:
     comptime assert has_accelerator(), "Requires a GPU"
     var ctx = DeviceContext()
-    var mega = getenv("BARO_MEGA", "1") == "1"
-    if mega and not MEGA_ALLOWED:
-        raise Error("BARO_MEGA=1 is not supported by the qwen35moe model profile")
+    var mega = getenv("BARO_MEGA", "1" if MEGA_ALLOWED else "0") == "1"
+    if mega and not MEGA_ALLOWED and getenv("BARO_TIER", "") != "":
+        raise Error("BARO_MEGA=1 (the MoE persistent token kernel) needs the routed experts in VRAM; unset BARO_TIER")
+    if mega and not MEGA_ALLOWED and getenv("BARO_EXPERTS", "") != "":
+        raise Error("BARO_MEGA=1 (the MoE persistent token kernel) does not write the expert trace; unset BARO_EXPERTS")
     var packdir = getenv("BARO_PACK", ".work/engine-pack-q4")
     var pack = load_pack(ctx, packdir)
     var wbuf = pack.wbuf
@@ -319,6 +321,14 @@ def main() raises:
         moe_logical.append(resolve_plain(moe_tensors, "output.weight").offset)
         off = moe_logical.copy()
         bufs.off = moe_logical.copy()
+        if len(moe_logical) > OFF_CAP:
+            raise Error("MoE offset table exceeds OFF_CAP")
+        var moff_h = ctx.enqueue_create_host_buffer[DType.int64](OFF_CAP)
+        ctx.synchronize()
+        for i in range(OFF_CAP):
+            moff_h[i] = Int64(moe_logical[i]) if i < len(moe_logical) else 0
+        ctx.enqueue_copy(dst_buf=bufs.off_d, src_buf=moff_h)
+        ctx.synchronize()
     var toks_d = bufs.toks_d
 
     var wst = WindowState(pos=0, pos_prev=0, ring=0, n_drafted=0, n_accepted=0, n_spec_windows=0, n_dumped=0, tp=0, tq=0, pf_att=0, pf_ssm=0, pf_ffn=0, pf_head=0, pf_proc=0, pf_draft=0, fc=[0, 0, 0, 0, 0, 0], pc=[0, 0, 0, 0, 0, 0, 0, 0], p3=[0, 0, 0, 0], pfx=[0, 0, 0, 0])

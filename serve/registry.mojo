@@ -24,6 +24,7 @@ from matmul_prefill import (
 )
 from matmul_prefill_lds import amar_matmul_prefill_lds, LDS_THREADS
 from mega import amar_mega_token, amar_mega_window, MEGA_G, MEGA_G_WIN, DATT_NLD
+from mega_moe import amar_mega_moe_token, W_ATT as MOE_W_ATT, W_SSM as MOE_W_SSM
 from sample import amar_sample_row, amar_sample_probs, amar_spec_accept, SAMP_THREADS
 from dattn import amar_dattn_split, amar_dattn_combine, dattn_nsplit
 from attn import (
@@ -143,7 +144,8 @@ comptime c_kv = row_major[1, KV]()
 comptime c_32 = row_major[1, NH_V]()
 comptime c_ffn = row_major[1, FFN]()
 
-comptime off_layout = row_major[512]()
+comptime OFF_CAP = 1024
+comptime off_layout = row_major[OFF_CAP]()
 comptime pf_sm = row_major[SM, FFN]()
 comptime ctr_layout = row_major[3]()
 comptime mega_token_k = amar_mega_token[
@@ -162,6 +164,7 @@ comptime mega_token_q4_k = amar_mega_token[
     type_of(pf_sm), type_of(ffnm_layout), type_of(off_layout), type_of(ctr_layout), type_of(toks_layout), type_of(dtok_layout),
     N_LAYERS, N_ATT,
 ]
+comptime mega_moe_k = amar_mega_moe_token[type_of(csall_layout), type_of(ssall_layout), N_LAYERS, N_ATT]
 comptime MEGA_MR = 3
 comptime mega_win_k = amar_mega_window[
     MEGA_MR, True, False, type_of(xm_layout), type_of(xm_layout),

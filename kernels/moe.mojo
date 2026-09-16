@@ -109,17 +109,18 @@ def amar_moe_router_top8[
             W[j] = rebind[W.ElementType](rebind[Scalar[f32]](W[j]) / wsum)
 
 
-def amar_moe_router_top8_sig[
+@always_inline
+def router_top8_sig_body[
     LLayout: TensorLayout, ILayout: TensorLayout, WLayout: TensorLayout,
     XLayout: TensorLayout, GLayout: TensorLayout, OLayout: TensorLayout
 ](
     L: TileTensor[f32, LLayout, MutAnyOrigin],
-    IDX: TileTensor[i32, ILayout, MutAnyOrigin],
-    W: TileTensor[f32, WLayout, MutAnyOrigin],
+    mut IDX: TileTensor[i32, ILayout, MutAnyOrigin],
+    mut W: TileTensor[f32, WLayout, MutAnyOrigin],
     X: TileTensor[f32, XLayout, MutAnyOrigin],
     G: TileTensor[f32, GLayout, MutAnyOrigin],
-    O: TileTensor[f32, OLayout, MutAnyOrigin],
-    k_dim: Int32,
+    mut O: TileTensor[f32, OLayout, MutAnyOrigin],
+    K: Int,
 ):
     comptime assert L.flat_rank == 1 and IDX.flat_rank == 1 and W.flat_rank == 1
     comptime assert X.flat_rank == 1 and G.flat_rank == 1 and O.flat_rank == 1
@@ -161,7 +162,6 @@ def amar_moe_router_top8_sig[
     if lane == 0:
         for j in range(TOPK):
             W[j] = rebind[W.ElementType](rebind[Scalar[f32]](W[j]) / wsum)
-    var K = Int(k_dim)
     var Xv = X.vectorize[8]()
     var Gv = G.vectorize[8]()
     var acc = SIMD[f32, 8](0)
@@ -172,6 +172,24 @@ def amar_moe_router_top8_sig[
     var t = warp.sum(acc.reduce_add())
     if lane == 0:
         O[0] = rebind[O.ElementType](Scalar[f32](1) / (Scalar[f32](1) + exp(-t)))
+
+
+def amar_moe_router_top8_sig[
+    LLayout: TensorLayout, ILayout: TensorLayout, WLayout: TensorLayout,
+    XLayout: TensorLayout, GLayout: TensorLayout, OLayout: TensorLayout
+](
+    L: TileTensor[f32, LLayout, MutAnyOrigin],
+    IDX: TileTensor[i32, ILayout, MutAnyOrigin],
+    W: TileTensor[f32, WLayout, MutAnyOrigin],
+    X: TileTensor[f32, XLayout, MutAnyOrigin],
+    G: TileTensor[f32, GLayout, MutAnyOrigin],
+    O: TileTensor[f32, OLayout, MutAnyOrigin],
+    k_dim: Int32,
+):
+    var IDX_ = IDX
+    var W_ = W
+    var O_ = O
+    router_top8_sig_body(L, IDX_, W_, X, G, O_, Int(k_dim))
 
 
 def amar_moe_sig_gate[
