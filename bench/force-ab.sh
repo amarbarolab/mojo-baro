@@ -1,25 +1,26 @@
 #!/usr/bin/env bash
-# usage: bench/force-ab.sh ENGINE_REF ENGINE_CAND OUTDIR [ENV]
+# usage: bench/force-ab.sh ENGINE_REF ENGINE_CAND OUTDIR [ENV] [ENV_CAND]
+# ENV applies to both arms; ENV_CAND replaces it for the candidate arm only.
 # Teacher-forced identity gate between two builds (CLAUDE.md: never greedy equality
 # past ~256 ids). For every bench/mtp-prompts/*.tokens: ENGINE_REF runs greedy, its
 # GENERATED ids become BARO_FORCE for ENGINE_CAND, and the candidate's
 # "forced agreement: a / n" line is recorded. Fail word read on every run.
 set -uo pipefail
 cd "$(dirname "$0")/.."
-ref=$1; cand=$2; out=$3; envx=${4:-}
+ref=$1; cand=$2; out=$3; envx=${4:-}; envc=${5:-$envx}
 mkdir -p "$out"
 ha=$(sha256sum "$ref" | cut -c1-16); hb=$(sha256sum "$cand" | cut -c1-16)
 if [ "$ha" = "$hb" ]; then
   echo "REFUSED: ref and cand are the same binary ($ha)" >&2; exit 2
 fi
-echo "ref=$ref cand=$cand shaRef=$ha shaCand=$hb env='$envx'" | tee "$out/arm.txt"
+echo "ref=$ref cand=$cand shaRef=$ha shaCand=$hb env='$envx' envCand='$envc'" | tee "$out/arm.txt"
 echo "prompt agree checked pct" > "$out/results.txt"
 for tf in bench/mtp-prompts/p*.tokens; do
   p=$(basename "$tf" .tokens)
   env BARO_PROMPT="$tf" BARO_SPEC=0 $envx "$ref" > "$out/$p.ref.log" 2>&1
   grep '^GENERATED:' "$out/$p.ref.log" | sed 's/^GENERATED://' > "$out/$p.ids"
   if [ ! -s "$out/$p.ids" ]; then echo "$p 0 0 VOID(ref)" >> "$out/results.txt"; continue; fi
-  env BARO_PROMPT="$tf" BARO_SPEC=0 BARO_FORCE="$out/$p.ids" $envx "$cand" > "$out/$p.cand.log" 2>&1
+  env BARO_PROMPT="$tf" BARO_SPEC=0 BARO_FORCE="$out/$p.ids" $envc "$cand" > "$out/$p.cand.log" 2>&1
   fa=$(grep -oE 'forced agreement: [0-9]+ / [0-9]+' "$out/$p.cand.log" | grep -oE '[0-9]+' | tr '\n' ' ')
   set -- $fa
   if [ -z "${1:-}" ] || [ "${2:-0}" = 0 ]; then echo "$p 0 0 VOID(cand)" >> "$out/results.txt"; continue; fi
