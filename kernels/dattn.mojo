@@ -21,6 +21,11 @@ def dkv_off[HD: Int, NKVH: Int, NAT: Int](t: Int, att_i: Int, kvh: Int) -> Int:
 
 
 @always_inline
+def dkv_tab_off[HD: Int, NKVH: Int, NAT: Int](tab: MutPointer[Scalar[DType.int32], MutAnyOrigin], t: Int, att_i: Int, kvh: Int) -> Int:
+    return ((Int(tab[t >> KVPSH]) * NAT + att_i) * NKVH + kvh) * (KVPAGE * HD) + (t & (KVPAGE - 1)) * HD
+
+
+@always_inline
 def dspan[HD: Int, NLD: Int]() -> Int:
     return NLD * (WARP_SIZE // (HD // 8))
 
@@ -34,6 +39,7 @@ def dattn_span[
     Q: TileTensor[f32, QLayout, MutAnyOrigin],
     Kc: TileTensor[KVT, KLayout, MutAnyOrigin],
     Vc: TileTensor[KVT, KLayout, MutAnyOrigin],
+    tab: MutPointer[Scalar[DType.int32], MutAnyOrigin],
     mut qs: TileTensor[f32, QsL, MutUntrackedOrigin, address_space = AddressSpace.SHARED],
     mut scores: TileTensor[f32, ScL, MutUntrackedOrigin, address_space = AddressSpace.SHARED],
     mut red: TileTensor[f32, RdL, MutUntrackedOrigin, address_space = AddressSpace.SHARED],
@@ -58,7 +64,7 @@ def dattn_span[
         if tid < HD:
             var t = t0 + tid
             if t < t_hi:
-                var kb = dkv_off[HD, NKVH, NAT](t, att_i, kvh)
+                var kb = dkv_tab_off[HD, NKVH, NAT](tab, t, att_i, kvh)
                 var Kr = TileTensor(kp.unsafe_offset(kb), row_major[HD]()).vectorize[8]()
                 var acc: Float32 = 0
                 for d8 in range(HD // 8):
@@ -102,13 +108,13 @@ def dattn_span[
                 var v = InlineArray[Float32, 8](uninitialized=True)
                 var sc = InlineArray[Float32, 8](uninitialized=True)
                 comptime for j in range(8):
-                    v[j] = vp[unsafe_offset=dkv_off[HD, NKVH, NAT](t0 + tt + j, att_i, kvh) + tid].cast[f32]()
+                    v[j] = vp[unsafe_offset=dkv_tab_off[HD, NKVH, NAT](tab, t0 + tt + j, att_i, kvh) + tid].cast[f32]()
                     sc[j] = rebind[Scalar[f32]](scores[tt + j])
                 comptime for j in range(8):
                     o += sc[j] * v[j]
                 tt += 8
             while tt < n:
-                o += rebind[Scalar[f32]](scores[tt]) * vp[unsafe_offset=dkv_off[HD, NKVH, NAT](t0 + tt, att_i, kvh) + tid].cast[f32]()
+                o += rebind[Scalar[f32]](scores[tt]) * vp[unsafe_offset=dkv_tab_off[HD, NKVH, NAT](tab, t0 + tt, att_i, kvh) + tid].cast[f32]()
                 tt += 1
         t0 += HD
     return SIMD[f32, 4](m_run, l_run, o, 0)
@@ -122,6 +128,7 @@ def amar_dattn_exact[
     Kc: TileTensor[KVT, KLayout, MutAnyOrigin],
     Vc: TileTensor[KVT, KLayout, MutAnyOrigin],
     O: TileTensor[f32, OLayout, MutAnyOrigin],
+    tab: MutPointer[Scalar[DType.int32], MutAnyOrigin],
     t_len: Int32,
     scale: Float32,
     att_i: Int32,
@@ -137,7 +144,7 @@ def amar_dattn_exact[
     var scores = stack_allocation[f32, address_space = AddressSpace.SHARED](row_major[HD]())
     var red = stack_allocation[f32, address_space = AddressSpace.SHARED](row_major[HD // WARP_SIZE]())
     var O_ = O
-    var res = dattn_span[HD, NQH, NKVH, KVT, NAT](Q, Kc, Vc, qs, scores, red, qrow, kvh, 0, T, tid, Int(lane_id()), scale, Int(att_i))
+    var res = dattn_span[HD, NQH, NKVH, KVT, NAT](Q, Kc, Vc, tab, qs, scores, red, qrow, kvh, 0, T, tid, Int(lane_id()), scale, Int(att_i))
     if tid < HD:
         var inv = 1 / res[1]
         O_[qrow, tid] = rebind[O_.ElementType](res[2] * inv)
@@ -149,6 +156,7 @@ def dattn_load_span[
 ](
     Kc: TileTensor[KVT, KLayout, MutAnyOrigin],
     Vc: TileTensor[KVT, KLayout, MutAnyOrigin],
+    tab: MutPointer[Scalar[DType.int32], MutAnyOrigin],
     mut kr: InlineArray[SIMD[KVT, 8], NLD],
     mut vr: InlineArray[SIMD[KVT, 8], NLD],
     t0: Int, T: Int, lr: Int, lc: Int, ai: Int, kvh: Int,
@@ -156,7 +164,7 @@ def dattn_load_span[
     comptime RPL = WARP_SIZE // (HD // 8)
     comptime SPAN = NLD * RPL
     comptime LSTR = RPL * HD
-    var base = dkv_off[HD, NKVH, NAT](t0, ai, kvh) + lc
+    var base = dkv_tab_off[HD, NKVH, NAT](tab, t0, ai, kvh) + lc
     if t0 + SPAN <= T:
         var b = base + lr * HD
         comptime for i in range(NLD):
@@ -257,6 +265,7 @@ def dattn_split_body[
     Vc: TileTensor[KVT, KLayout, MutAnyOrigin],
     mut O: TileTensor[f32, OLayout, MutAnyOrigin],
     Pg: TileTensor[f32, PLayout, MutAnyOrigin],
+    tab: MutPointer[Scalar[DType.int32], MutAnyOrigin],
     kvh: Int, sp: Int, r: Int, ns: Int, T: Int, scale: Float32, ai: Int, tid: Int,
 ):
     comptime assert Kc.flat_rank == 1 and Vc.flat_rank == 1 and O.flat_rank == 2
@@ -299,7 +308,7 @@ def dattn_split_body[
         if kk >= L:
             kk -= L
         var t0 = (s_lo + kk) * SPAN
-        dattn_load_span[HD, NKVH, KVT, NAT, NLD](Kc, Vc, kr, vr, t0, T, lr, lc, ai, kvh)
+        dattn_load_span[HD, NKVH, KVT, NAT, NLD](Kc, Vc, tab, kr, vr, t0, T, lr, lc, ai, kvh)
         dattn_step[HD, G, KVT, NLD](qs, kr, vr, o, m, l, t0, T, lane, lr, jtok)
         k += NW
     comptime for g in range(G):
@@ -426,6 +435,7 @@ def amar_dattn_split[
     Vc: TileTensor[KVT, KLayout, MutAnyOrigin],
     O: TileTensor[f32, OLayout, MutAnyOrigin],
     Pg: TileTensor[f32, PLayout, MutAnyOrigin],
+    tab: MutPointer[Scalar[DType.int32], MutAnyOrigin],
     t_len: Int32,
     nsplit: Int32,
     scale: Float32,
@@ -434,7 +444,7 @@ def amar_dattn_split[
     var O_ = O
     var r = Int(block_idx.z)
     dattn_split_body[HD, NQH, NKVH, KVT, NAT, NLD, ROT](
-        Q, Kc, Vc, O_, Pg, Int(block_idx.x), Int(block_idx.y), r, Int(nsplit), Int(t_len) + r, scale, Int(att_i), Int(thread_idx.x)
+        Q, Kc, Vc, O_, Pg, tab, Int(block_idx.x), Int(block_idx.y), r, Int(nsplit), Int(t_len) + r, scale, Int(att_i), Int(thread_idx.x)
     )
 
 

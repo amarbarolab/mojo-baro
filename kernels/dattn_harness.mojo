@@ -58,6 +58,11 @@ def launch_dattn[
 ) raises:
     comptime q_layout = row_major[DROWS * NQH, HD]()
     var Q = TileTensor(q_d, q_layout)
+    var tab_h = ctx.enqueue_create_host_buffer[DType.int32](4096)
+    for i in range(4096):
+        tab_h[i] = Int32(i)
+    var tab_d = ctx.enqueue_create_buffer[DType.int32](4096)
+    ctx.enqueue_copy(dst_buf=tab_d, src_buf=tab_h)
     var Kc = TileTensor(k_d, flat_layout)
     var Vc = TileTensor(v_d, flat_layout)
     var O = TileTensor(o_d, q_layout)
@@ -65,10 +70,10 @@ def launch_dattn[
     var scale = Float32(1) / sqrt(Float32(HD))
     if exact:
         comptime k_exact = amar_dattn_exact[HD, NQH, NKVH, KVT, 1, type_of(q_layout), type_of(flat_layout), type_of(q_layout)]
-        ctx.enqueue_function[k_exact](Q, Kc, Vc, O, Int32(T), scale, Int32(0), grid_dim=(NQH, m), block_dim=HD)
+        ctx.enqueue_function[k_exact](Q, Kc, Vc, O, tab_d.unsafe_ptr(), Int32(T), scale, Int32(0), grid_dim=(NQH, m), block_dim=HD)
     else:
         comptime k_split = amar_dattn_split[HD, NQH, NKVH, KVT, 1, NLD, ROT, type_of(q_layout), type_of(flat_layout), type_of(q_layout), type_of(flat_layout)]
-        ctx.enqueue_function[k_split](Q, Kc, Vc, O, Pg, Int32(T), Int32(ns), scale, Int32(0), grid_dim=(NKVH, ns, m), block_dim=DTHREADS)
+        ctx.enqueue_function[k_split](Q, Kc, Vc, O, Pg, tab_d.unsafe_ptr(), Int32(T), Int32(ns), scale, Int32(0), grid_dim=(NKVH, ns, m), block_dim=DTHREADS)
         if ns > 1:
             comptime k_comb = amar_dattn_combine[HD, DMAXS, type_of(flat_layout), type_of(q_layout)]
             ctx.enqueue_function[k_comb](Pg, O, Int32(ns), grid_dim=m * NQH, block_dim=DTHREADS)

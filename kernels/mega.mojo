@@ -14,7 +14,7 @@ from dattn import dattn_split_body, dattn_combine_body, dattn_nsplit
 from elementwise import EW_THREADS
 from matmul_skinny import ROW_WAVES, ROW_THREADS, q4_dot_blocks, bf16x16_to_f32
 from ssm import CONV, KDIM, NH_K, NH_V, SSTATE, SSM_EPS
-from attn import HD, NQH, NKVH, KVT, TCAP, KVPAGE, KVPSH, KVHSTR, kv_off, NROT, YARN_LOW, YARN_HIGH, FREQ_BASE, FREQ_SCALE, MSCALE, attn_head_body, attn_head_span
+from attn import HD, NQH, NKVH, KVT, TCAP, KVPAGE, KVPSH, KVHSTR, kv_off, kv_tab_off, NROT, YARN_LOW, YARN_HIGH, FREQ_BASE, FREQ_SCALE, MSCALE, attn_head_body, attn_head_span
 from model import H, FFN, QF, KV, N_LAYERS, MEGA_ALLOWED
 
 comptime u32 = DType.uint32
@@ -774,6 +774,7 @@ def attn_phases[
     mut AoB: TileTensor[bf16, CBL, MutAnyOrigin],
     mut Kc: TileTensor[KVT, CacheL, MutAnyOrigin],
     mut Vc: TileTensor[KVT, CacheL, MutAnyOrigin],
+    tab: MutPointer[Scalar[DType.int32], MutAnyOrigin],
     mut Ctr: TileTensor[u32, CtrL, MutAnyOrigin],
     mut Pg: TileTensor[f32, PL, MutAnyOrigin],
     pos: Int, M: Int, att_i: Int, att_split: Int,
@@ -896,7 +897,7 @@ def attn_phases[
             Kflat[r, h * HD + tid + NROT // 2] = rebind[Kflat.ElementType](x0 * cs[1] + x1 * cs[0])
         barrier()
         if tid < HD:
-            var kb = kv_off[NAT](pos + r, att_i, Int(h)) + tid
+            var kb = kv_tab_off[NAT](tab, pos + r, att_i, Int(h)) + tid
             Kc.ptr[unsafe_offset=kb] = rebind[Scalar[KVT]](
                 rebind[Scalar[f32]](Kflat[r, h * HD + tid]).cast[KVT]()
             )
@@ -915,7 +916,7 @@ def attn_phases[
             var qrow = r * NQH + h
             var kvh = h // (NQH // NKVH)
             var T = pos + 1 + r
-            var res = attn_head_span[NAT=NAT](Q, Kc, Vc, qs, scores, sums, qrow, kvh, 0, T, tid, lane, ATT_SCALE, att_i)
+            var res = attn_head_span[NAT=NAT](Q, Kc, Vc, tab, qs, scores, sums, qrow, kvh, 0, T, tid, lane, ATT_SCALE, att_i)
             if tid < HD:
                 var inv = 1 / res[1]
                 Ao[qrow, tid] = rebind[Ao.ElementType](res[2] * inv)
@@ -925,7 +926,7 @@ def attn_phases[
             var r = bid // (NKVH * ns)
             var rem = bid % (NKVH * ns)
             dattn_split_body[HD, NQH, NKVH, KVT, NAT, DATT_NLD, False](
-                Q, Kc, Vc, Ao, Pg, rem // ns, rem % ns, r, ns, pos + 1 + r, ATT_SCALE, att_i, tid
+                Q, Kc, Vc, Ao, Pg, tab, rem // ns, rem % ns, r, ns, pos + 1 + r, ATT_SCALE, att_i, tid
             )
         if ns > 1:
             if not grid_barrier(ctr, gen, fail):
@@ -1014,6 +1015,7 @@ def mega_body[
     Ao: TileTensor[f32, QmL, MutAnyOrigin],
     kc: MutPointer[Scalar[KVT], MutAnyOrigin],
     vc: MutPointer[Scalar[KVT], MutAnyOrigin],
+    tab: MutPointer[Scalar[DType.int32], MutAnyOrigin],
     Pg: TileTensor[f32, PfL, MutAnyOrigin],
     Pu: TileTensor[f32, PfL, MutAnyOrigin],
     FgB: TileTensor[bf16, FbL, MutAnyOrigin],
@@ -1084,7 +1086,7 @@ def mega_body[
                 wq[KV, H, Q4](wbuf, o3), ws[KV, H, Q4](wbuf, o3),
                 wf[HD](wbuf, o4), wf[HD](wbuf, o5),
                 wq[H, H, Q4](wbuf, o6), ws[H, H, Q4](wbuf, o6),
-                Qfm_, Kflat_, Vflat_, Q_, Gate_, Ao_, ResB_, Kc, Vc, Ctr_, Pg_, p, M, att_i, Int(att_split), prof, 16 * layer,
+                Qfm_, Kflat_, Vflat_, Q_, Gate_, Ao_, ResB_, Kc, Vc, tab, Ctr_, Pg_, p, M, att_i, Int(att_split), prof, 16 * layer,
             ):
                 return
             att_i += 1
@@ -1252,6 +1254,7 @@ def amar_mega_token[
     Ao: TileTensor[f32, QmL, MutAnyOrigin],
     kc: MutPointer[Scalar[KVT], MutAnyOrigin],
     vc: MutPointer[Scalar[KVT], MutAnyOrigin],
+    tab: MutPointer[Scalar[DType.int32], MutAnyOrigin],
     Pg: TileTensor[f32, PfL, MutAnyOrigin],
     Pu: TileTensor[f32, PfL, MutAnyOrigin],
     FgB: TileTensor[bf16, FbL, MutAnyOrigin],
@@ -1265,7 +1268,7 @@ def amar_mega_token[
     hidx: MutPointer[Scalar[i32], MutAnyOrigin],
     ring: Int32, slots: Int32, pos: Int32, m: Int32, dump: Int32, fold_head: Int32, att_split: Int32,
 ):
-    mega_body[MR, RELOAD, Q4, XL, CBL, QkvL, G32mL, ConvL, OmL, CsL, SsL, QfL, KvfL, QmL, GfL, PfL, FbL, OffL, CtrL, TkL, DkL, NL, NAT](wbuf, off, X, CurB, ResB, Qkvm, Zm, Araw, Braw, Eg, Beta, Conv, So, ConvState, SAll, Qfm, Kflat, Vflat, Q, Gate, Ao, kc, vc, Pg, Pu, FgB, Ctr, prof, dbg, Toks, Dtok, Hn, hmax, hidx, ring, slots, pos, m, dump, fold_head, att_split)
+    mega_body[MR, RELOAD, Q4, XL, CBL, QkvL, G32mL, ConvL, OmL, CsL, SsL, QfL, KvfL, QmL, GfL, PfL, FbL, OffL, CtrL, TkL, DkL, NL, NAT](wbuf, off, X, CurB, ResB, Qkvm, Zm, Araw, Braw, Eg, Beta, Conv, So, ConvState, SAll, Qfm, Kflat, Vflat, Q, Gate, Ao, kc, vc, tab, Pg, Pu, FgB, Ctr, prof, dbg, Toks, Dtok, Hn, hmax, hidx, ring, slots, pos, m, dump, fold_head, att_split)
 
 
 def amar_mega_window[
@@ -1300,6 +1303,7 @@ def amar_mega_window[
     Ao: TileTensor[f32, QmL, MutAnyOrigin],
     kc: MutPointer[Scalar[KVT], MutAnyOrigin],
     vc: MutPointer[Scalar[KVT], MutAnyOrigin],
+    tab: MutPointer[Scalar[DType.int32], MutAnyOrigin],
     Pg: TileTensor[f32, PfL, MutAnyOrigin],
     Pu: TileTensor[f32, PfL, MutAnyOrigin],
     FgB: TileTensor[bf16, FbL, MutAnyOrigin],
@@ -1313,4 +1317,4 @@ def amar_mega_window[
     hidx: MutPointer[Scalar[i32], MutAnyOrigin],
     ring: Int32, slots: Int32, pos: Int32, m: Int32, dump: Int32, fold_head: Int32, att_split: Int32,
 ):
-    mega_body[MR, RELOAD, Q4, XL, CBL, QkvL, G32mL, ConvL, OmL, CsL, SsL, QfL, KvfL, QmL, GfL, PfL, FbL, OffL, CtrL, TkL, DkL, NL, NAT](wbuf, off, X, CurB, ResB, Qkvm, Zm, Araw, Braw, Eg, Beta, Conv, So, ConvState, SAll, Qfm, Kflat, Vflat, Q, Gate, Ao, kc, vc, Pg, Pu, FgB, Ctr, prof, dbg, Toks, Dtok, Hn, hmax, hidx, ring, slots, pos, m, dump, fold_head, att_split)
+    mega_body[MR, RELOAD, Q4, XL, CBL, QkvL, G32mL, ConvL, OmL, CsL, SsL, QfL, KvfL, QmL, GfL, PfL, FbL, OffL, CtrL, TkL, DkL, NL, NAT](wbuf, off, X, CurB, ResB, Qkvm, Zm, Araw, Braw, Eg, Beta, Conv, So, ConvState, SAll, Qfm, Kflat, Vflat, Q, Gate, Ao, kc, vc, tab, Pg, Pu, FgB, Ctr, prof, dbg, Toks, Dtok, Hn, hmax, hidx, ring, slots, pos, m, dump, fold_head, att_split)

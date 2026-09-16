@@ -21,6 +21,11 @@ def kv_off[NAT: Int, HD_: Int = HD, NKVH_: Int = NKVH](t: Int, att_i: Int, kvh: 
     return (((t >> KVPSH) * NAT + att_i) * NKVH_ + kvh) * (KVPAGE * HD_ + KVPAD) + (t & (KVPAGE - 1)) * HD_
 
 
+@always_inline
+def kv_tab_off[NAT: Int, HD_: Int = HD, NKVH_: Int = NKVH](tab: MutPointer[Scalar[DType.int32], MutAnyOrigin], t: Int, att_i: Int, kvh: Int) -> Int:
+    return ((Int(tab[t >> KVPSH]) * NAT + att_i) * NKVH_ + kvh) * (KVPAGE * HD_ + KVPAD) + (t & (KVPAGE - 1)) * HD_
+
+
 def amar_head_rmsnorm[
     XLayout: TensorLayout, GLayout: TensorLayout
 ](
@@ -55,6 +60,7 @@ def attn_head_span[
     Q: TileTensor[f32, QLayout, MutAnyOrigin],
     Kc: TileTensor[KVT, KLayout, MutAnyOrigin],
     Vc: TileTensor[KVT, KLayout, MutAnyOrigin],
+    tab: MutPointer[Scalar[DType.int32], MutAnyOrigin],
     mut qs: TileTensor[f32, QsL, MutUntrackedOrigin, address_space = AddressSpace.SHARED],
     mut scores: TileTensor[f32, ScL, MutUntrackedOrigin, address_space = AddressSpace.SHARED],
     mut red: TileTensor[f32, RdL, MutUntrackedOrigin, address_space = AddressSpace.SHARED],
@@ -80,7 +86,7 @@ def attn_head_span[
         if tid < HD_:
             var t = t0 + tid
             if t < t_hi:
-                var kb = kv_off[NAT, HD_, NKVH_](t, att_i, kvh)
+                var kb = kv_tab_off[NAT, HD_, NKVH_](tab, t, att_i, kvh)
                 var Kr = TileTensor(kp.unsafe_offset(kb), row_major[HD_]()).vectorize[8]()
                 var acc: Float32 = 0
                 for d8 in range(HD_ // 8):
@@ -124,13 +130,13 @@ def attn_head_span[
                 var v = InlineArray[Float32, 8](uninitialized=True)
                 var sc = InlineArray[Float32, 8](uninitialized=True)
                 comptime for j in range(8):
-                    v[j] = vp[unsafe_offset=kv_off[NAT, HD_, NKVH_](t0 + tt + j, att_i, kvh) + tid].cast[f32]()
+                    v[j] = vp[unsafe_offset=kv_tab_off[NAT, HD_, NKVH_](tab, t0 + tt + j, att_i, kvh) + tid].cast[f32]()
                     sc[j] = rebind[Scalar[f32]](scores[tt + j])
                 comptime for j in range(8):
                     o += sc[j] * v[j]
                 tt += 8
             while tt < n:
-                o += rebind[Scalar[f32]](scores[tt]) * vp[unsafe_offset=kv_off[NAT, HD_, NKVH_](t0 + tt, att_i, kvh) + tid].cast[f32]()
+                o += rebind[Scalar[f32]](scores[tt]) * vp[unsafe_offset=kv_tab_off[NAT, HD_, NKVH_](tab, t0 + tt, att_i, kvh) + tid].cast[f32]()
                 tt += 1
         t0 += HD_
     return SIMD[f32, 4](m_run, l_run, o, 0)
@@ -144,6 +150,7 @@ def attn_head_body[
     Q: TileTensor[f32, QLayout, MutAnyOrigin],
     Kc: TileTensor[KVT, KLayout, MutAnyOrigin],
     Vc: TileTensor[KVT, KLayout, MutAnyOrigin],
+    tab: MutPointer[Scalar[DType.int32], MutAnyOrigin],
     mut O: TileTensor[f32, OLayout, MutAnyOrigin],
     mut qs: TileTensor[f32, QsL, MutUntrackedOrigin, address_space = AddressSpace.SHARED],
     mut scores: TileTensor[f32, ScL, MutUntrackedOrigin, address_space = AddressSpace.SHARED],
@@ -151,7 +158,7 @@ def attn_head_body[
     qrow: Int, kvh: Int, T: Int, tid: Int, lane: Int, scale: Float32, att_i: Int,
 ):
     comptime assert O.flat_rank == 2
-    var res = attn_head_span[NAT=NAT](Q, Kc, Vc, qs, scores, red, qrow, kvh, 0, T, tid, lane, scale, att_i)
+    var res = attn_head_span[NAT=NAT](Q, Kc, Vc, tab, qs, scores, red, qrow, kvh, 0, T, tid, lane, scale, att_i)
     if tid < HD:
         var inv = 1 / res[1]
         O[qrow, tid] = rebind[O.ElementType](res[2] * inv)
@@ -166,6 +173,7 @@ def amar_attn_decode[
     Kc: TileTensor[KVT, KLayout, MutAnyOrigin],
     Vc: TileTensor[KVT, KLayout, MutAnyOrigin],
     O: TileTensor[f32, OLayout, MutAnyOrigin],
+    tab: MutPointer[Scalar[DType.int32], MutAnyOrigin],
     t_len: Int32,
     scale: Float32,
     att_i: Int32,
@@ -181,7 +189,7 @@ def amar_attn_decode[
     var scores = stack_allocation[f32, address_space = AddressSpace.SHARED](row_major[HD]())
     var red = stack_allocation[f32, address_space = AddressSpace.SHARED](row_major[HD // WARP_SIZE]())
     var O_ = O
-    attn_head_body[NAT=NAT](Q, Kc, Vc, O_, qs, scores, red, qrow, kvh, T, tid, Int(lane_id()), scale, Int(att_i))
+    attn_head_body[NAT=NAT](Q, Kc, Vc, tab, O_, qs, scores, red, qrow, kvh, T, tid, Int(lane_id()), scale, Int(att_i))
 
 
 def amar_gate_mul[
@@ -270,6 +278,7 @@ def amar_kv_append[
 ](
     Cache: TileTensor[KVT, CLayout, MutAnyOrigin],
     New: TileTensor[f32, NLayout, MutAnyOrigin],
+    tab: MutPointer[Scalar[DType.int32], MutAnyOrigin],
     t_idx: Int32,
     att_i: Int32,
 ):
@@ -278,7 +287,7 @@ def amar_kv_append[
     var r = Int(block_idx.y)
     var d = thread_idx.x
     var t = Int(t_idx) + r
-    var cb = kv_off[NAT](t, Int(att_i), Int(h)) + Int(d)
+    var cb = kv_tab_off[NAT](tab, t, Int(att_i), Int(h)) + Int(d)
     Cache.ptr[unsafe_offset=cb] = rebind[Scalar[KVT]](
         rebind[Scalar[f32]](New[r * NKVH + h, d]).cast[KVT]()
     )
@@ -337,6 +346,7 @@ def amar_kv_append2[
     Vc: TileTensor[KVT, CLayout, MutAnyOrigin],
     Kn: TileTensor[f32, NLayout, MutAnyOrigin],
     Vn: TileTensor[f32, NLayout, MutAnyOrigin],
+    tab: MutPointer[Scalar[DType.int32], MutAnyOrigin],
     t_idx: Int32,
     att_i: Int32,
 ):
@@ -345,7 +355,7 @@ def amar_kv_append2[
     var r = Int(block_idx.y)
     var d = thread_idx.x
     var t = Int(t_idx) + r
-    var cb = kv_off[NAT](t, Int(att_i), Int(h)) + Int(d)
+    var cb = kv_tab_off[NAT](tab, t, Int(att_i), Int(h)) + Int(d)
     if block_idx.z == 0:
         Kc.ptr[unsafe_offset=cb] = rebind[Scalar[KVT]](
             rebind[Scalar[f32]](Kn[r * NKVH + h, d]).cast[KVT]()
@@ -368,6 +378,7 @@ def amar_attn_prefill[
     Kc: TileTensor[KVT, KLayout, MutAnyOrigin],
     Vc: TileTensor[KVT, KLayout, MutAnyOrigin],
     O: TileTensor[f32, OLayout, MutAnyOrigin],
+    tab: MutPointer[Scalar[DType.int32], MutAnyOrigin],
     pos: Int32,
     m: Int32,
     scale: Float32,
@@ -411,7 +422,7 @@ def amar_attn_prefill[
         barrier()
         var p = t0 + lp
         if p < t_blk:
-            var pb = kv_off[NAT](p, Int(att_i), kvh)
+            var pb = kv_tab_off[NAT](tab, p, Int(att_i), kvh)
             var Kr = TileTensor(Kc.ptr.unsafe_offset(pb), row_major[HD]()).vectorize[8]()
             var Vr = TileTensor(Vc.ptr.unsafe_offset(pb), row_major[HD]()).vectorize[8]()
             ksv[lp, lc] = rebind[ksv.ElementType](rebind[SIMD[KVT, 8]](Kr[lc]).cast[f32]())
@@ -472,6 +483,7 @@ def amar_attn_prefill_wmma[
     Kc: TileTensor[KVT, KLayout, MutAnyOrigin],
     Vc: TileTensor[KVT, KLayout, MutAnyOrigin],
     O: TileTensor[f32, OLayout, MutAnyOrigin],
+    tab: MutPointer[Scalar[DType.int32], MutAnyOrigin],
     pos: Int32,
     m: Int32,
     scale: Float32,
@@ -530,7 +542,7 @@ def amar_attn_prefill_wmma[
             var p = t0 + key
             var x = SIMD[f16, 8](0)
             if p < t_blk:
-                var Kr = TileTensor(Kc.ptr.unsafe_offset(kv_off[NAT](p, ai, kvh)), row_major[HD]()).vectorize[8]()
+                var Kr = TileTensor(Kc.ptr.unsafe_offset(kv_tab_off[NAT](tab, p, ai, kvh)), row_major[HD]()).vectorize[8]()
                 x = rebind[SIMD[KVT, 8]](Kr[c]).cast[f16]()
             ksv[key, c] = rebind[ksv.ElementType](x)
         comptime for s in range(PW_TK * HD // 8 // PW_THREADS):
@@ -540,7 +552,7 @@ def amar_attn_prefill_wmma[
             var p = t0 + key
             var x = SIMD[f16, 8](0)
             if p < t_blk:
-                var Vr = TileTensor(Vc.ptr.unsafe_offset(kv_off[NAT](p, ai, kvh)), row_major[HD]()).vectorize[8]()
+                var Vr = TileTensor(Vc.ptr.unsafe_offset(kv_tab_off[NAT](tab, p, ai, kvh)), row_major[HD]()).vectorize[8]()
                 x = rebind[SIMD[KVT, 8]](Vr[c]).cast[f16]()
             comptime for i in range(8):
                 vt[c * 8 + i, key] = rebind[vt.ElementType](x[i])

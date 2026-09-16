@@ -99,11 +99,16 @@ def run_case[HD_: Int, NQH_: Int, NKVH_: Int](ctx: DeviceContext, odir: String) 
     var Kn = TileTensor(kn_d, kv_l)
     var Vn = TileTensor(vn_d, kv_l)
     var G = TileTensor(g_d, g_l)
+    var tab_h = ctx.enqueue_create_host_buffer[DType.int32](4096)
+    for i in range(4096):
+        tab_h[i] = Int32(i)
+    var tab_d = ctx.enqueue_create_buffer[DType.int32](4096)
+    ctx.enqueue_copy(dst_buf=tab_d, src_buf=tab_h)
     var Kc = TileTensor(kp_d, c_l)
     var Vc = TileTensor(vp_d, c_l)
     var O = TileTensor(o_d, q_l)
     ctx.enqueue_function[k_app](
-        Kc, Vc, Kn, Vn, Int32(POS), BASE, Int32(ATT_I), grid_dim=(NKVH_, 2), block_dim=HD_
+        Kc, Vc, Kn, Vn, tab_d.unsafe_ptr(), Int32(POS), BASE, Int32(ATT_I), grid_dim=(NKVH_, 2), block_dim=HD_
     )
     var scale = Float32(1) / sqrt(Float32(HD_))
     var pre = odir + "/hd" + String(HD_) + "_"
@@ -111,7 +116,7 @@ def run_case[HD_: Int, NQH_: Int, NKVH_: Int](ctx: DeviceContext, odir: String) 
         var win = WIN if w == 1 else 0
         ctx.enqueue_memset(o_d, 0)
         ctx.enqueue_function[k_att](
-            Q, Kc, Vc, G, O, Int32(POS + 1), Int32(win), scale, Int32(ATT_I),
+            Q, Kc, Vc, G, O, tab_d.unsafe_ptr(), Int32(POS + 1), Int32(win), scale, Int32(ATT_I),
             grid_dim=(NQH_, R), block_dim=HD_,
         )
         ctx.enqueue_copy(dst_buf=o_h, src_buf=o_d)

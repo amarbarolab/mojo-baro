@@ -12,7 +12,7 @@ from dattn import dattn_split_body, dattn_combine_body, dattn_nsplit
 from elementwise import EW_THREADS
 from matmul_skinny import ROW_WAVES, ROW_THREADS, ROW_VEC, SPLITK, SM
 from ssm import CONV, KDIM, NH_K, NH_V, SSTATE, SSM_EPS
-from attn import HD, NQH, NKVH, KVT, TCAP, kv_off, NROT, attn_head_span
+from attn import HD, NQH, NKVH, KVT, TCAP, kv_off, kv_tab_off, NROT, attn_head_span
 from model import H, FFN, QF, KV
 from mega import grid_barrier, stamp, rope_cs, MEGA_G, RMS_EPS, ATT_SCALE, DATT_NLD
 from moe import (
@@ -290,6 +290,7 @@ def mega_moe_body[
     aob: MutPointer[Scalar[bf16], MutAnyOrigin],
     kc: MutPointer[Scalar[KVT], MutAnyOrigin],
     vc: MutPointer[Scalar[KVT], MutAnyOrigin],
+    tab: MutPointer[Scalar[DType.int32], MutAnyOrigin],
     patt: MutPointer[Scalar[f32], MutAnyOrigin],
     idxp: MutPointer[Scalar[i32], MutAnyOrigin],
     wtp: MutPointer[Scalar[f32], MutAnyOrigin],
@@ -445,7 +446,7 @@ def mega_moe_body[
                     Kflat[0, h * HD + tid] = rebind[Kflat.ElementType](x0 * cs[0] - x1 * cs[1])
                     Kflat[0, h * HD + tid + NROT // 2] = rebind[Kflat.ElementType](x0 * cs[1] + x1 * cs[0])
                 barrier()
-                var kb = kv_off[NAT](p, ai, h) + tid
+                var kb = kv_tab_off[NAT](tab, p, ai, h) + tid
                 Kc.ptr[unsafe_offset=kb] = rebind[Scalar[KVT]](rebind[Scalar[f32]](Kflat[0, h * HD + tid]).cast[KVT]())
                 Vc.ptr[unsafe_offset=kb] = rebind[Scalar[KVT]](rebind[Scalar[f32]](Vflat[0, h * HD + tid]).cast[KVT]())
             if not grid_barrier(ctr, gen, fail):
@@ -456,14 +457,14 @@ def mega_moe_body[
                 if bid < NQH:
                     var h = bid
                     var kvh = h // (NQH // NKVH)
-                    var res = attn_head_span[NAT=NAT](Q, Kc, Vc, qs, scores, sums, h, kvh, 0, p + 1, tid, lane, ATT_SCALE, ai)
+                    var res = attn_head_span[NAT=NAT](Q, Kc, Vc, tab, qs, scores, sums, h, kvh, 0, p + 1, tid, lane, ATT_SCALE, ai)
                     var inv = 1 / res[1]
                     Ao[h, tid] = rebind[Ao.ElementType](res[2] * inv)
             else:
                 var ns = dattn_nsplit[HD, DATT_NLD, NKVH](p + 1, 1, MEGA_G)
                 if bid < NKVH * ns:
                     dattn_split_body[HD, NQH, NKVH, KVT, NAT, DATT_NLD, False](
-                        Q, Kc, Vc, Ao, Pg, bid // ns, bid % ns, 0, ns, p + 1, ATT_SCALE, ai, tid
+                        Q, Kc, Vc, Ao, Pg, tab, bid // ns, bid % ns, 0, ns, p + 1, ATT_SCALE, ai, tid
                     )
                 if ns > 1:
                     if not grid_barrier(ctr, gen, fail):
@@ -787,6 +788,7 @@ def amar_mega_moe_token[
     aob: MutPointer[Scalar[bf16], MutAnyOrigin],
     kc: MutPointer[Scalar[KVT], MutAnyOrigin],
     vc: MutPointer[Scalar[KVT], MutAnyOrigin],
+    tab: MutPointer[Scalar[DType.int32], MutAnyOrigin],
     patt: MutPointer[Scalar[f32], MutAnyOrigin],
     idxp: MutPointer[Scalar[i32], MutAnyOrigin],
     wtp: MutPointer[Scalar[f32], MutAnyOrigin],
@@ -800,6 +802,6 @@ def amar_mega_moe_token[
 ):
     mega_moe_body[CsL, SsL, NL, NAT](
         wbuf, off, xp, curb, xg, fnp, qkv, zp, araw, braw, egp, betap, convp, sop, resb,
-        ConvState, SAll, qfp, kp, vp, qp, gatep, aop, aob, kc, vc, patt, idxp, wtp, sigp,
+        ConvState, SAll, qfp, kp, vp, qp, gatep, aop, aob, kc, vc, tab, patt, idxp, wtp, sigp,
         rhp, shp, ctrp, prof, dbg, ring, slots, pos, dump, att_split,
     )

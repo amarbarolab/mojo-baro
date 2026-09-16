@@ -258,6 +258,11 @@ def main() raises:
     var qkv_d = ctx.enqueue_create_buffer[f32](QKV)
     var kc_d = ctx.enqueue_create_buffer[KVT](KVPOOL)
     var vc_d = ctx.enqueue_create_buffer[KVT](KVPOOL)
+    var kvtab_h = ctx.enqueue_create_host_buffer[DType.int32](TPAGES)
+    for i in range(TPAGES):
+        kvtab_h[i] = Int32(i)
+    var kvtab_d = ctx.enqueue_create_buffer[DType.int32](TPAGES)
+    ctx.enqueue_copy(dst_buf=kvtab_d, src_buf=kvtab_h)
     var aob_d = ctx.enqueue_create_buffer[bf16](QDIM)
     var gate_d = ctx.enqueue_create_buffer[f32](NQH)
     var p_g_d = ctx.enqueue_create_buffer[f32](FFN)
@@ -434,13 +439,13 @@ def main() raises:
                     ctx.enqueue_function[k_bias](Qkv1, QkvBias, Int32(QKV), grid_dim=ceildiv(QKV, 256), block_dim=256)
                 if swa:
                     ctx.enqueue_function[k_rope_swa](Q, Int32(pos), Int32(NQH), BASE_SWA, grid_dim=(NQH, 1), block_dim=NROT_SWA // 2)
-                    ctx.enqueue_function[k_kv_swa](Kc, Vc, K, V, Int32(pos), BASE_SWA, Int32(i), grid_dim=(NKVH, 2), block_dim=HD)
+                    ctx.enqueue_function[k_kv_swa](Kc, Vc, K, V, kvtab_d.unsafe_ptr(), Int32(pos), BASE_SWA, Int32(i), grid_dim=(NKVH, 2), block_dim=HD)
                 else:
                     ctx.enqueue_function[k_rope_full](Q, Int32(pos), Int32(NQH), BASE_FULL, grid_dim=(NQH, 1), block_dim=NROT_FULL // 2)
-                    ctx.enqueue_function[k_kv_full](Kc, Vc, K, V, Int32(pos), BASE_FULL, Int32(i), grid_dim=(NKVH, 2), block_dim=HD)
+                    ctx.enqueue_function[k_kv_full](Kc, Vc, K, V, kvtab_d.unsafe_ptr(), Int32(pos), BASE_FULL, Int32(i), grid_dim=(NKVH, 2), block_dim=HD)
                 comptime if HAS_GATE:
                     ctx.enqueue_function[k_gate](Xb, wq(ctx, wbuf, off[e + OFF_GATE], NQH * H, q_gate), ws(ctx, wbuf, off[e + OFF_GATE], NQH * H, s_gate), Gate, Dummy, Int32(NQH), Int32(H), grid_dim=ceildiv(NQH, ROW_WAVES), block_dim=ROW_THREADS)
-                ctx.enqueue_function[k_att](Q, Kc, Vc, Gate, AoB2, Int32(pos + 1), Int32(SWA_WIN if swa else 0), ATTN_SCALE, Int32(i), grid_dim=(NQH, 1), block_dim=HD)
+                ctx.enqueue_function[k_att](Q, Kc, Vc, Gate, AoB2, kvtab_d.unsafe_ptr(), Int32(pos + 1), Int32(SWA_WIN if swa else 0), ATTN_SCALE, Int32(i), grid_dim=(NQH, 1), block_dim=HD)
                 ctx.enqueue_function[k_o](AoB, wq(ctx, wbuf, off[e + OFF_O], H * QDIM, q_o), ws(ctx, wbuf, off[e + OFF_O], H * QDIM, s_o), X1, Dummy, Int32(H), Int32(QDIM), grid_dim=ceildiv(H, ROW_WAVES), block_dim=ROW_THREADS)
                 ctx.enqueue_function[k_rms](X, FfnNorm, Xb, Int32(H), NORM_EPS, grid_dim=1, block_dim=256)
                 ctx.enqueue_function[k_ffn_gate](Xb, wq(ctx, wbuf, off[e + OFF_FFN_GATE], FFN * H, q_ffn), ws(ctx, wbuf, off[e + OFF_FFN_GATE], FFN * H, s_ffn), G1, Dummy, Int32(FFN), Int32(H), grid_dim=ceildiv(FFN, ROW_WAVES), block_dim=ROW_THREADS)

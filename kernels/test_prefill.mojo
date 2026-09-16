@@ -419,11 +419,16 @@ def test_attn(ctx: DeviceContext) raises:
     var O = TileTensor(o_d, qa_layout)
     var O2 = TileTensor(o2_d, qa_layout)
     var scale = Float32(0.0625)
+    var tab_h = ctx.enqueue_create_host_buffer[DType.int32](4096)
+    for i in range(4096):
+        tab_h[i] = Int32(i)
+    var tab_d = ctx.enqueue_create_buffer[DType.int32](4096)
+    ctx.enqueue_copy(dst_buf=tab_d, src_buf=tab_h)
     ctx.enqueue_function[amar_attn_prefill[type_of(qa_layout), type_of(kca_layout), type_of(qa_layout), 1]](
-        Q, Kc, Vc, O, Int32(AT_P), Int32(AT_M), scale, Int32(0), grid_dim=(NKVH, ceildiv(AT_M, PA_ROWS)), block_dim=256,
+        Q, Kc, Vc, O, tab_d.unsafe_ptr(), Int32(AT_P), Int32(AT_M), scale, Int32(0), grid_dim=(NKVH, ceildiv(AT_M, PA_ROWS)), block_dim=256,
     )
     ctx.enqueue_function[amar_attn_decode[type_of(qa_layout), type_of(kca_layout), type_of(qa_layout), 1]](
-        Q, Kc, Vc, O2, Int32(AT_P + 1), scale, Int32(0), grid_dim=(NQH, AT_M), block_dim=HD,
+        Q, Kc, Vc, O2, tab_d.unsafe_ptr(), Int32(AT_P + 1), scale, Int32(0), grid_dim=(NQH, AT_M), block_dim=HD,
     )
     ctx.enqueue_copy(dst_buf=o_h, src_buf=o_d)
     ctx.enqueue_copy(dst_buf=o2_h, src_buf=o2_d)
@@ -537,11 +542,16 @@ def attn_case[TM: Int, TP: Int](ctx: DeviceContext, seed: UInt64) raises -> Bool
     var O = TileTensor(o_d, ql)
     var O2 = TileTensor(o2_d, ql)
     var scale = Float32(0.0625)
+    var tab_h = ctx.enqueue_create_host_buffer[DType.int32](4096)
+    for i in range(4096):
+        tab_h[i] = Int32(i)
+    var tab_d = ctx.enqueue_create_buffer[DType.int32](4096)
+    ctx.enqueue_copy(dst_buf=tab_d, src_buf=tab_h)
     ctx.enqueue_function[amar_attn_prefill[type_of(ql), type_of(kca_layout), type_of(ql), 1]](
-        Q, Kc, Vc, O, Int32(TP), Int32(TM), scale, Int32(0), grid_dim=(NKVH, ceildiv(TM, PA_ROWS)), block_dim=256,
+        Q, Kc, Vc, O, tab_d.unsafe_ptr(), Int32(TP), Int32(TM), scale, Int32(0), grid_dim=(NKVH, ceildiv(TM, PA_ROWS)), block_dim=256,
     )
     ctx.enqueue_function[amar_attn_prefill_wmma[type_of(ql), type_of(kca_layout), type_of(ql), 1]](
-        Q, Kc, Vc, O2, Int32(TP), Int32(TM), scale, Int32(0), grid_dim=(NKVH, ceildiv(TM, PW_ROWS)), block_dim=PW_THREADS,
+        Q, Kc, Vc, O2, tab_d.unsafe_ptr(), Int32(TP), Int32(TM), scale, Int32(0), grid_dim=(NKVH, ceildiv(TM, PW_ROWS)), block_dim=PW_THREADS,
     )
     ctx.enqueue_copy(dst_buf=o_h, src_buf=o_d)
     ctx.enqueue_copy(dst_buf=o2_h, src_buf=o2_d)

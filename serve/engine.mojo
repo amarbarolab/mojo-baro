@@ -11,6 +11,7 @@ Parity target: byte-identical token ids vs llama.cpp on the same GGUF.
 from std.math import ceildiv
 from std.memory import memcpy, unsafe_memcpy
 from std.os import getenv
+from kvpage import PageTable
 from std.sys import exit, has_accelerator
 from std.time import perf_counter_ns
 
@@ -60,7 +61,7 @@ def _get_i64(data: List[UInt8], off: Int) -> Int:
 
 
 def save_state(
-    ctx: DeviceContext, chain: Chain, kc_d: DeviceBuffer[KVT], vc_d: DeviceBuffer[KVT],
+    ctx: DeviceContext, chain: Chain, kc_d: DeviceBuffer[KVT], vc_d: DeviceBuffer[KVT], kvtab_h: HostBuffer[DType.int32],
     path: String, prompt: List[Int], pos: Int,
 ) raises:
     comptime assert KVT == DType.float32, "state file stores f32 KV"
@@ -73,8 +74,12 @@ def save_state(
     var kvn = ceildiv(pos, KVPAGE) * N_ATT * NKVH * KVHSTR
     var kh = ctx.enqueue_create_host_buffer[KVT](kvn)
     var vh = ctx.enqueue_create_host_buffer[KVT](kvn)
-    ctx.enqueue_copy(dst_buf=kh, src_buf=DeviceBuffer[KVT](ctx, kc_d.unsafe_ptr(), kvn, owning=False))
-    ctx.enqueue_copy(dst_buf=vh, src_buf=DeviceBuffer[KVT](ctx, vc_d.unsafe_ptr(), kvn, owning=False))
+    # logical page order through the block table, so the file never depends on the mapping
+    comptime PAGE_ELEMS = N_ATT * NKVH * KVHSTR
+    for p in range(ceildiv(pos, KVPAGE)):
+        var pp = Int(kvtab_h[p])
+        ctx.enqueue_copy(dst_buf=kh.create_sub_buffer[KVT](p * PAGE_ELEMS, PAGE_ELEMS), src_buf=DeviceBuffer[KVT](ctx, kc_d.unsafe_ptr().unsafe_offset(pp * PAGE_ELEMS), PAGE_ELEMS, owning=False))
+        ctx.enqueue_copy(dst_buf=vh.create_sub_buffer[KVT](p * PAGE_ELEMS, PAGE_ELEMS), src_buf=DeviceBuffer[KVT](ctx, vc_d.unsafe_ptr().unsafe_offset(pp * PAGE_ELEMS), PAGE_ELEMS, owning=False))
     ctx.synchronize()
     var int8 = getenv("BARO_STATE_INT8", "0") == "1"
     var head = List[UInt8]()
@@ -143,6 +148,7 @@ def _dequantize_kv_int8(mut hb: HostBuffer[KVT], data: List[UInt8], scale_off: I
 
 def load_state(
     ctx: DeviceContext, mut chain: Chain, kc_d: DeviceBuffer[KVT], vc_d: DeviceBuffer[KVT],
+    kvtab_h: HostBuffer[DType.int32], mut kvtab_d: DeviceBuffer[DType.int32], tpages: Int,
     path: String, tmax: Int,
 ) raises -> Int:
     comptime assert KVT == DType.float32, "state file stores f32 KV"
@@ -216,6 +222,10 @@ def load_state(
         unsafe_memcpy(dest=vh.unsafe_ptr().unsafe_bitcast[UInt8](), src=data.unsafe_ptr().unsafe_offset(off + kvn * 4), count=kvn * 4)
     ctx.enqueue_copy(dst_buf=DeviceBuffer[KVT](ctx, kc_d.unsafe_ptr(), kvn, owning=False), src_buf=kh)
     ctx.enqueue_copy(dst_buf=DeviceBuffer[KVT](ctx, vc_d.unsafe_ptr(), kvn, owning=False), src_buf=vh)
+    # the file holds logical pages 0..n-1 contiguously, so the table is the identity after a load
+    for i in range(tpages):
+        kvtab_h[i] = Int32(i)
+    ctx.enqueue_copy(dst_buf=kvtab_d, src_buf=kvtab_h)
     ctx.synchronize()
     return pos
 
@@ -246,6 +256,7 @@ def main() raises:
     print("BARO_DOT:", dot3)
     print("pack q4 trunk:", pack_q4)
     print("BARO_MEGA:", mega)
+    var kvtab_mode = getenv("BARO_KVTAB", "identity")
     var mega_win = getenv("BARO_MEGA_WIN", "0") == "1"
     print("BARO_MEGA_WIN:", mega_win)
     var pf5 = getenv("BARO_PROFILE", "0") == "5"
@@ -351,6 +362,13 @@ def main() raises:
                 force_env.append(fval)
         print("BARO_FORCE:", force_path, " (", len(force_env), "ids )")
     var bufs = alloc_bufs(ctx, pack, tmax)
+    var kvtab = PageTable(bufs.tpages)
+    if kvtab_mode == "reverse":
+        kvtab.reverse()
+    elif kvtab_mode != "identity":
+        raise Error("BARO_KVTAB must be identity or reverse")
+    kvtab.upload(ctx, bufs.kvtab_h, bufs.kvtab_d)
+    print("BARO_KVTAB:", kvtab_mode, " kv pages:", bufs.tpages)
     # The dense path consumes Pack.off's historical order.  The MoE pack is
     # lexical by tensor name, so build a per-block semantic order by name;
     # the offsets remain byte offsets into the same Pack.wbuf blob.
@@ -426,7 +444,7 @@ def main() raises:
         print("latent: exporting checkpoints to", latent_sock)
     if state_load != "":
         var t_ld = perf_counter_ns()
-        var lpos = load_state(ctx, chain, bufs.kc_d, bufs.vc_d, state_load, tmax)
+        var lpos = load_state(ctx, chain, bufs.kc_d, bufs.vc_d, bufs.kvtab_h, bufs.kvtab_d, bufs.tpages, state_load, tmax)
         print("state loaded:", state_load, " pos", lpos, " in", Float64(perf_counter_ns() - t_ld) / 1e9, "s")
     var req_id = 0
     # Requests read off fd 0 by the cancel probe mid-generation, in arrival
@@ -565,7 +583,7 @@ def main() raises:
                 var load_err = String("")
                 try:
                     var t_ld = perf_counter_ns()
-                    var lpos = load_state(ctx, chain, bufs.kc_d, bufs.vc_d, req_state_load, tmax)
+                    var lpos = load_state(ctx, chain, bufs.kc_d, bufs.vc_d, bufs.kvtab_h, bufs.kvtab_d, bufs.tpages, req_state_load, tmax)
                     print("state loaded:", req_state_load, " pos", lpos, " in", Float64(perf_counter_ns() - t_ld) / 1e9, "s")
                 except e:
                     load_err = String(e)
@@ -835,10 +853,10 @@ def main() raises:
             latent_gen = chain.gen
             print("latent: exported", exported, "checkpoints, chain gen", latent_gen)
         if state_save != "":
-            save_state(ctx, chain, bufs.kc_d, bufs.vc_d, state_save, prompt, len(prompt) - 1)
+            save_state(ctx, chain, bufs.kc_d, bufs.vc_d, bufs.kvtab_h, state_save, prompt, len(prompt) - 1)
         if req_state_save != "":
             var t_sv = perf_counter_ns()
-            save_state(ctx, chain, bufs.kc_d, bufs.vc_d, req_state_save, prompt, len(prompt) - 1)
+            save_state(ctx, chain, bufs.kc_d, bufs.vc_d, bufs.kvtab_h, req_state_save, prompt, len(prompt) - 1)
             print("state saved:", req_state_save, " pos", len(prompt) - 1, " in", Float64(perf_counter_ns() - t_sv) / 1e9, "s")
         var dt = Float64(perf_counter_ns() - t0) / 1e9
         print("host_enqueue_s:", t_host, " gpu_total_s:", dt)
@@ -1162,7 +1180,7 @@ def main() raises:
         var hn_last = DeviceBuffer[f32](ctx, bufs.hn_d.unsafe_ptr(), H, owning=False)
         blk32_forward(ctx, wbuf, off, e, 1, 0, n_total - 1, True, hn_last,
             bufs.x_d, bufs.curb_d, bufs.qf_d, bufs.q_d, bufs.k_d, bufs.v_d, bufs.gate_d, bufs.ao_d, bufs.resb_d, bufs.fgb_d, bufs.p_qf_d, bufs.p_kv_d, bufs.p_h_d,
-            bufs.p_ffn_d, bufs.p_ffn2_d, bufs.p_v_d, bufs.logits_d, bufs.cc_d, bufs.de_d, bufs.hd_d, bufs.kc32_d, bufs.vc32_d, toks_d, bufs.dtok_d,
+            bufs.p_ffn_d, bufs.p_ffn2_d, bufs.p_v_d, bufs.logits_d, bufs.cc_d, bufs.de_d, bufs.hd_d, bufs.kc32_d, bufs.vc32_d, bufs.kvtab_d, toks_d, bufs.dtok_d,
             False, wst.p3, False, 0, pack_q4)
         var last_tok = generated[len(generated) - 1]
         ctx.synchronize()

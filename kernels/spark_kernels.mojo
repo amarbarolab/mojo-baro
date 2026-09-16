@@ -4,7 +4,7 @@ from max.gpu.sync import barrier
 from std.math import cos, exp, log, sin, tanh
 from max.gpu.memory import AddressSpace
 from layout import TileTensor, TensorLayout, row_major, stack_allocation
-from attn import KVT, HD, NQH, NKVH, attn_head_span, kv_off
+from attn import KVT, HD, NQH, NKVH, attn_head_span, kv_off, kv_tab_off
 from matmul_skinny import dtype, ROW_WAVES
 
 comptime f32 = DType.float32
@@ -126,6 +126,7 @@ def amar_rope_kv_append[
     Vc: TileTensor[KVT, CLayout, MutAnyOrigin],
     K: TileTensor[f32, NLayout, MutAnyOrigin],
     V: TileTensor[f32, NLayout, MutAnyOrigin],
+    tab: MutPointer[Scalar[DType.int32], MutAnyOrigin],
     pos: Int32,
     freq_base: Float32,
     att_i: Int32,
@@ -134,7 +135,7 @@ def amar_rope_kv_append[
     var h = block_idx.x
     var which = Int(block_idx.y)
     var d = Int(thread_idx.x)
-    var cb = kv_off[NAT, HD_, NKVH_](Int(pos), Int(att_i), Int(h)) + d
+    var cb = kv_tab_off[NAT, HD_, NKVH_](tab, Int(pos), Int(att_i), Int(h)) + d
     if which == 1:
         Vc.ptr[unsafe_offset=cb] = rebind[Scalar[KVT]](rebind[Scalar[f32]](V[h, d]).cast[KVT]())
         return
@@ -186,6 +187,7 @@ def amar_attn_decode_swa_gated[
     Vc: TileTensor[KVT, KLayout, MutAnyOrigin],
     Gate: TileTensor[f32, GLayout, MutAnyOrigin],
     O: TileTensor[DType.bfloat16, OLayout, MutAnyOrigin],
+    tab: MutPointer[Scalar[DType.int32], MutAnyOrigin],
     t_len: Int32,
     win: Int32,
     scale: Float32,
@@ -204,7 +206,7 @@ def amar_attn_decode_swa_gated[
     var qs = stack_allocation[f32, address_space = AddressSpace.SHARED](row_major[HD_]())
     var scores = stack_allocation[f32, address_space = AddressSpace.SHARED](row_major[HD_]())
     var red = stack_allocation[f32, address_space = AddressSpace.SHARED](row_major[HD_ // WARP_SIZE]())
-    var res = attn_head_span[NAT=NAT, HD_=HD_, NKVH_=NKVH_](Q, Kc, Vc, qs, scores, red, qrow, kvh, t_lo, T, tid, Int(lane_id()), scale, Int(att_i))
+    var res = attn_head_span[NAT=NAT, HD_=HD_, NKVH_=NKVH_](Q, Kc, Vc, tab, qs, scores, red, qrow, kvh, t_lo, T, tid, Int(lane_id()), scale, Int(att_i))
     if tid < HD_:
         var inv = 1 / res[1]
         var o = res[2] * inv

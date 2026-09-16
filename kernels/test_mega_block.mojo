@@ -305,6 +305,11 @@ def run_case[MRT: Int, Q4: Bool](ctx: DeviceContext, mut wbuf: DeviceBuffer[u8],
     var ssM = clone(ctx, ss0, NSS)
     var kcL = clone(ctx, kc0, NKC)
     var kcM = clone(ctx, kc0, NKC)
+    var tab_h = ctx.enqueue_create_host_buffer[DType.int32](4096)
+    for i in range(4096):
+        tab_h[i] = Int32(i)
+    var tab_d = ctx.enqueue_create_buffer[DType.int32](4096)
+    ctx.enqueue_copy(dst_buf=tab_d, src_buf=tab_h)
     var vcL = clone(ctx, vc0, NKC)
     var vcM = clone(ctx, vc0, NKC)
     var hnL = ctx.enqueue_create_buffer[f32](MRT * H)
@@ -429,9 +434,9 @@ def run_case[MRT: Int, Q4: Bool](ctx: DeviceContext, mut wbuf: DeviceBuffer[u8],
                 ctx.enqueue_function[hrms_kv](Khd, tf(ctx, wbuf, off[w + 5], HD, hd_layout), Float32(1e-6), grid_dim=M * NKVH, block_dim=HD)
                 ctx.enqueue_function[rope_q](Q, Int32(POS), Int32(NQH), grid_dim=(NQH, M), block_dim=32)
                 ctx.enqueue_function[rope_k](Khd, Int32(POS), Int32(NKVH), grid_dim=(NKVH, M), block_dim=32)
-                ctx.enqueue_function[append_k](KcL, Khd, Int32(POS), Int32(layer // 4), grid_dim=(NKVH, M), block_dim=HD)
-                ctx.enqueue_function[append_k](VcL, Vhd, Int32(POS), Int32(layer // 4), grid_dim=(NKVH, M), block_dim=HD)
-                ctx.enqueue_function[att_k](Q, KcL, VcL, Ao, Int32(POS + 1), Float32(0.0625), Int32(layer // 4), grid_dim=(NQH, M), block_dim=HD)
+                ctx.enqueue_function[append_k](KcL, Khd, tab_d.unsafe_ptr(), Int32(POS), Int32(layer // 4), grid_dim=(NKVH, M), block_dim=HD)
+                ctx.enqueue_function[append_k](VcL, Vhd, tab_d.unsafe_ptr(), Int32(POS), Int32(layer // 4), grid_dim=(NKVH, M), block_dim=HD)
+                ctx.enqueue_function[att_k](Q, KcL, VcL, Ao, tab_d.unsafe_ptr(), Int32(POS + 1), Float32(0.0625), Int32(layer // 4), grid_dim=(NQH, M), block_dim=HD)
                 ctx.enqueue_function[gmul_k](Aoflat, Gate, AoBflat, Int32(M * H), grid_dim=ceildiv(M * H, 256), block_dim=256)
                 gl[Q4, MRT, H, H](ctx, wbuf, ResB, off[w + 6], Ph, M)
                 ctx.enqueue_function[r_add](Ph, XL_, Int32(M), Int32(H), grid_dim=ceildiv(M * H, 256), block_dim=256)
@@ -473,7 +478,7 @@ def run_case[MRT: Int, Q4: Bool](ctx: DeviceContext, mut wbuf: DeviceBuffer[u8],
         comptime if MRT == 1:
             ctx.enqueue_function[mega_k](
                 wbuf.unsafe_ptr(), Off, XM_, CurB, ResB, Qkvm, Zm, Araw, Braw, Eg, Beta, Conv, So, CsM, SsM,
-                Qfm, Kflat, Vflat, Q, Gate, Ao, kcM.unsafe_ptr(), vcM.unsafe_ptr(), Pg1, Pu1, FgB, Ctr, prof_d.unsafe_ptr(), dbg_d.unsafe_ptr(),
+                Qfm, Kflat, Vflat, Q, Gate, Ao, kcM.unsafe_ptr(), vcM.unsafe_ptr(), tab_d.unsafe_ptr(), Pg1, Pu1, FgB, Ctr, prof_d.unsafe_ptr(), dbg_d.unsafe_ptr(),
                 ToksM, DtokM, HnM, hmax_d.unsafe_ptr(), hidx_d.unsafe_ptr(),
                 Int32(ring), Int32(SLOTS), Int32(POS), Int32(M), Int32(0), Int32(1), Int32(ATT_SPLIT),
                 grid_dim=MEGA_G, block_dim=ROW_THREADS,
@@ -481,7 +486,7 @@ def run_case[MRT: Int, Q4: Bool](ctx: DeviceContext, mut wbuf: DeviceBuffer[u8],
         else:
             ctx.enqueue_function[mega_w](
                 wbuf.unsafe_ptr(), Off, XM_, CurB, ResB, Qkvm, Zm, Araw, Braw, Eg, Beta, Conv, So, CsM, SsM,
-                Qfm, Kflat, Vflat, Q, Gate, Ao, kcM.unsafe_ptr(), vcM.unsafe_ptr(), Pg1, Pu1, FgB, Ctr, prof_d.unsafe_ptr(), dbg_d.unsafe_ptr(),
+                Qfm, Kflat, Vflat, Q, Gate, Ao, kcM.unsafe_ptr(), vcM.unsafe_ptr(), tab_d.unsafe_ptr(), Pg1, Pu1, FgB, Ctr, prof_d.unsafe_ptr(), dbg_d.unsafe_ptr(),
                 ToksM, DtokM, HnM, hmax_d.unsafe_ptr(), hidx_d.unsafe_ptr(),
                 Int32(ring), Int32(SLOTS), Int32(POS), Int32(M), Int32(0), Int32(2), Int32(ATT_SPLIT),
                 grid_dim=MEGA_G_WIN, block_dim=ROW_THREADS,
@@ -491,7 +496,7 @@ def run_case[MRT: Int, Q4: Bool](ctx: DeviceContext, mut wbuf: DeviceBuffer[u8],
     def window_path(ring: Int, grid: Int) raises:
         ctx.enqueue_function[mega_w](
             wbuf.unsafe_ptr(), Off, XM_, CurB, ResB, Qkvm, Zm, Araw, Braw, Eg, Beta, Conv, So, CsM, SsM,
-            Qfm, Kflat, Vflat, Q, Gate, Ao, kcM.unsafe_ptr(), vcM.unsafe_ptr(), Pg1, Pu1, FgB, Ctr, prof_d.unsafe_ptr(), dbg_d.unsafe_ptr(),
+            Qfm, Kflat, Vflat, Q, Gate, Ao, kcM.unsafe_ptr(), vcM.unsafe_ptr(), tab_d.unsafe_ptr(), Pg1, Pu1, FgB, Ctr, prof_d.unsafe_ptr(), dbg_d.unsafe_ptr(),
             ToksM, DtokM, HnM, hmax_d.unsafe_ptr(), hidx_d.unsafe_ptr(),
             Int32(ring), Int32(SLOTS), Int32(POS), Int32(M), Int32(0), Int32(1 if MRT == 1 else 2), Int32(ATT_SPLIT),
             grid_dim=grid, block_dim=ROW_THREADS,
