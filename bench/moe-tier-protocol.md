@@ -142,3 +142,28 @@ consistency check that it really evicted nothing.
 Gate 4 on `f798ed4`: `tools/ci-checks.sh` all non-GPU checks passed;
 `./run-tests.sh` exit 0, 104 PASS, census `97 kernels, 52 in registry, 0
 orphans`.
+
+## Stage 3
+
+Lane `MOE3`, plan `docs/MOE-STAGE3-PLAN.md`. Frozen before item 0's run.
+
+### Item 0: pinned store A/B, zero code
+
+Arm A `BARO_TIER_PINNED=0` (page-cache, the current default), arm B
+`BARO_TIER_PINNED=1` (pinned host store), same engine binary, cap 64, the 20
+`bench/mtp-prompts/`, one stint, `bench/clock-probe.sh` around the pair. No
+file changes: the tier already prints `mode pinned|page-cache` at load
+(`serve/expert_tier.mojo:218-222`), which is the P1 read-back, and per-request
+`refs`, `hits`, `bytes_fetched`, `bytes_per_token` (`:355-361`), so the item's
+own "add the echo if the engine does not print it" clause does not apply.
+
+Check: both arms' load line, hit rate and bytes/token equal to 3 digits (same
+LRU, same requests), identity 20/20 both arms and against the stage-2b
+full-pack reference ids.
+
+Frozen two-way falsifier (arithmetic from the measured pread cost, not a
+target): **arm B at or above 55 tok/s** means the blocking pread is the
+dominant term (model: 8.94 ms compute + 5.81 ms PCIe still on the critical
+path + 40 sync bubbles of 50-150 us = 17-21 ms, 48-58 tok/s). **Arm B near 39
+(below 43)** means it is not, and item 1's stamp table decides what is.
+Either result, item 0 ships no code.
