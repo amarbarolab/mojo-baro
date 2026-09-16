@@ -257,13 +257,46 @@ both engines' line protocol, `serve/serve_proto.mojo`, the Rust HTTP layer
 shape is real multi-file surgery I have not attempted yet; reported
 honestly as not done rather than claimed and left unverified.
 
+## INTERFACE received from fable (`w82:p5`), items 3-4
+
+Routed by the coordinator to fable, brief `briefs/2026-09-16-fable-sample-kernels.md`.
+Delivered interface for both kernels:
+
+- `amar_apply_penalties[XL,IL,CL,NL](X: [R,VOCAB] f32 in place, Ids: [R,CAP]
+  i32, Cnt: [R,CAP] i32, Npen: [R] i32, n_vocab, presence, frequency)`,
+  `grid_dim=R block_dim=256`. Sparse by design: the host keeps a per-row
+  list of DISTINCT generated ids and their counts (no device `Counts`
+  buffer, no bump kernel needed, simpler than what I proposed), uploads it
+  fresh each call. `X[row,id] -= presence + frequency*Cnt[row,id]`, applied
+  to raw logits before temperature/truncation, same float form as
+  `sample_ref.apply_penalties`.
+- `amar_topn_probs[XL,IL,PL,CAP=SAMP_CAP](X: [R,VOCAB], TopIds: [R,NMAX]
+  i32, TopProbs: [R,NMAX] f32, n_vocab, nsel<=20, temperature, top_k,
+  top_p, min_p)`, `grid_dim=R block_dim=SAMP_THREADS`. Returns the top-N of
+  the truncated post-penalty distribution at the request temperature (the
+  same distribution `amar_sample_row` draws from), sorted descending by
+  logit, ties by lower id, unused slots `id=-1 prob=0`. At `temperature<=0`
+  entry 0 is the argmax with an implicit prob of 1. Penalties are applied
+  to `X` before either kernel runs.
+
+Acknowledged to fable, with one scoping question sent: whether `Npen`/`Ids`
+for a spec-window row `j > 0` needs the shared history merged with drafts
+`0..j-1` by me, or whether row 0 (the plain non-spec path, which is what
+M5's `temperature > 0` branch actually reaches until spec+sample+penalties
+combine) is the only row this item needs to cover. **Holding the
+`serve/window.mojo`/`serve/spark.mojo` call sites until the kernel symbols
+exist in `kernels/sample.mojo`** so the host wiring compiles and can be
+gated properly (P8: a change against a symbol that does not exist yet
+cannot be verified, only guessed) rather than landing untested code against
+an interface that may still move during implementation.
+
 ## Status at this point in the lane
 
-Items 1-2 landed and gated, all receipts above. Item 3 blocked on the
-coordinator's kernel delivery (message sent, in progress). Item 4 scoped
-but not started. Whiteboard ticked per item as it lands (§3 LIVE RULE);
-`herd tell w82:p1` sent for each landing plus the KERNEL request.
-
-## Item 3-4
-
-Not started.
+Items 1-2 landed and gated, all receipts above. Item 3 (penalties) and item
+4's `top_logprobs` half are with fable (`w82:p5`) implementing the agreed
+interface; item 4's chosen-token-logprob half is scoped (needs no kernel,
+`amar_sample_row`'s own `Prob` output is already penalty-correct once
+`amar_apply_penalties` runs first) but not yet wired pending the same
+kernel landing, since both endpoints' logprob field should ship together
+rather than in two passes. Whiteboard ticked per item as it lands (§3 LIVE
+RULE); `herd tell` sent for each landing plus every coordinator exchange.
