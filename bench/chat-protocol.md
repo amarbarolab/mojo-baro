@@ -1788,3 +1788,52 @@ defaults (`.work/m5/ab-tail/results.txt`). Refusal for the untruncated shape
 lifted in `serve/engine.mojo`; live `POST /v1/chat/completions` at
 `temperature 1.0` returns a completion, nucleus and greedy unchanged
 (`.work/m5/verify-tail.sh`). Prediction held; falsifier did not fire.
+
+## A6: sampler cost at real vocab (preregistered 2026-09-16, before any run)
+
+Brief `~/Brain/mojo/mojo-baro/briefs/2026-09-16-A6-sampler-cost.md`, lane
+`lane-A6`, report `exchange/2026-09-16-A6-report.md`. Binds
+`bench/PROTOCOL-RULES.md`. Starting numbers, A1 gate 4 (one stint, 20
+prompts, `bench/spec-sample-protocol.md`): no-spec T=0.7/top_p 0.9 109.19
+tok/s against no-spec T=0 134.97, a 19.1% gap. Target: no-spec T=0.7 within
+5% of no-spec T=0 measured in the same stint, T=0 byte-identical, C3 device
+tests unchanged, spec at T=0.7 (147.15) not regressed.
+
+### A6.1 Accounting stint (harness before kernel, P6)
+
+**What the code says (hypotheses, P12).** `serve/engine.mojo` sets
+`mega_req = mega and sample.temperature <= 0 ...`, so every sampling request
+leaves the megakernel (one launch per token, `kernels/mega.mojo`, +22% over
+the launch path on 2026-09-06) for the per-layer launch path, and the
+sampler then runs as `amar_sample_row` + `tokcp_k` after the launch-path
+head. The served preset is T 0.7, top_k 0, top_p 0.9, min_p 0 (the request
+carries only temperature and top_p; `engine.mojo` defaults the rest), which
+is KSAMP-c's "k off" shape, measured at 180 us (peaked row) to 490 us (flat
+row, general path) per call, not the 70 us of the k=20 preset.
+
+- H1: the megakernel bypass is the larger part of the gap. Prediction: T=0
+  no-spec on the launch path (`BARO_MEGA=0`) lands at 110 to 120 tok/s
+  against the megakernel's 134 to 137, i.e. 12 to 18% of the 19%.
+- H2: the sampler itself costs 2 to 5% of a token. Prediction: on the same
+  launch path, T=0.7 no-spec is 2 to 5% below T=0 no-spec (`BARO_MEGA=0` for
+  both, one process), i.e. 0.15 to 0.4 ms per token at 7.5 to 9 ms per
+  token.
+- Falsifier for the whole plan: H1's launch-path T=0 within 5% of the
+  megakernel's T=0. Then the gap is not the bypass, the change in A6.2 is
+  not built, and the phase timers go on the sampler and the readback path
+  before anything else.
+
+**Arms.** `bench/spec-sample-ab.sh` on an engine built from this commit,
+unchanged code, twice: once at defaults (megakernel on for T=0 no-spec, the
+A1 shape) and once with `BARO_MEGA=0`. Four arms each, 20 prompts, n=64,
+seeds 1000+i, one resident process per run. Read-back (P1): `arm.txt` per
+run (engine sha, env, power cap, vddgfx, commit, dirty list), every done
+line's `tok_s`, `temperature`, `top_p`, `drafted`/`accepted`; `BARO_MEGA`
+is a process-level env, so the two runs are the arm definition and the
+engine's own `mega` echo at start-up is the receipt. Clock probe
+(`bench/clock-probe.sh`) before each run.
+
+**Breakdown table to write to the report before choosing a change:**
+megakernel T=0 vs launch T=0 (bypass cost), launch T=0 vs launch T=0.7
+(sampler + tokcp cost), megakernel T=0 vs launch T=0.7 (the A1 gap,
+reproduced or not), each as tok/s median and as ms per token.
