@@ -122,6 +122,30 @@ def load4[
     return r
 
 
+@always_inline
+def mload4[
+    MASK: Bool, XL: TensorLayout
+](X: TileTensor[f32, XL, MutAnyOrigin], base: Int, i: Int, N: Int, mask: MutPointer[Scalar[u64], MutAnyOrigin], mrow: Int) -> SIMD[f32, 4]:
+    var a = load4(X, base, i, N)
+    comptime if MASK:
+        var mb = (mask[unsafe_offset=mrow + (i >> 6)] >> UInt64(i & 63)) & UInt64(15)
+        comptime for e in range(4):
+            if ((mb >> UInt64(e)) & 1) == 0:
+                a[e] = nan[f32]()
+    return a
+
+
+@always_inline
+def mload1[
+    MASK: Bool, XL: TensorLayout
+](X: TileTensor[f32, XL, MutAnyOrigin], row: Int, i: Int, mask: MutPointer[Scalar[u64], MutAnyOrigin], mrow: Int) -> Float32:
+    var v = rebind[Scalar[f32]](X[row, i])
+    comptime if MASK:
+        if ((mask[unsafe_offset=mrow + (i >> 6)] >> UInt64(i & 63)) & UInt64(1)) == 0:
+            return nan[f32]()
+    return v
+
+
 comptime NWAVE = SAMP_THREADS // WARP_SIZE
 
 
@@ -238,7 +262,7 @@ def bargmax[
 
 @always_inline
 def greedy_tok[
-    XL: TensorLayout, FL: TensorLayout, IL: TensorLayout
+    MASK: Bool, XL: TensorLayout, FL: TensorLayout, IL: TensorLayout
 ](
     X: TileTensor[f32, XL, MutAnyOrigin],
     mut redf: TileTensor[f32, FL, MutUntrackedOrigin, address_space = AddressSpace.SHARED],
@@ -246,14 +270,16 @@ def greedy_tok[
     base: Int,
     N: Int,
     tid: Int,
+    mask: MutPointer[Scalar[u64], MutAnyOrigin],
+    mrow: Int,
 ) -> Int32:
     var best_v = Float32(-3.4e38)
     var best_i: Int32 = 0
     var g = tid * 4
     while g < N:
         var g2 = g + 4 * SAMP_THREADS
-        var a = load4(X, base, g, N)
-        var b = load4(X, base, g2, N)
+        var a = mload4[MASK](X, base, g, N, mask, mrow)
+        var b = mload4[MASK](X, base, g2, N, mask, mrow)
         comptime for e in range(4):
             if a[e] > best_v:
                 best_v = a[e]
@@ -267,7 +293,7 @@ def greedy_tok[
 
 
 def refine[
-    XL: TensorLayout, HL: TensorLayout, SL: TensorLayout
+    MASK: Bool, XL: TensorLayout, HL: TensorLayout, SL: TensorLayout
 ](
     X: TileTensor[f32, XL, MutAnyOrigin],
     mut hist: TileTensor[u64, HL, MutUntrackedOrigin, address_space = AddressSpace.SHARED],
@@ -281,6 +307,8 @@ def refine[
     ci: Int,
     use_mass: Bool,
     W: UInt64,
+    mask: MutPointer[Scalar[u64], MutAnyOrigin],
+    mrow: Int,
 ) -> Tuple[UInt32, Int]:
     comptime assert X.flat_rank == 2 and hist.flat_rank == 1 and st.flat_rank == 1
     var prefix: UInt32 = 0
@@ -294,7 +322,7 @@ def refine[
         barrier()
         var i = tid
         while i < N:
-            var v = rebind[Scalar[f32]](X[row, i])
+            var v = mload1[MASK](X, row, i, mask, mrow)
             if is_valid(v) and band_of(v, lmax) == b:
                 var k = okey(v)
                 if (k & pmask) == prefix and in_cut(k, i, ck, ci):
@@ -348,7 +376,7 @@ def refine[
         barrier()
         var i = tid
         while i < N:
-            var v = rebind[Scalar[f32]](X[row, i])
+            var v = mload1[MASK](X, row, i, mask, mrow)
             if is_valid(v) and band_of(v, lmax) == b:
                 var k = okey(v)
                 if k == prefix and in_cut(k, i, ck, ci) and (i & imask) == ipre:
@@ -397,7 +425,7 @@ def samp_update(
 
 
 def fast_cut[
-    XL: TensorLayout, SL: TensorLayout, CL: TensorLayout, UL: TensorLayout,
+    MASK: Bool, XL: TensorLayout, SL: TensorLayout, CL: TensorLayout, UL: TensorLayout,
     FL: TensorLayout, IL: TensorLayout, CAP: Int
 ](
     X: TileTensor[f32, XL, MutAnyOrigin],
@@ -416,6 +444,8 @@ def fast_cut[
     p_on: Bool,
     top_p: Float32,
     min_p: Float32,
+    mask: MutPointer[Scalar[u64], MutAnyOrigin],
+    mrow: Int,
 ) -> Tuple[Bool, UInt32, Int]:
     comptime assert st.flat_rank == 1 and srt.flat_rank == 1 and mas.flat_rank == 1
     comptime assert redf.flat_rank == 1 and redi.flat_rank == 1
@@ -429,7 +459,7 @@ def fast_cut[
     if N <= 16384:
         var g = tid * 4
         while g < N:
-            var a = load4(X, base, g, N)
+            var a = mload4[MASK](X, base, g, N, mask, mrow)
             comptime for e in range(4):
                 samp_update(a[e], lmax, dth, cnt, ms, z_on)
             g += 4 * SAMP_THREADS
@@ -437,7 +467,7 @@ def fast_cut[
         nsamp = 16384
         var g0 = ((((tid // 64) * N) // 16) & ~3) + (tid % 64) * 16
         comptime for q in range(4):
-            var a = load4(X, base, g0 + 4 * q, N)
+            var a = mload4[MASK](X, base, g0 + 4 * q, N, mask, mrow)
             comptime for e in range(4):
                 samp_update(a[e], lmax, dth, cnt, ms, z_on)
     var wv = tid // WARP_SIZE
@@ -484,7 +514,7 @@ def fast_cut[
         var cm: UInt64 = 0
         var g = tid * 4
         while g < N:
-            var a = load4(X, base, g, N)
+            var a = mload4[MASK](X, base, g, N, mask, mrow)
             comptime for e in range(4):
                 var v = a[e]
                 if is_valid(v):
@@ -606,7 +636,7 @@ def fast_cut[
 
 
 def sample_cut[
-    XL: TensorLayout, HL: TensorLayout, BL: TensorLayout, SL: TensorLayout,
+    MASK: Bool, XL: TensorLayout, HL: TensorLayout, BL: TensorLayout, SL: TensorLayout,
     CL: TensorLayout, UL: TensorLayout, FL: TensorLayout, IL: TensorLayout, CAP: Int
 ](
     X: TileTensor[f32, XL, MutAnyOrigin],
@@ -626,6 +656,8 @@ def sample_cut[
     top_k: Int32,
     top_p: Float32,
     min_p: Float32,
+    mask: MutPointer[Scalar[u64], MutAnyOrigin],
+    mrow: Int,
 ) -> Tuple[Float32, UInt64, UInt32, Int]:
     comptime assert X.flat_rank == 2 and hc.flat_rank == 1 and hm.flat_rank == 1 and st.flat_rank == 1
     var lm = -FMAX
@@ -633,8 +665,8 @@ def sample_cut[
     var g = tid * 4
     while g < N:
         var g2 = g + 4 * SAMP_THREADS
-        var a = load4(X, base, g, N)
-        var b = load4(X, base, g2, N)
+        var a = mload4[MASK](X, base, g, N, mask, mrow)
+        var b = mload4[MASK](X, base, g2, N, mask, mrow)
         comptime for e in range(4):
             if is_valid(a[e]):
                 if a[e] > lm:
@@ -658,8 +690,8 @@ def sample_cut[
     if not k_on and not p_on:
         return (lmax, nvalid, ck, ci)
 
-    var fc = fast_cut[CAP=CAP](
-        X, st, srt, mas, redu, redf, redi, base, N, tid, lmax, k_on, top_k, p_on, top_p, min_p
+    var fc = fast_cut[MASK, CAP=CAP](
+        X, st, srt, mas, redu, redf, redi, base, N, tid, lmax, k_on, top_k, p_on, top_p, min_p, mask, mrow
     )
     if fc[0]:
         return (lmax, nvalid, fc[1], fc[2])
@@ -670,7 +702,7 @@ def sample_cut[
     barrier()
     var i = tid
     while i < N:
-        var v = rebind[Scalar[f32]](X[row, i])
+        var v = mload1[MASK](X, row, i, mask, mrow)
         if is_valid(v):
             var bi = band_of(v, lmax)
             _ = Atomic.fetch_add(hc.ptr.unsafe_offset(bi), UInt64(1))
@@ -696,7 +728,7 @@ def sample_cut[
         bk = Int(rebind[Scalar[u64]](st[0]))
         var needk = rebind[Scalar[u64]](st[1])
         barrier()
-        var cut = refine(X, hist, st, row, N, tid, lmax, bk, ck, ci, False, needk)
+        var cut = refine[MASK](X, hist, st, row, N, tid, lmax, bk, ck, ci, False, needk, mask, mrow)
         ck = cut[0]
         ci = cut[1]
 
@@ -705,7 +737,7 @@ def sample_cut[
         if k_on:
             i = tid
             while i < N:
-                var v = rebind[Scalar[f32]](X[row, i])
+                var v = mload1[MASK](X, row, i, mask, mrow)
                 if is_valid(v) and in_cut(okey(v), i, ck, ci):
                     z += fixed_mass(v, lmax)
                 i += SAMP_THREADS
@@ -736,7 +768,7 @@ def sample_cut[
         var bp = Int(rebind[Scalar[u64]](st[0]))
         var needp = rebind[Scalar[u64]](st[1])
         barrier()
-        var cut = refine(X, hist, st, row, N, tid, lmax, bp, ck, ci, True, needp)
+        var cut = refine[MASK](X, hist, st, row, N, tid, lmax, bp, ck, ci, True, needp, mask, mrow)
         ck = cut[0]
         ci = cut[1]
     return (lmax, nvalid, ck, ci)
@@ -780,11 +812,12 @@ def sample_row_body[
     var row = block_idx.x
     var tid = thread_idx.x
     var base = row * Int(X.dim[1]())
+    var mrow = Int(row) * mask_stride
     var redf = stack_allocation[f32, address_space = AddressSpace.SHARED](row_major[SAMP_THREADS]())
     var redi = stack_allocation[i32, address_space = AddressSpace.SHARED](row_major[SAMP_THREADS]())
 
     if temperature <= 0:
-        var g = greedy_tok(X, redf, redi, base, N, tid)
+        var g = greedy_tok[MASK](X, redf, redi, base, N, tid, mask, mrow)
         if tid == 0:
             Out[row] = rebind[Out.ElementType](g)
             Prob[row] = rebind[Prob.ElementType](Float32(1))
@@ -797,8 +830,8 @@ def sample_row_body[
     var srt = stack_allocation[u64, address_space = AddressSpace.SHARED](row_major[CAP]())
     var mas = stack_allocation[u64, address_space = AddressSpace.SHARED](row_major[CAP]())
     var redu = stack_allocation[u64, address_space = AddressSpace.SHARED](row_major[SAMP_THREADS]())
-    var cut = sample_cut[CAP=CAP](
-        X, hist, hc, hm, st, srt, mas, redu, redf, redi, row, base, N, tid, top_k, top_p, min_p
+    var cut = sample_cut[MASK, CAP=CAP](
+        X, hist, hc, hm, st, srt, mas, redu, redf, redi, row, base, N, tid, top_k, top_p, min_p, mask, mrow
     )
     var lmax = cut[0]
     var ck = cut[2]
@@ -819,7 +852,7 @@ def sample_row_body[
         var a = load4(X, base, g, N)
         var mb = UInt64(15)
         comptime if MASK:
-            mb = (mask[unsafe_offset=row * mask_stride + (g >> 6)] >> UInt64(g & 63)) & UInt64(15)
+            mb = (mask[unsafe_offset=mrow + (g >> 6)] >> UInt64(g & 63)) & UInt64(15)
         var hit = False
         comptime for e in range(4):
             if ((mb >> UInt64(e)) & 1) != 0 and member(a[e], g + e, lmax, vcut, ck, ci, mpe):
@@ -881,8 +914,9 @@ def amar_sample_row_masked[
     sample_row_body[True, XLayout, OLayout, PLayout, CAP](X, Out, Prob, n, temperature, top_k, top_p, min_p, seed, counter, mask, Int(mask_stride))
 
 
-def amar_sample_probs[
-    XLayout: TensorLayout, PLayout: TensorLayout, CAP: Int = SAMP_CAP
+@always_inline
+def sample_probs_body[
+    MASK: Bool, XLayout: TensorLayout, PLayout: TensorLayout, CAP: Int
 ](
     X: TileTensor[f32, XLayout, MutAnyOrigin],
     P: TileTensor[f32, PLayout, MutAnyOrigin],
@@ -891,17 +925,20 @@ def amar_sample_probs[
     top_k: Int32,
     top_p: Float32,
     min_p: Float32,
+    mask: MutPointer[Scalar[u64], MutAnyOrigin],
+    mask_stride: Int,
 ):
     comptime assert X.flat_rank == 2 and P.flat_rank == 2
     var N = Int(n)
     var row = block_idx.x
     var tid = thread_idx.x
     var base = row * Int(X.dim[1]())
+    var mrow = Int(row) * mask_stride
     var redf = stack_allocation[f32, address_space = AddressSpace.SHARED](row_major[SAMP_THREADS]())
     var redi = stack_allocation[i32, address_space = AddressSpace.SHARED](row_major[SAMP_THREADS]())
 
     if temperature <= 0:
-        var gt = Int(greedy_tok(X, redf, redi, base, N, tid))
+        var gt = Int(greedy_tok[MASK](X, redf, redi, base, N, tid, mask, mrow))
         var i = tid
         while i < N:
             P[row, i] = rebind[P.ElementType](Float32(1) if i == gt else Float32(0))
@@ -915,8 +952,8 @@ def amar_sample_probs[
     var srt = stack_allocation[u64, address_space = AddressSpace.SHARED](row_major[CAP]())
     var mas = stack_allocation[u64, address_space = AddressSpace.SHARED](row_major[CAP]())
     var redu = stack_allocation[u64, address_space = AddressSpace.SHARED](row_major[SAMP_THREADS]())
-    var cut = sample_cut[CAP=CAP](
-        X, hist, hc, hm, st, srt, mas, redu, redf, redi, row, base, N, tid, top_k, top_p, min_p
+    var cut = sample_cut[MASK, CAP=CAP](
+        X, hist, hc, hm, st, srt, mas, redu, redf, redi, row, base, N, tid, top_k, top_p, min_p, mask, mrow
     )
     var lmax = cut[0]
     var ck = cut[2]
@@ -927,7 +964,7 @@ def amar_sample_probs[
     var zt: Float32 = 0
     var g = tid * 4
     while g < N and not none:
-        var a = load4(X, base, g, N)
+        var a = mload4[MASK](X, base, g, N, mask, mrow)
         comptime for e in range(4):
             if member(a[e], g + e, lmax, vcut, ck, ci, mpe):
                 zt += exp((a[e] - lmax) / temperature)
@@ -935,7 +972,7 @@ def amar_sample_probs[
     var z = bsum_f32(redf, tid, zt)
     g = tid * 4
     while g < N:
-        var a = load4(X, base, g, N)
+        var a = mload4[MASK](X, base, g, N, mask, mrow)
         comptime for e in range(4):
             if g + e < N:
                 var p: Float32 = 0
@@ -943,6 +980,37 @@ def amar_sample_probs[
                     p = exp((a[e] - lmax) / temperature) / z
                 P[row, g + e] = rebind[P.ElementType](p)
         g += 4 * SAMP_THREADS
+
+
+
+def amar_sample_probs[
+    XLayout: TensorLayout, PLayout: TensorLayout, CAP: Int = SAMP_CAP
+](
+    X: TileTensor[f32, XLayout, MutAnyOrigin],
+    P: TileTensor[f32, PLayout, MutAnyOrigin],
+    n: Int32,
+    temperature: Float32,
+    top_k: Int32,
+    top_p: Float32,
+    min_p: Float32,
+):
+    sample_probs_body[False, XLayout, PLayout, CAP](X, P, n, temperature, top_k, top_p, min_p, X.ptr.unsafe_bitcast[Scalar[u64]](), 0)
+
+
+def amar_sample_probs_masked[
+    XLayout: TensorLayout, PLayout: TensorLayout, CAP: Int = SAMP_CAP
+](
+    X: TileTensor[f32, XLayout, MutAnyOrigin],
+    P: TileTensor[f32, PLayout, MutAnyOrigin],
+    n: Int32,
+    temperature: Float32,
+    top_k: Int32,
+    top_p: Float32,
+    min_p: Float32,
+    mask: MutPointer[Scalar[u64], MutAnyOrigin],
+    mask_stride: Int32,
+):
+    sample_probs_body[True, XLayout, PLayout, CAP](X, P, n, temperature, top_k, top_p, min_p, mask, Int(mask_stride))
 
 
 def amar_spec_accept[
@@ -1093,8 +1161,9 @@ def amar_topn_probs[
         tk = Int32(0)
         tp = Float32(1)
         mp = Float32(0)
-    var cut = sample_cut[CAP=CAP](
-        X, hist, hc, hm, st, srt, mas, redu, redf, redi, row, base, N, tid, tk, tp, mp
+    var nomask = X.ptr.unsafe_bitcast[Scalar[u64]]()
+    var cut = sample_cut[False, CAP=CAP](
+        X, hist, hc, hm, st, srt, mas, redu, redf, redi, row, base, N, tid, tk, tp, mp, nomask, 0
     )
     var lmax = cut[0]
     var none = cut[1] == 0
@@ -1112,8 +1181,8 @@ def amar_topn_probs[
         g += 4 * SAMP_THREADS
     var z = bsum_f32(redf, tid, zt)
 
-    var sel = sample_cut[CAP=CAP](
-        X, hist, hc, hm, st, srt, mas, redu, redf, redi, row, base, N, tid, Int32(K), Float32(1), Float32(0)
+    var sel = sample_cut[False, CAP=CAP](
+        X, hist, hc, hm, st, srt, mas, redu, redf, redi, row, base, N, tid, Int32(K), Float32(1), Float32(0), nomask, 0
     )
     var ck2 = sel[2]
     var ci2 = sel[3]

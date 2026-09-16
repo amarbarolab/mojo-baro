@@ -12,6 +12,7 @@ correct. Not the device kernel: this is the flag-gated reference path and
 the oracle the kernel is checked against once it lands.
 """
 from std.math import exp, log
+from std.utils.numerics import nan
 
 comptime FMAX = Float32(3.4028234663852886e38)
 
@@ -337,3 +338,18 @@ def apply_penalties(
         var c = entry.value
         if tok >= 0 and tok < len(logits):
             logits[tok] -= presence_penalty + frequency_penalty * Float32(c)
+
+
+# ---- grammar mask reference ----------------------------------------------
+
+def mask_logits(logits: List[Float32], words: List[UInt64]) -> List[Float32]:
+    # Masked tokens (bit clear) become NaN, which is_valid rejects, so the
+    # existing sample_row_ref / sample_probs_ref on this copy are the masked
+    # reference: the mask is applied before every truncating sampler and a
+    # draw is impossible only when no allowed token exists.
+    var out = List[Float32](unsafe_uninit_length=len(logits))
+    for i in range(len(logits)):
+        var w = i // 64
+        var allowed = w < len(words) and ((words[w] >> UInt64(i % 64)) & 1) == 1
+        out[i] = logits[i] if allowed else nan[DType.float32]()
+    return out^
