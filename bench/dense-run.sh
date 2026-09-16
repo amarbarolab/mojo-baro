@@ -61,5 +61,19 @@ for tf in bench/mtp-prompts/p*.txt; do
   echo "$p $(wc -l < "$OUT/$p.ids") $ts $agree" >> "$OUT/results.txt"
 done
 cleanup_llama; trap - EXIT
+# the gate: forced agreement per prompt against MIN_PCT (default 90; the known-good targets sit at 95 to 98).
+# A results table with 0/64 everywhere used to print PASS here (2026-09-17, m.ledger/mojo-baro.md).
+MIN_PCT=${MIN_PCT:-90}
+verdict=$(python3 - "$OUT/results.txt" "$MIN_PCT" <<'PY'
+import sys
+rows = [l.split() for l in open(sys.argv[1]).read().splitlines()[1:]]
+pct = []
+for r in rows:
+    a, n = r[3].split("/"); pct.append(100.0 * int(a) / max(int(n), 1))
+bad = [r[0] for r, x in zip(rows, pct) if x < float(sys.argv[2])]
+print(f"min {min(pct):.1f}% mean {sum(pct)/len(pct):.1f}% over {len(pct)} prompts, bar {sys.argv[2]}%; below bar: {len(bad)} {' '.join(bad)}")
+sys.exit(1 if bad else 0)
+PY
+) && ok agreement "$verdict" || die agreement "$verdict"
 ok run "$(cat "$OUT/results.txt")"
 echo "== done, see $OUT/SUMMARY.txt =="
