@@ -176,7 +176,7 @@ def load_state(
         tokens.append(v)
     off += 4 * pos
     var ngroups = kvn // KVHSTR
-    var kv_bytes = 2 * kvn if not is_v2 else 2 * (ngroups * 4 + kvn)
+    var kv_bytes = 2 * kvn * 4 if not is_v2 else 2 * (ngroups * 4 + kvn)
     if len(data) != off + (CONV_SLOT + SSM_SLOT) * 4 + kv_bytes:
         raise Error("BARO_STATE_LOAD: payload length mismatch")
     if chain.cap == 0:
