@@ -217,6 +217,53 @@ deleted after these gates were recorded, per the coordinator's disk note
 **Item 2: all gates PASS on all 5 models. Named check for each sub-claim;
 nothing here is UNVERIFIED.**
 
+## Item 3: penalties, UNVERIFIED, blocked on the coordinator
+
+Host reference already exists and is tested (`serve/sample_ref.mojo`'s
+`apply_penalties`, part of the standing `run-tests.sh` suite: "PASS token 9
+penalized to 6.5 ; untouched token 8 stays 8.0"). `presence_penalty`/
+`frequency_penalty` are already parsed into `SampleParams` (C3/A5) but
+nothing downstream reads them yet. The device side is a kernel change per
+the brief's own routing rule, so it went to `w82:p1` as a `KERNEL:` message
+with a concrete interface proposal (confirmed delivered, coordinator status
+`working`): `amar_apply_penalties(X: [R,VOCAB], Counts: [R,VOCAB] i32, n,
+presence_penalty, frequency_penalty)` applied before truncation/softmax,
+plus a small `amar_bump_count` to update `Counts` once per generated token,
+both keeping the per-request history off the host (the same class of cost
+B4 already measured as the expensive one). Not started beyond the message:
+the host-side per-request `Counts` buffer allocation and the bump call site
+depend on whatever the coordinator actually lands, and building against a
+guessed layout risks landing the wrong thing.
+
+**Item 3: UNVERIFIED. Gate (device-vs-sample_ref check with penalties on,
+plus an HTTP request where frequency_penalty visibly suppresses a repeated
+token) cannot run until the kernel lands.**
+
+## Item 4: logprobs, PARTIALLY SCOPED, not started
+
+Chosen-token logprob needs no kernel change: `amar_sample_row` already
+returns the drawn token's own probability (`window.mojo`'s plain sampled
+path already computes it into `b.hmax_d` scratch, `serve/spark.mojo`'s new
+`Sprob` scratch from item 2 the same way) and nothing currently copies it
+back or surfaces it. `top_logprobs N` does need a kernel (shipping the
+whole VOCAB-width row to host every token to sort it there is the same
+expensive-round-trip class item 3 avoids), so it rode the same `KERNEL:`
+message as item 3, proposed as `amar_topn_probs` reusing `sample.mojo`'s
+existing radix-select machinery.
+
+**Item 4: UNVERIFIED, not started.** Wiring chosen-token logprob through
+both engines' line protocol, `serve/serve_proto.mojo`, the Rust HTTP layer
+(`serve/src/*.rs`) for both endpoints plus SSE, and the OpenAI response
+shape is real multi-file surgery I have not attempted yet; reported
+honestly as not done rather than claimed and left unverified.
+
+## Status at this point in the lane
+
+Items 1-2 landed and gated, all receipts above. Item 3 blocked on the
+coordinator's kernel delivery (message sent, in progress). Item 4 scoped
+but not started. Whiteboard ticked per item as it lands (§3 LIVE RULE);
+`herd tell w82:p1` sent for each landing plus the KERNEL request.
+
 ## Item 3-4
 
 Not started.
