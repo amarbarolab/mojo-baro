@@ -187,6 +187,14 @@ comptime mega_win_k = amar_mega_window[
     type_of(pf_sm), type_of(ffnm_layout), type_of(off_layout), type_of(ctr_layout), type_of(toks_layout), type_of(dtok_layout),
     N_LAYERS, N_ATT,
 ]
+comptime mega_win_q4_k = amar_mega_window[
+    MEGA_MR, True, True, type_of(xm_layout), type_of(xm_layout),
+    type_of(qfm_layout), type_of(g32m_layout), type_of(convm_layout), type_of(om_layout),
+    type_of(csall_layout), type_of(ssall_layout),
+    type_of(qfm_layout), type_of(kvm_flat), type_of(qm_layout), type_of(xflat_layout),
+    type_of(pf_sm), type_of(ffnm_layout), type_of(off_layout), type_of(ctr_layout), type_of(toks_layout), type_of(dtok_layout),
+    N_LAYERS, N_ATT,
+]
 
 comptime xp_layout = row_major[CP, H]()
 comptime xpflat_layout = row_major[CP * H]()

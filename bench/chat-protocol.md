@@ -1950,3 +1950,52 @@ inside the passing preflight. One process defect, ledgered: the first gate
 job read the grammar receipts from the server's stdout while baro-serve
 forwards them to stderr; 0/66 was the harness, the engine had printed all
 66 (fixed in `grammar-gate.py`'s docstring, one job lost).
+
+### A6.4 Speculative window on the megakernel: probe (frozen 2026-09-16, before its build's timed run)
+
+**Prior on the record.** `bench/megakernel-mrow-protocol.md` W2/W3
+(2026-09-06, q8 pack): `amar_mega_window[MR=3]` lost to the launch path
+both times (121.0 vs 122.2 with its own head; 110.9 vs 127.5 with the native
+head), cause per-row serialization inside persistent waves (GEMM phases
+scale 1.6x from m=1 vs 1.5x native, head 1.65x vs 1.22x), and the round
+closed with "multi-row windows stay on the launch path; the megakernel is
+an m=1 device". `bench/mtp-protocol.md` MSPEC step 1: the k=2 window's
+launch-gap share is 8.4 to 9.2% tracer-corrected, so +8% is the ceiling of
+any zero-gap window. Since then the pack moved to q4, the megakernel's q4
+dot loop re-rolled (`3824e20`) and `BARO_MEGA_WIN` stayed at 0.
+
+**Defect found reading the code.** `serve/registry.mojo` instantiated the
+window kernel with `Q4 = False` only, and `serve/window.mojo` launched it
+regardless of `cfg.pack_q4`: `BARO_MEGA_WIN=1` on the q4 pack ran q8
+dequant over q4 bytes. A flag flip was therefore not a valid probe.
+
+**Change.** `mega_win_q4_k = amar_mega_window[MEGA_MR, True, True, ...]`
+and a `cfg.pack_q4` branch in the window launch. Default stays
+`BARO_MEGA_WIN=0`. Kernel file untouched.
+
+**ISA gate before any GPU run (`tools/isa-receipt.py`, `isa-loops`).**
+The receipt prints VGPR, spills and private segment of the new q4 window
+kernel next to the existing ones (q8 window: 192 VGPR, 47 spills, 192 B
+private; q4 m=1 token: 256 VGPR, 0 spills), and the q4 m=1 token kernel's
+dot-loop fingerprint (`dual` columns) must be unchanged by the added
+instantiation. A q4 window kernel above 300 VGPR spills is recorded and
+still run once (the number is the finding); NOT-RESIDENT voids the arm.
+
+**Probe.** `bench/clock-probe.sh bench/ab-prompts.sh ENGINE OUT
+"BARO_SPEC=1 BARO_MEGA_WIN=0" "BARO_SPEC=1 BARO_MEGA_WIN=1"`, k=2, T=0,
+20 prompts, one-shot runs, arm A and B back to back per prompt. Receipts
+(P1): `BARO_MEGA_WIN:` echo per run, `mtp: drafted/accepted` per run,
+`mega barrier gen` and `mega fail word` on both arms, identity = GENERATED
+equal per prompt.
+
+**Prediction.** The window megakernel lands between 0.87x and 1.01x of the
+launch path on the 20-prompt median (the record's band, W3 to W2), i.e.
+below the land line; identity 20/20 (W1 proved the m=3 body bit-identical).
+
+**Land rule.** Median ratio >= 1.03 with identity 20/20, spread < 5%, fail
+word 0: `BARO_MEGA_WIN` defaults to 1 and a follow-up extends
+`mega_win_req` to temperature > 0 (the window kernel is layers-only, so the
+sampled accept rule after the native head is unaffected) with
+`spec-sample-ab.sh` as its gate. **Close rule.** Ratio < 1.03: the flag
+stays 0, the q4 instantiation is kept as the correctness fix for the flag,
+and the report records the number against the record's band.

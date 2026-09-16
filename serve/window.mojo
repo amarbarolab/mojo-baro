@@ -998,6 +998,21 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                         Toks, Dtok0, Hnm0, b.hmax_d.unsafe_ptr(), b.hidx_d.unsafe_ptr(),
                         Int32(st.ring), Int32(SLOTS), Int32(st.pos), Int32(1), Int32(1 if cfg.dump else 0), Int32(1 if plain_head else 0), Int32(cfg.att_split), grid_dim=MEGA_G, block_dim=ROW_THREADS,
                     )
+                elif cfg.pack_q4:
+                    ctx.enqueue_function[mega_win_q4_k](
+                        b.wbuf.unsafe_ptr(), TileTensor(b.off_d, off_layout), Xm, CurBm,
+                        TileTensor(b.resb_d, xm_layout), TileTensor(b.qkv_d, qfm_layout), TileTensor(b.z_d, xm_layout),
+                        TileTensor(b.araw_d, g32m_layout), TileTensor(b.braw_d, g32m_layout),
+                        TileTensor(b.eg_d, g32m_layout), TileTensor(b.beta_d, g32m_layout),
+                        TileTensor(b.conv_d, convm_layout), TileTensor(b.so_d, om_layout), ConvStateAll, SStateAll,
+                        TileTensor(b.qf_d, qfm_layout), TileTensor(b.k_d, kvm_flat), TileTensor(b.v_d, kvm_flat),
+                        TileTensor(b.q_d, qm_layout), TileTensor(b.gate_d, xflat_layout), TileTensor(b.ao_d, qm_layout),
+                        b.kc_d.unsafe_ptr(), b.vc_d.unsafe_ptr(),
+                        TileTensor(b.p_ffn_d, pf_sm), TileTensor(b.p_ffn2_d, pf_sm), TileTensor(b.fgb_d, ffnm_layout),
+                        TileTensor(b.ctr_d, ctr_layout), b.prof_d.unsafe_ptr(), b.dbg_d.unsafe_ptr(),
+                        Toks, Dtok0, Hnm0, b.hmax_d.unsafe_ptr(), b.hidx_d.unsafe_ptr(),
+                        Int32(st.ring), Int32(SLOTS), Int32(st.pos), Int32(m), Int32(0), Int32(0), Int32(cfg.att_split), grid_dim=MEGA_G_WIN, block_dim=ROW_THREADS,
+                    )
                 else:
                     ctx.enqueue_function[mega_win_k](
                         b.wbuf.unsafe_ptr(), TileTensor(b.off_d, off_layout), Xm, CurBm,
