@@ -114,7 +114,7 @@ when no grammar is set.
 
 ### A6. Sampler cost at real vocab (M, fable; found by A1's gate 4)
 
-**LANDED 2026-09-16 (`54fb4bb`, `exchange/2026-09-16-A6-report.md`): the cost was the megakernel bypass at T > 0, not the sampler; no-spec T=0.7 132.30 vs greedy 134.65 same stint, T=0 byte-identical.**
+**LANDED 2026-09-16 (`54fb4bb`, `exchange/2026-09-16-A6-report.md`): the cost was the megakernel bypass at T > 0, not the sampler; no-spec T=0.7 132.30 vs greedy 134.65 same stint, T=0 byte-identical. A6.3 `39f6a4c`: penalties, top_logprobs and grammar on the same route, grammar cost 1.253x -> 1.010x.**
 
 Sampling itself costs 19% of decode at this vocab (T=0.7 no-spec 109.19 vs
 greedy no-spec 134.97 tok/s, `bench/spec-sample-protocol.md`): the device

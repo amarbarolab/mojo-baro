@@ -384,8 +384,11 @@ against no-spec T=0 134.65 in the same stint (98.3%), was 108.32.** The 19%
 the sampler kernel itself costs nothing measurable against the launch path's
 argmax. A sampling request now runs `mega_token_*` with `fold_head = 0` and
 the launch-path head plus `amar_sample_row` after it; T<=0 is byte-identical
-(force-ab 20/20). Penalties, top_logprobs and grammar requests still take the
-launch path. Report `exchange/2026-09-16-A6-report.md`.
+(force-ab 20/20). Penalties, top_logprobs and grammar requests take the same
+route since `39f6a4c` (A6.3): penalized T=0 109.85 -> 133.38, top_logprobs
+107.45 -> 129.80, identity 20/20 on every arm (`bench/pen-ab.sh`); grammar cost
+1.253x -> 1.010x (`bench/grammar-cost.py`), 66/66 valid. Only a plain greedy
+request folds the head. Report `exchange/2026-09-16-A6-report.md`.
 
 **q4 m=1 champion since 2026-09-11 (`3824e20`, merge of lane-dattn): 136.37
 tok/s_gen no-spec, 20-prompt median** (was 133.9). Post-merge A/B against

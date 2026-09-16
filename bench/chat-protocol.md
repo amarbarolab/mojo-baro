@@ -1933,3 +1933,20 @@ at T=0, identity per prompt, penalty and logprob receipts).
 - Kill line: any identity miss in P-A6f or a validity miss in P-A6g means
   the branch is not merged; the first diagnosis is megakernel-vs-launch
   layer parity on that prompt (`BARO_DUMP`), not the sampler.
+
+**A6.3 result (2026-09-16, engine `e55a56aa954f49e4` built from `39f6a4c`,
+`.work/a6/gates3/` and `.work/a6/gates4/`, 290 W cap, -100 mV, sclk median
+2980 MHz, `BARO_MEGA: True` echoed by every process and by the live
+server).** P-A6e PASS: force-ab 20/20 at 100.0% against `d5021bb6c385b0b5`.
+P-A6f PASS, inside every band: `pen-ab.sh` identity 20/20 on U, P and L;
+receipts fired on both engines (penalties changed 17/20 streams, logprob
+field on 20/20); U 135.29 / 135.07; P 109.85 -> **133.38** (98.7% of U); L
+107.45 -> **129.80** (96.1% of U). P-A6g PASS: grammar gate 1 66/66 valid
+with masked draws == accepted; gate 5 **1.010x** (6.751 vs 6.685 ms/token,
+148.13 vs 149.58 tok/s), was 1.253x. P-A6h PASS: `tools/test_server.sh`
+ALL PASS (64/64 on completion, stream, queue, cancel recovery),
+`run-tests.sh` exit 0 (103 kernels, 0 orphans), `ci-checks.sh` exit 0
+inside the passing preflight. One process defect, ledgered: the first gate
+job read the grammar receipts from the server's stdout while baro-serve
+forwards them to stderr; 0/66 was the harness, the engine had printed all
+66 (fixed in `grammar-gate.py`'s docstring, one job lost).

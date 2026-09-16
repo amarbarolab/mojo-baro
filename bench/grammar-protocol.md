@@ -166,3 +166,10 @@ matcher advance cost 1.3% per token, inside the < 1% to 5% band the prediction w
 remaining 1.24x of the frozen comparison is the megakernel, which a grammar request cannot use (its
 token launch bakes an unmasked argmax). Closing the gap needs a masked megakernel head or spec
 composition (item 3), neither built this round.
+
+**Gate 5 closed 2026-09-16 (A6.3, `39f6a4c`, `bench/chat-protocol.md` A6.3).** The grammar request now
+runs the megakernel layers with `fold_head = 0` and the masked draw after the launch-path head, no
+masked megakernel head needed. Same script, live `baro-serve` on engine `e55a56aa954f49e4`
+(`BARO_MEGA: True`): grammar 6.751 ms/token vs plain 6.685, **cost 1.010x** (was 1.253x), under the
+< 5% line; gate 1 re-run on the same server 66/66 valid with masked draws == accepted
+(`.work/a6/gates4/`). The 1.013x diagnostic (mask fill, upload, matcher advance) is the whole cost now.
