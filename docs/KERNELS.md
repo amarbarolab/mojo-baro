@@ -30,7 +30,7 @@ must be reachable from `serve/registry.mojo`, a bench, or a test.
 | `amar_rope_rows` | `elementwise.mojo` | `XLayout: TensorLayout` |  | kernels/test_elementwise.mojo |
 | `amar_softmax_rows` | `elementwise.mojo` | `XLayout: TensorLayout` |  | kernels/test_elementwise.mojo |
 | `amar_swiglu` | `elementwise.mojo` | `GLayout: TensorLayout, ULayout: TensorLayout, OLayout: TensorLayout` |  | kernels/test_elementwise.mojo, kernels/test_q8_gemm.mojo |
-| `amar_tok_copy` | `elementwise.mojo` | `SLayout: TensorLayout, DLayout: TensorLayout` | tokcp_k, tokcp_b | serve/registry.mojo, bench/mspec_gaps.mojo |
+| `amar_tok_copy` | `elementwise.mojo` | `SLayout: TensorLayout, DLayout: TensorLayout` | tokcp_k, tokcp_b | serve/registry.mojo, serve/spark.mojo, bench/mspec_gaps.mojo |
 | `amar_tok_remap` | `elementwise.mojo` | `MLayout: TensorLayout, DLayout: TensorLayout` | remap_d | serve/registry.mojo |
 | `amar_matmul_naive` | `matmul.mojo` | `ALayout: TensorLayout, BLayout: TensorLayout, CLayout: TensorLayout` |  | bench/bench.mojo |
 | `amar_matmul_regtile` | `matmul.mojo` | `ALayout: TensorLayout, BLayout: TensorLayout, CLayout: TensorLayout` |  | bench/bench.mojo |
@@ -78,7 +78,7 @@ must be reachable from `serve/registry.mojo`, a bench, or a test.
 | `amar_realign_gather` | `realign_kernels.mojo` | `TLayout: TensorLayout, PLayout: TensorLayout, PartLayout: TensorLayout` |  | kernels/test_realign.mojo |
 | `amar_realign_reduce` | `realign_kernels.mojo` | `PartLayout: TensorLayout, ELayout: TensorLayout` |  | kernels/test_realign.mojo |
 | `amar_sample_probs` | `sample.mojo` | `XLayout: TensorLayout, PLayout: TensorLayout, CAP: Int = SAMP_CAP` | sample_probs_k, sample_probs_1 | serve/registry.mojo, kernels/test_sample.mojo, kernels/test_sample_device.mojo |
-| `amar_sample_row` | `sample.mojo` | `XLayout: TensorLayout, OLayout: TensorLayout, PLayout: TensorLayout, CAP: Int = SAMP_CAP` | sample_row_k, sample_row_1 | serve/registry.mojo, kernels/test_sample.mojo, kernels/test_sample_device.mojo |
+| `amar_sample_row` | `sample.mojo` | `XLayout: TensorLayout, OLayout: TensorLayout, PLayout: TensorLayout, CAP: Int = SAMP_CAP` | sample_row_k, sample_row_1 | serve/registry.mojo, serve/spark.mojo, kernels/test_sample.mojo, kernels/test_sample_device.mojo |
 | `amar_sample_row_masked` | `sample.mojo` | `XLayout: TensorLayout, OLayout: TensorLayout, PLayout: TensorLayout, CAP: Int = SAMP_CAP` |  | kernels/test_sample_device.mojo |
 | `amar_spec_accept` | `sample.mojo` | `PLayout: TensorLayout, TLayout: TensorLayout` | spec_accept_k | serve/registry.mojo, kernels/test_sample.mojo, kernels/test_sample_device.mojo |
 | `amar_argmax_final` | `spark_kernels.mojo` | `NB: Int, VLayout: TensorLayout, ILayout: TensorLayout, OLayout: TensorLayout` |  | serve/spark.mojo |

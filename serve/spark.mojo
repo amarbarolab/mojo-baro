@@ -7,10 +7,11 @@ from max.algorithm import parallelize
 from max.gpu.host import DeviceContext, DeviceBuffer
 from layout import TileTensor, TensorLayout, row_major
 from attn import KVT, KVPAGE, KVPAD
-from elementwise import amar_rmsnorm_cast
+from elementwise import amar_rmsnorm_cast, amar_tok_copy
 from matmul_skinny import ROW_WAVES, ROW_THREADS
 from tokenizer import Tokenizer
 from minja import render_chat
+from sample import amar_sample_row, SAMP_THREADS
 from serve_proto import read_line, parse_request, default_sample_params
 from spark_kernels import (
     amar_embed_lookup_f32, amar_gemv_q8, amar_argmax_part, amar_argmax_final, amar_rope_kv_append, amar_attn_decode_swa_gated, amar_rope_plain, amar_bias_add,
@@ -98,6 +99,18 @@ comptime k_down = amar_gemv_q8[1, type_of(fgb_l), type_of(q_down), type_of(s_dow
 comptime k_head = amar_gemv_q8[0, type_of(xb_l), type_of(q_out), type_of(s_out), type_of(v1_l), type_of(dummy_l)]
 comptime k_argmax = amar_argmax_part[AM_NB, type_of(v1_l), type_of(amv_l), type_of(amv_l)]
 comptime k_argmax_final = amar_argmax_final[AM_NB, type_of(amv_l), type_of(amv_l), type_of(toks_l)]
+# Item 2, briefs/2026-09-16-sampling-all-models-lane.md: amar_sample_row at
+# this profile's VOCAB, instantiated the same way registry.mojo's
+# sample_row_1 already is for the dense/MoE engine. samp_x_l is a 2-D
+# [1, VOCAB] view of the same v1_l-shaped logits_d buffer the argmax path
+# reads (sample_row_body requires X.flat_rank == 2); samp_o_l is the
+# 1-element scratch the token id and its probability land in before
+# amar_tok_copy moves the id into Toks, the same indirection registry.mojo
+# uses via amar_tok_copy for the megakernel window.
+comptime samp_x_l = row_major[1, VOCAB]()
+comptime samp_o_l = row_major[1]()
+comptime k_sample = amar_sample_row[type_of(samp_x_l), type_of(samp_o_l), type_of(samp_o_l)]
+comptime k_tokcp = amar_tok_copy[type_of(samp_o_l), type_of(toks_l)]
 
 
 def wq[LT: TensorLayout](ctx: DeviceContext, wbuf: DeviceBuffer[DType.uint8], o: Int, n: Int, lt: LT) -> TileTensor[DType.int8, LT, MutAnyOrigin]:
@@ -214,6 +227,11 @@ def main() raises:
     var packdir = getenv("BARO_PACK", ".work/spark/pack-q8")
     var serve = getenv("BARO_SERVE", "0") == "1"
     print("BARO_SERVE:", serve)
+    # Item 2, briefs/2026-09-16-sampling-all-models-lane.md: dumps the last
+    # decode step's target row (same buffer amar_argmax_part / amar_sample_row
+    # read from), one profile-agnostic capture path for the distribution test.
+    # Off by default, no effect on any existing path.
+    var dump_logits_path = getenv("BARO_DUMP_LOGITS", "")
     var force = List[Int]()
     var force_path = getenv("BARO_FORCE", "")
     if force_path != "":
@@ -265,10 +283,15 @@ def main() raises:
     var Gate = TileTensor(gate_d, gate_l)
     var Fgb = TileTensor(fgb_d, fgb_l)
     var Logits1 = TileTensor(logits_d, v1_l)
+    var LogitsSample = TileTensor(logits_d, samp_x_l)
     var amv_d = ctx.enqueue_create_buffer[f32](AM_NB)
     var ami_d = ctx.enqueue_create_buffer[DType.int32](AM_NB)
     var Amv = TileTensor(amv_d, amv_l)
     var Ami = TileTensor(ami_d, amv_l)
+    var stok_d = ctx.enqueue_create_buffer[DType.int32](1)
+    var sprob_d = ctx.enqueue_create_buffer[f32](1)
+    var Stok = TileTensor(stok_d, samp_o_l)
+    var Sprob = TileTensor(sprob_d, samp_o_l)
     var OutNorm = wf(ctx, wbuf, off[1 + LSTRIDE * N_LAYERS], H, h_l)
     var out_off = off[2 + LSTRIDE * N_LAYERS]
     var Woq = wq(ctx, wbuf, out_off, VOCAB * H, q_out)
@@ -287,6 +310,12 @@ def main() raises:
         var prompt: List[Int]
         var gen_n = atol(getenv("BARO_GEN", "64"))
         var stop_seqs = List[List[Int]]()
+        # Item 2, briefs/2026-09-16-sampling-all-models-lane.md: declared
+        # outside the branch (engine.mojo's own one-shot path does the same)
+        # so the decode loop below can read sample.temperature regardless of
+        # mode; one-shot stays the default (temperature 0, greedy), matching
+        # today's behaviour exactly.
+        var sample = default_sample_params()
         if serve:
             var line_in = read_line(0)
             if not line_in:
@@ -296,7 +325,6 @@ def main() raises:
             var req_spec = False
             var req_has_spec = False
             var ckpt_hints = List[Int]()
-            var sample = default_sample_params()
             var perr = parse_request(line_in.value(), req_id, prompt, req_n, req_spec, req_has_spec, stop_seqs, ckpt_hints, sample)
             if perr == "" and len(prompt) < 1:
                 perr = "empty prompt"
@@ -383,10 +411,33 @@ def main() raises:
             if pos >= n_prompt - 1:
                 ctx.enqueue_function[k_rms](X, OutNorm, Xb, Int32(H), NORM_EPS, grid_dim=1, block_dim=256)
                 ctx.enqueue_function[k_head](Xb, Woq, Wos, Logits1, Dummy, Int32(VOCAB), Int32(H), grid_dim=ceildiv(VOCAB, ROW_WAVES), block_dim=ROW_THREADS)
-                ctx.enqueue_function[k_argmax](Logits1, Amv, Ami, Int32(VOCAB), grid_dim=AM_NB, block_dim=256)
-                var fi = pos + 1 - n_prompt
-                var forced = Int32(force[fi]) if fi < len(force) else Int32(-1)
-                ctx.enqueue_function[k_argmax_final](Amv, Ami, Toks, Pred, Int32(pos + 1), forced, grid_dim=1, block_dim=32)
+                if dump_logits_path != "" and pos == n_total - 2:
+                    var lg_h = ctx.enqueue_create_host_buffer[f32](VOCAB)
+                    ctx.enqueue_copy(
+                        dst_buf=lg_h,
+                        src_buf=DeviceBuffer[f32](ctx, logits_d.unsafe_ptr(), VOCAB, owning=False),
+                    )
+                    ctx.synchronize()
+                    with open(dump_logits_path, "w") as f:
+                        var p = lg_h.unsafe_ptr().unsafe_bitcast[UInt8]()
+                        f.write_bytes(Span[UInt8](unsafe_ptr=p, length=VOCAB * 4))
+                    print("dumped final logits row to", dump_logits_path)
+                # Item 2, briefs/2026-09-16-sampling-all-models-lane.md: at
+                # temperature > 0 amar_sample_row replaces the argmax pair;
+                # at 0 (including one-shot, which never sets sample) the
+                # path below is untouched, byte for byte.
+                if sample.temperature > 0:
+                    ctx.enqueue_function[k_sample](
+                        LogitsSample, Stok, Sprob, Int32(VOCAB), Float32(sample.temperature), Int32(sample.top_k),
+                        Float32(sample.top_p), Float32(sample.min_p), sample.seed, UInt64(pos),
+                        grid_dim=1, block_dim=SAMP_THREADS,
+                    )
+                    ctx.enqueue_function[k_tokcp](Stok, Toks, Int32(0), Int32(pos + 1), Int32(1), grid_dim=1, block_dim=32)
+                else:
+                    ctx.enqueue_function[k_argmax](Logits1, Amv, Ami, Int32(VOCAB), grid_dim=AM_NB, block_dim=256)
+                    var fi = pos + 1 - n_prompt
+                    var forced = Int32(force[fi]) if fi < len(force) else Int32(-1)
+                    ctx.enqueue_function[k_argmax_final](Amv, Ami, Toks, Pred, Int32(pos + 1), forced, grid_dim=1, block_dim=32)
                 if serve:
                     ctx.enqueue_copy(dst_buf=tok1_h, src_buf=DeviceBuffer[DType.int32](ctx, toks_d.unsafe_ptr().unsafe_offset(pos + 1), 1, owning=False))
                     ctx.synchronize()
