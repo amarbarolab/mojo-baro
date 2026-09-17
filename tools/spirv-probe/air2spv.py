@@ -19,17 +19,16 @@ import re, struct, sys
 
 KERNELS = ["amar_rmsnorm", "amar_rmsnorm_cast", "amar_rmsnorm_cast2", "amar_swiglu", "amar_rope_rows",
            "amar_softmax_rows", "amar_embed_lookup", "amar_embed_lookup_pos", "amar_argmax_pos",
-           "amar_argmax_row", "amar_tok_copy", "amar_tok_remap", "amar_quantize_q8_rows"]
+           "amar_argmax_row", "amar_tok_copy", "amar_tok_remap", "amar_quantize_q8_rows",
+           "amar_matmul_skinny_q4rowb", "amar_skinny_reduce"]
 WARP = 32
 LOCAL_MAX = 256
 HEADER = ['target datalayout = "e-i64:64-v16:16-v24:32-v32:32-v48:64-v96:128-v192:256-v256:256-v512:512-v1024:1024-n8:16:32:64-G1"',
           'target triple = "spirv64-unknown-unknown"']
 IDS = {"threadgroup_position_in_grid": "_Z12get_group_idEj", "thread_position_in_threadgroup": "_Z12get_local_idEj",
        "threads_per_threadgroup": "_Z14get_local_sizeEj", "threads_per_grid": "_Z15get_global_sizeEj"}
-MATH = {"exp2": ("_Z4exp2f", 1), "rsqrt": ("_Z5rsqrtf", 1), "cos": ("_Z3cosf", 1), "sin": ("_Z3sinf", 1),
-        "log2": ("_Z4log2f", 1), "sqrt": ("_Z4sqrtf", 1), "fabs": ("_Z4fabsf", 1), "fmax": ("_Z4fmaxff", 2),
-        "fmin": ("_Z4fminff", 2), "fma": ("_Z3fmafff", 3)}
-LLTYPE = {"f32": "float", "i32": "i32", "i64": "i64"}
+MATH = {"exp2": 1, "rsqrt": 1, "cos": 1, "sin": 1, "log2": 1, "sqrt": 1, "fabs": 1, "fmax": 2, "fmin": 2, "fma": 3}
+LLTYPE = {"f32": "float", "i8": "i8", "i16": "i16", "i32": "i32", "i64": "i64"}
 NARROW = {"bfloat": "bf16", "half": "f16"}
 BARRIER = "  call spir_func void @_Z7barrierj(i32 1)"
 
@@ -39,7 +38,7 @@ class Unsupported(Exception):
 
 
 def kernel_name(mangled):
-    stem = re.sub(r"^.*?elementwise_", "", mangled)
+    stem = re.sub(r"^.*?(?=amar_)", "", mangled)
     stem = re.sub(r"_[0-9a-f]{16}$", "", stem)
     stem = re.sub(r"([0-9a-z][A-Z])+$", "", stem)
     stem = re.sub(r"_T[ensor]*$", "", stem)
@@ -49,6 +48,20 @@ def kernel_name(mangled):
     if len(hits) != 1:
         raise Unsupported(f"cannot resolve kernel name from '{mangled}' (stem '{stem}', candidates {hits})")
     return hits[0]
+
+
+def lltype(t):
+    m = re.fullmatch(r"v(\d+)(\w+)", t)
+    base = LLTYPE.get(m.group(2) if m else t)
+    if not base:
+        raise Unsupported(f"type {t}")
+    return f"<{m.group(1)} x {base}>" if m else base
+
+
+def builtin(name, t):
+    m = re.fullmatch(r"v(\d+)f32", t)
+    sig = (f"Dv{m.group(1)}_f" + "S_" * (MATH[name] - 1)) if m else "f" * MATH[name]
+    return f"_Z{len(name)}{name}{sig}"
 
 
 def f0x(m):
@@ -115,13 +128,13 @@ def convert(src_text):
                     f"  {r} = load {ty}, ptr addrspace(3) {r}.q", BARRIER]
             barriers += 2
             continue
-        m = re.match(r"(\s*%v\d+ = )call \w+ @air\.convert\.([fsu])\.(\w+)\.([fsu])\.(\w+)\((\w+) (\S+)\)", l)
+        m = re.match(r"(\s*%v\d+ = )call [^@]+@air\.convert\.([fsu])\.(\w+)\.([fsu])\.(\w+)\((<[^>]+>|\w+) (\S+)\)", l)
         if m:
             lhs, dk, dt, sk, st, sty, val = m.groups()
             op = {("f", "s"): "sitofp", ("f", "u"): "uitofp", ("s", "f"): "fptosi", ("u", "f"): "fptoui"}.get((dk, sk))
-            if not op or dt not in LLTYPE:
+            if not op:
                 raise Unsupported(f"air.convert {dk}.{dt} <- {sk}.{st}")
-            out.append(f"{lhs}{op} {sty} {val} to {LLTYPE[dt]}")
+            out.append(f"{lhs}{op} {lltype(st)} {val} to {lltype(dt)}")
             continue
         m = re.match(r"\s*(%v\d+) = fdiv (?:\w+ )*float (\S+), (\S+)$", l)
         if m:
@@ -134,23 +147,22 @@ def convert(src_text):
                 f"  {r}.o1 = fcmp one float {r}.c, 0x7FF0000000000000", f"  {r}.o2 = fcmp one float {r}.c, 0xFFF0000000000000",
                 f"  {r}.ok = and i1 {r}.o1, {r}.o2", f"  {r} = select i1 {r}.ok, float {r}.c, float {r}.q"]]
             continue
-        m = re.search(r"call (?:\w+ )*?(float) @(?:air|llvm)\.(\w+)\.f32\(", l)
+        m = re.search(r"call (?:\w+ )*?(float|<\d+ x float>) @(?:air|llvm)\.(\w+)\.(f32|v\d+f32)\(", l)
         if m and m.group(2) in MATH:
-            sym, nargs = MATH[m.group(2)]
-            decls.add(f"declare spir_func float @{sym}({', '.join(['float'] * nargs)})")
-            l = re.sub(r"call (?:\w+ )*?float @(?:air|llvm)\.\w+\.f32\(", f"call spir_func float @{sym}(", l)
+            ty, sym = m.group(1), builtin(m.group(2), m.group(3))
+            decls.add(f"declare spir_func {ty} @{sym}({', '.join([ty] * MATH[m.group(2)])})")
+            l = l[:m.start()] + f"call spir_func {ty} @{sym}(" + l[m.end():]
         for ty, tag in NARROW.items():
             l = re.sub(rf"(%v\d+) = fpext {ty} (\S+) to float", rf"\1 = call spir_func float @baro_{tag}_to_f32(i16 zeroext \2)", l)
             l = re.sub(rf"(%v\d+) = fptrunc float (\S+) to {ty}", rf"\1 = call spir_func zeroext i16 @baro_f32_to_{tag}(float \2)", l)
             l = re.sub(rf"\b(load|store|getelementptr inbounds|getelementptr) {ty}\b", r"\1 i16", l)
+            l = re.sub(rf"\b(load|store|bitcast) <(\d+) x {ty}>", r"\1 <\2 x i16>", l)
         out.append(literals(l))
 
     text = "\n".join(out)
     left = re.search(r"@air\.[\w.]+|\bbfloat\b|\bhalf\b", text)
     if left:
         raise Unsupported(f"no lowering for '{left.group(0)}'")
-    if "@baro_f16_to_f32" in text:
-        raise Unsupported("f16 -> f32 helper not written (no kernel needed it)")
 
     pro = [f"v{len(ptr_args)}:"]
     for var, sym in IDS.items():

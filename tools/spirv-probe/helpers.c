@@ -8,6 +8,15 @@ float baro_bf16_to_f32(unsigned short b) {
     unsigned u = (unsigned)b << 16; float f; __builtin_memcpy(&f, &u, 4); return f;
 }
 
+float baro_f16_to_f32(unsigned short h) {
+    unsigned sign = (unsigned)(h & 0x8000u) << 16, e = (h >> 10) & 0x1Fu, m = h & 0x3FFu, u;
+    if (e == 0x1Fu) u = sign | 0x7F800000u | (m << 13);
+    else if (e) u = sign | ((e + 112u) << 23) | (m << 13);
+    else if (!m) u = sign;
+    else { unsigned s = (unsigned)__builtin_clz(m) - 21u; u = sign | ((113u - s) << 23) | ((m << (13u + s)) & 0x7FFFFFu); }
+    float f; __builtin_memcpy(&f, &u, 4); return f;
+}
+
 unsigned short baro_f32_to_bf16(float f) {
     unsigned u = bits(f), hi = u >> 16, lo = u & 0xFFFFu;
     if ((u & 0x7F800000u) == 0x7F800000u) return (unsigned short)(hi | ((u & 0x007FFFFFu) && !(hi & 0x7Fu)));

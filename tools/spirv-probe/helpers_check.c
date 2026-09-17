@@ -21,6 +21,9 @@ int main(void) {
         uint32_t mid = (h << 16) | 0x8000u; one(mid - 1); one(mid); one(mid + 1);
         __bf16 b; uint16_t hb = (uint16_t)h; memcpy(&b, &hb, 2); float want = (float)b, got = baro_bf16_to_f32(hb);
         if (!isnan(want) && memcmp(&want, &got, 4) && !bad++) printf("FAIL helpers: bf16 0x%04x -> f32 mismatch\n", h);
+        _Float16 hx; memcpy(&hx, &hb, 2); float hw = (float)hx, hg = baro_f16_to_f32(hb);
+        if (!isnan(hw) && memcmp(&hw, &hg, 4) && !bad++) printf("FAIL helpers: f16 0x%04x -> f32 mismatch\n", h);
+        if (isnan(hw) && !isnan(hg) && !bad++) printf("FAIL helpers: f16 NaN 0x%04x lost\n", h);
         _Float16 x, y; uint16_t h1 = (uint16_t)(h + 1); memcpy(&x, &hb, 2); memcpy(&y, &h1, 2);
         if (isfinite((float)x) && isfinite((float)y) && (h & 0x7FFF) != 0x7FFF) {
             float m = (float)(((double)x + (double)y) / 2); uint32_t mu; memcpy(&mu, &m, 4); one(mu - 1); one(mu); one(mu + 1);

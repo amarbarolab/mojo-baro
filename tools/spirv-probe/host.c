@@ -216,6 +216,41 @@ static int t_quantize_q8_rows(Env *e, double *w) {
     return 0;
 }
 
+/* G1 scouting, not part of the default 13: the engine's m = 1 q4 GEMV (ggml Q4_0 layout) and its reduce. */
+#define GN 1024
+#define GK 4096
+static int gemv(Env *e, double *w, int reduce) {
+    uint16_t *a = malloc(2 * GK), *sc = malloc(2 * GN * (GK / 32)); uint8_t *q = malloc(GN * (GK / 2)); float *p = malloc(4 * GN), *c = malloc(4 * GN);
+    for (int i = 0; i < GK; i++) a[i] = to_bf16(rnd() * 2);
+    for (int i = 0; i < GN * (GK / 32); i++) sc[i] = to_f16((rnd() + 1.001f) * 0.05f * (i % 9 == 4 ? 1e-4f : 1.0f));
+    for (int i = 0; i < GN * (GK / 2); i++) { rng = rng * 1664525u + 1013904223u; q[i] = (uint8_t)(rng >> 13); }
+    for (int i = 0; i < GN; i++) p[i] = c[i] = SENT;
+    cl_mem bp = buf(e, 4 * GN, p), bc = buf(e, 4 * GN, c), g[7] = {buf(e, 2 * GK, a), buf(e, GN * (GK / 2), q), buf(e, 2 * GN * (GK / 32), sc), bp, ci(e, 1), ci(e, GN), ci(e, GK)};
+    if (launch(e, "amar_matmul_skinny_q4rowb", 7, g, GN / 8, 1, EW) || rd(e, bp, 4 * GN, p)) return 1;
+    if (reduce) {
+        cl_mem r[4] = {bp, bc, ci(e, 1), ci(e, GN)};
+        if (launch(e, "amar_skinny_reduce", 4, r, (GN + EW - 1) / EW, 1, EW) || rd(e, bc, 4 * GN, c)) return 1;
+        for (int i = 0; i < GN; i++) if (c[i] != p[i]) return fail(e, "C[%g] = %g is not Cp", i, c[i]);
+        return 0;
+    }
+    for (int row = 0; row < GN; row++) {
+        double dot = 0, mag = 0;
+        for (int b = 0; b < GK / 32; b++) {
+            _Float16 h; memcpy(&h, &sc[row * (GK / 32) + b], 2); double d = (double)h;
+            for (int j = 0; j < 16; j++) {
+                uint8_t by = q[row * (GK / 2) + b * 16 + j];
+                double t0 = ((by & 15) - 8) * d * from_bf16(a[b * 32 + j]), t1 = ((by >> 4) - 8) * d * from_bf16(a[b * 32 + 16 + j]);
+                dot += t0 + t1; mag += fabs(t0) + fabs(t1);
+            }
+        }
+        double x = fabs(p[row] - dot) / (mag + 1e-30); if (x > *w) *w = x;
+    }
+    return *w > TOL ? fail(e, "max err relative to sum|terms| %.3e > %.0e", *w, TOL) : 0;
+}
+static int t_q4rowb(Env *e, double *w) { return gemv(e, w, 0); }
+static int t_reduce(Env *e, double *w) { return gemv(e, w, 1); }
+
+#define DEFAULT_CASES 13
 static const struct { const char *name; int (*run)(Env *, double *); const char *metric; } CASES[] = {
     {"amar_rmsnorm", t_rmsnorm, "max rel err"}, {"amar_rmsnorm_cast", t_rmsnorm_cast, "in 1e-5 window, fraction not bit-equal to fp64-ref rounding"},
     {"amar_rmsnorm_cast2", t_rmsnorm_cast2, "in 1e-5 window, F exact, fraction not bit-equal"}, {"amar_swiglu", t_swiglu, "max rel err"},
@@ -224,6 +259,7 @@ static const struct { const char *name; int (*run)(Env *, double *); const char 
     {"amar_argmax_pos", t_argmax_pos, "exact, err"}, {"amar_argmax_row", t_argmax_row, "exact, err"},
     {"amar_tok_copy", t_tok_copy, "exact, err"}, {"amar_tok_remap", t_tok_remap, "exact, err"},
     {"amar_quantize_q8_rows", t_quantize_q8_rows, "codes and f16 scales exact, err"},
+    {"amar_matmul_skinny_q4rowb", t_q4rowb, "max err relative to sum|terms|"}, {"amar_skinny_reduce", t_reduce, "exact copy of the GEMV partials, err"},
 };
 
 int main(int argc, char **argv) {
@@ -239,7 +275,7 @@ int main(int argc, char **argv) {
     X = malloc(4 * R * H); G = malloc(4 * H); REF = malloc(8 * R * H);
     int total = 0, bad = 0; char names[1024] = "";
     for (size_t c = 0; c < sizeof CASES / sizeof CASES[0]; c++) {
-        int want = argc == 2; for (int i = 2; i < argc; i++) want |= !strcmp(argv[i], CASES[c].name);
+        int want = argc == 2 && c < DEFAULT_CASES; for (int i = 2; i < argc; i++) want |= !strcmp(argv[i], CASES[c].name);
         if (!want) continue;
         total++; int failed = 0; double worst = 0;
         for (int rep = 0; rep < REPS && !failed; rep++) { double w = 0; rng = 12345 + 977 * rep; failed = CASES[c].run(&e, &w); if (w > worst) worst = w; }
