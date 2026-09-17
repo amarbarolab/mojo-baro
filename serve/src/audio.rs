@@ -143,6 +143,18 @@ async fn ensure_running(app: &Shared) -> Result<(), String> {
             c.args(&gpu_wait_args);
             c
         };
+        // PR_SET_PDEATHSIG covers what a SIGTERM handler in main() cannot:
+        // a SIGKILL or an OOM kill on baro-serve gives it no chance to run
+        // any handler at all, but the kernel still delivers SIGTERM to this
+        // child directly the moment its parent dies, by any means.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM as libc::c_ulong) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
         let child = cmd
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())
