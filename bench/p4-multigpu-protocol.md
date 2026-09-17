@@ -1,10 +1,13 @@
 # P4 multi-GPU protocol
 
-Status: AMENDED 2026-09-17 (round 2, lane P4B), frozen by commit before any identity run. The
-iGPU arm stays as the pinning-and-wiring receipt, reported, never gated. The identity gate runs
-as two engine processes on the XTX. The state-move gate does not exist. This supersedes the
-"wiring preflight, timed gate pending" status below it replaces; the effective-device preflight,
-fixture manifest, and receipt discipline are unchanged.
+Status: AMENDED TWICE 2026-09-17/18 (round 2, lane P4B, then the P4B follow-up), frozen by commit
+before any identity run each time. The iGPU arm stays as the pinning-and-wiring receipt, reported,
+never gated. The identity gate runs as two engine processes on the XTX, sending the real 20-prompt,
+64-token-per-prompt fixture as token ids and comparing ids, not text (`bench/p4-router-identity.sh`,
+added 2026-09-18: the earlier amendment cited team A's `bench/p0b-gate1-placement.sh` as this
+receipt, which is wrong; see "Gate 1" below for why and what it demotes to). The state-move gate
+does not exist. This supersedes the "wiring preflight, timed gate pending" status below it
+replaces; the effective-device preflight, fixture manifest, and receipt discipline are unchanged.
 
 ## Scope
 
@@ -29,10 +32,12 @@ that index hash before a GPU run.
   that its kernels are deterministic when nothing goes wrong (768 logits rows bit-identical across
   12 fresh processes; 60 of 60, then 5 of 5, per-request checksum tables identical). It is
   REPORTED, not gated: see "The iGPU finding" below for why.
-- **Identity gate**: two real engine processes on the same XTX at `BARO_TMAX=4096`, 20 prompts
-  dispatched by the router, each response compared against a single-engine baseline at T=0. This
-  is the only gated claim P4 makes, and the receipt for it already exists (see "Gate 1" below):
-  it does not exercise a second physical device.
+- **Identity gate**: two real engine processes on the same XTX at `BARO_TMAX=4096`. The 20
+  `bench/mtp-prompts/p*.tokens` prompts are sent as token ids, `max_tokens` 64, `temperature` 0,
+  `spec` false, through the router, and each response's token ids are compared (`cmp`, never on
+  text) against the same prompt sent directly to one engine (the solo baseline); placement must
+  spread (both engines serve at least one of the 20) or the gate fails. This is the only gated
+  claim P4 makes, and does not exercise a second physical device.
 
 ## The iGPU finding (why it moved out of the gate)
 
@@ -54,8 +59,9 @@ about 1 in 3,700 tokens hides a regression; never gate identity on this device.
 
 The identity gate has passed by luck before: FAIL, FAIL, PASS on the unchanged iGPU gate, same
 binaries, 2026-09-17 (a single PASS is luck, not evidence, per the finding above). Any PASS claim
-for P4's identity gate is run 3 times on identical binaries; all 3 must pass. A miss in any of the
-3 keeps P4 FAILED; it is not retried until it passes.
+for P4's identity gate (`bench/p4-router-identity.sh`, the 20-prompt/64-token/token-id gate, not
+the placement gate) is run 3 times on identical binaries; all 3 must pass. A miss in any of the 3
+keeps P4 FAILED; it is not retried until it passes.
 
 ## State movement: no longer a P4 gate
 
@@ -87,27 +93,43 @@ Before any prompt is sent, the receipt must contain all of:
 
 Any missing or contradictory read-back stops the gate before prompts.
 
-## Gate 1: identity, two engine processes on the XTX
+## Gate 0 (demoted): team A's placement gate is not the identity receipt
 
-The receipt for this gate already exists and is not rebuilt: `exchange/lane-P0B-report.md`
-("Gate 1 receipt", team A), receipts on disk at
-`mojo-baro-lanes/team-a/.work/p0b-gates12/gate1/` (`gate1.log`, `identity.json`,
-`a.stderr`/`b.stderr`). It reports, at `BARO_TMAX=4096`, `MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_SIZE_PERCENT=10`
-(two 9B `baro-serve` processes at 10.7 GB each on the XTX): `pair-dispatch OK: 20/20 ok through
-the router`, `placement OK: a=10 b=10`, `identity OK: 20/20 proxied responses match the
-single-engine (a) baseline at T=0`. Both engine processes ran on the XTX under this box's default
-ROCm pin (no per-engine `ROCR_VISIBLE_DEVICES` override in the gate script); `a.stderr`/`b.stderr`
-show `limits Limits { tmax: 4096, ... }` for both. This is the identity-under-split receipt the
-repeat rule above applies to: run team A's own gate script and launch config, unchanged, 2 more
-times, for 3 total.
+`bench/p0b-gate1-placement.sh`'s 3 runs from the round-2 amendment (`exchange/lane-P0B-report.md`,
+`.work/p4b/gate1-run{1,2,3}/`) are PLACEMENT receipts only: `pair-dispatch OK: 20/20 ok through the
+router` and `placement OK: a=10 b=10` still stand as P0b's own claim. Their identity check was 5
+prompts x 4 repeats of short text answers (`\n\namber`, `\n\n4`, ...), about 70 tokens compared per
+run, roughly 35x fewer than P4's own 20-prompt/64-token fixture. Three passes of that check do not
+put the repeat-rule receipt behind P4's identity claim; that requires the gate below.
+
+## Gate 1: identity, two engine processes on the XTX, the real 20-prompt fixture
+
+`bench/p4-router-identity.sh`. Forks the launch half (`start_engine`, router bring-up, health
+wait) from `bench/p0b-gate1-placement.sh` rather than sourcing it (that script is linear, not
+decomposed into functions a caller can pull in without either re-running its own weaker identity
+check or restructuring team A's file); the payload/token-extraction/request functions are lifted
+unchanged from `.work/p4/run-two-engines.sh` in the main checkout (team B). For each of the 20
+`bench/mtp-prompts/p*.tokens` prompts: one request direct to engine a (the solo baseline) and one
+through the router, both with `max_tokens` 64, `temperature` 0, `spec` false, token ids in and out;
+`cmp` the two token-id files, never text. Placement must spread: `GET /v1/workloads` after all 20,
+grouped by engine, and the gate fails if either engine served zero (this gate's reverse arm, see
+`reverse-arm-gates`: an identity pass where one engine did all 20 proves nothing about the split).
+Device read-back per run, written to files, not asserted in prose: `rocm-smi --showpids` to a log
+file, both engines' actual GPU-touching child PIDs (found via `pgrep -P` on the tracked
+`baro-serve` PID, matched by `/proc/PID/comm` == `engine`) grepped present in it, and
+`MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_SIZE_PERCENT` plus `BARO_TMAX` read from each engine child's
+own `/proc/PID/environ`. CPU-only checks before any GPU run: `--selftest` (a comparator negative
+control: identical token files PASS, a one-id difference FAILs with a non-zero exit),
+`P4_CPU_PREFLIGHT=1` (binaries, pack hash, tools, prompt-file count), and `gate-dryrun` (stops at
+`GATE_DRYRUN=1` before the first real engine launch, arm file read back).
 
 The timed invocation is from the lane root, using an absolute script path and an explicit
 runtime `PATH`. `gpu-wait` admits jobs with a clean environment and may not preserve the caller's
 cwd, so the short relative form is not a valid submission receipt:
 
 ```text
-cd $HOME/Projects/mojo/mojo-baro-lanes/team-a
-$HOME/.local/bin/gpu-wait run --priority 20 --timeout 900 -- env PATH=/opt/rocm/bin:$HOME/iTools/bin:/usr/bin:/bin $HOME/Projects/mojo/mojo-baro-lanes/team-a/bench/p0b-gates12-live.sh
+cd $HOME/Projects/mojo/mojo-baro-lanes/p4b
+$HOME/.local/bin/gpu-wait run --priority 20 --timeout 600 -- env PATH=/opt/rocm/bin:$HOME/iTools/bin:/usr/bin:/bin BARO_ENGINE=... BARO_PACK=... BARO_SERVE_BIN=... ROUTER_BIN=... $HOME/Projects/mojo/mojo-baro-lanes/p4b/bench/p4-router-identity.sh .work/p4b/router-identity-runN
 ```
 
 The full harness is one serialized GPU job per run. No nested `gpu-wait` is allowed inside the
