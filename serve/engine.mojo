@@ -234,6 +234,140 @@ def load_state(
         return pos
 
 
+def a3b_state() -> WindowState:
+    return WindowState(pos=0, pos_prev=0, ring=0, n_drafted=0, n_accepted=0, n_spec_windows=0, n_dumped=0, tp=0, tq=0, pf_att=0, pf_ssm=0, pf_ffn=0, pf_head=0, pf_proc=0, pf_draft=0, fc=[0, 0, 0, 0, 0, 0], pc=[0, 0, 0, 0, 0, 0], p3=[0, 0, 0, 0], pfx=[0, 0, 0, 0], grammar=None, grammar_mask=Bitset(1), grammar_pending_think=False, grammar_think_buf=List[UInt8](), grammar_stop=False, grammar_masked_draws=0, grammar_accepted=0)
+
+
+def parse_a3b_request(line: String, tmax: Int, mut req_id: Int, mut prompt: List[Int], mut gen_n: Int, mut sample: SampleParams) raises -> String:
+    var spec = False
+    var has_spec = False
+    var stop = List[List[Int]]()
+    var ckpt = List[Int]()
+    var state_save = String("")
+    var state_load = String("")
+    var err = parse_request(line, req_id, prompt, gen_n, spec, has_spec, stop, ckpt, sample, state_save, state_load)
+    if err != "":
+        return err
+    if len(prompt) < 1:
+        return "empty prompt"
+    if gen_n < 1:
+        return "n must be >= 1"
+    if len(prompt) + gen_n > tmax:
+        return "prompt+n exceeds TMAX " + String(tmax)
+    if spec:
+        return "A3B requires spec=false"
+    if len(stop) > 0 or len(ckpt) > 0 or state_save != "" or state_load != "":
+        return "A3B accepts only prompt, n, and temperature=0"
+    if json_key(line, "force") >= 0 or json_key(line, "schema") >= 0 or sample.temperature != 0:
+        return "A3B accepts only greedy requests"
+    return ""
+
+
+def run_a3b_pair(
+    ctx: DeviceContext, mut bufs: WindowBufs, line_a: String, line_b: String,
+    pack_q4: Bool, draft_q4: Bool, q4_off: Int, e: Int, kcfg: Int, spec_dbg: Bool,
+    expert_trace: Bool, att_split: Int, dot3: Bool, pf_chunk: Int, pf_on: Bool,
+    mega: Bool, mega_win: Bool, fr_k: Int, fr_off: Int, fr_ids_off: Int, tmax: Int,
+    kvtab_mode: String,
+) raises:
+    var id_a = 0
+    var id_b = 0
+    var prompt_a = List[Int]()
+    var prompt_b = List[Int]()
+    var n_a = 0
+    var n_b = 0
+    var sample_a = default_sample_params()
+    var sample_b = default_sample_params()
+    var err = parse_a3b_request(line_a, tmax, id_a, prompt_a, n_a, sample_a)
+    if err != "":
+        print(err_line(id_a, err))
+        return
+    err = parse_a3b_request(line_b, tmax, id_b, prompt_b, n_b, sample_b)
+    if err != "":
+        print(err_line(id_b, err))
+        return
+    if id_a == id_b:
+        print(err_line(id_b, "A3B request ids must be distinct"))
+        return
+    var page_alloc = PageTable(SEQ_CAP * bufs.tpages)
+    var pages_a = page_alloc.alloc(bufs.tpages)
+    var pages_b = page_alloc.alloc(bufs.tpages)
+    var view_a = sequence_bufs(ctx, bufs, 0, tmax)
+    var view_b = sequence_bufs(ctx, bufs, 1, tmax)
+    for p in range(bufs.tpages):
+        var pa = pages_a[p]
+        var pb = pages_b[p]
+        if kvtab_mode == "reverse":
+            pa = pages_a[bufs.tpages - 1 - p]
+            pb = pages_b[bufs.tpages - 1 - p]
+        bufs.kvtab_h[p] = Int32(pa)
+        bufs.kvtab_h[bufs.tpages + p] = Int32(pb)
+    ctx.enqueue_memset(view_a.convstate_d, 0)
+    ctx.enqueue_memset(view_a.sstate_d, 0)
+    ctx.enqueue_memset(view_a.kc_d, 0)
+    ctx.enqueue_memset(view_a.vc_d, 0)
+    ctx.enqueue_memset(view_a.toks_d, 0)
+    ctx.enqueue_memset(view_b.convstate_d, 0)
+    ctx.enqueue_memset(view_b.sstate_d, 0)
+    ctx.enqueue_memset(view_b.kc_d, 0)
+    ctx.enqueue_memset(view_b.vc_d, 0)
+    ctx.enqueue_memset(view_b.toks_d, 0)
+    ctx.enqueue_copy(dst_buf=view_a.kvtab_d, src_buf=bufs.kvtab_h.create_sub_buffer[DType.int32](0, bufs.tpages))
+    ctx.enqueue_copy(dst_buf=view_b.kvtab_d, src_buf=bufs.kvtab_h.create_sub_buffer[DType.int32](bufs.tpages, bufs.tpages))
+    var toks_a = ctx.enqueue_create_host_buffer[DType.int32](tmax)
+    var toks_b = ctx.enqueue_create_host_buffer[DType.int32](tmax)
+    for i in range(len(prompt_a)):
+        toks_a[i] = Int32(prompt_a[i])
+    for i in range(len(prompt_b)):
+        toks_b[i] = Int32(prompt_b[i])
+    ctx.enqueue_copy(dst_buf=view_a.toks_d, src_buf=toks_a)
+    ctx.enqueue_copy(dst_buf=view_b.toks_d, src_buf=toks_b)
+    ctx.synchronize()
+    print("A3B slots: id", id_a, "slot 0 pages", pages_a[0], "..", pages_a[len(pages_a) - 1], "id", id_b, "slot 1 pages", pages_b[0], "..", pages_b[len(pages_b) - 1], "mapping", kvtab_mode)
+    var pf_rows_a = len(prompt_a) - 1 if pf_on and len(prompt_a) - 1 >= PF_MIN else 0
+    var pf_rows_b = len(prompt_b) - 1 if pf_on and len(prompt_b) - 1 >= PF_MIN else 0
+    var pf_tail_a = pf_rows_a % MROWS if pf_rows_a > 0 else 0
+    var pf_tail_b = pf_rows_b % MROWS if pf_rows_b > 0 else 0
+    if pf_tail_a == 0 and pf_rows_a > 0:
+        pf_tail_a = MROWS
+    if pf_tail_b == 0 and pf_rows_b > 0:
+        pf_tail_b = MROWS
+    var cfg_a = WindowCfg(pack_q4=pack_q4, draft_q4=draft_q4, q4_off=q4_off, fr_k=fr_k, fr_off=fr_off, fr_ids_off=fr_ids_off, e=e, kcfg=kcfg, spec=False, spec_dbg=spec_dbg, expert_trace=expert_trace, serve=True, req_id=id_a, prof=False, pf2=False, pf3=False, pf4=False, dump=False, dump4=False, dump_layer=0, mega=mega, att_split=att_split, mega_win=mega_win, dot3=dot3, pf_chunk=pf_chunk, pf_rows=pf_rows_a, pf_tail=pf_tail_a, n_total=len(prompt_a) + n_a, n_prompt=len(prompt_a), sample=sample_a.copy(), dump_pen=False)
+    var cfg_b = cfg_a.copy()
+    cfg_b.req_id = id_b
+    cfg_b.pf_rows = pf_rows_b
+    cfg_b.pf_tail = pf_tail_b
+    cfg_b.n_total = len(prompt_b) + n_b
+    cfg_b.n_prompt = len(prompt_b)
+    cfg_b.sample = sample_b.copy()
+    var st_a = a3b_state()
+    var st_b = a3b_state()
+    var alive_a = True
+    var alive_b = True
+    while alive_a or alive_b:
+        if alive_a:
+            step_window(ctx, view_a, cfg_a, st_a)
+            ctx.synchronize()
+            print("A3B boundary: resident ids", id_a, id_b, "slots 0,1")
+            if st_a.pos >= cfg_a.n_total - 1:
+                alive_a = False
+        if alive_b:
+            step_window(ctx, view_b, cfg_b, st_b)
+            ctx.synchronize()
+            print("A3B boundary: resident ids", id_a, id_b, "slots 0,1")
+            if st_b.pos >= cfg_b.n_total - 1:
+                alive_b = False
+    ctx.enqueue_copy(dst_buf=toks_a, src_buf=view_a.toks_d)
+    ctx.enqueue_copy(dst_buf=toks_b, src_buf=view_b.toks_d)
+    ctx.synchronize()
+    var generated_a = st_a.pos + 1 - len(prompt_a)
+    var generated_b = st_b.pos + 1 - len(prompt_b)
+    print("A3B done: id", id_a, "n", generated_a)
+    print("{\"id\":" + String(id_a) + ",\"done\":true,\"n\":" + String(generated_a) + ",\"prefill_s\":0.0,\"decode_s\":0.0,\"tok_s\":0.0,\"cached\":0,\"prefill_rows\":0,\"restore_s\":0.0,\"checkpoints\":0,\"finish\":\"length\"}")
+    print("A3B done: id", id_b, "n", generated_b)
+    print("{\"id\":" + String(id_b) + ",\"done\":true,\"n\":" + String(generated_b) + ",\"prefill_s\":0.0,\"decode_s\":0.0,\"tok_s\":0.0,\"cached\":0,\"prefill_rows\":0,\"restore_s\":0.0,\"checkpoints\":0,\"finish\":\"length\"}")
+
+
 def main() raises:
     comptime assert has_accelerator(), "Requires a GPU"
     var ctx = DeviceContext()
@@ -489,6 +623,17 @@ def main() raises:
                 line_in = read_line(0)
             if not line_in:
                 break
+            if json_key(line_in.value(), "a3b") >= 0:
+                var line_b = Optional[String](None)
+                if len(pending) > 0:
+                    line_b = Optional(pending.pop(0))
+                else:
+                    line_b = read_line(0)
+                if not line_b:
+                    print(err_line(0, "A3B pair ended before its second request"))
+                    continue
+                run_a3b_pair(ctx, bufs, line_in.value(), line_b.value(), pack_q4, draft_q4, q4_off, e, kcfg, spec_dbg, expert_trace, att_split, dot3, pf_chunk, pf_on, mega, mega_win, fr_k, fr_off, fr_ids_off, tmax, kvtab_mode)
+                continue
             var req_n = 0
             var req_spec = False
             var req_has_spec = False
@@ -678,7 +823,7 @@ def main() raises:
             toks_h[i] = 0
         for i in range(len(prompt)):
             toks_h[i] = Int32(prompt[i])
-        ctx.enqueue_copy(dst_buf=toks_d, src_buf=toks_h)
+        ctx.enqueue_copy(dst_buf=DeviceBuffer[DType.int32](ctx, toks_d.unsafe_ptr(), tmax, owning=False), src_buf=toks_h)
         ctx.synchronize()
         var t0 = perf_counter_ns()
         var t_prefill_end = t0
@@ -825,7 +970,7 @@ def main() raises:
                 break
             if len(stop_seqs) > 0 and wst.pos >= len(prompt):
                 ctx.synchronize()
-                ctx.enqueue_copy(dst_buf=toks_h, src_buf=toks_d)
+                ctx.enqueue_copy(dst_buf=toks_h, src_buf=DeviceBuffer[DType.int32](ctx, toks_d.unsafe_ptr(), tmax, owning=False))
                 ctx.synchronize()
                 var gen_len = wst.pos + 1 - len(prompt)
                 for si in range(len(stop_seqs)):
@@ -1082,7 +1227,7 @@ def main() raises:
             var st = Float64(wst.pc[0] + wst.pc[1] + wst.pc[2] + wst.pc[3] + wst.pc[4] + wst.pc[5] + wst.pc[6])
             for i in range(7):
                 print("ssm-kernel:", names[i], Float64(wst.pc[i]) / 1e9, Float64(wst.pc[i]) / st)
-        ctx.enqueue_copy(dst_buf=toks_h, src_buf=toks_d)
+        ctx.enqueue_copy(dst_buf=toks_h, src_buf=DeviceBuffer[DType.int32](ctx, toks_d.unsafe_ptr(), tmax, owning=False))
         ctx.synchronize()
         var generated = List[Int]()
         for i in range(len(prompt), wst.pos + 1):
