@@ -260,6 +260,19 @@ tensor ranges, or forced agreement below the class bar after one repair round, o
 regression without a written accepted trade-off; on a kill the base bake stays and the merge is
 reverted. Training stays in torch on this box; the engine's job is the receipts and the bake.
 
+**Forced-agreement bar, amended 2026-09-17 (coordinator, after the P5b control run).** The original
+"min over 20 prompts >= 90%" bar is void: it is unpassable by the unpatched base itself. Measured
+control, unpatched base packed with the identical `engine-pack.py --q4` (byte-identical pack size to
+the candidate arm), scores a minimum of 89.06% on `p03-story`, the same value the patched arm hit on
+`p09`. The floor is also unreachable by construction, since at `n_predict` 64 the achievable grid steps
+from 57/64 (89.06%) to 58/64 (90.63%) with no 90% in between. The bar is therefore **aggregate forced
+agreement measured against a same-arm control**, and the control run is a required part of the gate,
+not an optional diagnostic: every report states the control aggregate beside the candidate aggregate.
+No fixed pass margin is frozen; the coordinator judges the pair per item, since the gate has zero
+within-arm variance (a repeat control run reproduced all 20 prompts exactly) and any single number
+would itself be a guess. This is the same defect class as the FORK lane's gate 4, whose 20/20 bar was
+unreachable even llama-to-llama.
+
 ## P3. Audio: a sidecar today, native tokens when a model has an audio tower
 
 **P3a, speech in (S).** `~/Models/whisper.cpp/build/bin/whisper-server` and `whisper-cli` exist with
