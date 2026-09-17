@@ -7,16 +7,23 @@
 //! the prefix lookup, so only the suffix is prefilled. The payload never
 //! crosses HTTP: the object is metadata, the file is the payload.
 //!
-//! Identity: `pack` is the hex sha256 of the pack path, the value
-//! `load_state` refuses on ("saved from a different pack"); `runtime` is the
-//! engine repo's git HEAD; `tokenizer_sha` is sha256 of the tokenizer file.
-//! `weights_uuid` is null until the front reads the GGUF header (named gap).
+//! Identity: `pack` is `<pack>/identity.json`'s `pack_sha256` (P1-STATE-API.md
+//! CONTRACT 2, coordinator amendment 0c68cb4) when that file is present and
+//! its recorded `pack_bytes`/`pack_mtime_ns` still match `pack.bin` on disk;
+//! otherwise the hex sha256 of the pack PATH STRING, as before (`load_state`
+//! refuses a mismatch here with "saved from a different pack"). `runtime` is
+//! the engine repo's git HEAD; `tokenizer_sha` is sha256 of the tokenizer
+//! file, the same algorithm `tools/engine-pack.py --identity` uses for
+//! `identity.json`'s `tokenizer_sha256`, computed independently here (one
+//! algorithm, not one shared computation) rather than trusted from the file.
+//! `weights_uuid` stays null: CONTRACT 2 does not fill it from this struct.
 
 use super::*;
 use axum::extract::Path as UrlPath;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
+use std::time::UNIX_EPOCH;
 
 // ---- sha256, dependency-free -----------------------------------------------
 
@@ -89,11 +96,38 @@ pub struct Identity {
     pub tokenizer_sha: Option<String>,
 }
 
+/// `<pack>/identity.json`'s shape (`tools/engine-pack.py`); only the fields
+/// this reader needs. `tokenizer_sha256` and `source`/`general_uuid` are not
+/// read here: this struct exists to validate and extract `pack_sha256`.
+#[derive(Deserialize)]
+struct PackIdentityFile {
+    pack_sha256: String,
+    pack_bytes: u64,
+    pack_mtime_ns: u64,
+}
+
+/// `pack_sha256` from `<pack>/identity.json`, only when the file parses and
+/// its `pack_bytes`/`pack_mtime_ns` still match `<pack>/pack.bin` right now
+/// (a stat, not a re-hash of a file that can be many GB). Any miss returns
+/// `None`, never an error: the caller's own path-hash fallback is not a
+/// defect, it is CONTRACT 2's documented "identity.json absent" path.
+fn read_pack_sha256(pack: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(pack.join("identity.json")).ok()?;
+    let parsed: PackIdentityFile = serde_json::from_str(&text).ok()?;
+    let meta = std::fs::metadata(pack.join("pack.bin")).ok()?;
+    let mtime_ns = meta.modified().ok()?.duration_since(UNIX_EPOCH).ok()?.as_nanos() as u64;
+    if meta.len() != parsed.pack_bytes || mtime_ns != parsed.pack_mtime_ns {
+        return None;
+    }
+    Some(parsed.pack_sha256)
+}
+
 impl Identity {
     pub fn compute(pack: &Path, tokenizer: &Path) -> Identity {
         // The engine salts its checkpoint hashes with sha256 of the pack
         // path STRING it was given (serve/prefix.mojo `Chain.__init__`), so
-        // the same spelling is hashed here.
+        // the same spelling is hashed here -- unchanged fallback for a pack
+        // with no valid identity.json (CONTRACT 2).
         let pack_s = pack.to_string_lossy().into_owned();
         let runtime = std::env::var("BARO_RUNTIME").ok().unwrap_or_else(|| {
             std::process::Command::new("git")
@@ -105,7 +139,8 @@ impl Identity {
                 .unwrap_or_else(|| "unknown".into())
         });
         let tokenizer_sha = std::fs::read(tokenizer).ok().map(|b| hex(&sha256(&b)));
-        Identity { pack: hex(&sha256(pack_s.as_bytes())), runtime, tokenizer_sha }
+        let pack_field = read_pack_sha256(pack).unwrap_or_else(|| hex(&sha256(pack_s.as_bytes())));
+        Identity { pack: pack_field, runtime, tokenizer_sha }
     }
 
     fn json(&self) -> Value {
@@ -408,6 +443,49 @@ mod tests {
     fn sha256_matches_known_vectors() {
         assert_eq!(hex(&sha256(b"")), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
         assert_eq!(hex(&sha256(b"abc")), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    }
+
+    fn write_pack_fixture(dir: &Path, pack_bytes: &[u8]) -> u64 {
+        std::fs::write(dir.join("pack.bin"), pack_bytes).unwrap();
+        let meta = std::fs::metadata(dir.join("pack.bin")).unwrap();
+        meta.modified().unwrap().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64
+    }
+
+    #[test]
+    fn read_pack_sha256_returns_the_recorded_hash_when_stat_matches() {
+        let dir = std::env::temp_dir().join(format!("baro-identity-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mtime_ns = write_pack_fixture(&dir, b"hello world");
+        std::fs::write(
+            dir.join("identity.json"),
+            format!(r#"{{"pack_sha256":"deadbeef","pack_bytes":11,"pack_mtime_ns":{mtime_ns}}}"#),
+        )
+        .unwrap();
+        assert_eq!(read_pack_sha256(&dir), Some("deadbeef".to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_pack_sha256_is_none_on_a_size_mismatch() {
+        let dir = std::env::temp_dir().join(format!("baro-identity-test-size-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mtime_ns = write_pack_fixture(&dir, b"hello world");
+        std::fs::write(
+            dir.join("identity.json"),
+            format!(r#"{{"pack_sha256":"deadbeef","pack_bytes":999,"pack_mtime_ns":{mtime_ns}}}"#),
+        )
+        .unwrap();
+        assert_eq!(read_pack_sha256(&dir), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_pack_sha256_is_none_when_identity_json_is_absent() {
+        let dir = std::env::temp_dir().join(format!("baro-identity-test-absent-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        write_pack_fixture(&dir, b"hello world");
+        assert_eq!(read_pack_sha256(&dir), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

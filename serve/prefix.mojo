@@ -24,6 +24,7 @@ never the hint itself.
 from std.collections import Array
 from std.bit import rotate_bits_right
 from std.builtin.globals import global_constant
+from std.os import stat
 
 from max.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
 
@@ -210,6 +211,112 @@ struct Checkpoint(Copyable, Movable):
     var ssm_h: HostBuffer[f32]
 
 
+# ---- P1 CONTRACT 2 identity salt (P1-STATE-API.md, coordinator amendment
+# 0c68cb4): <packdir>/identity.json, written by tools/engine-pack.py, is the
+# only place `pack_sha256`/`tokenizer_sha256` are computed -- this reads it,
+# it never re-derives either hash. A hand-rolled reader, not a JSON library:
+# the file has a fixed, known shape (a handful of flat string/int keys), the
+# same idiom serve/identity.mojo already uses for GGUF header fields.
+
+
+def _hex_nibble_or_zero(c: UInt8) -> UInt8:
+    # Malformed input degrades to a wrong salt, never a crash or a silent
+    # match: a wrong salt only ever costs a spurious "saved from a different
+    # pack" refusal, the same failure mode as identity.json being absent.
+    if c >= 48 and c <= 57:
+        return c - 48
+    if c >= 97 and c <= 102:
+        return c - 97 + 10
+    if c >= 65 and c <= 70:
+        return c - 65 + 10
+    return 0
+
+
+def _hex_to_bytes(s: String) -> List[UInt8]:
+    var b = s.as_bytes()
+    var n = len(b) // 2
+    var out = List[UInt8](unsafe_uninit_length=n)
+    for i in range(n):
+        out[i] = (_hex_nibble_or_zero(b[i * 2]) << 4) | _hex_nibble_or_zero(b[i * 2 + 1])
+    return out^
+
+
+def _json_value_start(text: String, key: String) -> Int:
+    # Byte offset of the value right after `"key":`, skipping one optional
+    # space (`json.dumps(..., indent=2)`'s separator); -1 if the key is
+    # absent. Not a general JSON scanner: identity.json's keys never nest
+    # and never repeat, so a plain substring search is exact here.
+    var needle = String("\"") + key + String("\":")
+    var idx = text.find(needle)
+    if idx < 0:
+        return -1
+    var pos = idx + len(needle.as_bytes())
+    var b = text.as_bytes()
+    if pos < len(b) and b[pos] == 32:
+        pos += 1
+    return pos
+
+
+def _json_string_at(text: String, pos: Int) -> String:
+    var b = text.as_bytes()
+    if pos < 0 or pos >= len(b) or b[pos] != 34:
+        return String("")
+    var end = pos + 1
+    while end < len(b) and b[end] != 34:
+        end += 1
+    return String(StringSlice(unsafe_from_utf8=Span(b)[pos + 1:end]))
+
+
+def _json_int_at(text: String, pos: Int) -> Int:
+    var b = text.as_bytes()
+    if pos < 0:
+        return -1
+    var end = pos
+    while end < len(b) and ((b[end] >= 48 and b[end] <= 57) or b[end] == 45):
+        end += 1
+    if end == pos:
+        return -1
+    try:
+        return Int(String(StringSlice(unsafe_from_utf8=Span(b)[pos:end])))
+    except:
+        return -1
+
+
+def pack_identity_salt(packdir: String) -> List[UInt8]:
+    """CONTRACT 2: `sha256(pack_sha256 || tokenizer_sha256)` from
+    `<packdir>/identity.json`, only when the file is present, parses, and its
+    `pack_bytes`/`pack_mtime_ns` match `packdir/pack.bin` on disk right now
+    (a stat, not a re-hash -- P1's whole point is avoiding a 7 GB rehash at
+    every engine start). Any miss at all -- missing file, missing field,
+    malformed hex, or a stat mismatch -- falls back to today's
+    `sha256(packdir)`, never raises."""
+    var fallback = sha256_bytes(string_bytes(packdir))
+    var text: String
+    try:
+        var raw: List[UInt8]
+        with open(packdir + "/identity.json", "r") as f:
+            raw = f.read_bytes()
+        text = String(StringSlice(unsafe_from_utf8=Span(raw)))
+    except:
+        return fallback.copy()
+    var pack_sha_hex = _json_string_at(text, _json_value_start(text, "pack_sha256"))
+    var tok_sha_hex = _json_string_at(text, _json_value_start(text, "tokenizer_sha256"))
+    var recorded_bytes = _json_int_at(text, _json_value_start(text, "pack_bytes"))
+    var recorded_mtime = _json_int_at(text, _json_value_start(text, "pack_mtime_ns"))
+    if pack_sha_hex.byte_length() != 64 or tok_sha_hex.byte_length() != 64 or recorded_bytes < 0 or recorded_mtime < 0:
+        return fallback.copy()
+    try:
+        var st = stat(packdir + "/pack.bin")
+        if st.st_size != recorded_bytes or st.st_mtimespec.as_nanoseconds() != recorded_mtime:
+            return fallback.copy()
+    except:
+        return fallback.copy()
+    var msg = _hex_to_bytes(pack_sha_hex)
+    for b in _hex_to_bytes(tok_sha_hex):
+        msg.append(b)
+    return sha256_bytes(msg)
+
+
 struct Chain(Movable):
     var cap: Int
     var gen: Int
@@ -219,7 +326,7 @@ struct Chain(Movable):
     def __init__(out self, ctx: DeviceContext, cap: Int, packdir: String) raises:
         self.cap = cap
         self.gen = 0
-        self.salt = sha256_bytes(string_bytes(packdir))
+        self.salt = pack_identity_salt(packdir)
         self.items = List[Checkpoint]()
         for _ in range(cap):
             var c = ctx.enqueue_create_host_buffer[f32](CONV_SLOT)
