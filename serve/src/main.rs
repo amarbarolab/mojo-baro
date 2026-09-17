@@ -9,6 +9,7 @@
 //! The device runs one request at a time; the wire worker may admit later
 //! request lines before the current request completes.
 
+mod audio;
 mod checkpoints;
 mod engine;
 mod protocol;
@@ -41,6 +42,8 @@ struct App {
     /// Checkpoint API registry (LatentOS plan 10 sec 8).
     ckpts: checkpoints::Registry,
     identity: checkpoints::Identity,
+    /// P3a speech-in sidecar (`serve/src/audio.rs`).
+    audio: audio::AudioSidecar,
 }
 
 type Shared = Arc<App>;
@@ -54,6 +57,10 @@ struct Opts {
     tokenizer: Option<PathBuf>,
     host: String,
     port: u16,
+    /// P3a (`docs/PLATFORM-PLAN.md`): no LLM engine spawned, no pack loaded,
+    /// no VRAM held for it; `EnginePool::empty()` backs every route that
+    /// would otherwise need one with its existing 503 error path.
+    audio_only: bool,
 }
 
 fn parse_opts() -> Result<Opts, String> {
@@ -63,6 +70,7 @@ fn parse_opts() -> Result<Opts, String> {
         tokenizer: None,
         host: "127.0.0.1".into(),
         port: 8080,
+        audio_only: false,
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -73,8 +81,9 @@ fn parse_opts() -> Result<Opts, String> {
             "--tokenizer" => o.tokenizer = Some(PathBuf::from(val("--tokenizer")?)),
             "--host" => o.host = val("--host")?,
             "--port" => o.port = val("--port")?.parse().map_err(|e| format!("--port: {e}"))?,
+            "--audio-only" => o.audio_only = true,
             "-h" | "--help" => {
-                println!("usage: baro-serve [--engine PATH] [--pack DIR] [--tokenizer tokenizer.json] [--host H] [--port N]");
+                println!("usage: baro-serve [--engine PATH] [--pack DIR] [--tokenizer tokenizer.json] [--host H] [--port N] [--audio-only]");
                 std::process::exit(0);
             }
             other => return Err(format!("unknown argument {other}")),
@@ -92,8 +101,11 @@ async fn main() {
             std::process::exit(2);
         }
     };
-    let tok_path = opts.tokenizer.clone().unwrap_or_else(|| opts.pack.join("tokenizer.json"));
-    let text = if tok_path.exists() {
+    let tok_path = if opts.audio_only { PathBuf::new() } else { opts.tokenizer.clone().unwrap_or_else(|| opts.pack.join("tokenizer.json")) };
+    let text = if opts.audio_only {
+        eprintln!("audio-only: tokenizer not loaded, text endpoints disabled");
+        None
+    } else if tok_path.exists() {
         match Text::load(&tok_path) {
             Ok(t) => {
                 eprintln!("tokenizer: {} (stop ids {:?})", tok_path.display(), t.stop_ids);
@@ -109,11 +121,16 @@ async fn main() {
         None
     };
     let pool_size = std::env::var("BARO_POOL").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(1).max(1);
-    let engine = match EnginePool::spawn(&opts.engine, &opts.pack, pool_size).await {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("baro-serve: {e}");
-            std::process::exit(1);
+    let engine = if opts.audio_only {
+        eprintln!("audio-only: no LLM engine spawned, no pack loaded");
+        EnginePool::empty()
+    } else {
+        match EnginePool::spawn(&opts.engine, &opts.pack, pool_size).await {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("baro-serve: {e}");
+                std::process::exit(1);
+            }
         }
     };
     eprintln!("engine pool ready: {} engine(s), limits {:?}", engine.pool_size(), engine.limits);
@@ -122,10 +139,15 @@ async fn main() {
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "mojo-baro".into());
-    let identity = checkpoints::Identity::compute(&opts.pack, &tok_path);
+    let identity = if opts.audio_only {
+        checkpoints::Identity { pack: "audio-only".into(), runtime: "audio-only".into(), tokenizer_sha: None }
+    } else {
+        checkpoints::Identity::compute(&opts.pack, &tok_path)
+    };
     let ckpts = checkpoints::Registry::from_env();
     eprintln!("checkpoints: dir {} cap {} identity {:?}", ckpts.dir.display(), ckpts.cap, identity);
-    let app = Arc::new(App { engine, text, model, ckpts, identity });
+    let audio = audio::AudioSidecar::from_env();
+    let app = Arc::new(App { engine, text, model, ckpts, identity, audio });
 
     let router = Router::new()
         .route("/health", get(health))
@@ -133,6 +155,7 @@ async fn main() {
         .route("/v1/completions", post(completions))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/fork", post(fork))
+        .route("/v1/audio/transcriptions", post(audio::transcriptions))
         .route("/v1/checkpoints", post(checkpoints::create).get(checkpoints::list))
         .route("/v1/checkpoints/{id}", get(checkpoints::get_one).delete(checkpoints::delete))
         .route("/v1/checkpoints/{id}/fork", post(checkpoints::fork))
@@ -152,13 +175,23 @@ async fn main() {
     // The one line on stdout: scripts read the bound port from it.
     println!("listening on http://{addr}");
     let serve = axum::serve(listener, router).with_graceful_shutdown(async {
-        let _ = tokio::signal::ctrl_c().await;
+        // A gate script's cleanup trap sends SIGTERM, not Ctrl+C's SIGINT;
+        // without a handler for it the kernel's default disposition kills
+        // this process immediately, skipping graceful shutdown entirely and
+        // orphaning the audio sidecar child (found live, P3a timed gate).
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
         eprintln!("shutting down");
     });
     if let Err(e) = serve.await {
         eprintln!("baro-serve: {e}");
     }
     app.engine.shutdown().await;
+    app.audio.shutdown().await;
 }
 
 // ---- errors -----------------------------------------------------------------

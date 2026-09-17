@@ -202,6 +202,19 @@ pub struct EnginePool {
 }
 
 impl EnginePool {
+    /// No LLM engine (`--audio-only`, P3a): every text/decode route's existing
+    /// `submit` error path answers 503 with no engine process spawned, no
+    /// pack load, no VRAM held. `tmax` is `u32::MAX` so `check_and_submit`'s
+    /// exceed-context check never intercepts the request first; `submit`
+    /// itself is the thing that refuses.
+    pub fn empty() -> EnginePool {
+        EnginePool {
+            engines: Vec::new(),
+            next_id: AtomicU64::new(1),
+            limits: Limits { tmax: u32::MAX, mrows: 0, kmax: 0, spec_k: 0, pack: "none (--audio-only)".into() },
+        }
+    }
+
     pub async fn spawn(engine: &Path, pack: &Path, pool_size: usize) -> Result<EnginePool, String> {
         let mut engines = Vec::with_capacity(pool_size.max(1));
         for _ in 0..pool_size.max(1) {
@@ -242,6 +255,9 @@ impl EnginePool {
         schema: Option<serde_json::Value>, reasoning: Option<bool>,
         state: (Option<String>, Option<String>),
     ) -> Result<(u64, mpsc::UnboundedReceiver<Event>), String> {
+        if self.engines.is_empty() {
+            return Err("no engine loaded (--audio-only)".into());
+        }
         let mut best = 0;
         let mut best_q = self.engines[0].queue_depth();
         for (i, e) in self.engines.iter().enumerate().skip(1) {
