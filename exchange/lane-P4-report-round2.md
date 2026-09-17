@@ -68,8 +68,17 @@ A third run of the same body and the same binaries, watched from outside by
 ## 3. What the defect is, as far as measured
 
 A rare, transient, single-step corruption on the iGPU arm only. Observed 3 times in roughly
-11,000 undumped tokens (gate round 1, gate re-run, `fresh1`), all three between 10:40 and 17:45,
-and zero times in everything run after that:
+11,000 undumped tokens: gate round 1 at 10:43, then the gate re-run (p08 split written 20:25:12,
+token 39 of 64) and `fresh1` (log closed 20:26:22, token 1), which puts the second and third
+events about one minute apart. Zero in everything run after 20:27, about 10,000 tokens. Two of
+three events inside one minute and none in the next three hours is the strongest evidence here
+for a bursty external cause rather than a steady per-token fault rate. (Corrected 2026-09-17: the
+first version of this report said "all three before 17:45"; I had not read the file times.)
+
+The corruption is large, not a near-tie flip: in a clean capture of the same prompt
+(`.work/p4/glitch-capture/run1/row-39.bin`) the row at the p08 glitch step has token `15` at
+23.35, the runner-up at 17.09 and the emitted garbage id `110952` at -3.51, so that one logit,
+or the argmax over it, was off by more than 26.
 
 | run | engine requests | tokens | deviations |
 |---|---|---|---|
