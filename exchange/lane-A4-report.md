@@ -1,4 +1,4 @@
-# Lane A4 report: trained draft head, smoke ran, kill line FAILS (large regression)
+# Lane A4 report: trained draft head, two smokes run, kill line FAILS both times
 
 Brief: `briefs/2026-09-17-A4-draft-head.md`. Plan: `docs/NEXT-PLAN.md` A4.
 Preregistration: `bench/draft-head-protocol.md`. This session's first pass
@@ -7,13 +7,19 @@ first follow-up reran against the real 20-prompt gate set through the real,
 unmodified engine and harness, reproduced the documented 65-66% baseline
 directly, and resolved the earlier ambiguity in favor of domain shift over
 a wiring defect. the maintainer then authorized the smoke (Order step 3); it ran to
-completion this session and its kill line FAILS: the trained head's real
+completion and its kill line FAILED HARD: the trained head's real
 accepted/drafted rate dropped from 67.78% to 3.06% on the 5-prompt subset
-(-64.7 pp, not the required +4 pp lift), full 20-prompt greedy identity
-stayed 20/20 PASS. Detail in "Order step 3" below. Order step 4 (the full
-preemptible training run) has not started and should not start against
-this recipe. Per CLAUDE.md s18, every number below names the check that
-produced it; nothing is claimed as more than what its own receipt shows.
+(-64.7 pp against a required +4 pp), a recipe defect (lr borrowed from E13
+without E13's own gradient accumulation). the maintainer then authorized ONE
+corrected-recipe smoke (lr 2e-5, 16-document accumulation, grad clip,
+warmup, frozen `bench/draft-head-protocol.md` commit `0a8951d`). That
+smoke also ran to completion, was NOT void (loss fell monotonically across
+all 8 steps), and its kill line ALSO fails, but mildly: **-4.11 pp on the
+5-prompt subset (63.67% vs 67.78%), -2.71 pp on the full 20-prompt set
+(63.26% vs 65.97%), identity 20/20 PASS both stints.** Detail below. Order
+step 4 (the full preemptible training run) has not started. Per CLAUDE.md
+s18, every number below names the check that produced it; nothing is
+claimed as more than what its own receipt shows.
 
 ## The E13 question, answered
 
@@ -264,3 +270,78 @@ per the maintainer's own call on whether and how to spend more GPU time on this.
 
 **Still not done: Order step 4 (the full preemptible run) has not started,
 and should not start against this recipe.**
+
+## Order step 3, second attempt: corrected recipe, kill line FAILS mildly
+
+the maintainer authorized ONE corrected-recipe smoke and froze the recipe in
+`bench/draft-head-protocol.md` (commit `0a8951d`, before this training
+minute): `lr 2e-5`, 16-document gradient accumulation per optimizer step
+(`~/AMDHQ/tools/latent-os/e13_train.py`'s own `--accum 16` setting, this
+time paired with the `lr` it was actually tuned with instead of the first
+attempt's mismatch), grad-norm clip 1.0, 10% linear warmup, 8 optimizer
+steps (128 documents, `.work/a4/train-dump-v2.bin`, GSM8K text again, same
+held-out corpus, a larger prefix of it: 150 documents dumped this time,
+24,468 total supervised positions used). A frozen VOID check runs before
+any gate: the mean per-document loss at the last optimizer step must be
+lower than at the first.
+
+**Training (`gpu-wait run --priority 10 --preemptible --vram 22 --timeout 900`,
+`tools/mtp_train.py`).** 77.4 s wall. **Loss fell monotonically across all
+8 steps: 7.66, 5.64, 5.26, 4.88, 4.62, 4.28, 4.21, 4.04.** Gradient norms
+(pre-clip, clipped to 1.0) fell from 95.9 to 11.3, consistent with genuine
+convergence rather than noise. `void: false`, `loss_went_down: true`
+(`.work/a4/mtp-train-v2-report.json`) -- unlike the first attempt (loss
+rose from 6.99 to 7.97), this run is not void and proceeds to the gate.
+
+**Write-back and repack, same procedure as the first attempt.**
+`tools/mtp_head.py --mode writeback` then `--mode verify-writeback`:
+**zero differing bytes outside `blk.32`'s 15 tensor ranges, all 15 changed**
+(`.work/a4/writeback-verify-v2.json`, `"pass": true`). `tools/engine-pack.py`,
+unmodified, repacked the patched GGUF: 442 tensors, 6.72 GiB.
+
+**One operational snag, not a code defect:** the first gate attempt failed
+with a real `hipErrorOutOfMemory` from the engine itself
+(`.work/a4/mtp-untrained-5-v2/p01-water.A.log`). `gpu-wait list` showed
+"no jobs" at the time, yet `rocm-smi --showpids` showed a different lane's
+`engine-moe` process (PID from a `bench/ab-prompts.sh` / `gate-dryrun.sh`
+invocation, not itself wrapped in a visible `gpu-wait run`) holding 23.26 of
+23.98 GB: real concurrent GPU use this session's own `gpu-wait run` calls
+could not see in the queue listing. Waited for `gpu-wait gpu`'s own
+`vram_used` to drop before retrying (not killed, not touched -- another
+lane's legitimate work); the retry succeeded cleanly.
+
+**The gate, run.** Untrained pack, `p01`-`p05`, same stint as this attempt:
+drafted 270, accepted 183, **67.78%** (matches the first attempt's
+untrained baseline exactly, confirming the harness itself did not drift
+between sessions). Trained-v2 pack, same 5 prompts, same engine binary,
+same session: drafted 278, accepted 177, **63.67%**. **Lift: -4.11 pp**,
+still short of the required +4 pp, but two orders of magnitude milder than
+the first attempt's -64.7 pp. Full 20-prompt greedy identity: **20/20 PASS**.
+Full-set aggregate: 706/1116 = **63.26%** against the untrained 65.97%
+(-2.71 pp), consistent in direction and rough magnitude with the 5-prompt
+subset, so this is not a small-sample artifact either way.
+
+**Reading.** The recipe fix worked as intended: real, monotonic loss
+convergence, a byte-clean write-back, and a result that is a small
+regression rather than a catastrophic one. It is still not a lift. Two
+readings, not distinguished further this session (per the maintainer's own scope for
+this smoke -- one corrected attempt, report don't keep iterating
+unprompted): (1) 8 steps / 128 documents of one narrow text domain (GSM8K
+math/answer text) is enough to move the loss but not enough, or not varied
+enough, to actually improve second-token acceptance on general chat-style
+gate-set prompts -- consistent with the smoke's own frozen language that an
+unconverged run cannot kill the hypothesis, only fail to show the effect;
+(2) fine-tuning ALL of `blk.32` (attention, FFN and the wrapper stages
+together) on a narrow domain may be trading general-purpose acceptance for
+whatever GSM8K-shaped signal 128 documents carry, a real bias-variance cost
+that more data breadth, not just more steps, would need to address.
+
+**Verdict, per the frozen rule.** NOT a kill of the A4 hypothesis (same
+language as the first attempt: a small, single, un-tuned-for-scale smoke
+cannot kill it). Two real, receipted attempts have now both failed the kill
+line, the second one only mildly and with a genuine convergence signal
+behind it. Whether to run Order step 4 (the full preemptible run, wider and
+longer, 3 GPU-hour budget) against this improved-but-still-negative
+starting point, or to try a further-adjusted smoke (more steps, broader
+text, partial freezing of `blk.32`'s attention/FFN so only `eh_proj` and
+the norms move) is the maintainer's call, not decided here.
