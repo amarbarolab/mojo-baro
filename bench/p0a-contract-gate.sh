@@ -25,7 +25,7 @@ backend=ollama
 count=$count
 seed=0
 temperature=0
-embeddings=deferred-P0a-e
+embeddings=live-P0a-e-http
 pair_manager=$pair_manager
 EOF
 
@@ -84,17 +84,19 @@ print("read-back", health["limits"], items[0]["id"])
 PY
 model=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["data"][0]["id"])' "$out/models.json")
 
-python3 - "$url" "$out" <<'PY'
+python3 - "$url" "$model" "$out" <<'PY'
 import json, pathlib, sys
 import urllib.error
 import urllib.request
+import math
 
-url, out = sys.argv[1], pathlib.Path(sys.argv[2])
+url, model, out = sys.argv[1], sys.argv[2], pathlib.Path(sys.argv[3])
 rows = []
+prompt = "The capital of France is Paris, a city on the Seine."
 for path in ("/api/embeddings", "/v1/embeddings"):
     request = urllib.request.Request(
         url + path,
-        json.dumps({"model": "pending", "input": "pending"}).encode(),
+        json.dumps({"model": model, "input": prompt}).encode(),
         {"content-type": "application/json"},
     )
     try:
@@ -102,14 +104,34 @@ for path in ("/api/embeddings", "/v1/embeddings"):
             status, body = response.status, response.read()
     except urllib.error.HTTPError as error:
         status, body = error.code, error.read()
+    assert status == 200, (path, status, body[:500])
     payload = json.loads(body)
-    error = payload.get("error", {})
-    message = error.get("message", "") if isinstance(error, dict) else str(error)
-    assert status == 501, (path, status, payload)
-    assert "embeddings_pending" in message and "P0a-e" in message, (path, payload)
-    rows.append({"path": path, "status": status, "message": message})
-(out / "embeddings-pending.json").write_text(json.dumps(rows, indent=2) + "\n")
-print("embeddings pending contract: 2/2 routes return 501")
+    data = payload.get("data")
+    assert payload.get("object") == "list" and isinstance(data, list) and len(data) == 1, (path, payload)
+    row = data[0]
+    vector = row.get("embedding")
+    assert row.get("object") == "embedding" and row.get("index") == 0, (path, row)
+    assert isinstance(vector, list) and len(vector) == 4096, (path, len(vector) if isinstance(vector, list) else vector)
+    assert all(isinstance(x, (int, float)) and math.isfinite(x) for x in vector), (path, "non-finite vector")
+    norm = math.sqrt(sum(x * x for x in vector))
+    assert abs(norm - 1.0) < 1e-4, (path, norm)
+    usage = payload.get("usage", {})
+    assert usage.get("prompt_tokens", 0) > 0 and usage.get("total_tokens") == usage.get("prompt_tokens"), (path, usage)
+    rows.append({"path": path, "status": status, "dimension": len(vector), "norm": norm,
+                 "prompt_tokens": usage["prompt_tokens"]})
+batch_request = urllib.request.Request(
+    url + "/v1/embeddings",
+    json.dumps({"model": model, "input": ["Paris is the capital city of France.", "The 7900 XTX has 24 GB of memory."]}).encode(),
+    {"content-type": "application/json"},
+)
+with urllib.request.urlopen(batch_request) as response:
+    batch = json.loads(response.read())
+assert response.status == 200 and len(batch.get("data", [])) == 2, batch
+assert [row.get("index") for row in batch["data"]] == [0, 1], batch
+rows.append({"path": "/v1/embeddings", "batch": 2,
+             "dimensions": [len(row["embedding"]) for row in batch["data"]]})
+(out / "embeddings-http.json").write_text(json.dumps(rows, indent=2) + "\n")
+print("gate 4 HTTP embeddings: 2/2 routes, normalized 4096-d vectors, batch 2/2")
 PY
 
 prompts=(
@@ -320,4 +342,4 @@ result["adoption_log"] = "adopting already-running external engine"
 (out / "pair-manager.json").write_text(json.dumps(result, indent=2) + "\n")
 print("gate 3 PAIR engine manager: adopted Ollama on 11434 and routed request")
 PY
-echo "DEFERRED p0a embeddings gate 4: coordinator-owned P0a-e wire"
+echo "PASS p0a contract gates 1 through 4 (gate 4 HTTP embeddings)"

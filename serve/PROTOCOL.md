@@ -187,8 +187,8 @@ The Ollama routes share the existing `baro-serve` listener and model selected by
 | `POST /api/pull` | Returns `501` with the model-import command. Model import is not an inference-server operation. |
 | `POST /api/chat` | Accepts Ollama `messages`, `options`, and `stream`. The default stream is `true`; streamed responses are newline-delimited JSON. `stream: false` returns one final JSON object. |
 | `POST /api/generate` | Accepts `prompt`, optional `system`, `raw`, `options`, and `stream`. The default stream is `true`; streamed responses are newline-delimited JSON. `stream: false` returns one final JSON object. |
-| `POST /api/embeddings` | Returns `501` with `embeddings_pending` and `see: P0a-e` until the coordinator-owned engine wire is landed. |
-| `POST /v1/embeddings` | Same pending response as `/api/embeddings`; OpenAI route retained for client discovery. |
+| `POST /api/embeddings` | Accepts a string `prompt` or `input` and returns one Ollama-shaped embedding vector from the P0a-e wire. Arrays of strings are also accepted. Spark and `BARO_SEQS > 1` refusals return `501` with `embeddings_pending`. |
+| `POST /v1/embeddings` | Accepts a string or array of strings in `input` and returns an OpenAI-shaped list of L2-normalized P0a-e vectors. |
 
 The supported Ollama `options` mapping is `num_predict` to maximum generated
 tokens, `temperature`, `top_p`, `top_k`, `min_p`, `seed`, and `stop` to the
@@ -199,10 +199,12 @@ infer that an accepted option took effect without a read-back contract.
 
 Ollama stream chunks use `content-type: application/x-ndjson`, one JSON object
 per line, and finish with `done: true`, counts, durations, and the generated
-context. OpenAI routes continue to use SSE and are otherwise unchanged. The
-embeddings gate is intentionally deferred from P0a until P0a-e supplies a
-hidden-state field on the engine protocol; no embedding vector is promised by
-the pending response.
+context. OpenAI routes continue to use SSE and are otherwise unchanged.
+The HTTP embedding wrapper is gated by `bench/p0a-contract-gate.sh` gate 4.
+The engine-vector parity gate remains `bench/p0ae-embed-gate.sh`: it compares
+the last-prompt-token vector with llama.cpp `--pooling last`, checks the 4096
+float dimension, normalization, determinism, identity with and without the
+flag, and malformed-flag refusal.
 
 `stream: true` returns SSE: one `data:` chunk per token (`text` delta and
 `tokens: [id]`), a final chunk with `finish_reason` + `usage` + `timings`
