@@ -22,6 +22,7 @@ minijinja = { version = "2", features = ["loader", "json"] }
 minijinja-contrib = { version = "2", features = ["pycompat"] }
 libc = "0.2.189"
 mdns-sd = "0.21.3"
+reqwest = { version = "0.12", default-features = false, features = ["stream", "json"] }
 
 [profile.release]
 opt-level = 2
