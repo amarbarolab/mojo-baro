@@ -225,6 +225,38 @@ def err_line(id: Int, msg: String) -> String:
     return String("{\"id\":") + String(id) + ",\"error\":\"" + msg + "\"}"
 
 
+# Export-only state file for the llama.cpp bridge (P1 item 4): serve/engine.mojo's
+# BAROST01 with conv_n = ssm_n = 0 and a zero salt, the first ceil(pos/KVPAGE) pages
+# of the page-major pool. Spark keeps the identity page table and has no state_load.
+def save_kv_state(ctx: DeviceContext, kc_d: DeviceBuffer[KVT], vc_d: DeviceBuffer[KVT], path: String, prompt: List[Int], pos: Int) raises:
+    comptime if KVT != DType.float32:
+        raise Error("state_save: state files store f32 KV; this engine has BARO_KVQ=" + KVQ)
+    else:
+        var kvn = ceildiv(pos, KVPAGE) * N_LAYERS * NKVH * KVHSTR
+        var kh = ctx.enqueue_create_host_buffer[KVT](kvn)
+        var vh = ctx.enqueue_create_host_buffer[KVT](kvn)
+        ctx.enqueue_copy(dst_buf=kh, src_buf=DeviceBuffer[KVT](ctx, kc_d.unsafe_ptr(), kvn, owning=False))
+        ctx.enqueue_copy(dst_buf=vh, src_buf=DeviceBuffer[KVT](ctx, vc_d.unsafe_ptr(), kvn, owning=False))
+        ctx.synchronize()
+        var head = List[UInt8]()
+        var magic = String("BAROST01")
+        for i in range(8):
+            head.append(magic.as_bytes()[i])
+        for v in [pos, 0, 0, kvn]:
+            for b in range(8):
+                head.append(UInt8((v >> (8 * b)) & 0xFF))
+        for _ in range(32):
+            head.append(0)
+        for t in range(pos):
+            for b in range(4):
+                head.append(UInt8((prompt[t] >> (8 * b)) & 0xFF))
+        with open(path, "w") as f:
+            f.write_bytes(Span(head))
+            f.write_bytes(Span[UInt8](unsafe_ptr=kh.unsafe_ptr().unsafe_bitcast[UInt8](), length=kvn * 4))
+            f.write_bytes(Span[UInt8](unsafe_ptr=vh.unsafe_ptr().unsafe_bitcast[UInt8](), length=kvn * 4))
+        print("state saved:", path, " pos", pos, " kv pages", ceildiv(pos, KVPAGE), " format BAROST01 (kv only)")
+
+
 def main() raises:
     comptime if KVQ != "f32":
         raise Error("the spark profile keeps f32 KV; built with BARO_KVQ=" + KVQ)
@@ -334,6 +366,7 @@ def main() raises:
         # mode; one-shot stays the default (temperature 0, greedy), matching
         # today's behaviour exactly.
         var sample = default_sample_params()
+        var sp_state_save = String("")
         if serve:
             var line_in = read_line(0)
             if not line_in:
@@ -343,7 +376,6 @@ def main() raises:
             var req_spec = False
             var req_has_spec = False
             var ckpt_hints = List[Int]()
-            var sp_state_save = String("")
             var sp_state_load = String("")
             var perr = parse_request(line_in.value(), req_id, prompt, req_n, req_spec, req_has_spec, stop_seqs, ckpt_hints, sample, sp_state_save, sp_state_load)
             if perr == "" and len(prompt) < 1:
@@ -352,6 +384,10 @@ def main() raises:
                 perr = "n must be >= 1"
             if perr == "" and len(prompt) + req_n > TMAX:
                 perr = "prompt+n exceeds TMAX " + String(TMAX)
+            if perr == "" and sp_state_load != "":
+                perr = "state_load is not wired for this engine (spark); its state files are export-only (tools/state-to-llama-slot)"
+            if perr == "" and sp_state_save != "" and len(prompt) < 2:
+                perr = "state_save needs a prompt of at least 2 tokens"
             # Items 3-4, briefs/2026-09-16-sampling-all-models-lane.md: spark
             # parses presence_penalty/frequency_penalty/top_logprobs (M5/C3)
             # but has never acted on them -- silently ignoring a parameter
@@ -560,6 +596,8 @@ def main() raises:
             print("predicted:", ps)
             print("forced agreement:", agree, "/", min(n_gen, len(force)))
         print("tok/s_gen:", Float64(n_gen) / dt, "(", n_gen, "steps,", dt, "s )")
+        if sp_state_save != "":
+            save_kv_state(ctx, kc_d, vc_d, sp_state_save, prompt, n_prompt - 1)
         if serve:
             var tok_s = Float64(n_gen - 1) / dt if n_gen > 1 else 0.0
             print(

@@ -13,6 +13,7 @@ mod audio;
 mod checkpoints;
 mod embeddings;
 mod engine;
+mod fork_target;
 mod ollama;
 mod protocol;
 mod state;
@@ -763,6 +764,10 @@ struct ForkReq {
     model: Option<String>,
     prompt: Value,
     branches: Vec<ForkBranch>,
+    /// P1 item 2: a node address; the fork is exported here, imported there
+    /// and answered from there (`fork_target.rs`).
+    #[serde(default)]
+    target: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -777,11 +782,15 @@ struct ForkBranch {
     sampler: SamplerFields,
 }
 
-async fn fork(State(app): State<Shared>, Json(r): Json<ForkReq>) -> Result<Response, ApiError> {
+async fn fork(State(app): State<Shared>, Json(body): Json<Value>) -> Result<Response, ApiError> {
+    let r: ForkReq = serde_json::from_value(body.clone()).map_err(|e| bad(format!("invalid fork request: {e}")))?;
     if r.branches.is_empty() {
         return Err(bad("branches must be non-empty"));
     }
     let prompt = prompt_ids(&app, &r.prompt)?;
+    if let Some(target) = &r.target {
+        return fork_target::fork_on_target(&app, target, prompt, body).await;
+    }
     let model = r.model.unwrap_or_else(|| app.model.clone());
     let mut branches = Vec::with_capacity(r.branches.len());
     for (i, b) in r.branches.into_iter().enumerate() {
