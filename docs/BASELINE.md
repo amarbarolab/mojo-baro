@@ -443,6 +443,8 @@ cannot be set through `@__llvm_metadata` (six spellings rejected).
 
 **Expert tier pinned by default since 2026-09-17** (`BARO_TIER_PINNED=1`; `=0` for the page cache): experts in host RAM decode at 67.12 tok/s against 48.57 page-cached, identity 20/20, `exchange/lane-MOE3-report.md` item 0; the cost was the blocking pread, not the bus.
 
+**Zero-copy misses, opt-in since 2026-09-17** (`BARO_TIER_ZC=1`, `404ac04`, `bench/moe-tier-protocol.md`): a missed q4_k expert is read by the gate/up and down kernels straight from the pinned store while each lane stores what it loaded into the cache slot, so the per-piece DMA before the launch goes away; 67.71 -> 72.02 tok/s_gen (1.064), identity 20/20, `kernels/test_moe_block.mojo` zc arm bit-exact. The three q6_k down layers keep the DMA. In-kernel PCIe reads need 8 or more pieces in flight (probe `bench/tier_zerocopy_probe.mojo`: 24.6 to 27.2 GB/s at 8 to 24 pieces, 14 to 15 at 2).
+
 **Champion (2026-09-15, R6.0b `38ee0b7`, `bench/moe-persist-protocol.md`):
 111.89 tok/s_gen, 20-prompt median** (spread 1.2%), launch path
 (`BARO_MEGA=0`), no spec, 727 launches per token. Up from 107.28 (R6.0

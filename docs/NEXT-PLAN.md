@@ -56,6 +56,8 @@ acceptance), S.
 
 ### A2. Paged and quantized KV (L, fable for `kernels/dattn.mojo`, sonnet for the allocator)
 
+**LANDED 2026-09-17: step 1 paging `09a8cd9`/`acf92e5` (16-token blocks, block table, dattn through the table), step 2 int8 KV `0fae7bb` opt-in `-D BARO_KVQ=int8` (`exchange/lane-A2S2-report.md`), 60-prompt identity harness `bench/a2-gate.sh` (`652a86c`).**
+
 Step 1 paging: 16-token blocks, per-request block table (vLLM 2309.06180),
 `dattn` split kernel reads through the table; prefix checkpoints and the
 MTP (k+1)-slot ring keep working. Step 2 quantization on KIVI's axes
@@ -72,6 +74,8 @@ unaffected. This lane is also LatentOS C2 (compressed checkpoints).
 
 ### A3. Continuous batching (XL; plan first, sonnet on the scheduler, fable on the m>1 GEMV)
 
+**IN PROGRESS 2026-09-17 (codex lane, `docs/A3-PLAN.md`, `exchange/lane-A3-report.md`): (a) wire admission `3474e64`, (b) two resident sequence states `a96f6c4`, (c) host row harness and (d) admission gate `0413455` merged. Left: the per-row kernel seam (`exchange/lane-A3-c-kernel-request.md`, five row kernels taking a RowDesc pointer) before any one-launch batching or throughput claim.**
+
 Orca (OSDI 2022): iteration-level scheduling and selective batching, i.e.
 attention per request, linear layers batched as rows. The engine already
 runs m up to 8 rows per launch and the Rust front already has a request
@@ -85,6 +89,8 @@ row-scaling receipt (delta phase scales 1.46x at m=2, so predict, do not
 assume); no regression of the single-request 20-prompt median.
 
 ### A4. Trained draft head (M code; GPU in preemptible slices, sonnet)
+
+**PARKED 2026-09-17 (`f3acaab`, `exchange/lane-A4-report.md`): tooling landed (extract, torch replica, real-text dumps, training, byte-verified write-back), baseline reproduced on the real harness (65.97%), two smokes: lr 2e-4 wrecked the head (3.06%), the corrected recipe converged but reads 63.67% against 67.78% untrained. Open decision: retrain against the target's own greedy picks (that is what acceptance measures), or park.**
 
 Acceptance is the lever only through training: DeepSeek-V3's trained MTP
 head reaches 85 to 90% second-token acceptance (2412.19437) against our 42%.
