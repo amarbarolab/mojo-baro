@@ -5,6 +5,9 @@
 # Runs in CI and locally. Kernel work still needs ./run-tests.sh on the card.
 set -u
 cd "$(dirname "$0")/.."
+# Raise this when a rule is added to bench/PROTOCOL-RULES.md, so dropping any
+# existing rule fails the check. It read 6 while the file had grown to 20.
+PROTOCOL_RULES_N=20
 fails=0
 step() { printf '\n== %s\n' "$1"; }
 ok()   { echo "  OK  $1"; }
@@ -53,12 +56,12 @@ for p in sorted(pathlib.Path(".github").rglob("*.yml")):
 PY
 then ok "all .github yaml loads"; else bad "invalid issue template yaml"; fi
 
-step "protocol rules P1-P6 present"
+step "protocol rules P1-P$PROTOCOL_RULES_N present"
 missing=""
-for n in 1 2 3 4 5 6; do
+for n in $(seq 1 "$PROTOCOL_RULES_N"); do
   grep -qE "^## P$n\." bench/PROTOCOL-RULES.md || missing="$missing P$n"
 done
-if [ -z "$missing" ]; then ok "P1-P6 all present"
+if [ -z "$missing" ]; then ok "P1-P$PROTOCOL_RULES_N all present"
 else bad "PROTOCOL-RULES.md lost rules:$missing"; fi
 
 step "vendored tools/gguf_reader.mojo matches its upstream"

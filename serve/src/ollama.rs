@@ -221,7 +221,7 @@ pub async fn show(State(_app): State<Shared>, Json(_r): Json<ShowReq>) -> Json<V
 }
 
 pub async fn pull() -> ApiError {
-    pending_not_impl("use tools/model-import.py to add a model to this box (POST /api/pull is not implemented)")
+    pending_not_impl("see docs/CAPABILITIES.md 'Import and bake pipeline' to add a model to this box (POST /api/pull is not implemented)")
 }
 
 // ---- POST /api/chat ---------------------------------------------------------
