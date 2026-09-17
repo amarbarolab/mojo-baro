@@ -105,14 +105,39 @@ What is ruled out, with the evidence:
   (rocm-systems PR 2200 class) appears present: node 2 exports `cwsr_size 700416` and
   `ctl_stack_size 4096`. No amdgpu, KFD, MCE or EDAC line in `journalctl -k` for the period.
 
+### Graphics-load soak (added 2026-09-17 late, the maintainer: do it)
+
+`bench/p4-soak.sh` with `P4_SOAK_LOAD_CMD=bench/p4-igpu-load.sh`: the trace build serving p08-sql
+while `vkcube --gpu_number 1 --present_mode 0` (Vulkan GPU1 = RADV RAPHAEL, checked with a
+negative control) and a 60 fps VAAPI scale ran on the same iGPU. Job `mu5zh83w0nht`, receipts
+`.work/p4/gfx-soak1/`. Read-back from fdinfo at t=83 s: vkcube `drm-engine-gfx` 66.2 s and
+`drm-engine-dma` 50.2 s, ffmpeg `drm-engine-compute` 7.7 s, so the iGPU graphics engine was about
+80 percent busy beside the engine. The contention was real: decode fell from 2.8 to 1.0 tok/s,
+prefill from 9 s to 25.5 s, 67 to 89 s per request.
+
+Result: **0 deviations in 5 complete requests**; all 5 checksum tables identical (5 x 89
+positions x 85 cells) and identical to the unloaded stream. The job then exited 1 by design at
+t=450 s because the vkcube window went away (no coredump; most likely closed on the desktop), so
+the planned 30 requests became 5. The first submission (`mu5zgb95ts2t`) failed in 1 s on my own
+device check (`grep -A3` did not reach the deviceType line), fixed and re-tested on CPU with a
+negative control.
+
+Reading: 445 tokens is a small sample against a base rate of 3 in 11,000, so by token count this
+proves little. By preemption count it says more: the engine shared two CUs with an unthrottled
+renderer for 450 s, orders of magnitude more graphics submissions than Discord or Vivaldi could
+have produced in the one minute that held two of the three events, and nothing broke. Sustained
+graphics preemption does not corrupt this engine at any rate that could explain the failures.
+What this arm does NOT cover is bursty light use (idle to busy transitions, clock and power
+state changes), which is what desktop clients actually do.
+
 What is NOT ruled out (ranked by my own estimate, none measured):
 
-1. **Graphics work preempting compute on the 2-CU iGPU.** `fuser /dev/dri/renderD129` shows
-   Discord and Vivaldi holding the iGPU render node next to the engine. Mid-wave preemption by
-   the gfx pipe would be bursty in time, which is what the clustering looks like. Cheap test,
-   not run: the same soak with a deliberate iGPU gfx load beside it (headless:
-   `ffmpeg -vaapi_device /dev/dri/renderD129 -f lavfi -i testsrc2=size=1920x1080:rate=60 -vf format=nv12,hwupload,scale_vaapi=1280:720 -f null -`).
-   A jump from 0 in 2,560 to several per soak would name the mechanism; no change would clear it.
+1. **Power or clock state transitions on the iGPU** (bursty desktop use, GFXOFF exits, DPM
+   switches). Consistent with two events one minute apart during desktop activity and with a
+   sustained load being harmless. Not tested; a bursty load arm (1 s on, 3 s off) is the test.
+   Sustained graphics preemption itself is now substantially weakened, see the soak above.
+   Holding `renderD129` is not using it: at review time the only holders were Antigravity and
+   its language server, with zero gfx engine time in fdinfo.
 2. **Transient DDR5 read faults.** The iGPU streams about 7.6 GB of weights from system memory
    per token; the XTX arm never touches DIMMs for weights and never fails. No way to test this
    from the lane without a reboot (memtest) and no EDAC on this board.

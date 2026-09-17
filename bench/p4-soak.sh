@@ -6,6 +6,9 @@
 # against the majority stream and against the eviction time that accrued while it ran, so a
 # glitch can be tied to (or cleared of) a save/restore event without adding any sync to the engine.
 # P4_SOAK_ANALYZE=1 recomputes the report from an existing OUT dir without touching the GPU.
+# P4_SOAK_LOAD_CMD="cmd ..." runs a second iGPU client beside the engine for the whole soak (the
+# gfx-preemption arm). Its DRM engine time on the iGPU render node is read from fdinfo and the
+# soak FAILS if that time did not grow: a load that never reached the iGPU is not an arm.
 # Run under gpu-wait. P4_IGPU_ENGINE / P4_IGPU_PACK / P4_OUT / P4_SOAK_PROMPT / P4_SOAK_N.
 # P4_SOAK_ENV="K=V K=V" adds engine environment for an arm; the script reads the effect back
 # (bytes mapped through the render node) instead of trusting that the variable took.
@@ -20,6 +23,17 @@ TARGET=${P4_SOAK_PROMPT:-p08-sql}
 N=${P4_SOAK_N:-40}
 GEN=${P4_SOAK_GEN:-64}
 read -r -a EXTRA_ENV <<< "${P4_SOAK_ENV:-}"
+LOAD_CMD=${P4_SOAK_LOAD_CMD:-}
+IGPU_RENDER=/dev/dri/renderD$(for n in /sys/class/kfd/kfd/topology/nodes/*; do
+  grep -q "gfx_target_version 100306" "$n/properties" 2>/dev/null && awk '$1 == "drm_render_minor" {print $2}' "$n/properties"; done | head -1)
+load_ns() { # pid and its children -> "engine=ns ..." summed over the pid's fds on the iGPU render node
+  local fd q
+  for q in "$1" $(pgrep -P "$1" || true); do
+    for fd in /proc/"$q"/fd/*; do
+      if [ "$(readlink "$fd" 2>/dev/null)" = "$IGPU_RENDER" ]; then cat "/proc/$q/fdinfo/$(basename "$fd")" 2>/dev/null || true; fi
+    done
+  done | awk '/^drm-engine-/ { sub(/^drm-engine-/, "", $1); t[$1] += $2 } END { for (e in t) printf "%s=%d ", e, t[e] }'
+}
 fail() { echo "FAIL $1: $2 (log ${3:-none})"; exit 1; }
 
 PROMPT="$ROOT/bench/mtp-prompts/$TARGET.tokens"
@@ -49,12 +63,20 @@ if [ "${P4_SOAK_ANALYZE:-0}" != 1 ]; then
   echo "pack=$PACK"
   echo "target=$TARGET n=$N gen=$GEN igpu_gpu_id=$IGPU_ID"
   echo "extra_env=${P4_SOAK_ENV:-none}"
+  echo "load_cmd=${LOAD_CMD:-none} igpu_render=$IGPU_RENDER"
   echo "cwsr_enable=$(cat /sys/module/amdgpu/parameters/cwsr_enable) sched_policy=$(cat /sys/module/amdgpu/parameters/sched_policy)"
   echo "igpu_env:"; igpu-env
 } > "$OUT/arm.txt" 2>&1
 
 igpu-env --run env BARO_SERVE=1 BARO_PACK="$PACK" "${EXTRA_ENV[@]}" stdbuf -oL "$ENGINE" < "$OUT/req.jsonl" > "$OUT/engine.log" 2>&1 &
 pid=$!
+load_pid=
+if [ -n "$LOAD_CMD" ]; then
+  bash -c "exec $LOAD_CMD" > "$OUT/load.log" 2>&1 &
+  load_pid=$!
+  trap 'kill "$load_pid" 2>/dev/null || true' EXIT
+fi
+load_first=; load_last=
 stat="/sys/class/kfd/kfd/proc/$pid/stats_$IGPU_ID/evicted_ms"
 echo "t_s,done,evicted_ms" > "$OUT/poll.csv"
 t0=$(date +%s)
@@ -63,12 +85,23 @@ mapped=NA
 while kill -0 "$pid" 2>/dev/null; do
   m=$(awk '$6 ~ /renderD/ { split($1, a, "-"); t += strtonum("0x" a[2]) - strtonum("0x" a[1]) } END { printf "%d", t / 1048576 }' "/proc/$pid/maps" 2>/dev/null || true)
   [ -n "$m" ] && [ "$m" != 0 ] && mapped=$m
+  if [ -n "$load_pid" ]; then
+    kill -0 "$load_pid" 2>/dev/null || { kill "$pid" 2>/dev/null || true; fail load "load command exited during the soak" "$OUT/load.log"; }
+    ln=$(load_ns "$load_pid")
+    [ -n "$ln" ] && { [ -n "$load_first" ] || load_first=$ln; load_last=$ln; }
+  fi
   ev=$(cat "$stat" 2>/dev/null || echo NA)
   [ "$ev" != NA ] && seen_stat=1
   echo "$(( $(date +%s) - t0 )),$(grep -c '"done":true' "$OUT/engine.log" 2>/dev/null || true),$ev" >> "$OUT/poll.csv"
   sleep 1
 done
 wait "$pid" || fail soak "engine exited non-zero" "$OUT/engine.log"
+if [ -n "$load_pid" ]; then
+  kill "$load_pid" 2>/dev/null || true
+  echo "readback.load_engine_ns first: ${load_first:-none} last: ${load_last:-none}" | tee -a "$OUT/arm.txt"
+  case "$load_last" in *gfx=*) ;; *) [ "${P4_SOAK_LOAD_NEEDS_GFX:-1}" = 0 ] || fail load "load never showed drm-engine-gfx time on $IGPU_RENDER" "$OUT/load.log" ;; esac
+  [ -n "$load_last" ] && [ "$load_first" != "$load_last" ] || fail load "load engine time on $IGPU_RENDER never grew" "$OUT/load.log"
+fi
 [ "$seen_stat" = 1 ] || fail soak "never read $stat, the eviction receipt is missing" "$OUT/poll.csv"
 grep -q '"error"' "$OUT/engine.log" && fail soak "engine rejected a request" "$OUT/engine.log"
 echo "readback.render_node_mapped_mb=$mapped" | tee -a "$OUT/arm.txt"
