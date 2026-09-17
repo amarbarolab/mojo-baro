@@ -98,10 +98,12 @@ def amar_gemv_q8[
             acc += w * a
         kk += UNROLL * STEP
     while kk < K:
-        var q = rebind[SIMD[DType.int8, QV]](Qv[row, kk // QV + lane]).cast[f32]()
-        var d = rebind[Scalar[DType.float16]](S[row, (kk + lane * QV) // 32]).cast[f32]()
-        var a = rebind[SIMD[DType.bfloat16, QV]](Av[0, kk // QV + lane]).cast[f32]()
-        acc += q * d * a
+        var kv = kk + lane * QV
+        if kv < K:
+            var q = rebind[SIMD[DType.int8, QV]](Qv[row, kv // QV]).cast[f32]()
+            var d = rebind[Scalar[DType.float16]](S[row, kv // 32]).cast[f32]()
+            var a = rebind[SIMD[DType.bfloat16, QV]](Av[0, kv // QV]).cast[f32]()
+            acc += q * d * a
         kk += STEP
     var total = warp.sum(acc.reduce_add())
     if lane == 0:
