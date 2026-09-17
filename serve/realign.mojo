@@ -118,3 +118,32 @@ def final_norm_hidden(
         TileTensor(h_dev, h2_layout),
         Int32(H), Float32(1e-6), grid_dim=1, block_dim=256,
     )
+
+
+def head_logits(
+    ctx: DeviceContext,
+    mut b: WindowBufs,
+    pack_q4: Bool,
+    mut logits_dev: DeviceBuffer[f32],
+) raises:
+    """The trunk's own VOCAB logits at the current position (row 0 of
+    `b.x_d`, same convention `final_norm_hidden` uses). Identical to
+    `realign_expected_embedding`'s norm+GEMM prefix, stopping at the raw
+    logits instead of continuing into its own softmax and expected-embedding
+    reduction -- P5a (`bench/p5a-smoke-protocol.md`) needs the distribution
+    itself, not an embedding-space summary of it."""
+    var curb_d = ctx.enqueue_create_buffer[bf16](H)
+    ctx.enqueue_function[rmsc_h2](
+        row_f32(ctx, b.x_d, 0, H, h2_layout),
+        tens_f32(ctx, b.wbuf, b.off[HEAD_NORM_IDX], H, h_layout),
+        TileTensor(curb_d, h2_layout),
+        Int32(H), Float32(1e-6), grid_dim=1, block_dim=256,
+    )
+    gemm_w[VOCAB, H](
+        ctx, TileTensor(curb_d, h2_layout), b.wbuf, b.off[HEAD_NORM_IDX + 1], pack_q4,
+        TileTensor(b.p_v_d, p_v), 1,
+    )
+    ctx.enqueue_function[realign_head_reduce_k](
+        TileTensor(b.p_v_d, p_v), TileTensor(logits_dev, probs_layout), Int32(1), Int32(VOCAB),
+        grid_dim=ceildiv(VOCAB, 256), block_dim=256,
+    )
