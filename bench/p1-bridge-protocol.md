@@ -107,3 +107,32 @@ That a phone or a Mac continues our conversation: the receiver here is `llama-se
 XTX. That 8k or 32k states bridge correctly: the prompts are short, and the tool's cell loop is
 scalar, so a 32k conversion is minutes of CPU and unmeasured. That the int8 state format bridges
 with the same ids: the primary runs f32 states; int8 is a secondary row, reported, not gated.
+
+## Amendment 1, 2026-09-17, before any gate 4 GPU run: control L already missed once, on CPU
+
+The CPU preflight this note requires ran the round trip on all three architectures
+(`bench/bridge-roundtrip.sh`, llama-server `--device none`, f16 KV). The tool's output was
+byte-identical to llama.cpp's own slot file on all three, and llama.cpp reused it on all three
+(`cache_n` equal to the restored length). On qwen35 and llama the restored continuation equalled the
+cold one. **On qwen2 it did not: llama.cpp restoring its OWN bytes diverged from its own cold run at
+index 1** (`.work/fork/bridge-roundtrip-qwen25`). Both continuations are fluent and correct (an
+iterative and a recursive fibonacci), a near-tie opening that flips with batch shape: the cold run
+evaluates 27 tokens in one batch, the restored run evaluates 13 over 14 cached f16 cells.
+
+What this changes, and what it does not:
+
+- **My control L prediction for Qwen2.5 (20 of 20) is contradicted by this item before the GPU run.**
+  It is left in the table as frozen. It is one CPU item on a different backend, so it does not
+  predict the GPU count, and I am not replacing the number with a better guess now that I have seen
+  data.
+- It shows the classifier's early-index signal is weaker than I assumed when I froze it: a
+  byte-perfect restore produced "divergence at index 1". The rule already says "on MOST prompts of a
+  model", so one prompt does not trip it, and **no threshold is changed**.
+- **Added reporting, not a changed bar:** every primary miss is also labelled by whether control L
+  missed the same prompt. A prompt llama.cpp cannot reproduce from its own bytes is attributed to
+  llama.cpp's restore path, not to the bridge and not to our numerics. The raw primary count against
+  the plan's wording is reported unchanged beside it.
+- `bench/bridge-roundtrip.sh` exits on what can implicate the tool (byte identity with an
+  independent producer's file, `n_restored`, `cache_n`, 32 tokens generated) and prints
+  `restored_equals_cold` as its own line. That line was a hard failure until it failed on bytes the
+  tool did not author. The change was made after that failure, which is why it is written down here.
