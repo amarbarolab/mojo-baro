@@ -24,9 +24,26 @@ fail() { echo "FAIL $1: $2 (log $out/probe.log)"; exit 1; }
 vram() { cat /sys/class/drm/card*/device/mem_info_vram_used | sort -n | tail -1; }
 
 pids=()
-cleanup() { for p in "${pids[@]}"; do kill -INT "$p" 2>/dev/null || true; done; wait 2>/dev/null || true; }
+# baro-serve does not exit on INT/TERM while its engine child lives (measured in this lane:
+# the pair survived INT and TERM to the parent and went only when the child was signalled),
+# so the child is signalled first and the wait is bounded, never a bare `wait`.
+cleanup() {
+  for p in "${pids[@]}"; do
+    pkill -TERM -P "$p" 2>/dev/null || true
+    kill -TERM "$p" 2>/dev/null || true
+  done
+  for _ in $(seq 1 20); do
+    alive=0
+    for p in "${pids[@]}"; do kill -0 "$p" 2>/dev/null && alive=1; done
+    [ "$alive" = 0 ] && return 0
+    sleep 0.5
+  done
+  for p in "${pids[@]}"; do pkill -KILL -P "$p" 2>/dev/null || true; kill -KILL "$p" 2>/dev/null || true; done
+}
 trap cleanup EXIT
 
+# Sets $url. Never call this in a command substitution: a subshell would own the server
+# and the pid would be lost to cleanup (that left a node holding the GPU queue for 9 minutes).
 start() {
   name=$1
   env MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_SIZE_PERCENT="$pct" BARO_TMAX="$tmax" BARO_SPEC=0 \
@@ -39,14 +56,14 @@ start() {
     sleep 0.5
   done
   grep -q '^listening on' "$out/$name.stdout" || fail "start-$name" "no listening line in 300 s"
-  grep -m1 -oE 'http://[0-9.:]+' "$out/$name.stdout"
+  url=$(grep -m1 -oE 'http://[0-9.:]+' "$out/$name.stdout")
 }
 
 v0=$(vram)
 echo "arm: percent=$pct tmax=$tmax engine_sha=$(sha256sum "$engine" | cut -c1-16) pack=$pack vram_before=$v0"
-ua=$(start a); va=$(vram)
+start a; ua=$url; va=$(vram)
 echo "node a up at $ua vram_used=$va delta=$(( (va - v0) / 1048576 )) MiB"
-ub=$(start b); vb=$(vram)
+start b; ub=$url; vb=$(vram)
 echo "node b up at $ub vram_used=$vb delta=$(( (vb - va) / 1048576 )) MiB"
 grep -h -m1 'TMAX' "$out/a.stderr" "$out/b.stderr" || true
 
