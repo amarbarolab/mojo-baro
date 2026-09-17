@@ -228,16 +228,26 @@ card arrives, the wiring is the same plus one measurement: two engines against o
 router overhead. Tensor or pipeline parallel across cards is not planned: no hardware to measure on,
 and consumer PCIe peer-to-peer would make every layer boundary a 28 GB/s hop.
 
-**Gates.** (1) Two engines on this box (XTX with the dense q4 pack, iGPU with Qwen2.5-0.5B under the
-override on a WMMA-free kernel set), 20 prompts split by the router, each response identical to the
-same engine alone: each engine is compared with its own solo arm, never across engines (the two
-run different models). Until P0b lands the split is a 20-line round-robin script and the receipt says
-so; the router-backed run is a second receipt, and a missing dependency is recorded BLOCKED, never
-replaced by a weaker claim (team B). Preflight reads back which device each process attached
-(`rocm-smi --showpids`): a pin that did not take gives two engines on the XTX and clean numbers.
-(2) REMOVED 2026-09-17 with P1's gates: it asked whether state through P1 reproduces the ids,
-which is the rule we dropped for LatentOS. P4's kill line is gate 1 alone. **GPU:** 1 hour, one serialized harness job through `gpu-wait` covering both devices; the iGPU is not
-exempt from the queue (team B; confirmed by the maintainer 2026-09-17).
+**Gates, AMENDED 2026-09-17 round 2, then 2026-09-18** (`bench/p4-multigpu-protocol.md`, frozen by
+commit before each amendment's own identity runs). The iGPU arm is NOT bit-reproducible: 3
+one-token deviations in about 11,000 tokens, ruled out as request-state bleed and as systematic
+gfx1030-on-gfx1036 miscompute (same kernels, 0 deviations in 51,200 tokens on the XTX); cause not
+placed (`exchange/lane-P4-report-round2.md`, [[2026-09-17-p4-igpu-transient-corruption]]). It stays
+as the PINNING AND WIRING receipt, reported, never gated. (1) Identity gate: two real engine
+processes on the XTX (dense q4 pack, `BARO_TMAX=4096`), the real 20-prompt/64-token fixture sent as
+token ids through the router, compared by `cmp` against a single-engine baseline
+(`bench/p4-router-identity.sh`). The 2026-09-17 amendment wrongly cited team A's
+`bench/p0b-gate1-placement.sh` (5 prompts x 4 repeats, ~70 tokens of text) as this receipt; that
+gate's 3 runs stand only as PLACEMENT receipts (`a=10 b=10`), demoted in the 2026-09-18 amendment.
+`exchange/lane-P4B-report.md` records the real gate's 3 runs, because this gate has passed by luck
+before (the unchanged iGPU gate went FAIL, FAIL, PASS on identical binaries): any PASS claim needs
+3 of 3, not 1, and placement must spread (both engines serve at least one of the 20) or the gate
+fails. Preflight reads
+back which device each process attached (`rocm-smi --showpids`) and `BARO_TMAX` from each engine's
+own ready line. (2) REMOVED 2026-09-17 with P1's gates: it asked whether state through P1
+reproduces the ids, which is the rule we dropped for LatentOS. P4's kill line is the identity gate
+alone, all 3 runs. **GPU:** 45 minutes for the 3-run identity gate; the iGPU wiring receipt, when
+(re-)collected, is not exempt from the queue either (team B; confirmed by the maintainer 2026-09-17).
 
 ## P5. Training beyond the draft-head smoke
 
