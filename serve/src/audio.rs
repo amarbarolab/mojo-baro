@@ -87,6 +87,11 @@ async fn ensure_running(app: &Shared) -> Result<(), String> {
             a.beam.to_string(),
             "-t".into(),
             a.threads.to_string(),
+            // Matches the reference `whisper-cli -nt` in bench/p3a-gate.sh:
+            // enabling timestamps changes whisper.cpp's segment text join,
+            // dropping punctuation at segment boundaries (P3a CPU preflight,
+            // isolated by diffing a direct call with and without this flag).
+            "-nt".into(),
             "--host".into(),
             "127.0.0.1".into(),
             "--port".into(),
