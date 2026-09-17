@@ -1,8 +1,9 @@
 //! The engine child process: one `serve/engine.mojo` running with
 //! `BARO_SERVE=1`, driven over its stdin/stdout by a single worker task.
-//! The engine handles one request at a time, so the worker's inbox is the
-//! request queue.
+//! The engine advances one request at a time; the worker admits later lines
+//! while routing each response event by request id.
 
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -283,14 +284,98 @@ async fn worker(
     current: Arc<tokio::sync::Mutex<Option<u64>>>,
 ) {
     while let Some(job) = rx.recv().await {
-        let id = job.req.id;
-        *current.lock().await = Some(id);
-        let result = run_one(&job, &mut stdin, &mut lines, &mut cancel_rx).await;
+        let mut active = HashMap::<u64, mpsc::UnboundedSender<Event>>::new();
+        let mut order = VecDeque::<u64>::new();
+        let mut rx_open = true;
+        let mut error = None;
+        let first_id = job.req.id;
+        let first_line = job.req.line();
+        let first_out = job.out;
+        active.insert(first_id, first_out.clone());
+        order.push_back(first_id);
+        *current.lock().await = Some(first_id);
+        if let Err(e) = write_line(&mut stdin, first_line).await {
+            active.remove(&first_id);
+            order.pop_front();
+            let _ = first_out.send(Event::Error(e.clone()));
+            queued.fetch_sub(1, Ordering::SeqCst);
+            error = Some(e);
+        }
+
+        while error.is_none() && !active.is_empty() {
+            tokio::select! {
+                maybe_job = rx.recv(), if rx_open => match maybe_job {
+                    Some(job) => {
+                        let id = job.req.id;
+                        let line = job.req.line();
+                        let out = job.out;
+                        active.insert(id, out.clone());
+                        order.push_back(id);
+                        if let Some(running) = *current.lock().await {
+                            eprintln!("engine: wire admitted request {id} while request {running} is in flight");
+                        }
+                        if let Err(e) = write_line(&mut stdin, line).await {
+                            active.remove(&id);
+                            order.retain(|queued_id| *queued_id != id);
+                            let _ = out.send(Event::Error(e.clone()));
+                            queued.fetch_sub(1, Ordering::SeqCst);
+                            error = Some(e);
+                        }
+                    }
+                    None => rx_open = false,
+                },
+                line = lines.next_line() => match line {
+                    Ok(Some(line)) => match parse_line(&line) {
+                        EngineMsg::Tok { id, tok, logprob, top_logprobs } => {
+                            if let Some(out) = active.get(&id) {
+                                let _ = out.send(Event::Tok { tok, logprob, top_logprobs });
+                            } else {
+                                eprintln!("engine: line for unknown request ignored: {line}");
+                            }
+                        }
+                        EngineMsg::Done { id, stats } => {
+                            if let Some(out) = active.remove(&id) {
+                                let _ = out.send(Event::Done(stats));
+                                queued.fetch_sub(1, Ordering::SeqCst);
+                                order.retain(|queued_id| *queued_id != id);
+                                *current.lock().await = order.front().copied();
+                            } else {
+                                eprintln!("engine: terminal line for unknown request ignored: {line}");
+                            }
+                        }
+                        EngineMsg::Error { id, error: message } => {
+                            if let Some(out) = active.remove(&id) {
+                                let _ = out.send(Event::Error(message));
+                                queued.fetch_sub(1, Ordering::SeqCst);
+                                order.retain(|queued_id| *queued_id != id);
+                                *current.lock().await = order.front().copied();
+                            } else {
+                                eprintln!("engine: error line for unknown request ignored: {line}");
+                            }
+                        }
+                        EngineMsg::Ready { .. } => eprintln!("engine: unexpected ready line after startup"),
+                        EngineMsg::Log(s) => eprintln!("engine: {s}"),
+                    },
+                    Ok(None) => error = Some("engine exited mid-request".into()),
+                    Err(e) => error = Some(format!("engine stdout: {e}")),
+                },
+                Some(cancel_id) = cancel_rx.recv() => {
+                    if *current.lock().await == Some(cancel_id) {
+                        if let Err(e) = write_line(&mut stdin, cancel_line(cancel_id)).await {
+                            error = Some(e);
+                        }
+                    }
+                }
+            }
+        }
+
         *current.lock().await = None;
-        queued.fetch_sub(1, Ordering::SeqCst);
-        if let Err(e) = result {
-            eprintln!("engine: request {id}: {e}");
-            let _ = job.out.send(Event::Error(e));
+        if let Some(e) = error {
+            for (_, out) in active.drain() {
+                let _ = out.send(Event::Error(e.clone()));
+                queued.fetch_sub(1, Ordering::SeqCst);
+            }
+            eprintln!("engine: worker stopped: {e}");
             alive.store(false, Ordering::SeqCst);
             break;
         }
@@ -305,57 +390,7 @@ async fn worker(
     let _ = stdin.shutdown().await;
 }
 
-/// Write one request, forward its lines until its Done/Error. A cancel for
-/// this id (from `Engine::cancel`, via `cancel_rx`) is written to the same
-/// stdin the worker already owns; a cancel for any other id is stale (the
-/// request it named has already finished) and is dropped. Only an I/O
-/// failure or engine EOF is an `Err` (the engine is gone); a protocol-level
-/// rejection, or a cancelled request's own `done` line, is delivered as an
-/// `Event`.
-async fn run_one(
-    job: &Job,
-    stdin: &mut ChildStdin,
-    lines: &mut tokio::io::Lines<BufReader<ChildStdout>>,
-    cancel_rx: &mut mpsc::UnboundedReceiver<u64>,
-) -> Result<(), String> {
-    let id = job.req.id;
-    stdin
-        .write_all(job.req.line().as_bytes())
-        .await
-        .map_err(|e| format!("write to engine stdin: {e}"))?;
-    stdin.flush().await.map_err(|e| format!("flush engine stdin: {e}"))?;
-    loop {
-        let line = tokio::select! {
-            l = lines.next_line() => match l {
-                Ok(Some(l)) => l,
-                Ok(None) => return Err("engine exited mid-request".into()),
-                Err(e) => return Err(format!("engine stdout: {e}")),
-            },
-            Some(cancel_id) = cancel_rx.recv() => {
-                if cancel_id == id {
-                    stdin
-                        .write_all(cancel_line(id).as_bytes())
-                        .await
-                        .map_err(|e| format!("write cancel to engine stdin: {e}"))?;
-                    stdin.flush().await.map_err(|e| format!("flush engine stdin: {e}"))?;
-                }
-                continue;
-            }
-        };
-        match parse_line(&line) {
-            EngineMsg::Tok { id: rid, tok, logprob, top_logprobs } if rid == id => {
-                let _ = job.out.send(Event::Tok { tok, logprob, top_logprobs });
-            }
-            EngineMsg::Done { id: rid, stats } if rid == id => {
-                let _ = job.out.send(Event::Done(stats));
-                return Ok(());
-            }
-            EngineMsg::Error { id: rid, error } if rid == id => {
-                let _ = job.out.send(Event::Error(error));
-                return Ok(());
-            }
-            EngineMsg::Log(s) => eprintln!("engine: {s}"),
-            other => eprintln!("engine: line for another request ignored: {other:?}"),
-        }
-    }
+async fn write_line(stdin: &mut ChildStdin, line: String) -> Result<(), String> {
+    stdin.write_all(line.as_bytes()).await.map_err(|e| format!("write to engine stdin: {e}"))?;
+    stdin.flush().await.map_err(|e| format!("flush engine stdin: {e}"))
 }

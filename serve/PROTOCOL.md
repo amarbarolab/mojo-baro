@@ -6,7 +6,8 @@ that speak this same line protocol under `BARO_SERVE=1`, sharing the
 byte-scanner reader and request parser in `serve/serve_proto.mojo` rather
 than each defining their own wire format. `serve/src` (`baro-serve`, Rust)
 keeps one engine process alive (either binary, selected with `--engine`) and
-turns HTTP requests into engine requests one at a time. This file is the
+turns HTTP requests into addressed engine lines. Device execution remains
+one request at a time in this step. This file is the
 contract between the two, and the seam where the process boundary is later
 replaced by a C ABI. Not every optional field is acted on by every engine:
 spark has no draft head (`spec` is parsed and ignored, `spec_k` in its
@@ -27,15 +28,33 @@ client --HTTP--> baro-serve --stdin JSON lines--> engine (BARO_SERVE=1)
   `BARO_DRAFT_Q4`, ...) still reaches the engine.
 - The engine loads the pack and allocates every buffer **once**, prints the
   ready line, then blocks on stdin.
-- Requests are strictly serial: the server's worker writes one request line,
-  reads until that request's terminal line, then writes the next. HTTP
-  requests wait in a bounded queue (64) and get `503` beyond it.
+- Device requests are strictly serial: the engine advances one request at a
+  time. The server worker may write later addressed request lines before the
+  current request's terminal line; HTTP requests wait in a bounded queue (64)
+  and get `503` beyond it.
 - Stdin EOF ends the engine: the request loop exits and the process
   returns 0. That is the clean shutdown; the server closes stdin on
   SIGINT and kills the child only if it has not exited after 30 s.
 - `BARO_SERVE=0` (default) is the unchanged one-shot path: prompt from
   `BARO_PROMPT`/`<pack>/prompt-tokens.txt`, `GEN_N` tokens, `GENERATED:`
   line, draft receipt, exit. Every existing gate runs that path.
+
+## A3(a) wire-admission delta
+
+The A3(a) wire permits the server to write a second request line before the
+first request has printed its terminal `done` or `error` line. The engine
+still advances one request at a time in this item; this is admission and
+addressing, not device batching. The engine keeps each accepted request's id,
+and every `tok`, `done`, or `error` line carries that id so the server can
+route output to the waiting HTTP response without dropping lines for another
+request.
+
+The old contract's strict-serial statement above therefore changes only at
+the stdin/stdout boundary: HTTP work may be admitted ahead of completion,
+while device execution remains serial until A3(c). A malformed line remains a
+log/error and must not be mistaken for a request. The A3(a) gate records the
+second request's admission before the first terminal line, then checks both
+id streams to completion.
 
 ## Lines the engine prints (stdout)
 

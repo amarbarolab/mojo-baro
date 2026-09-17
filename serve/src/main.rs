@@ -6,7 +6,8 @@
 //! Endpoints: GET /health, GET /v1/models, POST /v1/completions,
 //! POST /v1/chat/completions (stream:true => SSE), POST /v1/fork
 //! (branches from one shared prompt, B5), POST /tokenize, POST /detokenize.
-//! One request runs at a time; the rest queue.
+//! The device runs one request at a time; the wire worker may admit later
+//! request lines before the current request completes.
 
 mod checkpoints;
 mod engine;
