@@ -84,7 +84,7 @@ frames, a final frame with `done:true`, `eval_count`, `eval_duration`, `prompt_e
 `/api/embeddings` and `/v1/embeddings`: neither route exists today and `mint_hidden_latent`
 (`serve/latent.mojo`) mints a per-step hidden-state memfd for IPC, not a pooled vector (team A), so this
 is new work inside the item: last-token pooling of the final hidden state, L2-normalized, about 80 LOC
-(pooling rule is the coordinator's assumption until the maintainer confirms). Options map: `num_predict`, `temperature`, `top_p`, `top_k`, `seed`, `stop`,
+(pooling rule confirmed by the maintainer 2026-09-17). Options map: `num_predict`, `temperature`, `top_p`, `top_k`, `seed`, `stop`,
 `repeat_penalty`; `num_ctx` above `BARO_TMAX` is reported, not silently clamped. `--ollama-port 11434`
 opts into PAIR's expected port. `/api/pull` answers 501 with the `model-import` command.
 
@@ -195,7 +195,7 @@ replaced by a weaker claim (team B). Preflight reads back which device each proc
 (`rocm-smi --showpids`): a pin that did not take gives two engines on the XTX and clean numbers.
 (2) State moved XTX to iGPU and back through P1 reproduces the ids. **Kill line:** any
 identity miss. **GPU:** 1 hour, one serialized harness job through `gpu-wait` covering both devices; the iGPU is not
-exempt from the queue (team B; coordinator's assumption until the maintainer names an exception).
+exempt from the queue (team B; confirmed by the maintainer 2026-09-17).
 
 ## P5. Training beyond the draft-head smoke
 
