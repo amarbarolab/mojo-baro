@@ -1,0 +1,10 @@
+ggml_vulkan: Found 2 Vulkan devices:
+ggml_vulkan: 0 = Intel(R) HD Graphics 520 (SKL GT2) (Intel open-source Mesa driver) | uma: 1 | fp16: 1 | bf16: 0 | fp4: 0 | warp size: 32 | shared memory: 49152 | int dot: 0 | matrix cores: none
+ggml_vulkan: 1 = AMD Radeon R5 M330 (RADV HAINAN) (radv) | uma: 0 | fp16: 0 | bf16: 0 | fp4: 0 | warp size: 64 | shared memory: 32768 | int dot: 0 | matrix cores: none
+| model                          |       size |     params | backend    | ngl | dev          |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | --: | ------------ | --------------: | -------------------: |
+| qwen2 1B Q4_0                  | 265.25 MiB |   494.03 M | Vulkan     |  -1 | none         |            tg64 |         54.47 ± 0.03 |
+build: unknown (0)
+radeon pm during this arm:      13 power level 0    sclk: 30000 mclk: 30000;
+4
+cpu MHz		: 2700.078

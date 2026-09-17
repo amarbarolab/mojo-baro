@@ -11,17 +11,22 @@
 
 mod audio;
 mod checkpoints;
+mod embeddings;
 mod engine;
+mod ollama;
 mod protocol;
+mod state;
 mod text;
+mod web;
 
 use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use axum::extract::State;
+use axum::extract::{Request as AxumRequest, State};
 use axum::http::StatusCode;
+use axum::middleware::{self, Next};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -160,7 +165,7 @@ async fn main() {
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "mojo-baro".into());
     let identity = if opts.audio_only {
-        checkpoints::Identity { pack: "audio-only".into(), runtime: "audio-only".into(), tokenizer_sha: None }
+        checkpoints::Identity { pack: "audio-only".into(), runtime: "audio-only".into(), tokenizer_sha: None, portable: false }
     } else {
         checkpoints::Identity::compute(&opts.pack, &tok_path)
     };
@@ -170,6 +175,8 @@ async fn main() {
     let app = Arc::new(App { engine, text, model, ckpts, identity, audio });
 
     let router = Router::new()
+        .route("/", get(web::index))
+        .route("/web/{*path}", get(web::asset))
         .route("/health", get(health))
         .route("/v1/models", get(models))
         .route("/v1/completions", post(completions))
@@ -182,7 +189,22 @@ async fn main() {
         .route("/v1/cancel", post(cancel))
         .route("/tokenize", post(tokenize))
         .route("/detokenize", post(detokenize))
-        .with_state(app.clone());
+        // P0a: Ollama-compatible API (docs/PLATFORM-PLAN.md).
+        .route("/api/tags", get(ollama::tags))
+        .route("/api/ps", get(ollama::ps))
+        .route("/api/version", get(ollama::version))
+        .route("/api/show", post(ollama::show))
+        .route("/api/pull", post(ollama::pull))
+        .route("/api/chat", post(ollama::chat))
+        .route("/api/generate", post(ollama::generate))
+        .route("/api/embeddings", post(embeddings::embeddings))
+        .route("/v1/embeddings", post(embeddings::embeddings))
+        // P1: cross-node state API (docs/P1-STATE-API.md).
+        .route("/v1/state", get(state::list))
+        .route("/v1/state/export", post(state::export))
+        .route("/v1/state/import", post(state::import))
+        .with_state(app.clone())
+        .layer(middleware::from_fn(access_log));
 
     let listener = match tokio::net::TcpListener::bind((opts.host.as_str(), opts.port)).await {
         Ok(l) => l,
@@ -221,6 +243,12 @@ enum ApiError {
     Exceed { n_prompt_tokens: u64, n_ctx: u64 },
     /// Checkpoint API: the checkpoint's identity and this server's differ in `field`.
     Mismatch(String),
+    /// P1 CONTRACT 2: a LAT1 import stream's `field` disagrees with this
+    /// server's own identity (or magic/version/pos). The exact top-level
+    /// shape `{"error":"state_identity","field","ours","theirs"}` is the
+    /// contract's, not this repo's usual `{"error":{"message",...}}`
+    /// envelope -- P0b's rank term and P4/P6 are written against it.
+    StateIdentity { field: String, ours: String, theirs: String },
 }
 
 impl ApiError {
@@ -241,6 +269,10 @@ impl IntoResponse for ApiError {
             ApiError::Mismatch(field) => {
                 let body = json!({"error": {"code": 409, "message": "IDENTITY_MISMATCH",
                     "type": "identity_mismatch", "field": field}});
+                (StatusCode::CONFLICT, Json(body)).into_response()
+            }
+            ApiError::StateIdentity { field, ours, theirs } => {
+                let body = json!({"error": "state_identity", "field": field, "ours": ours, "theirs": theirs});
                 (StatusCode::CONFLICT, Json(body)).into_response()
             }
             ApiError::Exceed { n_prompt_tokens, n_ctx } => {
@@ -269,6 +301,18 @@ fn need_text(app: &App) -> Result<&Text, ApiError> {
 
 fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// One stderr line per request: method, path, status, elapsed ms. Never the
+/// body or headers (coordinator, gate-3 gap b: proves a request reached
+/// `baro-serve` at all, e.g. one routed by PAIR's proxy).
+async fn access_log(req: AxumRequest, next: Next) -> Response {
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let start = Instant::now();
+    let resp = next.run(req).await;
+    eprintln!("access: {method} {path} {} {}ms", resp.status().as_u16(), start.elapsed().as_millis());
+    resp
 }
 
 // ---- health / models --------------------------------------------------------
@@ -341,6 +385,9 @@ struct Gen {
     schema: Option<Value>,
     /// Item 2: `chat_template_kwargs.enable_thinking`, default true.
     reasoning: Option<bool>,
+    /// P0a-e: ask the engine for the last-prompt-token embedding. `None` on
+    /// every endpoint but `/api/embeddings` and `/v1/embeddings`.
+    embed: Option<bool>,
 }
 
 /// OpenAI's `stop`: a single string or an array of strings.
@@ -388,7 +435,10 @@ fn check_and_submit(app: &App, g: &Gen) -> Result<(u64, mpsc::UnboundedReceiver<
         return Err(ApiError::exceed_context(g.prompt.len() as u64, tmax as u64));
     }
     app.engine
-        .submit(g.prompt.clone(), g.n, g.spec, g.stop.clone(), g.ckpt.clone(), g.sample.clone(), g.schema.clone(), g.reasoning, g.state.clone())
+        .submit(
+            g.prompt.clone(), g.n, g.spec, g.stop.clone(), g.ckpt.clone(), g.sample.clone(), g.schema.clone(), g.reasoning,
+            g.state.clone(), g.embed,
+        )
         .map_err(|e| ApiError::Plain(StatusCode::SERVICE_UNAVAILABLE, e))
 }
 
@@ -493,6 +543,9 @@ async fn collect(app: &App, mut rx: mpsc::UnboundedReceiver<Event>) -> Result<(A
                     text_out.push_str(&d);
                 }
             }
+            // P0a-e: no OpenAI/Ollama endpoint sets `embed`, so this never
+            // fires on those paths; embeddings.rs collects it separately.
+            Event::Embed(_) => {}
             Event::Done(s) => {
                 stats = stats_json(&s);
                 break;
@@ -526,6 +579,7 @@ fn sse_stream(
                     let delta = acc.take(app.text.as_ref(), tok, logprob, top_logprobs)?;
                     chunk(&app, ChunkKind::Delta { text: delta, token: tok, logprob: lp })
                 }
+                Event::Embed(_) => return None,
                 Event::Done(s) => {
                     ended = true;
                     let reason = acc.finish_reason(s.finish.as_deref());
@@ -678,6 +732,7 @@ async fn completions(State(app): State<Shared>, Json(r): Json<CompletionReq>) ->
         sample: r.sampler.to_sample_params(r.logprobs),
         schema: None,
         reasoning: None,
+        embed: None,
     };
     let model = r.model.unwrap_or_else(|| app.model.clone());
     let (req_id, rx) = check_and_submit(&app, &g)?;
@@ -764,6 +819,7 @@ async fn fork(State(app): State<Shared>, Json(r): Json<ForkReq>) -> Result<Respo
             sample: b.sampler.to_sample_params(None),
             schema: None,
             reasoning: None,
+            embed: None,
         };
         let n_prompt = g.prompt.len();
         let (req_id, rx) = check_and_submit(&app, &g)?;
@@ -1054,6 +1110,7 @@ async fn chat_completions(State(app): State<Shared>, Json(r): Json<ChatReq>) -> 
         sample: r.sampler.to_sample_params(if r.logprobs == Some(true) { Some(r.top_logprobs.unwrap_or(1)) } else { r.top_logprobs }),
         schema,
         reasoning,
+        embed: None,
     };
     let model = r.model.unwrap_or_else(|| app.model.clone());
     let (req_id, rx) = check_and_submit(&app, &g)?;

@@ -136,12 +136,21 @@ step "bench sources compile (no GPU needed to build)"
 # because nothing built bench/. grammar/ is vendored at the repo root (-I .), so every bench builds;
 # only a '# ci-checks: needs' marker (extra link flags) skips, and it is listed.
 benchbad=0; benchn=0; benchskip=""
+# The shim links ROCm HIP. Where HIP is absent, benches still compile to objects, which is
+# what this check guards (signature drift); only the final link is skipped, and that is printed.
+link=(-Xlinker -L.work/shim-build -Xlinker -lamarbaro_shim -Xlinker -rpath -Xlinker "$PWD/.work/shim-build")
+emit=()
+if ! { cmake -S shim -B .work/shim-build -DCMAKE_BUILD_TYPE=Release && cmake --build .work/shim-build -j; } > .work/ci-shim-build.log 2>&1; then
+  if grep -q '"hip"' .work/ci-shim-build.log; then echo "  note: no ROCm HIP on this host, benches compile to objects without linking"; link=(); emit=(--emit object)
+  else bad "shim build: .work/ci-shim-build.log"; fi
+fi
+# The engine targets gfx1100; naming it lets hosts without that GPU build benches too.
+accel=(--target-accelerator gfx1100)
 for f in bench/*.mojo; do
   grep -q '^def main' "$f" || continue
   if grep -q '^# ci-checks: needs' "$f"; then benchskip="$benchskip $(basename "$f")"; continue; fi
   benchn=$((benchn + 1))
-  "$MOJO" build "$f" -o .work/ci-bench-bin -I . -I kernels -I serve -I bench \
-    -Xlinker -L.work/shim-build -Xlinker -lamarbaro_shim -Xlinker -rpath -Xlinker "$PWD/.work/shim-build" \
+  "$MOJO" build "${accel[@]}" "${emit[@]}" "$f" -o .work/ci-bench-bin -I . -I kernels -I serve -I bench "${link[@]}" \
     > .work/ci-bench-build.log 2>&1 || { bad "$f: $(grep -m1 'error:' .work/ci-bench-build.log | cut -c1-140)"; benchbad=1; }
 done
 rm -f .work/ci-bench-bin

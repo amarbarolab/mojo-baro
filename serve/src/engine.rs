@@ -21,6 +21,8 @@ use crate::protocol::{cancel_line, parse_line, DoneStats, EngineMsg, Request, Sa
 #[derive(Debug, Clone)]
 pub enum Event {
     Tok { tok: u32, logprob: Option<f64>, top_logprobs: Vec<(u32, f64)> },
+    /// P0a-e: the requested embedding vector, sent once, before `Done`.
+    Embed(Vec<f32>),
     Done(DoneStats),
     Error(String),
 }
@@ -161,14 +163,14 @@ impl Engine {
     pub fn submit(
         &self, id: u64, prompt: Vec<u32>, n: u32, spec: bool, stop: Vec<Vec<u32>>, ckpt: Vec<u32>, sample: SampleParams,
         schema: Option<serde_json::Value>, reasoning: Option<bool>,
-        state: (Option<String>, Option<String>),
+        state: (Option<String>, Option<String>), embed: Option<bool>,
     ) -> Result<mpsc::UnboundedReceiver<Event>, String> {
         if !self.alive() {
             return Err("engine process has exited".into());
         }
         let (out, rx) = mpsc::unbounded_channel();
         let job = Job {
-            req: Request { id, prompt, n, spec, stop, ckpt, state_save: state.0, state_load: state.1, sample, schema, reasoning },
+            req: Request { id, prompt, n, spec, stop, ckpt, state_save: state.0, state_load: state.1, sample, schema, reasoning, embed },
             out,
         };
         self.queued.fetch_add(1, Ordering::SeqCst);
@@ -272,7 +274,7 @@ impl EnginePool {
     pub fn submit(
         &self, prompt: Vec<u32>, n: u32, spec: bool, stop: Vec<Vec<u32>>, ckpt: Vec<u32>, sample: SampleParams,
         schema: Option<serde_json::Value>, reasoning: Option<bool>,
-        state: (Option<String>, Option<String>),
+        state: (Option<String>, Option<String>), embed: Option<bool>,
     ) -> Result<(u64, mpsc::UnboundedReceiver<Event>), String> {
         if self.engines.is_empty() {
             return Err("no engine loaded (--audio-only)".into());
@@ -287,7 +289,7 @@ impl EnginePool {
             }
         }
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        let rx = self.engines[best].submit(id, prompt, n, spec, stop, ckpt, sample, schema, reasoning, state)?;
+        let rx = self.engines[best].submit(id, prompt, n, spec, stop, ckpt, sample, schema, reasoning, state, embed)?;
         Ok((id, rx))
     }
 
@@ -364,6 +366,13 @@ async fn worker(
                         EngineMsg::Tok { id, tok, logprob, top_logprobs } => {
                             if let Some(out) = active.get(&id) {
                                 let _ = out.send(Event::Tok { tok, logprob, top_logprobs });
+                            } else {
+                                eprintln!("engine: line for unknown request ignored: {line}");
+                            }
+                        }
+                        EngineMsg::Embed { id, vector } => {
+                            if let Some(out) = active.get(&id) {
+                                let _ = out.send(Event::Embed(vector));
                             } else {
                                 eprintln!("engine: line for unknown request ignored: {line}");
                             }

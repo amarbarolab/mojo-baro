@@ -7,16 +7,23 @@
 //! the prefix lookup, so only the suffix is prefilled. The payload never
 //! crosses HTTP: the object is metadata, the file is the payload.
 //!
-//! Identity: `pack` is the hex sha256 of the pack path, the value
-//! `load_state` refuses on ("saved from a different pack"); `runtime` is the
-//! engine repo's git HEAD; `tokenizer_sha` is sha256 of the tokenizer file.
-//! `weights_uuid` is null until the front reads the GGUF header (named gap).
+//! Identity: `pack` is `<pack>/identity.json`'s `pack_sha256` (P1-STATE-API.md
+//! CONTRACT 2, coordinator amendment 0c68cb4) when that file is present and
+//! its recorded `pack_bytes`/`pack_mtime_ns` still match `pack.bin` on disk;
+//! otherwise the hex sha256 of the pack PATH STRING, as before (`load_state`
+//! refuses a mismatch here with "saved from a different pack"). `runtime` is
+//! the engine repo's git HEAD; `tokenizer_sha` is sha256 of the tokenizer
+//! file, the same algorithm `tools/engine-pack.py --identity` uses for
+//! `identity.json`'s `tokenizer_sha256`, computed independently here (one
+//! algorithm, not one shared computation) rather than trusted from the file.
+//! `weights_uuid` stays null: CONTRACT 2 does not fill it from this struct.
 
 use super::*;
 use axum::extract::Path as UrlPath;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
+use std::time::UNIX_EPOCH;
 
 // ---- sha256, dependency-free -----------------------------------------------
 
@@ -29,51 +36,96 @@ const K: [u32; 64] = [
     0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
 ];
 
+const H0: [u32; 8] = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
+
+fn compress(h: &mut [u32; 8], block: &[u8; 64]) {
+    let mut w = [0u32; 64];
+    for i in 0..16 {
+        w[i] = u32::from_be_bytes([block[4 * i], block[4 * i + 1], block[4 * i + 2], block[4 * i + 3]]);
+    }
+    for i in 16..64 {
+        let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+        let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+        w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
+    }
+    let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = *h;
+    for i in 0..64 {
+        let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+        let ch = (e & f) ^ (!e & g);
+        let t1 = hh.wrapping_add(s1).wrapping_add(ch).wrapping_add(K[i]).wrapping_add(w[i]);
+        let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+        let maj = (a & b) ^ (a & c) ^ (b & c);
+        let t2 = s0.wrapping_add(maj);
+        hh = g;
+        g = f;
+        f = e;
+        e = d.wrapping_add(t1);
+        d = c;
+        c = b;
+        b = a;
+        a = t1.wrapping_add(t2);
+    }
+    for (x, y) in h.iter_mut().zip([a, b, c, d, e, f, g, hh]) {
+        *x = x.wrapping_add(y);
+    }
+}
+
+/// Incremental SHA-256: `update` any number of times, `finalize` once. P1
+/// (CONTRACT 1) hashes multi-GB state streams in 8 MiB chunks as they cross
+/// the wire; a one-shot `sha256(&[u8])` would need the whole stream in one
+/// `Vec` first, exactly what that contract forbids.
+pub struct Sha256 {
+    h: [u32; 8],
+    buf: Vec<u8>,
+    len: u64,
+}
+
+impl Sha256 {
+    pub fn new() -> Sha256 {
+        Sha256 { h: H0, buf: Vec::with_capacity(64), len: 0 }
+    }
+
+    pub fn update(&mut self, data: &[u8]) {
+        self.len = self.len.wrapping_add(data.len() as u64);
+        self.buf.extend_from_slice(data);
+        let mut i = 0;
+        while self.buf.len() - i >= 64 {
+            let block: [u8; 64] = self.buf[i..i + 64].try_into().unwrap();
+            compress(&mut self.h, &block);
+            i += 64;
+        }
+        self.buf.drain(..i);
+    }
+
+    pub fn finalize(mut self) -> [u8; 32] {
+        let bit_len = self.len.wrapping_mul(8);
+        self.buf.push(0x80);
+        while self.buf.len() % 64 != 56 {
+            self.buf.push(0);
+        }
+        self.buf.extend_from_slice(&bit_len.to_be_bytes());
+        for chunk in self.buf.chunks(64) {
+            let block: [u8; 64] = chunk.try_into().unwrap();
+            compress(&mut self.h, &block);
+        }
+        let mut out = [0u8; 32];
+        for (i, v) in self.h.iter().enumerate() {
+            out[4 * i..4 * i + 4].copy_from_slice(&v.to_be_bytes());
+        }
+        out
+    }
+}
+
+impl Default for Sha256 {
+    fn default() -> Sha256 {
+        Sha256::new()
+    }
+}
+
 pub fn sha256(data: &[u8]) -> [u8; 32] {
-    let mut h: [u32; 8] = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
-    let mut msg = data.to_vec();
-    let bit_len = (data.len() as u64).wrapping_mul(8);
-    msg.push(0x80);
-    while msg.len() % 64 != 56 {
-        msg.push(0);
-    }
-    msg.extend_from_slice(&bit_len.to_be_bytes());
-    for chunk in msg.chunks(64) {
-        let mut w = [0u32; 64];
-        for i in 0..16 {
-            w[i] = u32::from_be_bytes([chunk[4 * i], chunk[4 * i + 1], chunk[4 * i + 2], chunk[4 * i + 3]]);
-        }
-        for i in 16..64 {
-            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
-            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-            w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
-        }
-        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = h;
-        for i in 0..64 {
-            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-            let ch = (e & f) ^ (!e & g);
-            let t1 = hh.wrapping_add(s1).wrapping_add(ch).wrapping_add(K[i]).wrapping_add(w[i]);
-            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-            let maj = (a & b) ^ (a & c) ^ (b & c);
-            let t2 = s0.wrapping_add(maj);
-            hh = g;
-            g = f;
-            f = e;
-            e = d.wrapping_add(t1);
-            d = c;
-            c = b;
-            b = a;
-            a = t1.wrapping_add(t2);
-        }
-        for (x, y) in h.iter_mut().zip([a, b, c, d, e, f, g, hh]) {
-            *x = x.wrapping_add(y);
-        }
-    }
-    let mut out = [0u8; 32];
-    for (i, v) in h.iter().enumerate() {
-        out[4 * i..4 * i + 4].copy_from_slice(&v.to_be_bytes());
-    }
-    out
+    let mut h = Sha256::new();
+    h.update(data);
+    h.finalize()
 }
 
 fn hex(b: &[u8]) -> String {
@@ -87,13 +139,50 @@ pub struct Identity {
     pub pack: String,
     pub runtime: String,
     pub tokenizer_sha: Option<String>,
+    /// True when `pack` came from a validated `identity.json` (CONTRACT 2's
+    /// `pack_sha256`), false when it fell back to a hash of the pack PATH
+    /// string. `GET /v1/state` reports the false case as `"portable":false`.
+    pub portable: bool,
+}
+
+/// `<pack>/identity.json`'s shape (`tools/engine-pack.py`); only the fields
+/// this reader needs. `tokenizer_sha256` and `source`/`general_uuid` are not
+/// read here: this struct exists to validate and extract `pack_sha256`.
+#[derive(Deserialize)]
+struct PackIdentityFile {
+    pack_sha256: String,
+    pack_bytes: u64,
+    pack_mtime_ns: u64,
+}
+
+/// `pack_sha256` from `<pack>/identity.json`, only when the file parses and
+/// its `pack_bytes`/`pack_mtime_ns` still match `<pack>/pack.bin` right now
+/// (a stat, not a re-hash of a file that can be many GB). Any miss returns
+/// `None`, never an error: the caller's own path-hash fallback is not a
+/// defect, it is CONTRACT 2's documented "identity.json absent" path.
+fn read_pack_sha256(pack: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(pack.join("identity.json")).ok()?;
+    let parsed: PackIdentityFile = serde_json::from_str(&text).ok()?;
+    // A sha256 hex digest is always exactly 64 ASCII hex chars; reject
+    // anything else here rather than let a hand-edited or truncated file
+    // panic later at `Identity::weights_uuid_hex`'s `&self.pack[..32]`.
+    if parsed.pack_sha256.len() != 64 || !parsed.pack_sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let meta = std::fs::metadata(pack.join("pack.bin")).ok()?;
+    let mtime_ns = meta.modified().ok()?.duration_since(UNIX_EPOCH).ok()?.as_nanos() as u64;
+    if meta.len() != parsed.pack_bytes || mtime_ns != parsed.pack_mtime_ns {
+        return None;
+    }
+    Some(parsed.pack_sha256)
 }
 
 impl Identity {
     pub fn compute(pack: &Path, tokenizer: &Path) -> Identity {
         // The engine salts its checkpoint hashes with sha256 of the pack
         // path STRING it was given (serve/prefix.mojo `Chain.__init__`), so
-        // the same spelling is hashed here.
+        // the same spelling is hashed here -- unchanged fallback for a pack
+        // with no valid identity.json (CONTRACT 2).
         let pack_s = pack.to_string_lossy().into_owned();
         let runtime = std::env::var("BARO_RUNTIME").ok().unwrap_or_else(|| {
             std::process::Command::new("git")
@@ -105,7 +194,18 @@ impl Identity {
                 .unwrap_or_else(|| "unknown".into())
         });
         let tokenizer_sha = std::fs::read(tokenizer).ok().map(|b| hex(&sha256(&b)));
-        Identity { pack: hex(&sha256(pack_s.as_bytes())), runtime, tokenizer_sha }
+        let recorded_pack_sha256 = read_pack_sha256(pack);
+        let portable = recorded_pack_sha256.is_some();
+        let pack_field = recorded_pack_sha256.unwrap_or_else(|| hex(&sha256(pack_s.as_bytes())));
+        Identity { pack: pack_field, runtime, tokenizer_sha, portable }
+    }
+
+    /// CONTRACT 2 LAT1 mapping: `weights_uuid` (16 B) is `pack_sha256`'s
+    /// first 16 bytes, as hex -- only meaningful when `portable` (a
+    /// path-hash fallback is not a content identity, so it must not be
+    /// dressed up as one).
+    pub fn weights_uuid_hex(&self) -> Option<&str> {
+        self.portable.then(|| &self.pack[..32])
     }
 
     fn json(&self) -> Value {
@@ -289,6 +389,7 @@ pub async fn create(State(app): State<Shared>, Json(r): Json<CreateReq>) -> Resu
         sample: r.sampler.to_sample_params(None),
         schema: None,
         reasoning: None,
+        embed: None,
     };
     let n_prompt = g.prompt.len();
     let (req_id, rx) = check_and_submit(&app, &g)?;
@@ -383,6 +484,7 @@ pub async fn fork(State(app): State<Shared>, UrlPath(id): UrlPath<String>, Json(
             sample: b.sampler.to_sample_params(None),
             schema: None,
             reasoning: None,
+            embed: None,
         };
         let n_prompt = g.prompt.len();
         let (req_id, rx) = check_and_submit(&app, &g)?;
@@ -409,6 +511,101 @@ mod tests {
     }
 
     #[test]
+    fn sha256_streamed_in_arbitrary_chunks_matches_the_one_shot_hash() {
+        // Sized past several 64-byte compression blocks and one padding
+        // boundary, so both the block loop and the finalize-only tail path
+        // in `Sha256::update`/`finalize` run: the P1 import loop feeds
+        // 8 MiB chunks that never land on a 64-byte boundary either.
+        let data: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
+        let whole = sha256(&data);
+        for chunk_size in [1usize, 3, 64, 65, 8191, 8192] {
+            let mut h = Sha256::new();
+            for chunk in data.chunks(chunk_size) {
+                h.update(chunk);
+            }
+            assert_eq!(h.finalize(), whole, "chunk_size={chunk_size}");
+        }
+    }
+
+    fn write_pack_fixture(dir: &Path, pack_bytes: &[u8]) -> u64 {
+        std::fs::write(dir.join("pack.bin"), pack_bytes).unwrap();
+        let meta = std::fs::metadata(dir.join("pack.bin")).unwrap();
+        meta.modified().unwrap().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64
+    }
+
+    // sha256(b"hello world"), verified with Python's hashlib, not guessed
+    // (the same lesson as state.rs's fabricated-then-corrected test vector):
+    //   python3 -c "import hashlib; print(hashlib.sha256(b'hello world').hexdigest())"
+    const HELLO_WORLD_SHA256: &str = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
+
+    #[test]
+    fn read_pack_sha256_returns_the_recorded_hash_when_stat_matches() {
+        let dir = std::env::temp_dir().join(format!("baro-identity-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mtime_ns = write_pack_fixture(&dir, b"hello world");
+        std::fs::write(
+            dir.join("identity.json"),
+            format!(r#"{{"pack_sha256":"{HELLO_WORLD_SHA256}","pack_bytes":11,"pack_mtime_ns":{mtime_ns}}}"#),
+        )
+        .unwrap();
+        assert_eq!(read_pack_sha256(&dir), Some(HELLO_WORLD_SHA256.to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_pack_sha256_is_none_on_a_size_mismatch() {
+        let dir = std::env::temp_dir().join(format!("baro-identity-test-size-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mtime_ns = write_pack_fixture(&dir, b"hello world");
+        std::fs::write(
+            dir.join("identity.json"),
+            format!(r#"{{"pack_sha256":"{HELLO_WORLD_SHA256}","pack_bytes":999,"pack_mtime_ns":{mtime_ns}}}"#),
+        )
+        .unwrap();
+        assert_eq!(read_pack_sha256(&dir), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_pack_sha256_is_none_when_identity_json_is_absent() {
+        let dir = std::env::temp_dir().join(format!("baro-identity-test-absent-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        write_pack_fixture(&dir, b"hello world");
+        assert_eq!(read_pack_sha256(&dir), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_pack_sha256_rejects_a_malformed_hash_instead_of_panicking_later() {
+        let dir = std::env::temp_dir().join(format!("baro-identity-test-malformed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mtime_ns = write_pack_fixture(&dir, b"hello world");
+        // Too short: weights_uuid_hex's &pack[..32] would panic on this if
+        // it were ever accepted.
+        std::fs::write(
+            dir.join("identity.json"),
+            format!(r#"{{"pack_sha256":"short","pack_bytes":11,"pack_mtime_ns":{mtime_ns}}}"#),
+        )
+        .unwrap();
+        assert_eq!(read_pack_sha256(&dir), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn weights_uuid_hex_is_none_when_not_portable() {
+        let me = Identity { pack: "p".into(), runtime: "r".into(), tokenizer_sha: None, portable: false };
+        assert_eq!(me.weights_uuid_hex(), None);
+    }
+
+    #[test]
+    fn weights_uuid_hex_is_the_first_32_hex_chars_when_portable() {
+        let first_half = "a".repeat(32);
+        let pack = first_half.clone() + &"b".repeat(32);
+        let me = Identity { pack, runtime: "r".into(), tokenizer_sha: None, portable: true };
+        assert_eq!(me.weights_uuid_hex(), Some(first_half.as_str()));
+    }
+
+    #[test]
     fn id_is_stable_and_position_bound() {
         let a = Registry::id_for(&[1, 2, 3]);
         assert_eq!(a, Registry::id_for(&[1, 2, 3]));
@@ -431,7 +628,7 @@ mod tests {
 
     #[test]
     fn identity_mismatch_names_the_first_field() {
-        let me = Identity { pack: "p".into(), runtime: "r".into(), tokenizer_sha: Some("t".into()) };
+        let me = Identity { pack: "p".into(), runtime: "r".into(), tokenizer_sha: Some("t".into()), portable: false };
         assert_eq!(me.first_mismatch(&json!({"pack": "p", "runtime": "x"})), Some("runtime".into()));
         assert_eq!(me.first_mismatch(&json!({"tokenizer_sha": null})), None);
         assert_eq!(me.first_mismatch(&json!({})), None);
