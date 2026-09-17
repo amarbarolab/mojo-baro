@@ -13,6 +13,7 @@ port=${3:-0}
 engine=${BARO_ENGINE:-.work/engine}
 pack=${BARO_PACK:-.work/engine-pack-q4}
 serve=${BARO_SERVE_BIN:-serve/target/release/baro-serve}
+pair_manager=${PAIR_MANAGER_BIN:-$HOME/Projects/imports/Personal-AI-Router/services/build/bin/nvpair-engine-manager}
 mkdir -p "$out"
 exec > >(tee "$out/contract.log") 2>&1
 
@@ -25,6 +26,7 @@ count=$count
 seed=0
 temperature=0
 embeddings=deferred-P0a-e
+pair_manager=$pair_manager
 EOF
 
 # gate-dryrun must stop before a GPU process is launched while proving that
@@ -232,4 +234,92 @@ print(f"gate 2 ollama client: {len(rows)}/{len(rows)} chat/generate stream and n
 PY
 
 echo "PASS p0a contract gates 1 and 2"
+if [ "$actual_port" != 11434 ]; then
+  fail gate3 "PAIR adoption requires baro-serve on port 11434, got $actual_port"
+fi
+PAIR_MANAGER_BIN="$pair_manager" python3 - "$model" "$out" <<'PY'
+import json
+import os
+import pathlib
+import select
+import subprocess
+import sys
+import time
+
+model, out_name = sys.argv[1], sys.argv[2]
+out = pathlib.Path(out_name)
+manager = os.environ["PAIR_MANAGER_BIN"]
+assert os.access(manager, os.X_OK), manager
+stderr_path = out / "pair-manager.stderr"
+stdout_path = out / "pair-manager.stdout"
+stderr_file = stderr_path.open("w")
+stdout_file = stdout_path.open("w")
+manager_home = out / "pair-manager-home"
+manager_config = out / "pair-manager-config"
+manager_home.mkdir(parents=True, exist_ok=True)
+manager_config.mkdir(parents=True, exist_ok=True)
+proc = subprocess.Popen(
+    [manager, "--loaded-poll-interval", "0"],
+    stdin=subprocess.PIPE,
+    stdout=subprocess.PIPE,
+    stderr=stderr_file,
+    text=True,
+    env={**os.environ, "HOME": str(manager_home),
+         "XDG_CONFIG_HOME": str(manager_config)},
+)
+
+def rpc(request_id, method, params=None):
+    request = {"jsonrpc": "2.0", "id": request_id, "method": method}
+    if params is not None:
+        request["params"] = params
+    proc.stdin.write(json.dumps(request) + "\n")
+    proc.stdin.flush()
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        ready, _, _ = select.select([proc.stdout], [], [], 1)
+        if not ready:
+            continue
+        line = proc.stdout.readline()
+        if not line:
+            raise AssertionError(f"PAIR manager exited before response {request_id}")
+        stdout_file.write(line)
+        stdout_file.flush()
+        frame = json.loads(line)
+        if frame.get("id") == request_id:
+            assert "error" not in frame, frame
+            return frame.get("result")
+    raise AssertionError(f"PAIR manager response timeout id={request_id}")
+
+result = {}
+try:
+    installed = rpc(1, "engine:get-installed")
+    engines = installed.get("engines", [])
+    ollama = next((item for item in engines if item.get("engine") == "ollama"), None)
+    assert ollama and ollama.get("running") is True and ollama.get("healthy") is True, installed
+    assert ollama.get("port") == 11434, ollama
+    routed = rpc(2, "engine:action", {
+        "engine": "ollama", "action": "run_model",
+        "params": {"model": model, "prompt": "Reply with exactly the word adopted.", "stream": False},
+    })
+    assert routed.get("done") is True and isinstance(routed.get("response"), str), routed
+    result = {"engine_status": ollama, "routed_response": routed}
+finally:
+    try:
+        if proc.poll() is None:
+            proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 3, "method": "shutdown"}) + "\n")
+            proc.stdin.flush()
+            proc.wait(timeout=10)
+    except (BrokenPipeError, OSError, subprocess.TimeoutExpired):
+        if proc.poll() is None:
+            proc.terminate()
+            proc.wait(timeout=5)
+    stderr_file.close()
+    stdout_file.close()
+
+stderr = stderr_path.read_text()
+assert "adopting already-running external engine" in stderr, stderr
+result["adoption_log"] = "adopting already-running external engine"
+(out / "pair-manager.json").write_text(json.dumps(result, indent=2) + "\n")
+print("gate 3 PAIR engine manager: adopted Ollama on 11434 and routed request")
+PY
 echo "DEFERRED p0a embeddings gate 4: coordinator-owned P0a-e wire"
