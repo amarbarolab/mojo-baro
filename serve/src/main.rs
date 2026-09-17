@@ -175,13 +175,23 @@ async fn main() {
     // The one line on stdout: scripts read the bound port from it.
     println!("listening on http://{addr}");
     let serve = axum::serve(listener, router).with_graceful_shutdown(async {
-        let _ = tokio::signal::ctrl_c().await;
+        // A gate script's cleanup trap sends SIGTERM, not Ctrl+C's SIGINT;
+        // without a handler for it the kernel's default disposition kills
+        // this process immediately, skipping graceful shutdown entirely and
+        // orphaning the audio sidecar child (found live, P3a timed gate).
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
         eprintln!("shutting down");
     });
     if let Err(e) = serve.await {
         eprintln!("baro-serve: {e}");
     }
     app.engine.shutdown().await;
+    app.audio.shutdown().await;
 }
 
 // ---- errors -----------------------------------------------------------------

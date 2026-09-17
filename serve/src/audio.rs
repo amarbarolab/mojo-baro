@@ -62,6 +62,21 @@ impl AudioSidecar {
             last_used: AtomicU64::new(0),
         }
     }
+
+    /// Kill the sidecar if one is running. Explicit, not left to
+    /// `kill_on_drop`: a background reaper task (`reap_when_idle`) holds its
+    /// own `Shared` clone for as long as the sidecar has been used even
+    /// once, so `App`'s refcount never reaches zero on its own at shutdown,
+    /// and `kill_on_drop` never fires. Found live: a plain `kill <pid>`
+    /// (SIGTERM) on `baro-serve` terminated it via the kernel's default
+    /// disposition -- no handler installed, no unwind, no `Drop` -- and left
+    /// whisper-server orphaned under systemd, holding ~24.5 GB of VRAM after
+    /// the P3a timed gate's own cleanup trap believed it had killed it.
+    pub async fn shutdown(&self) {
+        let child = self.child.lock().await.take();
+        let Some(mut child) = child else { return };
+        let _ = child.kill().await;
+    }
 }
 
 /// Start the sidecar if it is not already up (or has exited), wait for its
