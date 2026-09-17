@@ -4,7 +4,7 @@
 # there. Needs a prior run.sh (uses its .work/spirv-probe/out). Last line: PASS reverse-arm or FAIL.
 set -euo pipefail
 R="$(cd "$(dirname "$0")/../.." && pwd)"
-W="$R/.work/spirv-probe"
+W="$R/.work/spirv-probe/elementwise"
 LAB="${LAB:-root@lab-host.example}"
 KS="amar_rmsnorm amar_rmsnorm_cast amar_rmsnorm_cast2 amar_softmax_rows amar_argmax_pos amar_argmax_row amar_quantize_q8_rows"
 rm -rf "$W/rev"; mkdir -p "$W/rev"
