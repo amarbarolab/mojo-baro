@@ -39,7 +39,7 @@ coordinator's answers. Where this file and your conference document differ, this
 - The standing GPU rule, restated here because codex cannot read the global config: every GPU
   workload (engine, llama.cpp, whisper-server on GPU, torch, benchmarks) runs as
   `gpu-wait run [--priority N] --vram GB --timeout S -- <cmd>`, never bare. The full suite is
-  wrapped whole: `gpu-wait run --vram 24 --timeout 3600 -- ./run-tests.sh`. CPU preflight first:
+  wrapped whole: `gpu-wait run --vram 24 --timeout 3600 -- ./run-tests.sh`. The client is `$HOME/.local/bin/gpu-wait`; a job's PATH is minimal (gpu-wait drops the shell env), so scripts and code name it absolutely. Inside a job (`GPU_WAITING_ROOM_JOB` set) GPU work runs bare: never nest `gpu-wait run`. CPU preflight first:
   build every binary and run the gate once on its smallest input before any queue slot.
 - No em dashes anywhere. No attribution lines in commits. `/tmp` is banned for artifacts: use
   `.work/team-<T>/<agent>/<item>/` in your worktree.
@@ -61,6 +61,11 @@ coordinator's answers. Where this file and your conference document differ, this
 - Turn your cards as you go; `done` needs the check and the log path.
 - Never idle on a question you have not posted in the room. Blocked on the coordinator:
   `~/iTools/bin/herd tell w82:pC "QUESTION: ..."` and continue with what does not depend on it.
+
+- An item is gated on a clean checkout of its own commit once the next item has started in the
+  same tree (`git worktree add ../team-<T>-<item> <commit>`, `lane-prep`, build, gate there, copy
+  the receipts back, remove the worktree). Never rebuild a gate's binary with the next item's
+  uncommitted edits in the tree, and never narrow a stale-binary guard to make it pass.
 
 ## Done means
 
