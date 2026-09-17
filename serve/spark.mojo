@@ -360,6 +360,8 @@ def main() raises:
             # penalized/logprob'd and isn't, until this is wired here too.
             if perr == "" and (sample.presence_penalty != 0 or sample.frequency_penalty != 0):
                 perr = "presence_penalty/frequency_penalty are not yet wired for this engine (spark); only the dense/MoE engine (serve/engine.mojo) supports them"
+            if perr == "" and sample.embed == 1:
+                perr = "embed is not wired for this engine (spark); only the dense engine (serve/engine.mojo) emits it"
             if perr != "":
                 print(err_line(req_id, perr))
                 continue
