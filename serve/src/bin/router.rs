@@ -35,7 +35,7 @@ struct RouterState {
     node_id: String,
     http_port: u16,
     discovery: DiscoveryAdvertisement,
-    _mdns: Option<MdnsRuntime>,
+    mdns: Option<MdnsRuntime>,
     engines: EngineRegistry,
     workloads: WorkloadCatalog,
     next_request: AtomicU64,
@@ -74,8 +74,43 @@ impl DiscoveryAdvertisement {
 }
 
 struct MdnsRuntime {
-    // Holding the daemon handle keeps its worker and both registrations alive.
-    _daemon: ServiceDaemon,
+    daemon: ServiceDaemon,
+    // Every record `register`ed below, by full name: gate 3's own failure
+    // (room A, 2026-09-17 -- PAIR's discovery:get-nodes returned a stale
+    // UUID from an earlier test run instead of the current one) traced to
+    // this: mdns-sd's PTR/TXT records carry a 75-minute TTL
+    // (`DNS_OTHER_TTL` in `service_info.rs`) and neither `ServiceDaemon` nor
+    // this struct sent a goodbye (TTL=0) on exit, only `Drop`ping the
+    // channel handles -- which `mdns-sd` does not treat as an unregister at
+    // all. Every peer that ever saw the record, PAIR's scanner included,
+    // keeps believing it for up to 75 minutes after the process is gone.
+    // Compounded by three router processes orphaned by earlier ad-hoc runs
+    // that were simply never killed (`ps` receipt, gate-3 diagnosis,
+    // exchange/lane-P0B-report.md): still alive, still re-announcing,
+    // still winning the race against the current run's fresh record.
+    fullnames: Vec<String>,
+}
+
+impl MdnsRuntime {
+    /// Sends an explicit goodbye for every record this process registered,
+    /// then stops the daemon. Must run before the process exits (wired
+    /// through `axum::serve(..).with_graceful_shutdown` on SIGINT/SIGTERM)
+    /// so a killed router leaves nothing for the next run, or a live peer's
+    /// cache, to trip over.
+    fn unregister_all(&self) {
+        for fullname in &self.fullnames {
+            match self.daemon.unregister(fullname) {
+                Ok(recv) => match recv.recv_timeout(Duration::from_secs(2)) {
+                    Ok(status) => eprintln!("mDNS unregister {fullname}: {status:?}"),
+                    Err(e) => eprintln!("mDNS unregister {fullname}: no ack ({e})"),
+                },
+                Err(e) => eprintln!("mDNS unregister {fullname}: {e}"),
+            }
+        }
+        if let Err(e) = self.daemon.shutdown() {
+            eprintln!("mDNS daemon shutdown: {e}");
+        }
+    }
 }
 
 fn start_mdns(advertisement: &DiscoveryAdvertisement, node_id: &str, advertise_ip: &str) -> Result<MdnsRuntime, String> {
@@ -86,6 +121,7 @@ fn start_mdns(advertisement: &DiscoveryAdvertisement, node_id: &str, advertise_i
     for (key, value) in &advertisement.txt {
         properties.insert(key.clone(), value.clone());
     }
+    let mut fullnames = Vec::new();
     for service in advertisement.browse_services() {
         let service_type = format!("{service}.local.");
         let srv_port = if service == PAIR_SERVICE { PAIR_SRV_PORT } else { advertisement.port };
@@ -98,6 +134,7 @@ fn start_mdns(advertisement: &DiscoveryAdvertisement, node_id: &str, advertise_i
             properties.clone(),
         )
         .map_err(|e| format!("mDNS service {service}: {e}"))?;
+        fullnames.push(info.get_fullname().to_string());
         daemon.register(info).map_err(|e| format!("mDNS register {service}: {e}"))?;
     }
     let browse_type = format!("{}.local.", advertisement.pair_service);
@@ -112,7 +149,7 @@ fn start_mdns(advertisement: &DiscoveryAdvertisement, node_id: &str, advertise_i
             }
         })
         .map_err(|e| format!("mDNS browse thread: {e}"))?;
-    Ok(MdnsRuntime { _daemon: daemon })
+    Ok(MdnsRuntime { daemon, fullnames })
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -446,11 +483,12 @@ async fn main() {
         node_id,
         http_port: port,
         discovery,
-        _mdns: mdns,
+        mdns,
         engines: engines.clone(),
         workloads: WorkloadCatalog::new(),
         next_request: AtomicU64::new(1),
     });
+    let state_for_shutdown = state.clone();
     tokio::spawn(probe_loop(engines));
     let app = Router::new()
         .route("/health", get(health))
@@ -474,8 +512,42 @@ async fn main() {
         }
     };
     println!("listening on http://{address}");
-    if let Err(error) = axum::serve(listener, app).await {
+    if let Err(error) = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal(state_for_shutdown)).await {
         eprintln!("baro-router: {error}");
+    }
+}
+
+/// Waits for SIGINT or SIGTERM, then sends mDNS goodbyes before the caller
+/// lets the process exit. `mdns-sd`'s own `Drop` (there isn't one) or a bare
+/// process exit does not do this -- see `MdnsRuntime`'s own doc comment for
+/// the gate-3 failure this traces to.
+async fn shutdown_signal(state: Arc<RouterState>) {
+    let ctrl_c = async { tokio::signal::ctrl_c().await.ok() };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(error) => eprintln!("baro-router: SIGTERM handler: {error}"),
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+    if state.mdns.is_some() {
+        // unregister_all blocks on a flume recv_timeout per record; off the
+        // async executor thread so a slow ack never stalls other tasks.
+        let state = state.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Some(runtime) = state.mdns.as_ref() {
+                runtime.unregister_all();
+            }
+        })
+        .await;
     }
 }
 
