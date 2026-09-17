@@ -132,7 +132,7 @@ PASS igpu-env: kernel ran on the iGPU (ROCr index 1, gfx1030 objects under the o
 **Round 1 (this section's original text, kept for the record): WRONG.** I cited team A's
 `bench/p0b-gate1-placement.sh` (5 prompts x 4 repeats of short text answers, about 70 tokens
 compared per run) as "the identity-under-split receipt" and ran it 3 times, all PASS
-(`.work/p4b/gate1-run{1,2,3}/`). Driver review 2026-09-18 caught it: that is P0b's PLACEMENT gate
+(`.work/p4b/gate1-run1/`, `.work/p4b/gate1-run2/`, `.work/p4b/gate1-run3/`). Driver review 2026-09-18 caught it: that is P0b's PLACEMENT gate
 with a small identity check bolted on, right for P0b, not a stand-in for P4's own protocol, which
 specifies 20 prompts x 64 tokens (`bench/mtp-prompts/p*.tokens`), about 35x more compared tokens.
 Three passes of the thin check did not put the repeat-rule receipt behind P4; those 3 runs are
@@ -151,7 +151,7 @@ demoted to PLACEMENT receipts only (`a=10 b=10` stands as P0b's own claim, nothi
    function definitions, and its `EXIT` trap kills both engines the moment it finishes, so sourcing
    it would either re-run its own check first or require restructuring team A's file, out of scope
    here. The `payload`/`tokens`/`request` functions are lifted unchanged from
-   `.work/p4/run-two-engines.sh` in the main checkout (team B).
+   the P4 gate body `run-two-engines.sh` under the main checkout's P4 receipts dir (team B).
 3. CPU-only checks before any GPU run: `--selftest` (negative control: identical token files
    PASS; a one-id difference correctly FAILs with exit 1), `P4_CPU_PREFLIGHT=1` (binaries, pack
    hash `491de801...` matching, tools, 20 prompt files), `gate-dryrun` (stops at `GATE_DRYRUN=1`
