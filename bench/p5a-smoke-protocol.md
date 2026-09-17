@@ -35,10 +35,11 @@ checks all fields including position and hidden-row alignment before any GPU dum
 
 ## Loss and data
 
-The trunk is frozen. The existing next-token cross-entropy remains on the true label
-`tokens[P+1]`. The added self-distillation term uses normalized-top8 KL with equal weight:
+The trunk is frozen. The cross-entropy target is the recorded trunk greedy target
+`target_argmax`, and the added self-distillation term uses normalized-top8 KL with equal
+weight:
 
-    loss = cross_entropy(student_logits, tokens[P+1]) + KL(q8 || p8)
+    loss = cross_entropy(student_logits, target_argmax) + KL(q8 || p8)
 
 `q8` is the recorded normalized `top8_probs`. `p8` is the student's softmax restricted to
 the same eight token IDs, renormalized over those IDs. No tail mass is inferred or silently
@@ -50,6 +51,14 @@ acceptance subset is exactly `bench/mtp-prompts/p01.tokens` through `p05.tokens`
 identity set is all 20 files consumed by `bench/mtp-prompts.sh`. The trained and untrained
 arms use the same engine binary, pack, session, and harness invocation. The receipt records
 paths, pack checksum, draft-head checksum, model settings, prompt list, and the denominator.
+
+### Dated ruling
+
+2026-09-17, before any P5a training run: the maintainer ruled that the corrected plan document governs
+this protocol. CE must target the trunk's own greedy pick, `target_argmax`, rather than the
+human next token `tokens[P+1]`, because the acceptance gate measures agreement with that same
+greedy pick. This amendment resolves the earlier protocol wording and is binding for the
+trainer and its receipts.
 
 ## Preflight and gates
 
