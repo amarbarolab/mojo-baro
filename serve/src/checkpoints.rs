@@ -36,51 +36,96 @@ const K: [u32; 64] = [
     0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
 ];
 
+const H0: [u32; 8] = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
+
+fn compress(h: &mut [u32; 8], block: &[u8; 64]) {
+    let mut w = [0u32; 64];
+    for i in 0..16 {
+        w[i] = u32::from_be_bytes([block[4 * i], block[4 * i + 1], block[4 * i + 2], block[4 * i + 3]]);
+    }
+    for i in 16..64 {
+        let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+        let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+        w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
+    }
+    let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = *h;
+    for i in 0..64 {
+        let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+        let ch = (e & f) ^ (!e & g);
+        let t1 = hh.wrapping_add(s1).wrapping_add(ch).wrapping_add(K[i]).wrapping_add(w[i]);
+        let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+        let maj = (a & b) ^ (a & c) ^ (b & c);
+        let t2 = s0.wrapping_add(maj);
+        hh = g;
+        g = f;
+        f = e;
+        e = d.wrapping_add(t1);
+        d = c;
+        c = b;
+        b = a;
+        a = t1.wrapping_add(t2);
+    }
+    for (x, y) in h.iter_mut().zip([a, b, c, d, e, f, g, hh]) {
+        *x = x.wrapping_add(y);
+    }
+}
+
+/// Incremental SHA-256: `update` any number of times, `finalize` once. P1
+/// (CONTRACT 1) hashes multi-GB state streams in 8 MiB chunks as they cross
+/// the wire; a one-shot `sha256(&[u8])` would need the whole stream in one
+/// `Vec` first, exactly what that contract forbids.
+pub struct Sha256 {
+    h: [u32; 8],
+    buf: Vec<u8>,
+    len: u64,
+}
+
+impl Sha256 {
+    pub fn new() -> Sha256 {
+        Sha256 { h: H0, buf: Vec::with_capacity(64), len: 0 }
+    }
+
+    pub fn update(&mut self, data: &[u8]) {
+        self.len = self.len.wrapping_add(data.len() as u64);
+        self.buf.extend_from_slice(data);
+        let mut i = 0;
+        while self.buf.len() - i >= 64 {
+            let block: [u8; 64] = self.buf[i..i + 64].try_into().unwrap();
+            compress(&mut self.h, &block);
+            i += 64;
+        }
+        self.buf.drain(..i);
+    }
+
+    pub fn finalize(mut self) -> [u8; 32] {
+        let bit_len = self.len.wrapping_mul(8);
+        self.buf.push(0x80);
+        while self.buf.len() % 64 != 56 {
+            self.buf.push(0);
+        }
+        self.buf.extend_from_slice(&bit_len.to_be_bytes());
+        for chunk in self.buf.chunks(64) {
+            let block: [u8; 64] = chunk.try_into().unwrap();
+            compress(&mut self.h, &block);
+        }
+        let mut out = [0u8; 32];
+        for (i, v) in self.h.iter().enumerate() {
+            out[4 * i..4 * i + 4].copy_from_slice(&v.to_be_bytes());
+        }
+        out
+    }
+}
+
+impl Default for Sha256 {
+    fn default() -> Sha256 {
+        Sha256::new()
+    }
+}
+
 pub fn sha256(data: &[u8]) -> [u8; 32] {
-    let mut h: [u32; 8] = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
-    let mut msg = data.to_vec();
-    let bit_len = (data.len() as u64).wrapping_mul(8);
-    msg.push(0x80);
-    while msg.len() % 64 != 56 {
-        msg.push(0);
-    }
-    msg.extend_from_slice(&bit_len.to_be_bytes());
-    for chunk in msg.chunks(64) {
-        let mut w = [0u32; 64];
-        for i in 0..16 {
-            w[i] = u32::from_be_bytes([chunk[4 * i], chunk[4 * i + 1], chunk[4 * i + 2], chunk[4 * i + 3]]);
-        }
-        for i in 16..64 {
-            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
-            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-            w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
-        }
-        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = h;
-        for i in 0..64 {
-            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-            let ch = (e & f) ^ (!e & g);
-            let t1 = hh.wrapping_add(s1).wrapping_add(ch).wrapping_add(K[i]).wrapping_add(w[i]);
-            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-            let maj = (a & b) ^ (a & c) ^ (b & c);
-            let t2 = s0.wrapping_add(maj);
-            hh = g;
-            g = f;
-            f = e;
-            e = d.wrapping_add(t1);
-            d = c;
-            c = b;
-            b = a;
-            a = t1.wrapping_add(t2);
-        }
-        for (x, y) in h.iter_mut().zip([a, b, c, d, e, f, g, hh]) {
-            *x = x.wrapping_add(y);
-        }
-    }
-    let mut out = [0u8; 32];
-    for (i, v) in h.iter().enumerate() {
-        out[4 * i..4 * i + 4].copy_from_slice(&v.to_be_bytes());
-    }
-    out
+    let mut h = Sha256::new();
+    h.update(data);
+    h.finalize()
 }
 
 fn hex(b: &[u8]) -> String {
@@ -463,6 +508,23 @@ mod tests {
     fn sha256_matches_known_vectors() {
         assert_eq!(hex(&sha256(b"")), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
         assert_eq!(hex(&sha256(b"abc")), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    }
+
+    #[test]
+    fn sha256_streamed_in_arbitrary_chunks_matches_the_one_shot_hash() {
+        // Sized past several 64-byte compression blocks and one padding
+        // boundary, so both the block loop and the finalize-only tail path
+        // in `Sha256::update`/`finalize` run: the P1 import loop feeds
+        // 8 MiB chunks that never land on a 64-byte boundary either.
+        let data: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
+        let whole = sha256(&data);
+        for chunk_size in [1usize, 3, 64, 65, 8191, 8192] {
+            let mut h = Sha256::new();
+            for chunk in data.chunks(chunk_size) {
+                h.update(chunk);
+            }
+            assert_eq!(h.finalize(), whole, "chunk_size={chunk_size}");
+        }
     }
 
     fn write_pack_fixture(dir: &Path, pack_bytes: &[u8]) -> u64 {

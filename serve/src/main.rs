@@ -187,6 +187,12 @@ enum ApiError {
     Exceed { n_prompt_tokens: u64, n_ctx: u64 },
     /// Checkpoint API: the checkpoint's identity and this server's differ in `field`.
     Mismatch(String),
+    /// P1 CONTRACT 2: a LAT1 import stream's `field` disagrees with this
+    /// server's own identity (or magic/version/pos). The exact top-level
+    /// shape `{"error":"state_identity","field","ours","theirs"}` is the
+    /// contract's, not this repo's usual `{"error":{"message",...}}`
+    /// envelope -- P0b's rank term and P4/P6 are written against it.
+    StateIdentity { field: String, ours: String, theirs: String },
 }
 
 impl ApiError {
@@ -207,6 +213,10 @@ impl IntoResponse for ApiError {
             ApiError::Mismatch(field) => {
                 let body = json!({"error": {"code": 409, "message": "IDENTITY_MISMATCH",
                     "type": "identity_mismatch", "field": field}});
+                (StatusCode::CONFLICT, Json(body)).into_response()
+            }
+            ApiError::StateIdentity { field, ours, theirs } => {
+                let body = json!({"error": "state_identity", "field": field, "ours": ours, "theirs": theirs});
                 (StatusCode::CONFLICT, Json(body)).into_response()
             }
             ApiError::Exceed { n_prompt_tokens, n_ctx } => {
