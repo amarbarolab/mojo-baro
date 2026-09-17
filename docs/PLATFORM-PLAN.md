@@ -60,7 +60,9 @@ surface, so a PAIR client or `inference-dispatcher` cannot tell the difference.
 Standing rules, unchanged from `NEXT-PLAN.md` plus today's ledger: protocol note frozen before the
 timed run, every GPU job through `gpu-wait run --timeout`, `bench/preflight.sh` and `gate-dryrun`
 (with a dry-run stop in the script) before a queue, identity gates against a reference arm, the lane's
-own `./run-tests.sh` receipt in its report before a merge, no kernel file comments, commits by pathspec.
+own `./run-tests.sh` receipt in its report before a merge (`lane-merge BRANCH` checks it, the cited receipts and ci
+in the lane's worktree), no kernel file comments, commits by pathspec. Before a lane that bakes: `disk-dupes` for
+exclusive bytes, never apparent.
 
 ## P0a. Ollama-compatible API on `baro-serve` (S)
 
@@ -76,7 +78,7 @@ exposes it). Options map: `num_predict`, `temperature`, `top_p`, `top_k`, `seed`
 `repeat_penalty`; `num_ctx` above `BARO_TMAX` is reported, not silently clamped. `--ollama-port 11434`
 opts into PAIR's expected port. `/api/pull` answers 501 with the `model-import` command.
 
-**Gates.** (1) PAIR's `scripts/inference-dispatcher.sh --backend ollama --port <ours> --count 5 --mode
+**Gates.** (1) `pair-dispatch --backend ollama --port <ours> --count 5 --mode
 parallel` completes 5/5 with token counts equal to the same prompts through `/v1/completions` (same
 seed, T=0). (2) The `ollama` Python client, `chat` and `generate`, streaming and not: byte-identical
 text to `/v1/chat/completions` on 20 prompts. (3) PAIR built from source on this box adopts `baro-serve`
@@ -135,7 +137,7 @@ after it (EAP-NOOB is the right protocol; their Go library is not ours to embed,
 80 LOC that the P6 clients display as a QR). One TOML config; with none, `baro-router` fronts the local
 engines alone, which is what the ComfyUI node and the phone clients talk to.
 
-**Gates.** (1) `inference-dispatcher --count 20 --mode parallel` against the router with two engines on
+**Gates.** (1) `pair-dispatch --count 20 --mode parallel` against the router with two engines on
 this box (P4's rig): 20/20 complete, placement follows the rank rule (catalog shows pending balanced
 within one), every response identical to its single-engine run at T=0. (2) Kill one engine mid-run:
 requests in flight on it fail loudly, new ones route to the other; receipt in the catalog. (3) A PAIR
@@ -148,7 +150,7 @@ response that differs from its single-engine run. **GPU:** 30 minutes.
 compiles (`.work/xc/dev.mojo`). The MAX runtime holds about 22 GB per engine process regardless of pack
 (COMFY receipt), so two engines cannot share the XTX. The iGPU runs our kernels under
 `HSA_OVERRIDE_GFX_VERSION=10.3.0` with a build made under that override (vector add, 0 mismatches, OS
-note 2026-09-17) but has no bf16 WMMA or bf16 dot, so only kernels without them run there: a functional
+note 2026-09-17; `igpu-env` prints the env, `--probe` proves it, `--run CMD` applies it) but has no bf16 WMMA or bf16 dot, so only kernels without them run there: a functional
 second device for the harness, never a performance arm.
 
 **Design.** One `baro-serve` process per GPU, pinned by `ROCR_VISIBLE_DEVICES` (UUID for discrete cards,
@@ -207,7 +209,8 @@ pattern. Gate: fixed-seed audio identical across two runs (sha256).
 ## P2. Vision input: the encoder is 27 blocks of kernels we already have (XL)
 
 **Facts.** Three of our models ship a projector: `mmproj-Ornith-1.5-9B-BF16.gguf`,
-`mmproj-Qwythos-9B-v2-BF16.gguf`, `RegesCore-1.0-35/mmproj-F16.gguf`. The Ornith file (gguf-py):
+`mmproj-Qwythos-9B-v2-BF16.gguf`, `RegesCore-1.0-35/mmproj-F16.gguf`; `mmproj-info FILE` reads them in one line (same 27-block encoder in all three,
+about 411M parameters, 576 image tokens per picture; RegesCore projects to 2048). The Ornith file:
 architecture `clip`, `clip.projector_type = qwen3vl_merger`, image 768, patch 16, hidden 1152, FFN 4304,
 27 blocks, 16 heads, GELU, spatial merge 2x2, projection dim 4096 (the LLM hidden), 363 tensors,
 `is_deepstack_layers` flags per block. Reference arms: `llama-mtmd-cli` and `libmtmd` (built here) and
