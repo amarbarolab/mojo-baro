@@ -8,6 +8,8 @@
 //   embd.f32          final embeddings, [n_tokens, n_embd] row-major float32
 //   <name>.f32        every f32 tensor whose graph name starts with one of WANT below
 //   manifest.tsv      name, ne0, ne1, ne2, ne3, bytes
+// Flash attention is off unless ORACLE_FA=on: clip's FA path casts K and V to f16, which put 1.6e-2
+// relative error into attn_out-0 and dropped layer_out-26 cosine from 0.9997 to 0.9907.
 // The text model is loaded vocab-only: libmtmd wants it for the marker tokens, never for weights.
 #include "llama.h"
 #include "ggml.h"
@@ -84,6 +86,7 @@ int main(int argc, char ** argv) {
     mtmd_context_params cp = mtmd_context_params_default();
     cp.use_gpu = gpu;
     cp.n_threads = 8;
+    cp.flash_attn_type = (getenv("ORACLE_FA") && strcmp(getenv("ORACLE_FA"), "on") == 0) ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
     cp.cb_eval = on_eval;
     cp.cb_eval_user_data = nullptr;
     mtmd_context * ctx = mtmd_init_from_file(mmproj, model, cp);
