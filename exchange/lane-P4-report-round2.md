@@ -130,6 +130,28 @@ graphics preemption does not corrupt this engine at any rate that could explain 
 What this arm does NOT cover is bursty light use (idle to busy transitions, clock and power
 state changes), which is what desktop clients actually do.
 
+### Control arm: the same spark engine on the XTX (added 2026-09-17 late, the maintainer: do it)
+
+`bench/p4-build.sh` with `P4_QWEN_NATIVE=1` builds the same `serve/spark.mojo` + Qwen2.5-7B
+profile + trace define for gfx1100 (`.work/p4/bin-xtx-trace/`, engine sha256 `03341a74...`), and
+`bench/p4-soak.sh` with `P4_SOAK_DEVICE=xtx` pins it to `GPU-859baafa301986cb`. Same pack, same
+prompt, same kernel source; only the device and the compile target differ. Read-back: 22,192 MB
+mapped through the XTX render node, 67.7 tok/s decode (the iGPU does 2.8).
+
+| run | requests | tokens | deviations | checksum tables |
+|---|---|---|---|---|
+| `.work/p4/xtx-soak1` | 160 | 10,240 | 0 | 160 of 160 identical |
+| `.work/p4/xtx-soak2` | 640 | 40,960 | 0 | 640 of 640 identical |
+
+The XTX token stream is also identical to the iGPU's clean stream for this prompt. At the iGPU's
+observed per-token rate (3 in about 11,000) the chance of 51,200 clean tokens is about one in a
+million, so **a per-execution race in the spark kernels at that rate is ruled out on gfx1100**.
+The fault belongs to the iGPU rig (the gfx1036 part under the gfx1030 override, its system-memory
+weights, its power states), not to the engine code that also serves llama, qwen2 and granite
+models on the XTX. Limit of this control: it matches the iGPU by token count, not by wall time
+(14 minutes against about 75), so it says nothing about faults that arrive per minute rather
+than per kernel launch; those are rig faults by definition.
+
 What is NOT ruled out (ranked by my own estimate, none measured):
 
 1. **Power or clock state transitions on the iGPU** (bursty desktop use, GFXOFF exits, DPM
@@ -141,9 +163,10 @@ What is NOT ruled out (ranked by my own estimate, none measured):
 2. **Transient DDR5 read faults.** The iGPU streams about 7.6 GB of weights from system memory
    per token; the XTX arm never touches DIMMs for weights and never fails. No way to test this
    from the lane without a reboot (memtest) and no EDAC on this board.
-3. **A low-rate kernel race.** Nothing in the read of `spark_kernels.mojo`, `attn.mojo` and
-   `elementwise.mojo` shows a missing barrier, and 768 bit-identical rows argue against it, but
-   the dump path adds a sync between the head GEMV and the argmax, so it is not excluded.
+3. **A race that only the gfx1030 code object or the 2-CU timing exposes.** The XTX control
+   clears the kernels as written and as compiled for gfx1100; it cannot clear the gfx1030 build
+   on the gfx1036 part. Still the least likely of the three: 768 bit-identical rows and 60 plus 5
+   identical checksum tables on the iGPU itself.
 
 ## 4. Fix
 
