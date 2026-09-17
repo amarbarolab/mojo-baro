@@ -1,8 +1,3 @@
-# VENDORED COPY. Upstream is ~/iTools/lib/mojo/gguf-reader.mojo; this repo keeps
-# a real file rather than a symlink, because a clone must build without anything
-# outside it. Sync by hand if the upstream changes; tools/ci-checks.sh compares
-# the two when the upstream is present and says so when they drift.
-#
 # Generic GGUF v3 header reader for Mojo tools that need a model's own metadata
 # and tensor shapes (dims, dtype, offset) -- not just the tokenizer.* keys.
 # Self-contained: no dependency on any other project's tokenizer/parser code.
@@ -128,6 +123,7 @@ struct GGUFModel:
     var floats: Dict[String, Float64]
     var int_arrays: Dict[String, List[Int]]
     var tensor_dims: Dict[String, List[Int]]
+    var strings: Dict[String, String]
 
     def __init__(out self, path: String) raises:
         self.arch = String("")
@@ -135,6 +131,7 @@ struct GGUFModel:
         self.floats = Dict[String, Float64]()
         self.int_arrays = Dict[String, List[Int]]()
         self.tensor_dims = Dict[String, List[Int]]()
+        self.strings = Dict[String, String]()
         var buf: List[UInt8]
         with open(path, "r") as f:
             buf = f.read_bytes(HEADER_MAX)
@@ -152,6 +149,7 @@ struct GGUFModel:
             var vtype = r.u32()
             if vtype == 8:
                 var s = r.string()
+                self.strings[key] = s
                 if key == "general.architecture":
                     self.arch = s
             elif vtype == 9:
