@@ -1,4 +1,14 @@
-# P1 gate 2, identity half: frozen before the first gate run
+# P1 cross-node fork: what the rig did (was gate 2, identity half)
+
+> **NO LONGER A GATE (2026-09-17, the maintainer).** The bars, the verdict rule and the kill line in this
+> note were removed with the rest of the LatentOS rules. They were normal-model rules: they asked
+> whether our state reproduces a token sequence, and that question decided a PASS or FAIL it had no
+> business deciding. Nothing here passes or fails anything now.
+>
+> What the note is kept FOR: the predictions were frozen before the runs and the numbers were
+> measured against them, so this is a record of what the rig actually did. Read it as observations.
+> The falsifiers are the part worth reusing, because they are what found real defects: the
+> K/V-swapped states, the corrupted byte, the reuse check.
 
 A fork exported on node A and answered by node B must give the ids one node gives alone, at 100
 Mbit, 1 Gbit and 10 Gbit. I expect that to hold on every prompt with f32 states and on 19 of 20
@@ -102,7 +112,7 @@ A miss is attributed in this order, and the order is part of the freeze:
    anything. This is the documented E14 class (reduction order) and is not the cross-node move.
 2. **int8 quantization:** the arm is int8 and the f32 arm matched that prompt at that rate.
 3. **Cross-node defect:** anything else. Control S reproduced the cold ids and the forked state
-   did not. **This fires the lane's kill line** ("an identity miss outside the documented E14 one").
+   did not. **This used to fire the lane's kill line; there is no kill line now** ("an identity miss outside the documented E14 one").
 
 A run with only class 1 and class 2 misses is reported NOT MET against the plan's wording, with the
 attribution beside it, and whether that wording should change is the coordinator's call, as for

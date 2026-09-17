@@ -47,8 +47,8 @@ surface, so a PAIR client or `inference-dispatcher` cannot tell the difference.
 | # | item | size | lane | GPU | unblocks |
 |---|---|---|---|---|---|
 | P0a | Ollama-compatible API on `baro-serve` | S (380 LOC Rust, embeddings included) | team A | minutes | PAIR adoption, Open WebUI, phone clients |
-| P1 | LatentOS standard: state export/import API, cross-node fork, reader/followers policy | M (450) | coordinator design, team A build | 30 min | routing on state, P6 clients |
-| P0b | `baro-router`: discovery, pairing, inventory, rank, proxies, state locality | L (1,150 Rust with the eight Pingora ideas) | team A, skeleton parallel to P1, rank gate after P1 | 30 min | P4, P6 |
+| P1 | LatentOS: state export/import, cross-node fork, reader/followers. **EXPLORATION, ungated, blocks nothing** | open-ended | unowned | open-ended | nothing waits on it |
+| P0b | `baro-router`: discovery, pairing, inventory, rank, proxies, state locality | L (1,150 Rust with the eight Pingora ideas) | team A | 30 min | P4, P6 |
 | P4 | Multi-GPU: engine per device, router data parallel; harness on this box with the iGPU | S wiring, M gate (250) | sonnet | 1 h | |
 | P5a | Draft head by self-distillation | S (120 Python) | sonnet | 20 min smoke, 3 h full | A4 unpark |
 | P3a | Speech in: whisper.cpp sidecar behind `/v1/audio/transcriptions` | S (150 Rust) | sonnet | minutes | voice clients |
@@ -65,8 +65,8 @@ in the lane's worktree), no kernel file comments, commits by pathspec. Before a 
 exclusive bytes, never apparent.
 
 **Teams (2026-09-17).** Two mixed pairs (one sonnet, one codex each; skill `mixed-pair-teams`) build the
-items: team A takes P0a, P1, P0b in that order (P0b's rank consumes P1's state-locality term); team B
-takes P3a, P3b, P5a, P4 wiring, P5b, P4 timed gate, P6. P2 kernels and the P1 design spec stay with the
+items: team A takes P0a then P0b (P1 left the chain 2026-09-17 and is an exploration); team B
+takes P3a, P3b, P5a, P4 wiring, P5b, P4 timed gate, P6. P2 kernels stay with the
 coordinator. Their conference records, with the item template every build item is written in, are
 `exchange/2026-09-17-team-A-plan-shape.md` and `exchange/2026-09-17-team-B-plan-shape.md`; the
 corrections below marked (team A) or (team B) come from them, each checked against the source first.
@@ -100,7 +100,7 @@ teams keep building with `baro-router` as the primary path (team A). Gate 3 need
 (measured 2026-09-17: exit 0 on this box, Go 1.27, log `.work/pair/build.log`); the engine manager adopts
 whatever already answers on an engine's fixed port when `engine:start` runs (its README, Adoption). **GPU:** minutes.
 
-## P1. LatentOS as a standard ability (M)
+## P1. LatentOS: an exploration (ungated since 2026-09-17)
 
 **Exists.** `serve/latent.mojo` mints and ingests KV pages, SSM checkpoints, hidden states and chain
 slots (`mint_*`, `ingest_*`); the LAT1 header and kinds (`latentos/proto.mojo`: KV_PAGES, SSM_CKPT,
@@ -112,7 +112,9 @@ llama.cpp at N=3, 3.70x at N=10, identity 3/3 and 9/10), E15 (the handoff works 
 state API on three other models), B4-mini (payload vs recipe on a shaped link, `bench/b4-cross-host.sh`).
 Design docs in `~/AMDHQ/docs/design/latent-os/`.
 
-**Design.** Promote the experiment surface to a documented, gated API that the router moves around:
+**Direction, not a spec.** Promote the experiment surface to an API the router can move around.
+Everything below is what we were building toward when the item was gated; it is kept as a sketch
+and none of it is frozen:
 
 1. `POST /v1/state/export` `{request_id | prefix_hash, kinds:[kv_pages, ssm_ckpt, hidden], pos}` returns a
    LAT1 stream, or writes a `.baro` file when `path` is given; `POST /v1/state/import` ingests one and
@@ -128,17 +130,22 @@ Design docs in `~/AMDHQ/docs/design/latent-os/`.
 4. llama.cpp nodes take part through E15's bridge: LAT1 KV state to llama.cpp's slot file
    (`tools/llama-slot-to-state.mojo` is the reverse direction; the forward direction is 150 LOC), so a
    phone or a Mac running llama.cpp continues a conversation our engine started.
-5. Identity on every move: the LAT1 header's model id, tokenizer hash and `check_identity` are enforced
-   on import; a mismatch is a 409 naming both ids, never a silent restore.
+5. The LAT1 header carries a model id and tokenizer hash, and `check_identity` refuses an import
+   across two different models. That is a safety catch against restoring nonsense, not a gate: it
+   says the two ends are the same model, never that the state is good.
 
-**Gates.** (1) Export then import on one node reproduces E12's 20-prompt identity and the restore band
-(2.2 to 4.3 ms). (2) Cross-node through the B4-mini veth rig at 100 Mbit, 1 Gbit, 10 Gbit: fork-on-target
-ids equal single-node ids; the payload arm beats the recipe arm at 1 Gbit and above for a 32k prefix
-(B4-mini's own prediction, re-measured). (3) E14 through the API: N=3 identity 3/3, N=10 at least 9/10
-with the reduction-order discordance documented, tok/s within 5% of the E14 receipt. (4) The bridge:
-E15's three models continue from our state with the first 32 tokens identical. **Kill line:** an identity
-miss outside the documented E14 one, or a cross-node fork slower than re-prefill at 1 Gbit for 32k.
-**GPU:** about 30 minutes.
+**No gates, no kill line (the maintainer 2026-09-17).** P1's four gates and their bars were removed, and
+nothing replaced them. They were written for a normal model, where the question is whether a token
+sequence reproduces, and they made this item answer that question: every check asked whether our
+state gives the same 32 ids as llama.cpp. That is not what state moving between nodes is for, and
+the bars failed the lane on a question nobody wanted answered (gate 4 held llama.cpp to a bar
+llama.cpp misses handing state to itself; gate 2's ids could not tell a correct state from a
+swapped one). LatentOS is an EXPLORATION now. Findings go to Brain as observations. A bar comes
+back only when we know what the thing is for, and it will not be an ids bar.
+
+**Not a dependency of anything.** P0b's rank, P4's gate 2 and P6's clients were written against
+P1's contracts; those contracts are gone, so nothing downstream waits on this item and this item
+waits on nothing. If a router or a client wants state locality, it names what it needs then.
 
 ## P0b. `baro-router` (L)
 
@@ -182,7 +189,7 @@ stays on axum and tokio, no new framework).**
 8. *Pooled upstream connections.* Keep-alive connections per engine, reused across requests.
 
 Staging: 1, 2, 3 and 7 are the skeleton's shape and land with it. 8 lands with the proxies. 4 and 5
-need P1 and land with gate 4. 6 lands last, with its own check.
+can use P1's state routes if they exist by then, and do not wait on them. 6 lands last, with its own check.
 
 **Gates.** (5) Failover safety: an engine that accepts a request and then stalls is cancelled before
 the retry, and the catalog shows exactly one completed generation for that request id. (6) Flap: an
@@ -198,7 +205,7 @@ built from source lists our node from the mDNS answer. (4) State locality (team 
 permanently empty): after P1, a request whose prefix hash is resident on the worse-ranked engine goes
 there, and the catalog row names the locality term as the reason; the same request with the hash absent
 follows plain rank. Staging: the CPU skeleton (mDNS, node-info without the term, port-probe adoption,
-proxies) and gate 3 run parallel to P1; gates 1, 2 and 4 wait for P1's `/v1/state` contract, deferred
+proxies) and gate 3 run parallel to P1; gates 1, 2 and 4 used to wait on P1's `/v1/state` contract, deferred
 and never stubbed. **Kill line:** placement off the rule, or a response that differs from its
 single-engine run. **GPU:** 30 minutes.
 
@@ -228,8 +235,8 @@ run different models). Until P0b lands the split is a 20-line round-robin script
 so; the router-backed run is a second receipt, and a missing dependency is recorded BLOCKED, never
 replaced by a weaker claim (team B). Preflight reads back which device each process attached
 (`rocm-smi --showpids`): a pin that did not take gives two engines on the XTX and clean numbers.
-(2) State moved XTX to iGPU and back through P1 reproduces the ids. **Kill line:** any
-identity miss. **GPU:** 1 hour, one serialized harness job through `gpu-wait` covering both devices; the iGPU is not
+(2) REMOVED 2026-09-17 with P1's gates: it asked whether state through P1 reproduces the ids,
+which is the rule we dropped for LatentOS. P4's kill line is gate 1 alone. **GPU:** 1 hour, one serialized harness job through `gpu-wait` covering both devices; the iGPU is not
 exempt from the queue (team B; confirmed by the maintainer 2026-09-17).
 
 ## P5. Training beyond the draft-head smoke

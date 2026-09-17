@@ -1,10 +1,20 @@
-# P1 gate 4, the llama.cpp bridge: frozen before the first GPU run
+# P1 llama.cpp bridge: what the three models did (was gate 4)
+
+> **NO LONGER A GATE (2026-09-17, the maintainer).** The bars, the verdict rule and the kill line in this
+> note were removed with the rest of the LatentOS rules. They were normal-model rules: they asked
+> whether our state reproduces a token sequence, and that question decided a PASS or FAIL it had no
+> business deciding. Nothing here passes or fails anything now.
+>
+> What the note is kept FOR: the predictions were frozen before the runs and the numbers were
+> measured against them, so this is a record of what the rig actually did. Read it as observations.
+> The falsifiers are the part worth reusing, because they are what found real defects: the
+> K/V-swapped states, the corrupted byte, the reuse check.
 
 Gate 4's bar has never been cleared by anything in this repo, so a miss could not tell a broken
 bridge from ordinary numerics. The plan asks that "E15's three models continue from our state with
 the first 32 tokens identical". Our dense path, the one that ships, reaches 51.90 of 64 against
 llama.cpp on a quant-matched arm (`bench/PROTOCOL-RULES.md` P14), because our activations pass through
-bf16 and llama keeps f32. This note keeps the plan's bar word for word as the primary, measures what
+bf16 and llama keeps f32. This note kept the plan's bar word for word as the primary (that bar is now removed), measures what
 a known-good configuration reaches on the same comparison (P14), and proves the gate can fail (P11),
 all before the bridge is judged. Frozen by commit before any gate 4 GPU minute.
 
