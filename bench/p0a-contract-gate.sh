@@ -247,7 +247,7 @@ import sys
 import time
 
 model, out_name = sys.argv[1], sys.argv[2]
-out = pathlib.Path(out_name)
+out = pathlib.Path(out_name).resolve()
 manager = os.environ["PAIR_MANAGER_BIN"]
 assert os.access(manager, os.X_OK), manager
 stderr_path = out / "pair-manager.stderr"
@@ -292,10 +292,8 @@ def rpc(request_id, method, params=None):
 
 result = {}
 try:
-    installed = rpc(1, "engine:get-installed")
-    engines = installed.get("engines", [])
-    ollama = next((item for item in engines if item.get("engine") == "ollama"), None)
-    assert ollama and ollama.get("running") is True and ollama.get("healthy") is True, installed
+    ollama = rpc(1, "engine:start", {"engine": "ollama"})
+    assert ollama.get("running") is True and ollama.get("healthy") is True, ollama
     assert ollama.get("port") == 11434, ollama
     routed = rpc(2, "engine:action", {
         "engine": "ollama", "action": "run_model",
