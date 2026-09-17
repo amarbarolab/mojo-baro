@@ -7,9 +7,9 @@ aarch64 lab image, `briefs/2026-09-17-team-c-aarch64-labimage.md`): a real
 Arch Linux ARM guest built and booted, `baro-serve` builds natively (not
 cross-compiled) as a real aarch64 ELF binary, `pip install "max[all]==26.5.0"`
 installs Mojo 1.0.0 natively on aarch64, and `tools/ci-checks.sh` passes
-clean (EXIT=0) inside the guest. One sub-check is BLOCKED with an exact
-reason (full model-based tokenizer parity needs a GGUF pack that is out of
-this S probe's authorized download scope) rather than substituted. No GPU
+clean (EXIT=0) inside the guest. Tokenizer parity against llama-tokenize
+passes 61/61 on aarch64 (first reported BLOCKED for lack of a GGUF; closed with a
+local 0.5B GGUF, no download). No GPU
 work was performed; downloads were limited to the authorized rootfs plus its
 `.md5`/`.sig`.
 
@@ -137,17 +137,17 @@ NEW `vm/aarch64/boot.sh`: direct-kernel `qemu-system-aarch64 -M virt -cpu max
   `ELF 64-bit ... ARM aarch64`, and it prints its usage line correctly
   (`.../step2/baro-tokenize-native-file.txt`, `.../step2/baro-tokenize-run.txt`).
 
-**Tokenizer parity -- partial, one piece BLOCKED.** `tools/ci-checks.sh`'s
-own pre-tokenizer regex check (`tools/pretok-check.py` against
-`serve/pretok-table.json`) ran on the guest and PASSED: 10 implemented, 0
-differ. The deeper, model-based gate (`tools/test_tokenizer_mojo.py`,
-`decode(encode(x)) == x` plus agreement with `llama-tokenize` on a real GGUF)
-is **BLOCKED**: it requires `--gguf` (a real model pack, hundreds of MB to
-GB), a built `~/llama.cpp/build/bin/llama-tokenize`, and
-`~/llama.cpp/gguf-py` on `sys.path`, none of which exist on this guest.
-Copying a model pack onto the guest is outside this S probe's authorized
-download scope (the rootfs plus its `.md5`/`.sig` only); not substituted
-with a weaker check.
+**Tokenizer parity -- PASS (closed by the coordinator after the report).** `tools/ci-checks.sh`'s
+own pre-tokenizer regex check (`tools/pretok-check.py` against `serve/pretok-table.json`) ran on the
+guest and PASSED: 10 implemented, 0 differ. The model-based gate `tools/test_tokenizer_mojo.py` was
+then run with the guest's native aarch64 `baro-tokenize` (`/root/mojo-baro/.work/baro-tokenize`, ELF
+aarch64) as the CLI under test, through a wrapper that copies each case file into the guest and runs
+the binary there against a local copy of
+`~/Models/qwen2.5-0.5b-instruct-import/qwen2.5-0.5b-instruct-q4_K_M.gguf` (397,807,968 bytes, a file
+already on this machine, no download). The reference stays `llama-tokenize` on the host, same GGUF.
+Result: `PASS: 61 cases, 0 failures` on aarch64; the same test with the x86_64 build of the same
+source: `PASS: 61 cases, 0 failures`. Receipts: `.work/team-C/coordinator/p6-aarch64/parity-aarch64.log`,
+`parity-x86.log`, `guest-cli.sh`.
 
 **Original x86_64 rig, for the record.** `qemu-system-aarch64` is present at
 version 11.1.1 on the host. The pre-existing `~/AMDHQ/labiso/vm/boot-test.sh`
