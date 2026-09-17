@@ -87,6 +87,11 @@ impl Engine {
             .kill_on_drop(true)
             .spawn()
             .map_err(|e| format!("spawn {}: {e}", engine.display()))?;
+        // P4: the GPU work happens in THIS child, not in baro-serve itself --
+        // a preflight matching rocm-smi PIDs against baro-serve's own pid
+        // checks the wrong process. Log the child's pid so a gate script can
+        // grep it instead.
+        eprintln!("engine child pid: {} ({})", child.id().map(|p| p.to_string()).unwrap_or_else(|| "unknown".into()), engine.display());
         let stdin = child.stdin.take().ok_or("engine stdin not piped")?;
         let stdout = child.stdout.take().ok_or("engine stdout not piped")?;
         let mut lines = BufReader::new(stdout).lines();
