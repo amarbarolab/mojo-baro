@@ -212,3 +212,34 @@ P8).
 default arm 67.54, ratio 1.379, identity 20/20, each arm's own start-up line reading `mode page-cache`
 and `mode pinned` respectively (P1). Matches stage 3 item 0 (48.57 / 67.12). Cost: 18.3 GB of locked
 host RAM for the engine's lifetime; `=0` restores the page cache.
+
+## Zero-copy misses (2026-09-17, frozen before the timed run)
+
+**Probe first** (`bench/tier_zerocopy_probe.mojo`, `.work/tier-zc/`, checksums equal across arms, medians of 11):
+a kernel reading pinned host memory over PCIe with 16-byte loads reaches 24.6 GB/s at 8 pieces of
+589,824 bytes and 27.2 GB/s at 24 pieces, against 21.9 GB/s for today's per-piece `enqueue_copy` path,
+and 14 to 15 GB/s at 2 pieces where too few loads are in flight (the same at 32 KB chunks, so it is
+parallelism, not chunking). Kernel-after-DMA (today's serialized miss cost) is 82 / 243 / 666 us at
+2 / 8 / 24 pieces; the zero-copy kernel is 84 / 191 / 520 us.
+
+**Design.** `BARO_TIER_ZC=1` (opt-in, pinned store only; the start-up line reads `mode pinned+zc`, P1).
+On a miss, `prepare()` no longer enqueues the DMA for the q4_k pieces: it writes the expert's original
+id into a per-launch `hoste` table (-1 for hits, `slots` still carries the cache slot) and the gate/up
+and down kernels (`moe_gate_up_q4k_zc`, `amar_moe_down_q4k_zc`) read that expert's rows straight from
+the pinned store while each lane stores the bytes it loaded into the assigned cache slot (read-through
+fill, `q4k_dot_blocks_fill`). No second stream, no extra PCIe bytes: the fill is a VRAM write of what
+the wave already holds. The three q6_k down layers (34, 38, 39) keep the DMA path, so their kernel is
+unchanged. The hit path is byte-identical to today.
+
+**Predictions.** (1) Identity: 20/20 generated sequences equal to the `BARO_TIER_ZC=0` arm, because
+the fill writes the same bytes the DMA wrote and the dot reads the same values; any miss is a defect.
+(2) The tier's `bytes_fetched` per token is unchanged (same misses), `copy_us` in the stamp table drops
+to the q6_k share (about 3/40). (3) Decode: the miss transfer per token is about 140 MB (20-prompt
+median `bytes_per_token` from the pinned receipt); at 21.9 vs 26 GB/s that is 6.4 vs 5.4 ms of a
+14.8 ms token, so **predicted 67.5 to about 72 tok/s_gen, +7%, band +4% to +10%**. Below +4% means
+the GEMV's read pattern does not reach the probe's parallelism regime and the round closes at the
+number. **Kill line:** any identity miss, or a ratio under 1.00.
+
+**Gate.** `bench/ab-prompts.sh` on `.work/engine-moe`, arms `BARO_PACK=.work/moe-tier BARO_TIER=64
+BARO_MEGA=0 BARO_SPEC=0` with `BARO_TIER_ZC=0` (A) and `=1` (B), 20 prompts one stint under
+`bench/clock-probe.sh`, identity per prompt, both start-up lines read back. Dry-run on CPU first.
