@@ -8,7 +8,7 @@ greedy token ids.
 
 Parity target: byte-identical token ids vs llama.cpp on the same GGUF.
 """
-from std.math import ceildiv
+from std.math import ceildiv, sqrt
 from std.memory import memcpy, unsafe_memcpy
 from std.os import getenv
 from kvpage import PageTable
@@ -248,6 +248,8 @@ def parse_a3b_request(line: String, tmax: Int, mut req_id: Int, mut prompt: List
     var err = parse_request(line, req_id, prompt, gen_n, spec, has_spec, stop, ckpt, sample, state_save, state_load)
     if err != "":
         return err
+    if sample.embed == 1:
+        return "embed is not wired on the multi-sequence path (BARO_SEQS > 1); send it to a single-sequence engine"
     if len(prompt) < 1:
         return "empty prompt"
     if gen_n < 1:
@@ -1018,6 +1020,20 @@ def main() raises:
             # window.mojo. bufs.dump_row_h and bufs.pen_hist_h were staged
             # by window.mojo's own enqueue_copy calls (cfg.dump_pen /
             # penalties-or-logprobs), synchronized here for the first time.
+            if sample.embed == 1 and pos_before == len(prompt) - 1:
+                var emb_h = ctx.enqueue_create_host_buffer[f32](H)
+                ctx.enqueue_copy(dst_buf=emb_h, src_buf=DeviceBuffer[f32](ctx, bufs.hn_d.unsafe_ptr(), H, owning=False))
+                ctx.synchronize()
+                var ss: Float64 = 0
+                for ei in range(H):
+                    ss += Float64(emb_h[ei]) * Float64(emb_h[ei])
+                var inv = 1.0 / sqrt(ss) if ss > 0 else 0.0
+                var el = String("{\"id\":") + String(req_id) + ",\"embed\":["
+                for ei in range(H):
+                    if ei > 0:
+                        el += ","
+                    el += String(Float32(Float64(emb_h[ei]) * inv))
+                print(el + "]}")
             if cfg.dump_pen and wst.pos == pos_before + 1 and pos_before + 1 >= len(prompt):
                 ctx.synchronize()
                 var step = pos_before + 1 - len(prompt)

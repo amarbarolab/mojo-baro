@@ -158,10 +158,15 @@ struct SampleParams(Copyable, Movable):
     # matching every other field's convention here. Bounded to
     # kernels/sample.mojo's amar_topn_probs CAP (<= 20) by the caller.
     var top_logprobs: Int
+    # P0a-e: 1 asks for the last prompt token's post-final-norm hidden row,
+    # L2-normalized, as one {"id":ID,"embed":[...]} line before the first
+    # token line. Not a sampling knob; it rides here so parse_request keeps
+    # its signature across the three harnesses that call it.
+    var embed: Int
 
 
 def default_sample_params() -> SampleParams:
-    return SampleParams(temperature=0, top_p=1.0, top_k=0, min_p=0, seed=0, presence_penalty=0, frequency_penalty=0, top_logprobs=0)
+    return SampleParams(temperature=0, top_p=1.0, top_k=0, min_p=0, seed=0, presence_penalty=0, frequency_penalty=0, top_logprobs=0, embed=0)
 
 
 def parse_request(
@@ -311,6 +316,12 @@ def parse_request(
         if not json_int(line, fi, iv3) or iv3 < 0:
             return "top_logprobs must be a non-negative integer"
         sample.top_logprobs = iv3
+    fi = json_key(line, "embed")
+    if fi >= 0:
+        if line.as_bytes()[fi] == 116:
+            sample.embed = 1
+        elif line.as_bytes()[fi] != 102:
+            return "embed must be true or false"
     return ""
 
 
