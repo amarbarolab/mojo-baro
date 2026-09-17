@@ -61,6 +61,10 @@ struct Opts {
     /// no VRAM held for it; `EnginePool::empty()` backs every route that
     /// would otherwise need one with its existing 503 error path.
     audio_only: bool,
+    /// P4: per-engine environment seam so a device pin (`ROCR_VISIBLE_DEVICES`,
+    /// `HSA_OVERRIDE_GFX_VERSION`) is an explicit, logged baro-serve argument
+    /// rather than only whatever launched it. `KEY=` (empty value) unsets KEY.
+    engine_env: Vec<(String, String)>,
 }
 
 fn parse_opts() -> Result<Opts, String> {
@@ -71,6 +75,7 @@ fn parse_opts() -> Result<Opts, String> {
         host: "127.0.0.1".into(),
         port: 8080,
         audio_only: false,
+        engine_env: Vec::new(),
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -82,8 +87,13 @@ fn parse_opts() -> Result<Opts, String> {
             "--host" => o.host = val("--host")?,
             "--port" => o.port = val("--port")?.parse().map_err(|e| format!("--port: {e}"))?,
             "--audio-only" => o.audio_only = true,
+            "--engine-env" => {
+                let kv = val("--engine-env")?;
+                let (k, v) = kv.split_once('=').ok_or_else(|| format!("--engine-env {kv}: needs KEY=VALUE (KEY= to unset)"))?;
+                o.engine_env.push((k.to_string(), v.to_string()));
+            }
             "-h" | "--help" => {
-                println!("usage: baro-serve [--engine PATH] [--pack DIR] [--tokenizer tokenizer.json] [--host H] [--port N] [--audio-only]");
+                println!("usage: baro-serve [--engine PATH] [--pack DIR] [--tokenizer tokenizer.json] [--host H] [--port N] [--audio-only] [--engine-env KEY=VALUE]...");
                 std::process::exit(0);
             }
             other => return Err(format!("unknown argument {other}")),
@@ -125,7 +135,7 @@ async fn main() {
         eprintln!("audio-only: no LLM engine spawned, no pack loaded");
         EnginePool::empty()
     } else {
-        match EnginePool::spawn(&opts.engine, &opts.pack, pool_size).await {
+        match EnginePool::spawn(&opts.engine, &opts.pack, pool_size, &opts.engine_env).await {
             Ok(e) => e,
             Err(e) => {
                 eprintln!("baro-serve: {e}");
@@ -133,6 +143,9 @@ async fn main() {
             }
         }
     };
+    if !opts.engine_env.is_empty() {
+        eprintln!("engine env overrides: {:?}", opts.engine_env);
+    }
     eprintln!("engine pool ready: {} engine(s), limits {:?}", engine.pool_size(), engine.limits);
     let model = opts
         .pack

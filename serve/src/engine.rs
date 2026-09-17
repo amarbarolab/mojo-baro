@@ -62,11 +62,23 @@ const QUEUE_CAP: usize = 64;
 impl Engine {
     /// Spawn the engine, wait for its ready line, start the worker.
     /// The child inherits this process's environment (BARO_* knobs pass
-    /// through); `BARO_SERVE=1` and `BARO_PACK` are set here.
-    pub async fn spawn(engine: &Path, pack: &Path) -> Result<Engine, String> {
-        let mut child = tokio::process::Command::new(engine)
-            .env("BARO_SERVE", "1")
-            .env("BARO_PACK", pack)
+    /// through); `BARO_SERVE=1` and `BARO_PACK` are set here. `extra_env`
+    /// applies on top (P4: `ROCR_VISIBLE_DEVICES`/`HSA_OVERRIDE_GFX_VERSION`
+    /// for a device pin explicit in baro-serve's own args, not only in
+    /// whatever launched it), each entry a `(KEY, VALUE)` pair; an empty
+    /// value unsets the key instead of setting it (`igpu-env` needs
+    /// `HIP_VISIBLE_DEVICES` unset, not set to empty).
+    pub async fn spawn(engine: &Path, pack: &Path, extra_env: &[(String, String)]) -> Result<Engine, String> {
+        let mut cmd = tokio::process::Command::new(engine);
+        cmd.env("BARO_SERVE", "1").env("BARO_PACK", pack);
+        for (k, v) in extra_env {
+            if v.is_empty() {
+                cmd.env_remove(k);
+            } else {
+                cmd.env(k, v);
+            }
+        }
+        let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -215,10 +227,10 @@ impl EnginePool {
         }
     }
 
-    pub async fn spawn(engine: &Path, pack: &Path, pool_size: usize) -> Result<EnginePool, String> {
+    pub async fn spawn(engine: &Path, pack: &Path, pool_size: usize, extra_env: &[(String, String)]) -> Result<EnginePool, String> {
         let mut engines = Vec::with_capacity(pool_size.max(1));
         for _ in 0..pool_size.max(1) {
-            engines.push(Engine::spawn(engine, pack).await?);
+            engines.push(Engine::spawn(engine, pack, extra_env).await?);
         }
         let limits = engines[0].limits.clone();
         Ok(EnginePool {
