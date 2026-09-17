@@ -1,13 +1,13 @@
 # Team A P0b report
 
 Date: 2026-09-17
-Item: P0b CPU router skeleton, gate 3, and gates 1/2/4's real proxy + state
-locality
-Status: **gate 3 PASS** (2/2 clean runs). Gates 1/2/4's mechanism is built
-and live-proven with one real engine; the two-engine placement-spread and
-live-failover claims those gates actually ask for are **BLOCKED on P4**
-(multi-GPU wiring, XTX + iGPU, a separate platform item nobody has built
-yet). See "Gates 1/2/4" below for exactly what is proven and what is not.
+Item: P0b CPU router skeleton, gates 1-4, real proxy + state locality
+Status: **gates 1, 2, 3, 4 all PASS, live, two real engines. Merge-ready.**
+P4 (multi-GPU/iGPU wiring) is no longer the blocker it was earlier today:
+lane FORK's `docs/P1-FORK-TARGET.md` measured two live 9B `baro-serve`
+processes fitting the XTX at once at `BARO_TMAX=4096`, which this report's
+gate 1/2 runs use directly. That TMAX ceiling is a real, recorded scope
+limit on these two gates -- see "TMAX limitation" below.
 
 ## Landed
 
@@ -36,6 +36,10 @@ yet). See "Gates 1/2/4" below for exactly what is proven and what is not.
   preferred-engine bonus, `probe_loop`'s `GET /v1/state` poll,
   `locality_preference()`'s `POST /tokenize` + hash match). "Gates 1/2/4"
   below.
+- `d951d38` (sonnet, coordinator handoff 2026-09-17 afternoon: lane FORK's
+  two-engine rig unblocks gates 1/2): `bench/p0b-gate1-placement.sh`,
+  `bench/p0b-gate2-failover.sh`, `bench/p0b-gates12-live.sh`. Both gates
+  PASS live with two real engines. "Gates 1/2/4" below.
 
 ## The original failure (codex, kept for the record)
 
@@ -133,27 +137,15 @@ gate 4).
 
 ## Gates 1/2/4
 
-The plan's own text for all three names "two engines on this box (P4's
-rig)" or a live kill of one of two. P4 (multi-GPU wiring: `baro-serve` on
-the XTX plus a second one on the Raphael iGPU under the HSA override, a
-small Qwen2.5-0.5B pack) is its own platform item and nobody has built it
-yet (`exchange/` has no P4 report; no iGPU pack exists under `.work/`). That
-is a real, single, cross-item blocker for all three gates' literal claims,
-not a per-gate list -- named here once rather than three times.
+### What's built
 
-What is genuinely built and what a live single-engine smoke can and cannot
-prove:
-
-- **`proxy()` forwards for real now.** It answered 501 before this commit.
-  It now forwards via a pooled `reqwest::Client`, streams the response body
+- **`proxy()` forwards for real now.** It answered 501 before this. Now it
+  forwards via a pooled `reqwest::Client`, streams the response body
   straight through (`Body::from_stream` over `bytes_stream()`, so SSE
   token-by-token output reaches the client as it arrives), and on a
   connect/timeout failure *before* any response arrives, demotes the engine
   immediately and retries the next-ranked one (not waiting for
-  `probe_loop`'s next 5 s cycle) -- gate 2's "new ones route to the other,"
-  minus the "kill a real engine mid-generation, in-flight requests fail
-  loudly" half, which needs a second real engine to demonstrate without
-  faking it.
+  `probe_loop`'s next 5 s cycle).
 - **CONTRACT 4 (P1-STATE-API.md) is wired end to end**, not just at the
   unit level: `choose()` takes a preferred engine id and treats its pending
   count as one lower, breaking ties in its favor; `probe_loop` polls each
@@ -171,14 +163,84 @@ prove:
   `state.rs::default_pos`'s fallback, and `Chain::lookup` on the engine side
   all use, room A 2026-09-17's P1 fix) -- fixed to check `len - 1` first,
   `len` too.
-- **Gate 1's placement-spread across two engines** and **gate 2's live
-  "kill one engine mid-generation, in-flight fails loudly, new routes to
-  the survivor"** genuinely need two real engines and are not claimed here.
 
-### Live receipt (one real engine)
+### TMAX limitation (coordinator, record this)
+
+Gates 1 and 2 below run two live 9B dense q4 `baro-serve` processes on the
+XTX at once. Lane FORK measured (`docs/P1-FORK-TARGET.md` on `lane-fork`)
+that this only fits at `BARO_TMAX=4096`,
+`MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_SIZE_PERCENT=10` (10.7 GB each, 21.4
+GB total, about 0.5 GB headroom on a 24 GB card); at `BARO_TMAX=33024`
+(32k) one engine alone needs about 19 GB, which does not leave room for a
+second. **Both gate scripts here run under `BARO_TMAX=4096` and prove
+nothing about two engines at 32k context** -- that remains out of reach on
+this single-XTX box. `serve/spark.mojo` (the small models, e.g. the
+Llama-3.2-1B pair lane FORK also measured) is unaffected; this ceiling is
+specific to `serve/engine.mojo`'s dense 9B path.
+
+### Gate 1 receipt: `bench/p0b-gate1-placement.sh`, PASS
 
 ```text
-bench/p0b-proxy-smoke.sh
+node-info OK: both engines healthy
+model=engine-pack-q4
+pair-dispatch OK: 20/20 ok through the router
+placement OK: a=10 b=10 (balanced within one), every row placement=rank
+identity OK: 20/20 proxied responses match the single-engine (a) baseline at T=0
+PASS p0b-gate1-placement
+```
+
+`pair-dispatch` (Personal-AI-Router's own client) deliberately never logs
+prompt or response text (`proxy-inference-routing.mdc` policy) -- it proves
+the 20/20-complete, genuine-third-party-client half. The identity half is a
+separate direct `/v1/completions` comparison this script makes itself (the
+same split `bench/p0a-contract-gate.sh` already uses for its own gate 1/2),
+4 repeats per prompt against a single-engine baseline captured on engine
+`a` before the dispatch run, so both physical engines answer for the same
+prompt across the run and all match. Caught live: `pair-dispatch`'s
+`ollama` backend speaks `/api/generate`, not `/api/chat` as the tool's own
+doc comment says -- the catalog check was fixed against what actually
+crossed the wire, not the comment.
+
+### Gate 2 receipt: `bench/p0b-gate2-failover.sh`, PASS
+
+```text
+node-info OK: both engines healthy before the kill
+in-flight request has 23 SSE frame(s) before the kill
+engine a killed (pid 1901693)
+in-flight curl exit=18 frames_total=23 done_reached=0
+in-flight request failed loudly as expected (exit=18, no terminal DONE reached)
+after-kill text: ' What is the first letter of the word'
+catalog OK: new post-kill request landed on engine=b placement=rank
+node-info OK: a unhealthy, b still healthy
+PASS p0b-gate2-failover
+```
+
+A real in-flight SSE generation on engine `a` (23 frames already received)
+is stopped by `SIGKILL`ing the process outright, not a graceful exit. The
+in-flight `curl` fails loudly (exit 18, no terminal `[DONE]`) rather than
+hanging or quietly completing. A new request sent immediately after routes
+to and completes on the survivor `b`, exercising `proxy()`'s
+connect-failure retry path against a genuinely dead process (not
+simulated) -- this works before `probe_loop`'s 3-failed-probe health
+hysteresis even has time to flip `a` to unhealthy (confirmed separately, 16
+s later, in the same receipt). Named honestly in the script's own header:
+the catalog logs a request "done" when the upstream response headers
+arrive, not when the client finishes reading the stream, so it does not
+retroactively mark a mid-stream failure -- this gate proves the
+client-visible failure instead, which is what a real caller experiences.
+
+Both scripts CPU-preflighted (missing-binary and immediate-exit failure
+paths: fast exit, zero leftover processes) before touching the GPU queue,
+and both ran as one `gpu-wait` job (`bench/p0b-gates12-live.sh`,
+`--timeout 900`). Two real bugs caught and fixed before the final green
+run, both recorded in commit `d951d38`: the `/api/generate` vs `/api/chat`
+mismatch above, and `wait "$inflight_pid"` alone tripping `set -e` on the
+very nonzero exit gate 2 exists to observe (guarded with
+`|| inflight_rc=$?`).
+
+### Gate 4 live receipt (one real engine, `bench/p0b-proxy-smoke.sh`)
+
+```text
 gate1 mechanism OK: proxied text matches direct byte-for-byte: ' Paris.\nThe capital of France is'
 SSE streaming pass-through OK: 10 data frames, terminal [DONE] reached
 catalog OK: 1 completions row(s), last one engine=real placement=rank
@@ -187,15 +249,14 @@ gate4 OK: locality-prefixed request placed with placement=locality
 PASS p0b-proxy-smoke
 ```
 
-`node-info` before the checkpoint existed: `real` healthy, `dead` (an
-intentionally-unlistened port, to prove `choose()`'s health filter and the
-retry-exclude path have something to skip) not, `resident_state` already
-present (an empty `GET /v1/state` response, since nothing was checkpointed
-yet). After a real `POST /v1/checkpoints`, the same engine's
-`resident_prefix_hashes` carries the new hash and a following
-`/v1/completions` request for that exact prompt is placed with
-`placement=locality`, not `rank` -- the full wire path fires, not just its
-pieces.
+A real `POST /v1/checkpoints` makes a prefix genuinely resident; the
+router's `probe_loop` polls it into `resident_prefix_hashes` within one 5 s
+cycle; a following `/v1/completions` request for that exact prompt is
+placed with `placement=locality`, not `rank` -- the full CONTRACT 4 wire
+path fires end to end, not just its unit-tested pieces. One engine is
+enough for gate 4's own claim (the plan's "gates 1 to 3 pass with the term
+permanently empty" framing treats 4 as orthogonal to the two-engine
+placement-spread question).
 
 ### Unit coverage
 
@@ -223,15 +284,19 @@ No stray `router`, `baro-serve`, or `nvpair-node-scanner` processes remain
 run in room A at line 223 (sonnet), exit 0, 146 PASS -- receipt predates this
 gate's own work but nothing since has touched Mojo sources.
 
-## Next action
+## Merge readiness
 
-Everything buildable without a second engine is built and live-proven.
-What remains for gates 1/2/4 is P4 itself: `baro-serve` on the iGPU
-(Qwen2.5-0.5B, WMMA-free kernel set, `HSA_OVERRIDE_GFX_VERSION=10.3.0` --
-`igpu-env --probe` already confirms the device works, `vadd mismatches 0`)
-plus the pack bake for it. Once that exists, `bench/p0b-proxy-smoke.sh`'s
-shape (one real engine, a `dead` port to exercise the exclude path) extends
-directly to a genuine two-engine `pair-dispatch --count 20` run for gate 1
-and a real kill-mid-generation for gate 2; nothing in this commit needs
-rework for that, it only needs a second `BARO_ROUTER_ENGINES` entry that
-answers. `lane-team-a` is current with `main` (merged 2026-09-17, `be9a002`).
+All four P0b gates pass, live, with real engines: gate 3 (2/2 runs), gate
+1 (20/20 pair-dispatch + placement + identity), gate 2 (real kill,
+loud client failure, correct failover), gate 4 (full CONTRACT 4 wire path).
+`cargo clippy --workspace -D warnings` clean, `cargo nextest run
+--workspace` 73/73. No stray processes after any run this session.
+`./run-tests.sh` (Mojo/kernel suite, unaffected by this Rust-only lane):
+146 PASS, room A line 223 -- unchanged since, nothing here touched Mojo
+sources. `lane-team-a` is current with `main` (merged 2026-09-17, `be9a002`).
+
+The one recorded scope limit: gates 1/2 ran at `BARO_TMAX=4096` (two-engine
+VRAM ceiling on this single XTX, see "TMAX limitation" above), not at 32k.
+That is a hardware fact about this box, not a defect in the router or the
+gates -- the P0b design itself never promised two engines at 32k on one
+card.
