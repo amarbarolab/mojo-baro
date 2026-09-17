@@ -205,10 +205,17 @@ structural reasons rather than bad luck:
 1. Both minima are exactly 57/64 = 89.06%. At `n_predict` 64 the achievable grid
    steps from 57/64 (89.06%) to 58/64 (90.63%); there is no 90%. The floor is
    unreachable by construction at this generation length.
-2. The prompt holding the minimum is not a stable property of the model.
+2. The prompt holding the minimum is not a stable property across arms.
    `p03-story` is the worst prompt unpatched (89.06%) and the third-best patched
-   (96.88%); `p09` moves the other way (95.31% to 89.06%). Min-over-20 is
-   measuring sampling noise; the aggregate moved -0.42 pp.
+   (96.88%); `p09` moves the other way (95.31% to 89.06%). Min-over-20 therefore
+   reports whichever single prompt happens to sit worst in that arm, while the
+   aggregate moved only -0.42 pp.
+
+   This is NOT measurement noise: the gate is deterministic within an arm. The
+   control was run twice (`forced/` and `forced-rep2/`, separate servers and
+   ports) and both runs agree on all 20 prompts, 1230/1264 = 97.31% each, zero
+   differing prompts. The per-prompt swings above are real, reproducible effects
+   of the LoRA that scatter in both directions and largely cancel in aggregate.
 
 This is the same class as the FORK lane's gate 4, where the plan's 20/20 bar was
 unreachable even llama-to-llama (control L 15/16/16), and as llama.cpp's own
