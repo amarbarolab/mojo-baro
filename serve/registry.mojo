@@ -57,7 +57,7 @@ comptime i8 = DType.int8
 
 comptime MROWS = SM
 comptime KMAX = SM
-comptime SEQ_CAP = 2
+comptime SEQ_CAP = 4
 comptime SLOTS = KMAX + 1
 comptime CONV_SLOT = N_SSM * 3 * CONV
 comptime SSM_SLOT = N_SSM * NH_V * SSTATE * SSTATE

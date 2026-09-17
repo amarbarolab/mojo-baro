@@ -26,6 +26,18 @@ single-request median must remain within +/-2% of its pre-batch value. A result
 below 2.08x is a below-bar result, not a rounded pass. A result above 2.54x
 requires receipt audit before adoption.
 
+## Staged pre-kernel gate
+
+The coordinator-owned row-kernel seam is not present in this tree. Before
+timing the one-launch candidate, the host harness gate is therefore a
+two-request identity check using one `a3c2` batch marker followed by two
+request rows. The engine allocates both row descriptors and advances the rows
+with serial `step_window` calls inside one batch step, printing both ids and
+their slots. This gate proves request parsing, descriptor population, private
+state/page-table selection, readback and receipt coverage; it explicitly makes
+no one-launch or throughput claim. The one-launch gate below remains frozen for
+the coordinator's kernel implementation.
+
 ## Frozen gate
 
 `bench/a3-c-gate.sh` uses the 20 exact-token prompts in
@@ -54,4 +66,3 @@ positions and recurrent-state regions without changing `kernels/*.mojo`, stop
 before timing and write `ENGINE:` with the exact missing ABI. Do not relabel
 same-sequence MTP rows as distinct requests and do not substitute four
 serialized `step_window` calls.
-
