@@ -64,17 +64,36 @@ const QUEUE_CAP: usize = 64;
 impl Engine {
     /// Spawn the engine, wait for its ready line, start the worker.
     /// The child inherits this process's environment (BARO_* knobs pass
-    /// through); `BARO_SERVE=1` and `BARO_PACK` are set here.
-    pub async fn spawn(engine: &Path, pack: &Path) -> Result<Engine, String> {
-        let mut child = tokio::process::Command::new(engine)
-            .env("BARO_SERVE", "1")
-            .env("BARO_PACK", pack)
+    /// through); `BARO_SERVE=1` and `BARO_PACK` are set here. `extra_env`
+    /// applies on top (P4: `ROCR_VISIBLE_DEVICES`/`HSA_OVERRIDE_GFX_VERSION`
+    /// for a device pin explicit in baro-serve's own args, not only in
+    /// whatever launched it -- the same list for every engine this call
+    /// spawns, since `EnginePool` uses it pool-wide, one device per
+    /// process), each entry a `(KEY, VALUE)` pair; an empty value unsets
+    /// the key instead of setting it (`igpu-env` needs `HIP_VISIBLE_DEVICES`
+    /// unset, not set to empty).
+    pub async fn spawn(engine: &Path, pack: &Path, extra_env: &[(String, String)]) -> Result<Engine, String> {
+        let mut cmd = tokio::process::Command::new(engine);
+        cmd.env("BARO_SERVE", "1").env("BARO_PACK", pack);
+        for (k, v) in extra_env {
+            if v.is_empty() {
+                cmd.env_remove(k);
+            } else {
+                cmd.env(k, v);
+            }
+        }
+        let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .kill_on_drop(true)
             .spawn()
             .map_err(|e| format!("spawn {}: {e}", engine.display()))?;
+        // P4: the GPU work happens in THIS child, not in baro-serve itself --
+        // a preflight matching rocm-smi PIDs against baro-serve's own pid
+        // checks the wrong process. Log the child's pid so a gate script can
+        // grep it instead.
+        eprintln!("engine child pid: {} ({})", child.id().map(|p| p.to_string()).unwrap_or_else(|| "unknown".into()), engine.display());
         let stdin = child.stdin.take().ok_or("engine stdin not piped")?;
         let stdout = child.stdout.take().ok_or("engine stdout not piped")?;
         let mut lines = BufReader::new(stdout).lines();
@@ -217,10 +236,10 @@ impl EnginePool {
         }
     }
 
-    pub async fn spawn(engine: &Path, pack: &Path, pool_size: usize) -> Result<EnginePool, String> {
+    pub async fn spawn(engine: &Path, pack: &Path, pool_size: usize, extra_env: &[(String, String)]) -> Result<EnginePool, String> {
         let mut engines = Vec::with_capacity(pool_size.max(1));
         for _ in 0..pool_size.max(1) {
-            engines.push(Engine::spawn(engine, pack).await?);
+            engines.push(Engine::spawn(engine, pack, extra_env).await?);
         }
         let limits = engines[0].limits.clone();
         Ok(EnginePool {

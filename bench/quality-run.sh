@@ -3,8 +3,9 @@
 #   bench/quality-run.sh KEY            full row
 #   QUICK=N bench/quality-run.sh KEY    first N task items, 2 PPL chunks (iteration only, never cited)
 # Runs OUTSIDE gpu-wait: CPU steps (tokenizer server, prep, builds, scoring) hold no GPU; each GPU step is
-# its own gpu-wait job. llama.cpp outputs go through ~/iTools/bin/refcache (model sha + llama.cpp commit +
-# inputs, P17); the ours arm always runs. Any failure prints FAIL <step> and exits non-zero (P16).
+# its own gpu-wait job. llama.cpp outputs go through ~/iTools/dev/refcache/refcache.sh (model sha + llama.cpp
+# commit + inputs, P17; NOT the ~/iTools/bin/refcache shim, which now points to an incompatible rewrite with
+# a different CLI); the ours arm always runs. Any failure prints FAIL <step> and exits non-zero (P16).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 KEY=$1; QUICK=${QUICK:-0}
@@ -48,7 +49,7 @@ gpu 1800 env $renv "$PY" bench/quality-ppl-run.py --engine "$OUT/engine-head" --
   --ref-prompt "$(jq -r '.["baro.run.prompt.tokens"]' <<<"$meta")" --ref-tokens "$(jq -r '.["baro.run.ref.tokens"]' <<<"$meta")" \
   --chunks "$chunks" --out "$OUT/ppl-ours" > "$OUT/ppl-ours.log" 2>&1 || die ppl-ours "$(tail -2 "$OUT/ppl-ours.log")"
 ok ppl-ours "$(tail -1 "$OUT/ppl-ours.log")"
-REFCACHE_DIR=$PWD/.work/refcache ~/iTools/bin/refcache --key-file "$llama_gguf" --key-file "$WIKI" --key "llama.cpp=$llama_sha ppl c512 chunks$chunks" \
+REFCACHE_DIR=$PWD/.work/refcache ~/iTools/dev/refcache/refcache.sh --key-file "$llama_gguf" --key-file "$WIKI" --key "llama.cpp=$llama_sha ppl c512 chunks$chunks" \
   --out "$OUT/ppl-llama.log" -- gpu-wait run --vram "$((vram + 2))" --priority 20 --timeout 900 -- bash -c '"$1" -m "$2" -f "$3" -c 512 --chunks "$4" -ngl 99 -fa on -ctk f16 -ctv f16 -t 8 > "$5" 2>&1' \
   _ "$LB/llama-perplexity" "$llama_gguf" "$WIKI" "$chunks" "$OUT/ppl-llama.log" 2>&1 | tee -a "$OUT/SUMMARY.txt"
 ok ppl-llama "$(grep 'Final estimate' "$OUT/ppl-llama.log")"
@@ -59,7 +60,7 @@ ok prep "$(tail -1 "$OUT/task.log")"
 spec=$([ "$engine" = dense ] && echo 1 || echo 0)
 gpu 2400 "$PY" bench/quality-task-ids.py ours --engine "$cache_engine" --pack "$cache_pack" --env "$renv" --spec "$spec" --out "$OUT/task" >> "$OUT/task.log" 2>&1 || die ours "$OUT/task.log"
 ok ours "$(tail -1 "$OUT/task.log")"
-REFCACHE_DIR=$PWD/.work/refcache ~/iTools/bin/refcache --key-file "$llama_gguf" --key-file "$OUT/task/prompts.json" --key "llama.cpp=$llama_sha task n300 np8 topk1" \
+REFCACHE_DIR=$PWD/.work/refcache ~/iTools/dev/refcache/refcache.sh --key-file "$llama_gguf" --key-file "$OUT/task/prompts.json" --key "llama.cpp=$llama_sha task n300 np8 topk1" \
   --out "$OUT/task/llama-ids.json" -- gpu-wait run --vram "$((vram + 2))" --priority 20 --timeout 2400 -- bash -c '"$1" -m "$2" -c 16384 -np 8 -ngl 99 -fa on -ctk f16 -ctv f16 -t 8 --host 127.0.0.1 --port 8199 > "$3/llama-server.log" 2>&1 & p=$!
     trap "kill $p" EXIT
     for _ in $(seq 600); do curl -sf localhost:8199/health >/dev/null 2>&1 && break; kill -0 $p || exit 1; sleep 1; done
