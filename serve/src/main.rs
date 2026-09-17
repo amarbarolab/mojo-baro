@@ -156,6 +156,7 @@ async fn main() {
         // P1: cross-node state API (docs/P1-STATE-API.md).
         .route("/v1/state", get(state::list))
         .route("/v1/state/export", post(state::export))
+        .route("/v1/state/import", post(state::import))
         .with_state(app.clone())
         .layer(middleware::from_fn(access_log));
 

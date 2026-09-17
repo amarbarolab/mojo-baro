@@ -6,21 +6,26 @@
 //! export needs, `fork()` already runs the `state_load` restore import
 //! needs (room A, 2026-09-17 design review with codex).
 //!
-//! Build order: `GET /v1/state` (read-only, no GPU) landed first. This
-//! commit adds `POST /v1/state/export`, `path` variant only: the caller
-//! names a file, the response is JSON metadata, not the LAT1-wrapped
-//! streaming body CONTRACT 1 also describes -- that is a following commit,
-//! built on this one's engine-submission logic. `POST /v1/state/import`
-//! follows after.
+//! Build order: `GET /v1/state` (read-only, no GPU), then `POST
+//! /v1/state/export` (`path` variant), both landed. This commit adds `POST
+//! /v1/state/import`, also the `path` variant: the caller names an existing
+//! raw `BAROST01`/`BAROST02` file (as `export`'s `path` form writes), the
+//! response is JSON metadata. The LAT1-wrapped streaming body/response
+//! CONTRACT 1 also describes, for both routes, is a following commit.
 //!
-//! Two spec-vs-reality gaps found while building this (room A, 2026-09-17):
-//! CONTRACT 3's per-request `n = 0` prefill does not exist (`check_and_submit`
-//! rejects `n == 0`); this uses `n = 1`, the same working pattern
-//! `checkpoints::create` already ships. And the per-request `"format"` field
-//! cannot be honored: `serve/engine.mojo:86` reads `BARO_STATE_INT8` once at
-//! server startup, there is no per-request override on the wire, so a
-//! request whose `format` disagrees with the server's actual fixed format
-//! gets a 409 naming both, not a silently wrong file.
+//! Gaps found while building this, handled honestly rather than silently
+//! (room A, 2026-09-17): CONTRACT 3's per-request `n = 0` prefill does not
+//! exist (`check_and_submit` rejects `n == 0`); this uses `n = 1`, the same
+//! working pattern `checkpoints::create` already ships. The per-request
+//! `"format"` field cannot be honored: `serve/engine.mojo:86` reads
+//! `BARO_STATE_INT8` once at server startup, so export 409s a mismatched
+//! request instead of writing a silently wrong file. And `runtime_differs`
+//! in import's response is always `null`, not `false`: a raw BAROST0x file
+//! (`serve/engine.mojo`'s `save_state`) carries no `runtime` field at all
+//! (magic, pos, CONV_SLOT, SSM_SLOT, kvn, salt, tokens -- that's the whole
+//! 72-byte header plus the token array), only the LAT1 wrapper does, so
+//! there is nothing to compare yet; `false` would claim a check that never
+//! happened.
 
 use super::*;
 use crate::checkpoints::sha256;
@@ -228,6 +233,93 @@ pub async fn export(State(app): State<Shared>, Json(r): Json<ExportReq>) -> Resu
     })))
 }
 
+/// `(pos, tokens[0:pos])` embedded in a `BAROST01`/`BAROST02` file
+/// (`serve/engine.mojo`'s `save_state`/`load_state`): magic(8) pos(i64 LE)
+/// CONV_SLOT(i64 LE) SSM_SLOT(i64 LE) kvn(i64 LE) salt(32) tokens(pos*4,
+/// i32 LE each) -- a 72-byte fixed header, then the token array; the salt
+/// and payload past it are not read here, the engine re-checks the salt
+/// itself during `load_state` and refuses a mismatch on its own.
+fn read_state_header(path: &str) -> Result<(usize, Vec<u32>), ApiError> {
+    let data = std::fs::read(path).map_err(|e| ApiError::Plain(StatusCode::BAD_REQUEST, format!("cannot read {path}: {e}")))?;
+    if data.len() < 72 {
+        return Err(bad(format!("{path} is too short to be a BAROST01/BAROST02 state file")));
+    }
+    if &data[0..8] != b"BAROST01" && &data[0..8] != b"BAROST02" {
+        return Err(bad(format!("{path} is not a BAROST01/BAROST02 state file")));
+    }
+    let pos = i64::from_le_bytes(data[8..16].try_into().unwrap());
+    if pos < 0 {
+        return Err(bad(format!("{path}: negative pos in header")));
+    }
+    let pos = pos as usize;
+    let tok_start = 72;
+    let tok_end = tok_start + pos * 4;
+    if data.len() < tok_end {
+        return Err(bad(format!(
+            "{path} is truncated: expected {} token bytes after the header, has {}",
+            tok_end - tok_start,
+            data.len().saturating_sub(tok_start)
+        )));
+    }
+    let tokens = data[tok_start..tok_end].as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect();
+    Ok((pos, tokens))
+}
+
+#[derive(Deserialize)]
+pub struct ImportReq {
+    #[serde(default)]
+    path: Option<String>,
+}
+
+/// `POST /v1/state/import`, `path` variant: `{"prefix_hash","pos",
+/// "restore_ms","runtime_differs"}`. Reads the file's own embedded tokens
+/// (`read_state_header`) to build the request `chain.lookup` needs to find
+/// the checkpoint `state_load` just brought in (`serve/engine.mojo:852-867`:
+/// load happens, THEN the request's own prompt is looked up against the
+/// chain by salted hash) -- the caller does not supply a prompt for this
+/// route, the file already carries the only prompt that can match itself.
+pub async fn import(State(app): State<Shared>, Json(r): Json<ImportReq>) -> Result<Json<Value>, ApiError> {
+    let Some(path) = r.path.clone() else {
+        return Err(ApiError::Plain(
+            StatusCode::NOT_IMPLEMENTED,
+            "the LAT1 stream-as-body form (no \"path\") is not built yet; pass \"path\" for the file form".into(),
+        ));
+    };
+    let (pos, tokens) = read_state_header(&path)?;
+    if pos == 0 {
+        return Err(bad(format!("{path}: pos is 0, nothing to import")));
+    }
+    let g = Gen {
+        prompt: tokens.clone(),
+        n: 1,
+        spec: false,
+        stream: false,
+        stop: vec![],
+        ckpt: vec![],
+        state: (None, Some(path.clone())),
+        sample: protocol::SampleParams::default(),
+        schema: None,
+        reasoning: None,
+        embed: None,
+    };
+    let (_req_id, rx) = check_and_submit(&app, &g)?;
+    let (_acc, _text, stats) = collect(&app, rx).await.map_err(map_kvq_refusal)?;
+    let restore_s = stats.get("restore_s").and_then(Value::as_f64).unwrap_or(0.0);
+    let cached = stats.get("cached").and_then(Value::as_u64).unwrap_or(0) as usize;
+    if cached < pos {
+        return Err(ApiError::Plain(
+            StatusCode::BAD_GATEWAY,
+            format!("import ran but the chain lookup did not find the loaded state (cached={cached}, expected >={pos}): the file's salt or tokens likely do not match this pack"),
+        ));
+    }
+    Ok(Json(json!({
+        "prefix_hash": format!("{:016x}", exact_prefix_hash(&tokens, pos)),
+        "pos": pos,
+        "restore_ms": restore_s * 1000.0,
+        "runtime_differs": Value::Null,
+    })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,5 +386,75 @@ mod tests {
             }
             _ => panic!("expected ApiError::Plain"),
         }
+    }
+
+    fn ok<T>(r: Result<T, ApiError>) -> T {
+        match r {
+            Ok(v) => v,
+            Err(_) => panic!("expected Ok"),
+        }
+    }
+
+    /// A hand-built BAROST01 file, matching `serve/engine.mojo::save_state`
+    /// byte for byte: magic, pos, CONV_SLOT, SSM_SLOT, kvn (i64 LE each),
+    /// a 32-byte salt, then `pos` i32-LE tokens, then arbitrary payload
+    /// bytes (never read by `read_state_header`).
+    fn barost01_fixture(tokens: &[u32], extra_payload: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"BAROST01");
+        buf.extend_from_slice(&(tokens.len() as i64).to_le_bytes()); // pos
+        buf.extend_from_slice(&100i64.to_le_bytes()); // CONV_SLOT, arbitrary
+        buf.extend_from_slice(&200i64.to_le_bytes()); // SSM_SLOT, arbitrary
+        buf.extend_from_slice(&50i64.to_le_bytes()); // kvn, arbitrary
+        buf.extend_from_slice(&[0u8; 32]); // salt, not read by this function
+        for &t in tokens {
+            buf.extend_from_slice(&t.to_le_bytes());
+        }
+        buf.extend_from_slice(extra_payload);
+        buf
+    }
+
+    fn write_temp(name: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("baro-state-test-{name}-{}", std::process::id()));
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn read_state_header_extracts_pos_and_tokens() {
+        let path = write_temp("ok", &barost01_fixture(&[7, 8, 9], b"payload"));
+        let (pos, tokens) = ok(read_state_header(path.to_str().unwrap()));
+        assert_eq!(pos, 3);
+        assert_eq!(tokens, vec![7, 8, 9]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_state_header_accepts_the_int8_magic_too() {
+        let mut bytes = barost01_fixture(&[1], b"");
+        bytes[0..8].copy_from_slice(b"BAROST02");
+        let path = write_temp("int8", &bytes);
+        let (pos, tokens) = ok(read_state_header(path.to_str().unwrap()));
+        assert_eq!(pos, 1);
+        assert_eq!(tokens, vec![1]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_state_header_rejects_a_bad_magic() {
+        let mut bytes = barost01_fixture(&[1], b"");
+        bytes[0..8].copy_from_slice(b"NOTASTAT");
+        let path = write_temp("badmagic", &bytes);
+        assert!(read_state_header(path.to_str().unwrap()).is_err());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_state_header_rejects_a_truncated_token_array() {
+        let mut bytes = barost01_fixture(&[1, 2, 3], b"");
+        bytes.truncate(bytes.len() - 2); // cut into the last token's bytes
+        let path = write_temp("truncated", &bytes);
+        assert!(read_state_header(path.to_str().unwrap()).is_err());
+        let _ = std::fs::remove_file(&path);
     }
 }
