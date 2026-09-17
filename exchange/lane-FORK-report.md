@@ -187,8 +187,10 @@ lane's minutes, so I have counts and no minutes.
 At `6bf0bc2`: `tools/ci-checks.sh` (GPU-free) exit 0, 14 OK steps, no FAIL line
 (`.work/fork/ci-checks.log`); `cargo nextest run --bin baro-serve` 75 of 75. `serve/spark.mojo` was
 built from this worktree for two profiles and its `state_save` ran on the GPU in the lily and
-Qwen2.5 gates. `./run-tests.sh` NOT RUN: it is the on-card kernel suite and this lane touched no
-kernel file. None of this verifies `/v1/fork` `target` between live nodes.
+Qwen2.5 gates. `./run-tests.sh` RUN before the merge, 2026-09-17: rc=0, 145 PASS lines, no FAIL,
+under `gpu-wait run --vram 10` on the lane worktree after `lane-prep`
+(`.work/run-tests-lane-fork.log`). It had been skipped during the lane itself because no kernel
+file was touched. None of this verifies `/v1/fork` `target` between live nodes.
 
 ## What would prove this wrong, and what it does not show
 
