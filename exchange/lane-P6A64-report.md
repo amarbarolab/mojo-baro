@@ -2,30 +2,28 @@
 
 ## Result
 
-BLOCKED at the host cross-link step, with the requested evidence collected.
-No download or GPU work was performed.
+Step 1 PASS. Overall item remains blocked at Step 2 because no usable
+aarch64 guest rig is available. No download or GPU work was performed.
 
 ## Item template
 
 - **Files:** NEW `exchange/lane-P6A64-report.md`; receipts under
   `.work/team-C/codex/p6-aarch64/`.
-- **Build command:** `cd serve && CARGO_TARGET_DIR=$PWD/../.work/team-C/codex/target cargo build --release`
-  is the native Rust baseline. The target command would be
-  `cd serve && CARGO_TARGET_DIR=$PWD/../.work/team-C/codex/aarch64-target cargo build --release --target aarch64-unknown-linux-gnu`.
+- **Build command:** `cd serve && CARGO_TARGET_DIR=$PWD/../.work/team-C/codex/aarch64-target CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc cargo build --release --target aarch64-unknown-linux-gnu`.
 - **Preflight:** `rustup target add aarch64-unknown-linux-gnu` succeeded, and
-  `rustup target list --installed` confirms the target. The target build was
-  not started because no `aarch64-linux-gnu-gcc` linker is installed.
+  `rustup target list --installed` confirms the target. The target release
+  build passed after the approved linker installation.
 - **Gate:** On an aarch64 guest, build `baro-serve`, the router, and CPU-only
   Mojo tools, then run `tools/ci-checks.sh` and tokenizer parity. This gate is
   UNVERIFIED because the available guest rig is x86_64-only and unrelated.
-- **Receipts:** `.work/team-C/codex/p6-aarch64/environment.md` and
+- **Receipts:** `.work/team-C/codex/p6-aarch64/environment.md`,
+  `.work/team-C/codex/p6-aarch64/step1-cross-build.txt`, and
   `.work/team-C/codex/p6-aarch64/vm-rig.md`.
-- **Kill line:** missing linker stops Step 1; missing guest rig stops Step 2.
-  The item is reported blocked rather than substituted with a host build.
+- **Kill line:** missing guest rig stops Step 2. Step 1 is now a verified
+  cross-build, not a substituted host build.
 - **GPU budget:** none. The probe is CPU and VM tooling only.
-- **Dependencies:** aarch64 GNU linker for host cross-linking, or an aarch64
-  Linux guest with the Modular aarch64 package for native builds; no downloads
-  were authorized.
+- **Dependencies:** an aarch64 Linux guest with the Modular aarch64 package for
+  native builds; no downloads were authorized.
 - **Owner:** codex leads the probe and report; Sonnet verified the linker result.
 - **Size:** S probe, report and receipts only.
 
@@ -33,13 +31,13 @@ No download or GPU work was performed.
 
 The installed-target read-back is `aarch64-unknown-linux-gnu`,
 `aarch64-unknown-linux-musl`, `x86_64-unknown-linux-gnu`, and
-`x86_64-unknown-linux-musl`. `aarch64-linux-gnu-gcc` is absent, so the target
-cross-build was not run.
+`x86_64-unknown-linux-musl`. With the approved `/usr/bin/aarch64-linux-gnu-gcc`
+16.1.0, the target release build exited 0 and produced an ELF aarch64 binary.
+The exact command and `file` read-back are in
+`.work/team-C/codex/p6-aarch64/step1-cross-build.txt`.
 
-Sonnet identified the exact unrun package request as
-`pacman -S aarch64-linux-gnu-gcc`, with a 90.49 MiB download and 410.87 MiB
-installed footprint, including its cross-toolchain dependencies. Installing
-system packages requires coordinator approval.
+The earlier linker block is resolved. No Rust runtime execution is claimed on
+the x86 host because the output is aarch64.
 
 ## Step 2: VM rig
 
