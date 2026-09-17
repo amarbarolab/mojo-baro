@@ -184,20 +184,24 @@ def read_dump(path: str):
 
 
 def read_parity(path: str):
-    """bench/draft_dump.mojo --mode parity format: [n_pairs u32] then per
-    pair [pos u32][tok_input u32][true_next u32][draft_argmax i32][H f32].
-    tok_input = Toks[pos+1] (embedded as blk32's input token); true_next =
-    Toks[pos+2] (what the draft argmax actually predicts)."""
+    """bench/draft_dump.mojo --mode parity format: ONE [n_pairs u32] + pairs
+    block PER DOCUMENT, back to back (bench/draft_dump.mojo's main() calls
+    run_parity once per document on the same open file handle) -- not a
+    single global n_pairs. Each pair: [pos u32][tok_input u32][true_next
+    u32][draft_argmax i32][H f32]. tok_input = Toks[pos] (embedded as
+    blk32's input token); true_next = Toks[pos+1] (what the draft argmax
+    actually predicts)."""
     with open(path, "rb") as f:
         data = f.read()
-    (npairs,) = struct.unpack_from("<I", data, 0)
-    off = 4
+    off, n = 0, len(data)
     rows = []
-    for _ in range(npairs):
-        pos, tok_input, true_next, argmax = struct.unpack_from("<IIIi", data, off); off += 16
-        h = struct.unpack_from(f"<{H}f", data, off); off += H * 4
-        rows.append({"pos": pos, "tok_input": tok_input, "true_next": true_next,
-                     "engine_argmax": argmax, "h": torch.tensor(h, dtype=torch.float32)})
+    while off < n:
+        (npairs,) = struct.unpack_from("<I", data, off); off += 4
+        for _ in range(npairs):
+            pos, tok_input, true_next, argmax = struct.unpack_from("<IIIi", data, off); off += 16
+            h = struct.unpack_from(f"<{H}f", data, off); off += H * 4
+            rows.append({"pos": pos, "tok_input": tok_input, "true_next": true_next,
+                         "engine_argmax": argmax, "h": torch.tensor(h, dtype=torch.float32)})
     return rows
 
 

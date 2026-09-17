@@ -34,6 +34,8 @@ from realign import final_norm_hidden
 from bench_latent_handoff import run_to_prompt_end, reset_and_load, make_cfg
 from harness import load_pack, alloc_bufs, Pack
 from grammar.automaton import Bitset
+from grammar.json_value import parse_json_file
+from bench_latent_handoff import get_int_list
 
 
 def write_u32(mut f: FileHandle, v: Int) raises:
@@ -155,33 +157,58 @@ def main() raises:
     var buf = alloc_bufs(ctx, pack, tmax)
     var wst = WindowState(pos=0, pos_prev=0, ring=0, n_drafted=0, n_accepted=0, n_spec_windows=0, n_dumped=0, tp=0, tq=0, pf_att=0, pf_ssm=0, pf_ffn=0, pf_head=0, pf_proc=0, pf_draft=0, fc=[0, 0, 0, 0, 0, 0], pc=[0, 0, 0, 0, 0, 0, 0, 0], p3=[0, 0, 0, 0], pfx=[0, 0, 0, 0], grammar=None, grammar_mask=Bitset(1), grammar_pending_think=False, grammar_think_buf=List[UInt8](), grammar_stop=False, grammar_masked_draws=0, grammar_accepted=0)
 
-    # bench/data/e8_tasks.json's own "tokens" field, same stored ids the
-    # harness already scores against elsewhere (e13_engine_dump.mojo's own
-    # --mode check convention): fine for a structural parity check, NOT a
-    # held-out training corpus (bench/draft-head-protocol.md: the gate set
-    # stays a gate). Real --mode dump data collection needs a genuinely
-    # held-out text source, wired separately.
-    var text_path = getenv("A4_TEXT_PATH", "bench/data/e8_tasks.json")
     var out_path = getenv("A4_OUT", ".work/a4/dump.bin")
-
-    from grammar.json_value import parse_json_file
-    from bench_latent_handoff import get_int_list
-    var doc = parse_json_file(text_path)
-    var root = doc.get(doc.root)
     var limit = atol(getenv("A4_LIMIT", "0"))
     var draft_q4 = pack.have_q4_draft and getenv("BARO_DRAFT_Q4", "0") == "1"
     var n_written = 0
+    var text_mode = getenv("A4_TEXT_MODE", "json")
 
     with open(out_path, "w") as out:
-        for j in range(len(root.arr)):
-            var tokens = get_int_list(doc, root.arr[j], "tokens")
-            if len(tokens) < 4 or len(tokens) + 2 > tmax:
-                continue
-            if mode == "dump":
-                dump_document_stepwise(ctx, buf, wst, pack.pack_q4, pack.q4_off, pack.e, tokens, tmax, out)
-            else:
-                run_parity(ctx, buf, wst, pack.pack_q4, pack.q4_off, pack.e, draft_q4, pack.q4_off, tokens, tmax, out)
-            n_written += 1
-            if limit > 0 and n_written >= limit:
-                break
+        if text_mode == "tokens":
+            # bench/mtp-prompts/*.tokens: the real 20-prompt gate set (space-
+            # separated decimal ids), same files bench/mtp-prompts.sh reads,
+            # comma-separated in A4_TOKENS_FILES (this session's real-gate-set
+            # rerun, exchange/lane-A4-report.md; the gate set stays a gate,
+            # never trained on).
+            var files_env = getenv("A4_TOKENS_FILES", "")
+            for fp in files_env.split(","):
+                var fpath = String(fp)
+                if fpath.byte_length() == 0:
+                    continue
+                var raw = String("")
+                with open(fpath, "r") as tf:
+                    raw = tf.read()
+                var tokens = List[Int]()
+                for piece in raw.split(" "):
+                    var s = String(piece).strip()
+                    if s.byte_length() > 0:
+                        tokens.append(atol(s))
+                if len(tokens) < 4 or len(tokens) + 2 > tmax:
+                    continue
+                if mode == "dump":
+                    dump_document_stepwise(ctx, buf, wst, pack.pack_q4, pack.q4_off, pack.e, tokens, tmax, out)
+                else:
+                    run_parity(ctx, buf, wst, pack.pack_q4, pack.q4_off, pack.e, draft_q4, pack.q4_off, tokens, tmax, out)
+                n_written += 1
+                if limit > 0 and n_written >= limit:
+                    break
+        else:
+            # bench/data/e8_tasks.json's own "tokens" field, same stored ids
+            # the harness already scores against elsewhere: fine for a
+            # structural check, NOT a held-out training corpus
+            # (bench/draft-head-protocol.md: the gate set stays a gate).
+            var text_path = getenv("A4_TEXT_PATH", "bench/data/e8_tasks.json")
+            var doc = parse_json_file(text_path)
+            var root = doc.get(doc.root)
+            for j in range(len(root.arr)):
+                var tokens = get_int_list(doc, root.arr[j], "tokens")
+                if len(tokens) < 4 or len(tokens) + 2 > tmax:
+                    continue
+                if mode == "dump":
+                    dump_document_stepwise(ctx, buf, wst, pack.pack_q4, pack.q4_off, pack.e, tokens, tmax, out)
+                else:
+                    run_parity(ctx, buf, wst, pack.pack_q4, pack.q4_off, pack.e, draft_q4, pack.q4_off, tokens, tmax, out)
+                n_written += 1
+                if limit > 0 and n_written >= limit:
+                    break
     print("draft_dump: wrote", n_written, "documents, mode=", mode, "->", out_path)

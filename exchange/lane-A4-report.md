@@ -1,11 +1,14 @@
-# Lane A4 report: trained draft head, PARTIAL, stopped at the parity gate
+# Lane A4 report: trained draft head, PARTIAL, parity gate now supported
 
 Brief: `briefs/2026-09-17-A4-draft-head.md`. Plan: `docs/NEXT-PLAN.md` A4.
 Preregistration: `bench/draft-head-protocol.md`. **Not done: no training ran,
-no smoke result exists. This session stopped at the parity gate the plan's
-own Order step 1 puts before any GPU training minute, because the gate did
-not clearly pass (CLAUDE.md s18: no check landed, so the word is
-UNVERIFIED, not done).**
+no smoke result exists.** This session's first pass stopped at the parity
+gate because the numbers looked inconclusive; the follow-up below reruns
+against the real 20-prompt gate set through the real, unmodified engine and
+harness, reproduces the documented 65-66% baseline directly, and resolves
+the earlier ambiguity in favor of domain shift over a wiring defect. Still,
+per CLAUDE.md s18, no training has run: that word stays UNVERIFIED until it
+does.
 
 ## The E13 question, answered
 
@@ -104,11 +107,67 @@ acceptance number exists for a trained head. `kernels/` untouched, as the
 brief requires. `run-tests.sh`/`tools/ci-checks.sh` run against this branch
 before this report (results in the commit this report lands with).
 
-## Recommendation
+## Update: real gate-set rerun (this session's follow-up)
 
-Before spending any training GPU minutes: resolve the parity ambiguity by
-rerunning against the real 20-prompt gate set through the real spec-decode
-harness. If that reproduces 42% and torch-vs-engine agreement rises well
-above the current 62%, the smoke (Order step 3) is next. If 42% still does
-not reproduce on real gate-set text, the bug is real and unfixed, and no
-training should run against this wiring.
+Did the recommended step. Built `.work/a4/engine` (`mojo build serve/engine.mojo
+-I . -I kernels`), ran the REAL, unmodified `bench/mtp-prompts.sh` (not a
+hand-rolled call) through `gpu-wait`, quick subset first (3 prompts), then
+all 20:
+
+**Quick subset (p01-p03, k=2):** 3/3 greedy identity PASS, accepted/drafted
+34/59, 39/50, 32/62 (aggregate 61.4%). Already a strong signal against the
+earlier 13% math-text number.
+
+**Full 20 prompts, `bench/mtp-prompts.sh .work/a4/engine .work/a4/mtp-full 2`
+(`.work/a4/mtp-full/results.txt`):** **20/20 greedy identity PASS.** Aggregate
+`accepted/drafted` = 721/1093 = **65.97%**, mean per-prompt = 67.0%. **This
+reproduces the documented "0.66 on the 20 prompts" baseline directly, via
+the real unmodified engine and harness, cleanly.** The void check the smoke
+section requires (baseline within 5 pp of the documented figure) PASSES on
+this reproduction.
+
+**Torch-vs-engine on the same real prompt files** (`bench/draft_dump.mojo
+--mode parity` with a new `A4_TEXT_MODE=tokens` path added this session to
+read `bench/mtp-prompts/*.tokens` directly, same files, never trained on):
+quick subset (3 prompts, 42 positions) 35/42 (83%) torch-vs-engine argmax
+agreement, 14/42 (33%) engine-vs-true-next; full 20 prompts (339 positions)
+241/339 (71%) torch-vs-engine, 64/339 (19%) engine-vs-true-next. Both well
+above the 62%/13% figures measured on `e8_tasks.json`'s math/JSON text,
+confirming domain shift was the dominant effect there, not a wiring defect.
+**A second real bug found while doing this: `tools/mtp_head.py`'s
+`read_parity` only read the FIRST document's block from a multi-document
+dump file** (`bench/draft_dump.mojo` writes one `[n_pairs][pairs...]` block
+per document, back to back; the reader had no outer loop, so the "full
+20-prompt" run's first pass silently returned the same 11-position numbers
+as the 3-prompt quick run, byte-for-byte, until noticed and fixed).
+
+**Why 19% (engine-vs-true-next, prompt replay) does not match 42%/66%
+(the documented decode-phase figure), and this is not a further bug:**
+`bench/mtp-prompts/*.tokens` are PROMPTS ONLY (`n_prompt` in
+`bench/mtp-prompts.sh`'s own output, 7 to 59 tokens) with no generated
+continuation appended. `bench/draft_dump.mojo --mode parity` walks that
+prompt and compares blk.32's prediction against the PROMPT's own literal
+next word, i.e. against human-written prose. The documented 42%/66% figures
+are measured during DECODE, where the accept rule compares the draft's
+prediction against the TARGET MODEL's OWN greedy choice at that step, not
+against arbitrary human text: a materially easier, more self-consistent
+target (both numbers come from the same weights on the same context). These
+are two different statistics; a numeric gap between 19% and 42% says
+nothing about correctness by itself, unlike the 13%-vs-62%-torch-vs-engine
+comparison, which was informative because it held the SAME statistic
+constant and only changed the text domain. **This wiring's real-engine
+reproduction of the 66% headline figure, direct and unmodified, is the
+answer to the question this recommendation asked.**
+
+## Revised verdict
+
+The baseline reproduces cleanly (20/20 identity, 65.97% aggregate acceptance
+against a documented 65-66%). Domain shift, not a wiring defect, explains
+the earlier low numbers on math/JSON text; that reading is now supported by
+a second, independent measurement (torch-vs-engine rising from 62% to 71%
+on real gate-set text) rather than assumed. The alignment fix from the first
+pass of this report (`pos == tok_pos`) and this pass's `read_parity` fix are
+both load-bearing and now behind real receipts. **Still not done: no
+training has run.** The parity gate is now a reasonable basis to proceed to
+Order step 3 (the 10-minute smoke), which stays the maintainer's call, not
+self-authorized here.
