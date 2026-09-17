@@ -14,6 +14,7 @@ mod checkpoints;
 mod engine;
 mod protocol;
 mod text;
+mod web;
 
 use std::convert::Infallible;
 use std::path::PathBuf;
@@ -150,6 +151,8 @@ async fn main() {
     let app = Arc::new(App { engine, text, model, ckpts, identity, audio });
 
     let router = Router::new()
+        .route("/", get(web::index))
+        .route("/web/{*path}", get(web::asset))
         .route("/health", get(health))
         .route("/v1/models", get(models))
         .route("/v1/completions", post(completions))
