@@ -90,8 +90,10 @@ struct Snap(Movable):
         ctx.synchronize()
         ctx.enqueue_copy(dst_buf=self.conv_h, src_buf=DeviceBuffer[f32](ctx, bufs.convstate_d.unsafe_ptr() + ring * CONV_SLOT, CONV_SLOT, owning=False))
         ctx.enqueue_copy(dst_buf=self.ssm_h, src_buf=DeviceBuffer[f32](ctx, bufs.sstate_d.unsafe_ptr() + ring * SSM_SLOT, SSM_SLOT, owning=False))
-        ctx.enqueue_copy(dst_buf=self.kc_h, src_buf=bufs.kc_d)
-        ctx.enqueue_copy(dst_buf=self.vc_h, src_buf=bufs.vc_d)
+        # Slot 0 only: since A3(b) the KV pool holds SEQ_CAP resident
+        # sequences and this test drives one.
+        ctx.enqueue_copy(dst_buf=self.kc_h, src_buf=DeviceBuffer[KVT](ctx, bufs.kc_d.unsafe_ptr(), bufs.kvpool, owning=False))
+        ctx.enqueue_copy(dst_buf=self.vc_h, src_buf=DeviceBuffer[KVT](ctx, bufs.vc_d.unsafe_ptr(), bufs.kvpool, owning=False))
         ctx.enqueue_copy(dst_buf=self.hmax_h, src_buf=bufs.hmax_d)
         ctx.enqueue_copy(dst_buf=self.hidx_h, src_buf=bufs.hidx_d)
         ctx.enqueue_copy(dst_buf=self.logits_h, src_buf=DeviceBuffer[f32](ctx, bufs.logits_d.unsafe_ptr(), VOCAB, owning=False))
@@ -188,7 +190,7 @@ def load_prompt(ctx: DeviceContext, mut bufs: WindowBufs, prompt: List[Int]) rai
         toks_h[i] = 0
     for i in range(len(prompt)):
         toks_h[i] = Int32(prompt[i])
-    ctx.enqueue_copy(dst_buf=bufs.toks_d, src_buf=toks_h)
+    ctx.enqueue_copy(dst_buf=DeviceBuffer[DType.int32](ctx, bufs.toks_d.unsafe_ptr(), len(toks_h), owning=False), src_buf=toks_h)
     ctx.synchronize()
 
 
