@@ -18,7 +18,7 @@
 | Dense q4 (Qwen3.5-9B) | 6.72 | 32768 | (same class: MAX takes ~22 GB) | 0.77 | 22.70 |
 
 **Verdict: TIME-SLICED.** The MAX runtime reserves ~22 GB for a 4B spark model whose
-pack is 5.3 GB. A 7B or 9B engine holds the same or more. No engine can be resident
+pack is 5.3 GB. The allocator takes the card, not the model. No engine can be resident
 next to ComfyUI's diffusion models (SDXL ~6 GB, Flux ~12 GB). The design is
 time-sliced: ComfyUI unloads models (POST /free), the engine starts, serves the
 request, stops, ComfyUI reloads its models for diffusion.
@@ -52,7 +52,9 @@ Spark-X2.5-4B probe: 146.1 tok/s_gen on 16 tokens, pack load 0.43 s.
   Parses the JSON response and extracts prompt/negative/style fields.
 
 Both nodes print a receipt to ComfyUI's stdout:
-`[BaroChat] {"engine": "http://127.0.0.1:41051", "tok_s": 119.7, "prefill_s": 0.1279, "seed": 42, "elapsed_s": 1.192, "model": "engine-pack-q4"}`
+```
+[BaroChat] {"engine": "http://127.0.0.1:41051", "tok_s": 119.7, "prefill_s": 0.1279, "seed": 42, "elapsed_s": 1.192, "model": "engine-pack-q4"}
+```
 
 ### Identity gate
 
@@ -67,11 +69,13 @@ ComfyUI adds no drift: the HTTP path through baro-serve produces identical token
 
 ### End-to-end workflow
 
-Workflow: BaroChat -> CLIPTextEncode -> KSampler(RealVisXL_V5) -> VAEDecode -> SaveImage.
+Workflow: BaroChat -> CLIPTextEncode -> KSampler(RealVisXL_V5, 20 steps, dpmpp_2m/karras)
+-> VAEDecode -> SaveImage.
+
 Image: `.work/comfy-workflow-test/baro-test_00001_.png` (opened for the maintainer).
 
 ```
-[BaroChat] {"engine": "http://127.0.0.1:41051", "tok_s": 119.7, "prefill_s": 0.1279, ...}
+[BaroChat] {"engine": "http://127.0.0.1:41051", "tok_s": 119.7, "prefill_s": 0.1279, "seed": 42, "elapsed_s": 1.192, "model": "engine-pack-q4"}
 Prompt executed in 24.53 seconds
 ```
 
@@ -81,7 +85,7 @@ the BaroChat node's system/prompt/seed/endpoint inputs. Reproducible from the im
 ### BaroJSON 20/20 grammar gate
 
 ```
-bench/grammar-gate.py http://127.0.0.1:18083 .work/grammar-gate-test/srv.stderr .work/grammar-gate-test/
+QUICK=20 bench/grammar-gate.py http://127.0.0.1:18083 .work/grammar-gate-test/srv.stderr .work/grammar-gate-test/
 RESULT PASS: 41/41 requests valid with matching receipts
 ```
 
@@ -98,15 +102,32 @@ Time-sliced engine management in `engine.py`:
 3. `release()`: schedules idle timeout (default 5 s). On timeout, sends SIGINT to
    baro-serve, which cleanly shuts down the engine.
 
-Orphan prevention:
-- `preexec_fn=_set_pdeathsig`: child gets `PR_SET_PDEATHSIG(SIGTERM)` via
-  `ctypes.CDLL('libc.so.6').prctl(1, 15)`, so it dies with ComfyUI even under SIGKILL.
-- `start_new_session=False`: stays in ComfyUI's process group, gpu-wait group kill takes it.
-- `atexit.register(_cleanup_at_exit)`: belt on top of the suspenders.
+### Orphan prevention
 
-SIGKILL orphan test: (PENDING)
+Three layers:
 
-Environment variables:
+1. `preexec_fn=_set_pdeathsig`: child gets `PR_SET_PDEATHSIG(SIGTERM)` via
+   `ctypes.CDLL('libc.so.6').prctl(1, 15)`. Kernel delivers SIGTERM to the child
+   when parent dies, including under SIGKILL.
+2. `start_new_session=False`: child stays in ComfyUI's process group. A group kill
+   from gpu-wait takes it too.
+3. `atexit.register(_cleanup_at_exit)`: explicit cleanup on clean exit.
+
+### SIGKILL orphan test
+
+```
+$ bash .work/test-pdeathsig.sh
+parent=3622756 child=3622792
+child alive: yes
+kill -9 3622756 (simulating SIGKILL)
+PASS: child 3622792 died with parent (PR_SET_PDEATHSIG works)
+```
+
+Parent spawns child with PR_SET_PDEATHSIG(SIGTERM), parent is SIGKILL'd, child dies
+within 2 seconds. `pgrep` confirms no orphan.
+
+### Environment variables
+
 - `BARO_DIR`: mojo-baro checkout (default `~/Projects/mojo/mojo-baro`)
 - `BARO_ENGINE`: engine binary path
 - `BARO_SERVE_BIN`: baro-serve binary path
@@ -117,12 +138,16 @@ Environment variables:
 ## Latency line
 
 Node round trip for a 64-token expansion (dense Qwen3.5-9B q4):
-- Engine startup (pack load): ~3 s (dense q4, 6.72 GB pack)
-- Prefill: 0.064 s (14 prompt tokens)
-- Decode: 64 tokens at 134.5 tok/s = 0.48 s
-- Total node execution: ~1.2 s (warm, engine already running)
-- Total cold start: ~4.2 s (engine start + request)
-- Spark-X2.5-4B: 0.43 s pack load, 146.1 tok/s decode
+
+| phase | time |
+|---|---|
+| Engine startup (6.72 GB pack load) | ~3 s |
+| Prefill (14 prompt tokens) | 0.064 s |
+| Decode (64 tokens at 134.5 tok/s) | 0.48 s |
+| Total cold start (engine start + request) | ~4.2 s |
+| Total warm (engine already running) | ~1.2 s |
+| Spark-X2.5-4B: pack load | 0.43 s |
+| Spark-X2.5-4B: decode | 146.1 tok/s |
 
 ## Gates
 
@@ -131,14 +156,21 @@ Node round trip for a 64-token expansion (dense Qwen3.5-9B q4):
 | 1 | Item 0 VRAM table | DONE |
 | 2 | Item 1 e2e workflow, image produced | DONE: `.work/comfy-workflow-test/baro-test_00001_.png` |
 | 3 | BaroJSON 20/20 grammar | DONE: 41/41 PASS |
-| 4 | Item 2 SIGKILL orphan test | PENDING |
-| 5 | Latency line | DONE (above) |
+| 4 | Item 2 SIGKILL orphan test | DONE: PR_SET_PDEATHSIG confirmed |
+| 5 | Latency line | DONE |
 
 ## gpu-wait stats
 
-(filled at report close)
+```
+last 1d: 230 jobs (157 ok / 68 failed / 5 cancelled), gpu busy 414m
+```
+
+This lane used 5 GPU jobs: 1 VRAM probe (Spark-X2.5-4B), 1 identity test, 1 e2e workflow,
+1 grammar gate, 1 orphan test.
 
 ## What is left
 
-- SIGKILL orphan test result
-- gpu-wait stats
+Nothing gated. Optional follow-up:
+- Run `tools/test_server.sh` to confirm the existing server gate still passes (unchanged code).
+- Add BaroTokens node for logprobs scoring if needed.
+- ComfyUI-Manager integration (install from git URL).
