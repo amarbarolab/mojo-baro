@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""A4 Order step 3: the draft-head training smoke
+"""P5a: the draft-head self-distillation training smoke
 (bench/draft-head-protocol.md). Fine-tunes MTPHead (tools/mtp_head.py) on
 dense real-text next-token supervision from bench/draft_dump.mojo --mode
 dump --env A4_TEXT_MODE=gsm8k (GSM8K train.jsonl question+answer text,
@@ -64,7 +64,9 @@ def flatten_v2_document(doc):
         return None
     h = torch.stack([r["h"] for r in records])
     input_ids = torch.tensor([r["input_token"] for r in records], dtype=torch.long)
-    labels = torch.tensor([doc["tokens"][r["pos"] + 1] for r in records], dtype=torch.long)
+    # the maintainer's 2026-09-17 ruling: acceptance is agreement with the trunk's
+    # greedy pick, so CE uses the recorded target argmax, not tokens[pos+1].
+    labels = torch.tensor([r["target_argmax"] for r in records], dtype=torch.long)
     top8_ids = torch.stack([r["top8_ids"] for r in records])
     top8_probs = torch.stack([r["top8_probs"] for r in records])
     return h, input_ids, labels, top8_ids, top8_probs
