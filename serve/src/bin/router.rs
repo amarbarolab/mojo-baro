@@ -23,6 +23,10 @@ use tokio::net::TcpStream;
 
 const BARO_SERVICE: &str = "_baro-node._tcp";
 const PAIR_SERVICE: &str = "_nvpair-node._tcp";
+// PAIR uses a fixed SRV port for the node record; the actual node-info port is
+// carried by the ni TXT entry.  Consumers must not mistake the SRV port for
+// the HTTP endpoint.
+const PAIR_SRV_PORT: u16 = 14318;
 
 #[derive(Clone)]
 struct Shared(Arc<RouterState>);
@@ -74,21 +78,23 @@ struct MdnsRuntime {
     _daemon: ServiceDaemon,
 }
 
-fn start_mdns(advertisement: &DiscoveryAdvertisement, node_id: &str) -> Result<MdnsRuntime, String> {
+fn start_mdns(advertisement: &DiscoveryAdvertisement, node_id: &str, advertise_ip: &str) -> Result<MdnsRuntime, String> {
     let daemon = ServiceDaemon::new().map_err(|e| format!("mDNS daemon: {e}"))?;
-    let host = format!("baro-{node_id}.local.");
+    let host = std::env::var("BARO_ROUTER_MDNS_HOST")
+        .unwrap_or_else(|_| format!("baro-{node_id}.local."));
     let mut properties = HashMap::new();
     for (key, value) in &advertisement.txt {
         properties.insert(key.clone(), value.clone());
     }
     for service in advertisement.browse_services() {
         let service_type = format!("{service}.local.");
+        let srv_port = if service == PAIR_SERVICE { PAIR_SRV_PORT } else { advertisement.port };
         let info = ServiceInfo::new(
             &service_type,
             &advertisement.instance,
             &host,
-            "127.0.0.1",
-            advertisement.port,
+            advertise_ip,
+            srv_port,
             properties.clone(),
         )
         .map_err(|e| format!("mDNS service {service}: {e}"))?;
@@ -427,8 +433,9 @@ async fn main() {
     };
     let engines = EngineRegistry::from_env();
     let discovery = DiscoveryAdvertisement::new(&node_id, port);
+    let advertise_ip = std::env::var("BARO_ROUTER_ADVERTISE_IP").unwrap_or_else(|_| "127.0.0.1".into());
     eprintln!("discovery advertise={} browse={:?} txt={:?}", discovery.service, discovery.browse_services(), discovery.txt);
-    let mdns = match start_mdns(&discovery, &node_id) {
+    let mdns = match start_mdns(&discovery, &node_id, &advertise_ip) {
         Ok(runtime) => Some(runtime),
         Err(error) => {
             eprintln!("baro-router: mDNS unavailable: {error}");
