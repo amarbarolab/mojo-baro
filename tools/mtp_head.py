@@ -1,0 +1,319 @@
+#!/usr/bin/env python
+"""A4: blk.32 (NextN) draft head, extraction / torch replica / parity /
+write-back (bench/draft-head-protocol.md).
+
+Unlike E13's projector (a foreign Linear-GELU-Linear MLP standing in for a
+task the trunk cannot do alone), this module retrains blk.32 AS ITSELF: the
+same 15 tensors tools/engine-pack.py already packs (attn_norm, attn_q/k/v,
+attn_q_norm/k_norm, attn_output, post_attention_norm, ffn_gate/up/down,
+nextn.eh_proj, nextn.enorm/hnorm/shared_head_norm), same shapes, same slot,
+no kernel change. docs/mtp-notes.md SS1-2 established blk.32's attention+FFN
+is structurally identical to one full-attention trunk decoder block, so its
+torch replica reuses transformers' own Qwen3_5DecoderLayer / Qwen3_5Attention
+/ Qwen3_5MLP / Qwen3_5RMSNorm (the SAME classes the frozen trunk uses for its
+own full-attention layers), not a hand-rolled reimplementation.
+
+Extraction reuses the tensor-name-and-permutation mapping already proven in
+~/AMDHQ/tools/latent-os/gguf_to_hf_qwen35.py's `is_full` branch (verbatim
+transpose convention, verbatim "+1" RMSNorm bias), applied to block 32
+instead of a trunk block, plus the four nextn.* tensors that block never
+handles.
+
+Run only via gpu-wait when a mode touches the GPU (parity, train):
+  PYTHONPATH=~/llama.cpp/gguf-py gpu-wait run --priority 20 --vram 24 -- \\
+    ~/AMDHQ/.venv/bin/python tools/mtp_head.py --mode parity ...
+`--mode extract` and `--mode writeback` are CPU-only (GGUF/state-dict I/O),
+no GPU needed, no gpu-wait required.
+"""
+import argparse
+import json
+import struct
+import sys
+
+import numpy as np
+import torch
+import torch.nn as nn
+
+H = 4096
+NORM_PLUS_ONE = True  # blk.32's norms follow the trunk's own "+1" GGUF convention (verified at extract time, not assumed)
+
+BLK32_CORE = [
+    "attn_norm.weight", "attn_q.weight", "attn_k.weight", "attn_v.weight",
+    "attn_q_norm.weight", "attn_k_norm.weight", "attn_output.weight",
+    "post_attention_norm.weight", "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight",
+]
+BLK32_NEXTN = ["nextn.eh_proj.weight", "nextn.enorm.weight", "nextn.hnorm.weight", "nextn.shared_head_norm.weight"]
+
+
+def gguf_tensor_to_torch(t):
+    kind = t.tensor_type.name
+    data = t.data
+    if kind == "F32":
+        return torch.from_numpy(np.ascontiguousarray(data)).to(torch.float32)
+    if kind == "BF16":
+        u16 = data.view(np.uint16)
+        return torch.from_numpy(np.ascontiguousarray(u16)).view(torch.bfloat16)
+    raise ValueError(f"unhandled gguf tensor dtype {kind} for {t.name}")
+
+
+def torch_to_gguf_bytes(t: torch.Tensor, dtype: str) -> bytes:
+    if dtype == "F32":
+        return t.detach().to(torch.float32).cpu().numpy().tobytes()
+    if dtype == "BF16":
+        return t.detach().to(torch.bfloat16).cpu().view(torch.uint16).numpy().tobytes()
+    raise ValueError(dtype)
+
+
+def extract_blk32(gguf_path: str) -> dict:
+    """blk.32.* raw GGUF tensors -> a state dict keyed to MTPHead's own
+    module names. Same take()/permutation logic as gguf_to_hf_qwen35.py's
+    is_full branch (verbatim: attn_q/k/v/output map straight across, no
+    fused-qkv split, no v-head reorder -- that machinery is the
+    linear_attention branch only, which blk.32 never is)."""
+    from gguf import GGUFReader
+    reader = GGUFReader(gguf_path)
+    by_name = {t.name: t for t in reader.tensors}
+    missing = [p for p in [f"blk.32.{n}" for n in BLK32_CORE + BLK32_NEXTN] if p not in by_name]
+    if missing:
+        raise ValueError(f"blk.32 tensors missing from {gguf_path}: {missing}")
+
+    def take(name):
+        return gguf_tensor_to_torch(by_name[f"blk.32.{name}"])
+
+    sd = {}
+    sd["decoder.input_layernorm.weight"] = take("attn_norm.weight").float() - 1.0
+    sd["decoder.self_attn.q_proj.weight"] = take("attn_q.weight")
+    sd["decoder.self_attn.k_proj.weight"] = take("attn_k.weight")
+    sd["decoder.self_attn.v_proj.weight"] = take("attn_v.weight")
+    sd["decoder.self_attn.o_proj.weight"] = take("attn_output.weight")
+    sd["decoder.self_attn.q_norm.weight"] = take("attn_q_norm.weight").float() - 1.0
+    sd["decoder.self_attn.k_norm.weight"] = take("attn_k_norm.weight").float() - 1.0
+    sd["decoder.post_attention_layernorm.weight"] = take("post_attention_norm.weight").float() - 1.0
+    sd["decoder.mlp.gate_proj.weight"] = take("ffn_gate.weight")
+    sd["decoder.mlp.up_proj.weight"] = take("ffn_up.weight")
+    sd["decoder.mlp.down_proj.weight"] = take("ffn_down.weight")
+    sd["eh_proj.weight"] = take("nextn.eh_proj.weight")
+    sd["enorm.weight"] = take("nextn.enorm.weight").float() - 1.0
+    sd["hnorm.weight"] = take("nextn.hnorm.weight").float() - 1.0
+    sd["shared_head_norm.weight"] = take("nextn.shared_head_norm.weight").float() - 1.0
+    for k in list(sd):
+        if sd[k].dtype == torch.float32 and "weight" in k and sd[k].dim() == 2:
+            pass  # 2D weights stay bf16 (attn/ffn/eh_proj matrices); norms are f32 by construction above
+    return sd
+
+
+class MTPHead(nn.Module):
+    """eh_proj(concat(enorm(embed(tok_t)), hnorm(h_{t-1}))) -> one
+    Qwen3_5DecoderLayer (full_attention config, forced) -> shared_head_norm
+    -> (frozen, shared) lm_head. embed_tokens/lm_head/rotary_emb are passed
+    in from the frozen trunk model, never copied or trained."""
+
+    def __init__(self, trunk_config, layer_idx: int = 32):
+        super().__init__()
+        from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DecoderLayer, Qwen3_5RMSNorm
+        import copy
+        cfg = copy.deepcopy(trunk_config)
+        cfg.layer_types = list(cfg.layer_types) + ["full_attention"]
+        self.eh_proj = nn.Linear(2 * H, H, bias=False)
+        self.enorm = Qwen3_5RMSNorm(H, eps=cfg.rms_norm_eps)
+        self.hnorm = Qwen3_5RMSNorm(H, eps=cfg.rms_norm_eps)
+        self.shared_head_norm = Qwen3_5RMSNorm(H, eps=cfg.rms_norm_eps)
+        self.decoder = Qwen3_5DecoderLayer(cfg, layer_idx=layer_idx)
+        self.decoder.block_type = "full_attention"
+
+    def load_blk32(self, sd: dict):
+        own = self.state_dict()
+        for k in own:
+            if k not in sd:
+                raise KeyError(f"MTPHead.load_blk32: missing {k}")
+        self.load_state_dict({k: v.to(own[k].dtype) for k, v in sd.items()}, strict=True)
+
+    def forward(self, tok_embed_row, h_prev, rotary_emb, position_ids, causal_mask):
+        """tok_embed_row: [T, H] frozen embed(tok_t) for t=1..T (the token
+        BEING predicted-from, per docs/mtp-notes.md: 'row r is token
+        Toks[tok_pos+r]'). h_prev: [T, H] the trunk's own final-norm hidden
+        state from BEFORE that token (h_{t-1}). Returns [T, H] pre-lm_head
+        hidden (caller applies the frozen lm_head)."""
+        e = self.enorm(tok_embed_row.float())
+        hn = self.hnorm(h_prev.float())
+        x = self.eh_proj(torch.cat([e, hn], dim=-1)).unsqueeze(0)
+        # Qwen3_5TextModel.forward: the 4-channel (text, temporal, height,
+        # width) position_ids splits into text_position_ids (channel 0, fed
+        # to the decoder layer / attention mask) and the remaining 3
+        # channels (fed to rotary_emb, matching mrope_section=[11,11,10]).
+        # For pure text all 4 channels already carry the same scalar
+        # position, so this split changes nothing numerically, but the
+        # rotary module's own shape assertion requires exactly 3.
+        text_position_ids = position_ids[0]
+        rope_position_ids = position_ids[1:]
+        pe = rotary_emb(x, rope_position_ids)
+        out = self.decoder(x, position_embeddings=pe, attention_mask=causal_mask, position_ids=text_position_ids)
+        return self.shared_head_norm(out.squeeze(0))
+
+
+def build_causal_mask(n: int, dtype, device):
+    m = torch.full((n, n), float("-inf"), dtype=dtype, device=device)
+    m = torch.triu(m, diagonal=1)
+    return m.view(1, 1, n, n)
+
+
+def load_trunk(hf_dir: str):
+    from transformers import Qwen3_5ForCausalLM
+    model = Qwen3_5ForCausalLM.from_pretrained(hf_dir, dtype="auto")
+    model.eval()
+    for p in model.parameters():
+        p.requires_grad_(False)
+    return model
+
+
+def read_dump(path: str):
+    """bench/draft_dump.mojo --mode dump format: repeated
+    [n_tok u32][tok ids u32*n_tok][(n_tok-1)*H f32]. Returns list of
+    {tokens, h: [n_tok-1, H]}."""
+    with open(path, "rb") as f:
+        data = f.read()
+    off, n = 0, len(data)
+    docs = []
+    while off < n:
+        (nt,) = struct.unpack_from("<I", data, off); off += 4
+        toks = list(struct.unpack_from(f"<{nt}I", data, off)); off += nt * 4
+        nrows = max(0, nt - 1)
+        h = struct.unpack_from(f"<{nrows * H}f", data, off); off += nrows * H * 4
+        docs.append({"tokens": toks, "h": torch.tensor(h, dtype=torch.float32).view(nrows, H)})
+    return docs
+
+
+def read_parity(path: str):
+    """bench/draft_dump.mojo --mode parity format: [n_pairs u32] then per
+    pair [pos u32][tok_input u32][true_next u32][draft_argmax i32][H f32].
+    tok_input = Toks[pos+1] (embedded as blk32's input token); true_next =
+    Toks[pos+2] (what the draft argmax actually predicts)."""
+    with open(path, "rb") as f:
+        data = f.read()
+    (npairs,) = struct.unpack_from("<I", data, 0)
+    off = 4
+    rows = []
+    for _ in range(npairs):
+        pos, tok_input, true_next, argmax = struct.unpack_from("<IIIi", data, off); off += 16
+        h = struct.unpack_from(f"<{H}f", data, off); off += H * 4
+        rows.append({"pos": pos, "tok_input": tok_input, "true_next": true_next,
+                     "engine_argmax": argmax, "h": torch.tensor(h, dtype=torch.float32)})
+    return rows
+
+
+def cmd_extract(args):
+    sd = extract_blk32(args.gguf)
+    torch.save(sd, args.out)
+    print(json.dumps({"out": args.out, "n_tensors": len(sd),
+                       "shapes": {k: list(v.shape) for k, v in sd.items()}}, indent=2))
+
+
+def cmd_parity(args):
+    model = load_trunk(args.hf_dir)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model.to(device)
+    head = MTPHead(model.config.get_text_config() if hasattr(model.config, "get_text_config") else model.config)
+    head.load_blk32({k: v.to(device) for k, v in torch.load(args.extracted, map_location=device).items()})
+    head.to(device).eval()
+    embed = model.get_input_embeddings()
+    lm_head = model.get_output_embeddings()
+    rotary = model.model.rotary_emb if hasattr(model, "model") else model.language_model.rotary_emb
+
+    rows = read_parity(args.parity_dump)
+    n_ok_argmax_vs_engine = 0
+    n_ok_argmax_vs_true = 0
+    n_engine_ok_vs_true = 0
+    cos_sum = 0.0
+    with torch.no_grad():
+        for r in rows:
+            pos = r["pos"]
+            tok_t = torch.tensor([r["tok_input"]], device=device)  # embed(Toks[pos+1]), the token blk32 is given
+            h_prev = r["h"].to(device).unsqueeze(0)
+            e_row = embed(tok_t)
+            pos_ids = torch.tensor([r["pos"] + 1], device=device).view(1, 1, -1).expand(4, 1, -1)
+            mask = build_causal_mask(1, torch.float32, device)
+            out = head(e_row, h_prev, rotary, pos_ids, mask)
+            logits = lm_head(out.to(lm_head.weight.dtype))
+            argmax = int(logits.argmax(dim=-1).item())
+            if argmax == r["engine_argmax"]:
+                n_ok_argmax_vs_engine += 1
+            if argmax == r["true_next"]:
+                n_ok_argmax_vs_true += 1
+            if r["engine_argmax"] == r["true_next"]:
+                n_engine_ok_vs_true += 1
+    report = {
+        "n_positions": len(rows),
+        "torch_argmax_matches_engine_argmax": n_ok_argmax_vs_engine,
+        "torch_argmax_matches_true_next": n_ok_argmax_vs_true,
+        "engine_argmax_matches_true_next": n_engine_ok_vs_true,
+    }
+    print(json.dumps(report, indent=2))
+    with open(args.report, "w") as f:
+        json.dump(report, f, indent=2)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--mode", choices=["extract", "parity", "writeback"], required=True)
+    ap.add_argument("--gguf")
+    ap.add_argument("--out")
+    ap.add_argument("--hf-dir", default="$HOME/Models/qwythos-9b-claude-mythos-5-1m-mtp-bf16/hf")
+    ap.add_argument("--extracted")
+    ap.add_argument("--parity-dump")
+    ap.add_argument("--report", default=".work/a4/parity-report.json")
+    ap.add_argument("--trained")
+    ap.add_argument("--src-gguf")
+    ap.add_argument("--dst-gguf")
+    args = ap.parse_args()
+
+    if args.mode == "extract":
+        cmd_extract(args)
+    elif args.mode == "parity":
+        cmd_parity(args)
+    elif args.mode == "writeback":
+        cmd_writeback(args)
+
+
+def cmd_writeback(args):
+    """Copy src_gguf to dst_gguf, then patch blk.32.*'s 15 tensor byte
+    ranges in place with the trained state dict's values, same shapes, same
+    dtype, same file offsets: no GGUFWriter, no re-serialization of anything
+    else in the file."""
+    import shutil
+    from gguf import GGUFReader
+    shutil.copyfile(args.src_gguf, args.dst_gguf)
+    reader = GGUFReader(args.src_gguf)  # read offsets from the ORIGINAL (dst is a byte-identical copy at this point)
+    sd = torch.load(args.trained, map_location="cpu")
+    name_map = {
+        "decoder.input_layernorm.weight": ("attn_norm.weight", "F32", 1.0),
+        "decoder.self_attn.q_proj.weight": ("attn_q.weight", "BF16", 0.0),
+        "decoder.self_attn.k_proj.weight": ("attn_k.weight", "BF16", 0.0),
+        "decoder.self_attn.v_proj.weight": ("attn_v.weight", "BF16", 0.0),
+        "decoder.self_attn.o_proj.weight": ("attn_output.weight", "BF16", 0.0),
+        "decoder.self_attn.q_norm.weight": ("attn_q_norm.weight", "F32", 1.0),
+        "decoder.self_attn.k_norm.weight": ("attn_k_norm.weight", "F32", 1.0),
+        "decoder.post_attention_layernorm.weight": ("post_attention_norm.weight", "F32", 1.0),
+        "decoder.mlp.gate_proj.weight": ("ffn_gate.weight", "BF16", 0.0),
+        "decoder.mlp.up_proj.weight": ("ffn_up.weight", "BF16", 0.0),
+        "decoder.mlp.down_proj.weight": ("ffn_down.weight", "BF16", 0.0),
+        "eh_proj.weight": ("nextn.eh_proj.weight", "BF16", 0.0),
+        "enorm.weight": ("nextn.enorm.weight", "F32", 1.0),
+        "hnorm.weight": ("nextn.hnorm.weight", "F32", 1.0),
+        "shared_head_norm.weight": ("nextn.shared_head_norm.weight", "F32", 1.0),
+    }
+    by_name = {t.name: t for t in reader.tensors}
+    with open(args.dst_gguf, "r+b") as out:
+        for our_key, (gguf_suffix, dt, bias) in name_map.items():
+            gname = f"blk.32.{gguf_suffix}"
+            t = by_name[gname]
+            val = sd[our_key].float() + bias if bias else sd[our_key]
+            raw = torch_to_gguf_bytes(val, dt)
+            if len(raw) != t.n_bytes:
+                raise ValueError(f"{our_key} -> {gname}: byte length {len(raw)} != gguf's {t.n_bytes}")
+            out.seek(t.data_offset)
+            out.write(raw)
+    print(json.dumps({"patched": len(name_map), "dst": args.dst_gguf}, indent=2))
+
+
+if __name__ == "__main__":
+    main()
