@@ -42,6 +42,27 @@ fi
 command -v curl >/dev/null || fail setup "curl is required"
 command -v python3 >/dev/null || fail setup "python3 is required"
 
+# A gate must never silently exercise an engine older than the Mojo source it
+# claims to verify. This catches the common post-merge stale-binary failure
+# before reserving the GPU. Record both the source watermark and binary hash
+# in the arm so a receipt identifies the exact executable.
+newest_mojo=$(find serve -type f -name '*.mojo' -printf '%T@ %p\n' | sort -nr | head -1)
+[ -n "$newest_mojo" ] || fail setup "no serve/*.mojo source files found"
+newest_mojo_mtime=${newest_mojo%% *}
+newest_mojo_path=${newest_mojo#* }
+engine_mtime=$(stat -c '%Y' "$engine")
+newest_mojo_epoch=${newest_mojo_mtime%%.*}
+[ "$engine_mtime" -ge "$newest_mojo_epoch" ] || fail setup "engine older than $newest_mojo_path; rebuild $engine"
+engine_sha256=$(sha256sum "$engine" | cut -d' ' -f1)
+{
+  echo "engine=$engine"
+  echo "engine_sha256=$engine_sha256"
+  echo "engine_mtime=$(stat -c '%y' "$engine")"
+  echo "newest_mojo=$newest_mojo_path"
+  echo "newest_mojo_mtime=$(stat -c '%y' "$newest_mojo_path")"
+} >> "$arm"
+echo "engine read-back: sha256=${engine_sha256:0:12} mtime=$(stat -c '%y' "$engine"); newest Mojo $newest_mojo_path"
+
 "$serve" --engine "$engine" --pack "$pack" --port "$port" \
   > "$out/server.stdout" 2> "$out/server.stderr" &
 srv=$!
