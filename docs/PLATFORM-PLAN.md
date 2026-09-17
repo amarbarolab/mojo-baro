@@ -48,7 +48,7 @@ surface, so a PAIR client or `inference-dispatcher` cannot tell the difference.
 |---|---|---|---|---|---|
 | P0a | Ollama-compatible API on `baro-serve` | S (380 LOC Rust, embeddings included) | team A | minutes | PAIR adoption, Open WebUI, phone clients |
 | P1 | LatentOS standard: state export/import API, cross-node fork, reader/followers policy | M (450) | coordinator design, team A build | 30 min | routing on state, P6 clients |
-| P0b | `baro-router`: discovery, pairing, inventory, rank, proxies, state locality | L (900 Rust) | team A, skeleton parallel to P1, rank gate after P1 | 30 min | P4, P6 |
+| P0b | `baro-router`: discovery, pairing, inventory, rank, proxies, state locality | L (1,150 Rust with the eight Pingora ideas) | team A, skeleton parallel to P1, rank gate after P1 | 30 min | P4, P6 |
 | P4 | Multi-GPU: engine per device, router data parallel; harness on this box with the iGPU | S wiring, M gate (250) | sonnet | 1 h | |
 | P5a | Draft head by self-distillation | S (120 Python) | sonnet | 20 min smoke, 3 h full | A4 unpark |
 | P3a | Speech in: whisper.cpp sidecar behind `/v1/audio/transcriptions` | S (150 Rust) | sonnet | minutes | voice clients |
@@ -155,7 +155,42 @@ after it (EAP-NOOB is the right protocol; their Go library is not ours to embed,
 80 LOC that the P6 clients display as a QR). One TOML config; with none, `baro-router` fronts the local
 engines alone, which is what the ComfyUI node and the phone clients talk to.
 
-**Gates.** (1) `pair-dispatch --count 20 --mode parallel` against the router with two engines on
+**Router shape, eight ideas taken from Cloudflare's Pingora (the maintainer 2026-09-17; ideas only, the router
+stays on axum and tokio, no new framework).**
+
+1. *Named phases.* One function per step of a proxied request, in this order: `request_filter`,
+   `choose_engine` (rank plus state locality, the only place placement is decided), `connected`,
+   `fail_to_connect`, `response_filter`, `error_while_proxy`, `log` (the catalog row is written here
+   and nowhere else). No handler mixes two phases.
+2. *Failover by what was sent, not only by what came back.* Connection never opened: retry on the next
+   ranked engine, freely. Request sent, no response byte yet: retry only after a `/v1/cancel` to the
+   first engine has been acknowledged or has timed out, so a generation never runs twice. First
+   response byte sent downstream: never retry, fail loudly.
+3. *Health flips on consecutive checks.* An engine leaves rotation after 3 failed checks in a row and
+   returns after 2 passed; a check is `/health` with a timeout longer than the longest prefill the
+   engine advertises, so a 16 s prefill at 32k never reads as death.
+4. *Consistent hashing as the stickiness fallback.* When no fresh `/v1/state` inventory exists for a
+   request's prefix hash, the hash picks the engine on a ring, so a conversation keeps landing on the
+   same engine with no router state, and only a departed engine's conversations move.
+5. *Stampede lock on a prefix.* N requests for a prefix that is not yet resident: one runs the
+   prefill, the rest wait on it and restore its state (P1 import). This is E14's reader and followers
+   enforced by the router; `/v1/fanout` is the explicit form.
+6. *Upgrade without a refused connection.* A new router process takes the listening socket from the
+   old one over a Unix socket; the old one finishes its streams within a grace period and exits.
+7. *Exact in-flight counts.* `pending` per engine is a counter the router bumps at `connected` and
+   drops at `log`, never a polled number.
+8. *Pooled upstream connections.* Keep-alive connections per engine, reused across requests.
+
+Staging: 1, 2, 3 and 7 are the skeleton's shape and land with it. 8 lands with the proxies. 4 and 5
+need P1 and land with gate 4. 6 lands last, with its own check.
+
+**Gates.** (5) Failover safety: an engine that accepts a request and then stalls is cancelled before
+the retry, and the catalog shows exactly one completed generation for that request id. (6) Flap: an
+engine held busy by a 32k prefill stays in rotation; an engine answering nothing for 3 checks leaves
+and returns after 2. (7) Stampede: 10 identical long-prefix requests produce one prefill in the
+engine logs and 10 identical answers. (8) Upgrade: a streaming request in flight across a router
+upgrade completes byte-identical, and a request started during the upgrade is not refused.
+(1) `pair-dispatch --count 20 --mode parallel` against the router with two engines on
 this box (P4's rig): 20/20 complete, placement follows the rank rule (catalog shows pending balanced
 within one), every response identical to its single-engine run at T=0. (2) Kill one engine mid-run:
 requests in flight on it fail loudly, new ones route to the other; receipt in the catalog. (3) A PAIR

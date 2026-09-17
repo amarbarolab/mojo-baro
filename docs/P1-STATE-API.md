@@ -38,16 +38,35 @@ BAROST01 or BAROST02 body, unchanged
 - Media type `application/vnd.baro.state`. Streams are written and read in 8 MiB chunks; no route
   buffers a whole 32k state in the HTTP layer.
 
-## CONTRACT 2: identity
+## CONTRACT 2: identity (amended 2026-09-17 after team A's finding)
 
-The pack salt today is `sha256(packdir)`. Two nodes holding the same bake under different paths
-refuse each other's state ("saved from a different pack"). First build step:
+The pack salt today is `sha256(packdir)`. Two nodes holding the same pack under different paths
+refuse each other's state ("saved from a different pack"). The first draft of this spec keyed the
+fix on `weights_uuid` and the vocab-and-merges `tokenizer_sha` of `serve/identity.mojo`. Team A
+showed that nothing at serve time can produce either: the pack directory holds no GGUF, that module
+is called only from a bench, and `serve/src/checkpoints.rs` hashes the tokenizer FILE, a different
+algorithm. The identity is therefore the thing the engine actually runs:
 
-- Salt becomes `sha256(weights_uuid || tokenizer_sha)` when the bake carries an identity block, and
-  stays `sha256(packdir)` otherwise, so old packs keep working on one node. State files written
-  under the old salt are refused with a message that says so; they are caches, not data.
-- Import checks, in order: LAT1 magic and version; `payload_sha`; `weights_uuid`; `tokenizer_sha`;
-  slot sizes and `pos` against `BARO_TMAX`. Any miss is `409 {"error":"state_identity","field":...,
+- `pack_sha256` = sha256 of `pack.bin`, all 32 bytes. A q4 and a q8 pack of one GGUF differ here,
+  which is correct: their KV is not interchangeable.
+- `tokenizer_sha256` = sha256 of the pack's `tokenizer.json` file bytes, the algorithm
+  `checkpoints.rs` already uses. `serve/identity.mojo` stays a bench module and is not used by P1.
+- Both live in `<pack>/identity.json`: `{"pack_sha256","tokenizer_sha256","pack_bytes","pack_mtime_ns",
+  "source":NAME,"general_uuid":STR or null}`. `tools/engine-pack.py` writes it at pack time, and
+  `tools/engine-pack.py --identity PACKDIR` writes it for an existing pack (one 7 GB hash, reused
+  while `pack_bytes` and `pack_mtime_ns` still match). One writer, in one language; the engine and
+  `baro-serve` only READ the file, so no hash logic is duplicated.
+- Salt = `sha256(pack_sha256 || tokenizer_sha256)` when `identity.json` is present and its size and
+  mtime fields match `pack.bin`; else `sha256(packdir)` as today, and `GET /v1/state` reports
+  `"portable":false`, and export answers 409 `{"error":"pack_identity_missing","fix":"engine-pack.py --identity"}`.
+  State files written under the old salt are refused with a message that says so; they are caches.
+- LAT1 header mapping: `role_sha` (32 B, "plain artifact sha256") = `pack_sha256`; `weights_uuid`
+  (16 B) = its first 16 bytes; `tokenizer_sha` = `tokenizer_sha256`.
+- `checkpoints.rs` `Identity`: `pack` becomes `pack_sha256` from the file (path hash when absent),
+  `weights_uuid` stays null, `tokenizer_sha` unchanged. It sits beside the current field, it does
+  not change its algorithm.
+- Import checks, in order: LAT1 magic and version; `payload_sha`; `role_sha`; `tokenizer_sha`; slot
+  sizes and `pos` against `BARO_TMAX`. Any miss is `409 {"error":"state_identity","field":...,
   "ours":...,"theirs":...}` and nothing is restored. A differing `runtime` is reported
   (`"runtime_differs":true`), not refused: the identity gate judges it.
 
@@ -87,7 +106,7 @@ states, hmac enforcement, MoE packs (MoE export answers 501 until measured).
 
 ## Build order (each step lands with its gate, in the team's item template)
 
-1. **Salt and container.** Identity-block salt, LAT1 wrap and unwrap, the 409 paths. Gate:
+1. **Salt and container.** `identity.json` writer in `tools/engine-pack.py`, the salt read from it, LAT1 wrap and unwrap, the 409 paths. Gate:
    `bench/checkpoint-api.sh` still green; a state saved under pack path A loads under a symlinked
    path B (show it failing before the change); a flipped body byte is a 409.
 2. **Routes.** `GET /v1/state`, export, import, in a NEW `serve/src/state.rs`; `main.rs` lines in one
