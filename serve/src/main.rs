@@ -19,10 +19,11 @@ mod text;
 use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use axum::extract::State;
+use axum::extract::{Request as AxumRequest, State};
 use axum::http::StatusCode;
+use axum::middleware::{self, Next};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -151,7 +152,8 @@ async fn main() {
         .route("/api/generate", post(ollama::generate))
         .route("/api/embeddings", post(embeddings::embeddings))
         .route("/v1/embeddings", post(embeddings::embeddings))
-        .with_state(app.clone());
+        .with_state(app.clone())
+        .layer(middleware::from_fn(access_log));
 
     let listener = match tokio::net::TcpListener::bind((opts.host.as_str(), opts.port)).await {
         Ok(l) => l,
@@ -228,6 +230,18 @@ fn need_text(app: &App) -> Result<&Text, ApiError> {
 
 fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// One stderr line per request: method, path, status, elapsed ms. Never the
+/// body or headers (coordinator, gate-3 gap b: proves a request reached
+/// `baro-serve` at all, e.g. one routed by PAIR's proxy).
+async fn access_log(req: AxumRequest, next: Next) -> Response {
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let start = Instant::now();
+    let resp = next.run(req).await;
+    eprintln!("access: {method} {path} {} {}ms", resp.status().as_u16(), start.elapsed().as_millis());
+    resp
 }
 
 // ---- health / models --------------------------------------------------------
