@@ -10,7 +10,9 @@
 //! request lines before the current request completes.
 
 mod checkpoints;
+mod embeddings;
 mod engine;
+mod ollama;
 mod protocol;
 mod text;
 
@@ -139,6 +141,16 @@ async fn main() {
         .route("/v1/cancel", post(cancel))
         .route("/tokenize", post(tokenize))
         .route("/detokenize", post(detokenize))
+        // P0a: Ollama-compatible API (docs/PLATFORM-PLAN.md).
+        .route("/api/tags", get(ollama::tags))
+        .route("/api/ps", get(ollama::ps))
+        .route("/api/version", get(ollama::version))
+        .route("/api/show", post(ollama::show))
+        .route("/api/pull", post(ollama::pull))
+        .route("/api/chat", post(ollama::chat))
+        .route("/api/generate", post(ollama::generate))
+        .route("/api/embeddings", post(embeddings::embeddings))
+        .route("/v1/embeddings", post(embeddings::embeddings))
         .with_state(app.clone());
 
     let listener = match tokio::net::TcpListener::bind((opts.host.as_str(), opts.port)).await {
