@@ -110,7 +110,11 @@ def main():
     for i, (A, B, down) in adapters.items():
         delta = (args.alpha / args.rank) * (B.float() @ A.float())
         w = (down.weight.detach().float() + delta).to(torch.bfloat16)
-        merged[f"blk.{i}.ffn_down.weight"] = w.t().contiguous().view(torch.uint16).cpu().numpy()
+        # NOT transposed: down_proj.weight's natural torch shape (out, in) is
+        # already gguf-writeback.py's expected numpy-natural array shape for
+        # this tensor (verified byte-for-byte against the source GGUF); a
+        # .t() here writes a scrambled, transposed matrix into the file.
+        merged[f"blk.{i}.ffn_down.weight"] = w.contiguous().view(torch.uint16).cpu().numpy()
     np.savez(args.out, **merged)
 
     report = {

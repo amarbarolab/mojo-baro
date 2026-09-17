@@ -73,7 +73,17 @@ def tensor_table(path: Path, names: list[str]) -> list[dict]:
         rows.append(
             {
                 "name": name,
-                "shape": [int(dim) for dim in tensor.shape],
+                # GGUF metadata lists dims fastest-first (reversed from a
+                # numpy/torch row-major shape); GGUFReader.shape passes that
+                # convention through unchanged. The on-disk bytes -- and
+                # every patch array this tool accepts -- are in the REVERSED,
+                # numpy-natural shape (verified against an HF-loaded
+                # nn.Linear.weight for a non-square tensor: only the
+                # reversed order round-trips as an exact byte match).
+                # Reporting tensor.shape here directly, as an earlier
+                # version did, silently accepted a transposed patch array
+                # for any non-square tensor and wrote scrambled bytes.
+                "shape": [int(dim) for dim in reversed(tensor.shape)],
                 "dtype": tensor.tensor_type.name,
                 "offset": start,
                 "n_bytes": n_bytes,
