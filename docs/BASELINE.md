@@ -407,6 +407,12 @@ identity AND reverse tables, decode after 32k **117.69 vs 100.54 f32 (1.171x)**,
 1.011x, RULER niah_single 100.0 at 64k and 128k, `BARO_STATE_SAVE` refuses int8 (step 3). The default
 f32 build is ISA-identical to the pre-merge engine. Report `exchange/lane-A2S2-report.md`.
 
+**ComfyUI node since 2026-09-17 (`exchange/lane-COMFY-report.md`):** `~/Projects/imports/ComfyUI/custom_nodes/comfyui-baro/`
+(own git) adds BaroChat and BaroJSON over `baro-serve`, time-sliced: the MAX runtime holds about 22 GB
+per engine process whatever the pack (5.3 GB pack, 21.75 GB held), so the engine runs between
+ComfyUI's model loads (`/free`, engine under gpu-wait per request, PR_SET_PDEATHSIG child). Gates:
+identity 64/64, an image whose PNG carries the expanded prompt, BaroJSON 41/41 valid, kill -9 orphan test.
+
 **q4 m=1 champion since 2026-09-11 (`3824e20`, merge of lane-dattn): 136.37
 tok/s_gen no-spec, 20-prompt median** (was 133.9). Post-merge A/B against
 pre-merge main (`.work/engine-premerge`, same pack and env): 127.98 -> 136.37
@@ -434,6 +440,8 @@ cannot be set through `@__llvm_metadata` (six spellings rejected).
 
 
 ## qwen35moe decode
+
+**Expert tier pinned by default since 2026-09-17** (`BARO_TIER_PINNED=1`; `=0` for the page cache): experts in host RAM decode at 67.12 tok/s against 48.57 page-cached, identity 20/20, `exchange/lane-MOE3-report.md` item 0; the cost was the blocking pread, not the bus.
 
 **Champion (2026-09-15, R6.0b `38ee0b7`, `bench/moe-persist-protocol.md`):
 111.89 tok/s_gen, 20-prompt median** (spread 1.2%), launch path

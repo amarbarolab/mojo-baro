@@ -23,11 +23,14 @@ Cache layout per layer, one contiguous block:
 860,160 (q6_k: layers 34, 38, 39). At cap 64 that is 113 MB per layer and
 4.53 GB over 40 layers, against 18.1 GB for all 256.
 
-The host store is read through the page cache by default rather than held in
-18 GB of pinned memory: stage 1 measured pinned and pageable host-to-device
-at 28.78 against 28.60 GB/s on this box, a 0.6% difference, and this machine
-runs other work. `BARO_TIER_PINNED=1` holds the whole store pinned instead,
-and the tier prints which one it is using, because that is an arm-defining
+The host store is PINNED by default since 2026-09-17 (the maintainer's decision after
+stage 3, `exchange/lane-MOE3-report.md`): with the page cache, every miss
+does a blocking pread into the staging buffer before its copy, 55% of the
+tier's host time, and the measured cost was 48.57 against 67.12 tok/s pinned,
+identical output on all 20 prompts. The DMA rate itself is the same either
+way (stage 1: 28.78 vs 28.60 GB/s). `BARO_TIER_PINNED=0` reads through the
+page cache instead when the 18 GB of locked RAM is not affordable, and the
+tier prints which one it is using, because that is an arm-defining
 parameter (P1).
 
 A miss costs a host round trip: the top-8 is only known after the router
@@ -184,7 +187,7 @@ struct ExpertTier(Copyable, Movable):
         self.active = True
         self.cap = cap
         self.n_layers = n_layers
-        self.pinned = getenv("BARO_TIER_PINNED", "0") == "1"
+        self.pinned = getenv("BARO_TIER_PINNED", "1") == "1"
         self.hot_active = (not self.pinned) and getenv("BARO_TIER_HOT", "0") == "1"
         self.hot_cap = Int(getenv("BARO_TIER_HOTCAP", "128"))
         self.geom = List[LayerGeom]()
