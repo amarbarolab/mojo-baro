@@ -67,12 +67,16 @@ def save_state(
     comptime if KVT != DType.float32:
         raise Error("BARO_STATE_SAVE: state files store f32 KV; this engine has BARO_KVQ=" + KVQ + " (quantized KV state is A2 step 3)")
     else:
+        # The checkpoint must be THIS prompt's. Matching on pos alone wrote another conversation's
+        # conv and SSM state into the file whenever two resident checkpoints shared a position
+        # (bench/fork-bytes-check.sh: p05's export carried p02's recurrent state, both at pos 14).
+        var want = prefix_hash(chain.salt, prompt, pos)
         var idx = -1
         for i in range(len(chain.items)):
-            if chain.items[i].valid and chain.items[i].pos == pos:
+            if chain.items[i].valid and chain.items[i].pos == pos and bytes_eq(chain.items[i].hash, want):
                 idx = i
         if idx < 0:
-            raise Error("BARO_STATE_SAVE: no committed checkpoint at pos " + String(pos))
+            raise Error("BARO_STATE_SAVE: no committed checkpoint for this prompt at pos " + String(pos))
         var kvn = ceildiv(pos, KVPAGE) * N_ATT * NKVH * KVHSTR
         var kh = ctx.enqueue_create_host_buffer[KVT](kvn)
         var vh = ctx.enqueue_create_host_buffer[KVT](kvn)
