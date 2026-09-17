@@ -101,8 +101,11 @@ async fn main() {
             std::process::exit(2);
         }
     };
-    let tok_path = opts.tokenizer.clone().unwrap_or_else(|| opts.pack.join("tokenizer.json"));
-    let text = if tok_path.exists() {
+    let tok_path = if opts.audio_only { PathBuf::new() } else { opts.tokenizer.clone().unwrap_or_else(|| opts.pack.join("tokenizer.json")) };
+    let text = if opts.audio_only {
+        eprintln!("audio-only: tokenizer not loaded, text endpoints disabled");
+        None
+    } else if tok_path.exists() {
         match Text::load(&tok_path) {
             Ok(t) => {
                 eprintln!("tokenizer: {} (stop ids {:?})", tok_path.display(), t.stop_ids);
@@ -136,7 +139,11 @@ async fn main() {
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "mojo-baro".into());
-    let identity = checkpoints::Identity::compute(&opts.pack, &tok_path);
+    let identity = if opts.audio_only {
+        checkpoints::Identity { pack: "audio-only".into(), runtime: "audio-only".into(), tokenizer_sha: None }
+    } else {
+        checkpoints::Identity::compute(&opts.pack, &tok_path)
+    };
     let ckpts = checkpoints::Registry::from_env();
     eprintln!("checkpoints: dir {} cap {} identity {:?}", ckpts.dir.display(), ckpts.cap, identity);
     let audio = audio::AudioSidecar::from_env();

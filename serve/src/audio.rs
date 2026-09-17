@@ -32,6 +32,11 @@ pub struct AudioSidecar {
     threads: u32,
     port: u16,
     idle_secs: u64,
+    /// P3a preflight (`docs/PLATFORM-PLAN.md`): one clip through the
+    /// endpoint on CPU with a small model, before the real GPU gate. When
+    /// set, the sidecar is not wrapped in `gpu-wait` at all -- it is not a
+    /// GPU workload.
+    no_gpu: bool,
     child: tokio::sync::Mutex<Option<Child>>,
     last_used: AtomicU64,
 }
@@ -46,6 +51,7 @@ impl AudioSidecar {
             threads: env_num("BARO_WHISPER_THREADS", 8u32),
             port: env_num("BARO_WHISPER_PORT", 8090u16),
             idle_secs: env_num("BARO_WHISPER_IDLE_SECS", 300u64),
+            no_gpu: env_str("BARO_WHISPER_NO_GPU", "0") == "1",
             child: tokio::sync::Mutex::new(None),
             last_used: AtomicU64::new(0),
         }
@@ -71,27 +77,37 @@ async fn ensure_running(app: &Shared) -> Result<(), String> {
             }
             *guard = None; // exited: fall through and respawn
         }
-        let child = Command::new("gpu-wait")
-            .args([
-                "run",
-                "--shared",
-                "--vram",
-                "4",
-                "--",
-                &a.bin,
-                "-m",
-                &a.model,
-                "-l",
-                &a.language,
-                "-bs",
-                &a.beam.to_string(),
-                "-t",
-                &a.threads.to_string(),
-                "--host",
-                "127.0.0.1",
-                "--port",
-                &a.port.to_string(),
-            ])
+        let mut whisper_args = vec![
+            a.bin.clone(),
+            "-m".into(),
+            a.model.clone(),
+            "-l".into(),
+            a.language.clone(),
+            "-bs".into(),
+            a.beam.to_string(),
+            "-t".into(),
+            a.threads.to_string(),
+            "--host".into(),
+            "127.0.0.1".into(),
+            "--port".into(),
+            a.port.to_string(),
+        ];
+        if a.no_gpu {
+            whisper_args.push("-ng".into());
+        }
+        let mut cmd = if a.no_gpu {
+            // Not a GPU workload: run directly, no gpu-wait admission needed.
+            let mut c = Command::new(&whisper_args[0]);
+            c.args(&whisper_args[1..]);
+            c
+        } else {
+            let mut gpu_wait_args = vec!["run".to_string(), "--shared".into(), "--vram".into(), "4".into(), "--".into()];
+            gpu_wait_args.extend(whisper_args);
+            let mut c = Command::new("gpu-wait");
+            c.args(&gpu_wait_args);
+            c
+        };
+        let child = cmd
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
