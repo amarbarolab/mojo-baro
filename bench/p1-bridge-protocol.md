@@ -172,3 +172,38 @@ finding.
    seconds (loudly, nothing left running). The harness now runs `tools/baro-tokenize encode` from
    the GGUF on the CPU before any GPU job. On p01 our ids equal llama.cpp's own tokenization
    exactly (17 ids).
+
+## Amendment 3, 2026-09-17, after the full lily and Qwen2.5 runs and before the Ornith run
+
+Written after seeing the full 20-prompt data for two of the three models, so it is frozen only for
+Ornith. For lily and Qwen2.5 it is a disclosed post hoc correction, and both readings are shown.
+
+1. **My scorer voided prompts the note never said to void.** llama.cpp's cold run reached EOS
+   before 32 tokens on two prompts per model (lily p05 at 5 and p13 at 27; Qwen2.5 p08 at 14 and
+   p13 at 23). The scorer demanded exactly 32 cold tokens and called the gate VOID. The note's void
+   list has two entries only: reuse not held, cold not cold. An answer that ends is neither. The
+   scorer now compares every arm over everything it generated and counts a different LENGTH as a
+   divergence. Under the scorer as first run both models read VOID; under the note as written they
+   read NOT MET, 16 of 20 and 13 of 20. **Neither reading is a pass**, so this correction cannot
+   flatter the result, which is the only reason I am comfortable making it after the fact. All
+   four EOS prompts were identical on every arm.
+2. **A harness check of mine failed the Ornith job.** `serve/engine.mojo` prints two
+   `state saved:` lines per save and `serve/spark.mojo` prints one. I had read both print sites
+   and still wrote a check that assumed one, so Ornith's job exported 20 states correctly and then
+   died on "40 state-saved lines for 20 prompts". Loud, nothing left running, and about two GPU
+   minutes wasted on an error a careful read would have caught. The check now counts the
+   `format BAROST` line, which both engines print exactly once per save.
+3. **My control L prediction was wrong, by a lot.** I froze 20, 20 and 19 to 20. Measured: lily
+   15 of 20, Qwen2.5 16 of 20. llama.cpp restoring its OWN bytes disagrees with its OWN cold run on
+   a fifth to a quarter of these prompts. The plan's bar could not be met by llama.cpp handing
+   state to itself. My primary prediction (17 to 20) was also too high: 16 and 13.
+4. **The classifier lands on UNCLASSIFIED for both, and I am leaving it there.** Each model has one
+   primary miss before index 3 (lily p11 at 1, Qwen2.5 p10 at 1), and the numerics clause requires
+   every miss at 3 or later. On lily p11, control L and control N miss at the same index 1, so the
+   early index there is the cold arm's. Amendment 1 had already said the early-index signal was
+   weaker than I assumed and deliberately changed no threshold. I am not changing one now that the
+   rule has produced an awkward answer. Qwen2.5's primary (13) sits exactly 2 below its control N
+   (15): at the kill-line margin, not past it.
+5. **A new instrument, reported only:** `tools/slot-kv-diff.py` compares the K/V we exported with
+   the K/V llama.cpp computed for the same tokens, elementwise, from the slot files already on
+   disk. Calibrated first: 0.0000 against itself, 1.0 to 48 against the K/V-swapped falsifier file.

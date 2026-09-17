@@ -27,11 +27,14 @@ rows, voids = [], []
 for p in names:
     n_prompt = len((out / "ids" / f"{p}.ids").read_text().strip().split(","))
     cold = load(p, "cold")
-    if cold is None or len(cold["tokens"]) != 32:
-        voids.append(f"{p}: no cold reference with 32 tokens"); continue
+    # Amendment 3: a cold run that reaches EOS before 32 tokens is a legitimate answer, not a void.
+    # The frozen void list names two things only (reuse not held, cold not cold). Every arm is then
+    # compared over everything it generated, and a different LENGTH is a divergence (first_div).
+    if cold is None or not cold["tokens"] or (len(cold["tokens"]) < 32 and cold.get("stop_type") != "eos"):
+        voids.append(f"{p}: no usable cold reference ({0 if cold is None else len(cold['tokens'])} tokens, stop {None if cold is None else cold.get('stop_type')})"); continue
     if cold["timings"].get("cache_n", 0) != 0:
         voids.append(f"{p}: cold arm was not cold (cache_n {cold['timings'].get('cache_n')})")
-    row = {"p": p, "n_prompt": n_prompt}
+    row = {"p": p, "n_prompt": n_prompt, "n_cold": len(cold["tokens"])}
     for arm in ("ctrlL", "primary") + (("falsify",) if falsify else ()):
         d, r = load(p, arm), load(p, f"{arm}.restore")
         if d is None or r is None:
@@ -48,7 +51,8 @@ for p in names:
         row["vsL"] = first_div(b["tokens"], a["tokens"])
     ours = load(p, "ours")
     if ours is not None:
-        row["ctrlN"] = first_div(cold["tokens"], ours["choices"][0]["tokens"][:32])
+        # our engine has no EOS stop on this route, so it is compared over the cold run's length
+        row["ctrlN"] = first_div(cold["tokens"], ours["choices"][0]["tokens"][: len(cold["tokens"])])
     rows.append(row)
 
 same = lambda arm: sum(1 for r in rows if arm in r and r[arm] is None)  # noqa: E731
@@ -61,7 +65,11 @@ for r in rows:
     for n in r.get("notes", []):
         print(f"    control L not usable: {n}")
 prim, ctl = same("primary"), same("ctrlL")
-print(f"identical of {N}: control L {ctl}, control N {same('ctrlN') if have_n else 'n/a'}, primary {prim}" + (f", falsifier {same('falsify')}" if falsify else ""))
+S = len(rows)
+short = [f"{r['p']} ({r['n_cold']})" for r in rows if r["n_cold"] < 32]
+if short:
+    print(f"cold run ended at EOS before 32 tokens, compared over its full length: {', '.join(short)}")
+print(f"identical of {S} scored ({N} prompts): control L {ctl}, control N {same('ctrlN') if have_n else 'n/a'}, primary {prim}" + (f", falsifier {same('falsify')}" if falsify else ""))
 # Reported, never gated (amendment 2): does OUR state make llama.cpp produce what ITS OWN state
 # at the same position makes it produce? Both arms restore at |P|-1 and evaluate one token, so
 # this comparison has no batch-shape difference in it, unlike anything measured against cold.

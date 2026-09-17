@@ -117,7 +117,9 @@ phase_ours() {
     curl -sS --fail-with-body -X POST "$ourl/v1/state/export" -H 'content-type: application/json' --data @"$out/req.json" -o "$out/states/$p.state" || fail ours "$p export: $(head -c 300 "$out/states/$p.state")"
   done
   stop
-  local ns; ns=$(grep -c 'state saved:' "$out/ours.stderr" || true)
+  # serve/engine.mojo prints two "state saved:" lines per save (one names the format, one the
+  # time) and serve/spark.mojo prints one; the format line is the one both print exactly once.
+  local ns; ns=$(grep -c 'state saved:.*format BAROST' "$out/ours.stderr" || true)
   [ "$ns" = "${#names[@]}" ] || fail ours "$ns state-saved lines for ${#names[@]} prompts"
   echo "ours readback: $ns/${#names[@]} state-saved lines in the engine log" | tee -a "$out/arm.txt"
 }
