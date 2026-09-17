@@ -293,47 +293,66 @@ def pack_sha256(pack_bin):
     return h.hexdigest()
 
 
-def write_identity(outdir):
+def write_identity(outdir, model=None):
     """Writes <outdir>/identity.json: pack_sha256 (pack.bin, full-file hash)
     plus tokenizer_sha256 (tokenizer.json file bytes, the SAME algorithm
     serve/src/checkpoints.rs already uses for its tokenizer_sha field) so
     the Mojo engine and the Rust front agree on one salt without either side
     re-deriving a hash the other computed differently (P1-STATE-API.md
-    CONTRACT 2, coordinator amendment 2026-09-17, 0c68cb4). Cached by
-    pack_bytes/pack_mtime_ns via `ensure_identity`; this function always
-    recomputes.
+    CONTRACT 2, coordinator amendment 2026-09-17, 0c68cb4).
+
+    Called two ways that see different files: at pack time (this function,
+    right after pack.bin is written, `model` given) tokenizer.json does not
+    exist yet in the real pipeline (model-import.sh runs the tokenizer
+    export step after packing) so tokenizer_sha256 is null; `--identity
+    PACKDIR` (`ensure_identity`, `model=None`) runs later once it does. A
+    prior identity.json's `source`/`general_uuid`/`tokenizer_sha256` are
+    kept when this call cannot recompute them, so either order converges on
+    a complete file.
     """
     pack_bin = outdir / "pack.bin"
     stat = pack_bin.stat()
     tok_path = outdir / "tokenizer.json"
     tokenizer_sha256 = hashlib.sha256(tok_path.read_bytes()).hexdigest() if tok_path.exists() else None
+    id_path = outdir / "identity.json"
+    prior = {}
+    if id_path.exists():
+        try:
+            prior = json.loads(id_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            prior = {}
     identity = {
         "pack_sha256": pack_sha256(pack_bin),
         "pack_bytes": stat.st_size,
         "pack_mtime_ns": stat.st_mtime_ns,
-        "tokenizer_sha256": tokenizer_sha256,
+        "tokenizer_sha256": tokenizer_sha256 if tokenizer_sha256 is not None else prior.get("tokenizer_sha256"),
+        "source": str(model) if model is not None else prior.get("source"),
+        "general_uuid": prior.get("general_uuid"),
     }
-    (outdir / "identity.json").write_text(json.dumps(identity, indent=2) + "\n")
-    tok_head = tokenizer_sha256[:16] if tokenizer_sha256 else None
+    id_path.write_text(json.dumps(identity, indent=2) + "\n")
+    tok_head = identity["tokenizer_sha256"][:16] if identity["tokenizer_sha256"] else None
     print(f"identity: pack_sha256={identity['pack_sha256'][:16]}... tokenizer_sha256={tok_head}")
     return identity
 
 
-def ensure_identity(outdir, force=False):
+def ensure_identity(outdir):
     """`write_identity`, skipped when `outdir/identity.json` already matches
-    the current `pack.bin` size and mtime (coordinator: cache by pack_bytes
-    and pack_mtime_ns, a full pack_sha256 re-hash is not free)."""
+    the current `pack.bin` size and mtime AND already has a tokenizer_sha256
+    if `tokenizer.json` exists (coordinator: cache by pack_bytes and
+    pack_mtime_ns, a full pack_sha256 re-hash is not free)."""
     pack_bin = outdir / "pack.bin"
     if not pack_bin.exists():
         raise SystemExit(f"engine-pack --identity: no pack.bin in {outdir}")
     id_path = outdir / "identity.json"
-    if not force and id_path.exists():
+    if id_path.exists():
         stat = pack_bin.stat()
         try:
             existing = json.loads(id_path.read_text())
         except (OSError, json.JSONDecodeError):
             existing = {}
-        if existing.get("pack_bytes") == stat.st_size and existing.get("pack_mtime_ns") == stat.st_mtime_ns:
+        tok_path = outdir / "tokenizer.json"
+        tok_covered = existing.get("tokenizer_sha256") is not None or not tok_path.exists()
+        if existing.get("pack_bytes") == stat.st_size and existing.get("pack_mtime_ns") == stat.st_mtime_ns and tok_covered:
             print(f"identity: cached (pack unchanged), pack_sha256={existing['pack_sha256'][:16]}...")
             return existing
     return write_identity(outdir)
@@ -430,6 +449,7 @@ def pack_dense(model, outdir):
 
     (outdir / "index.txt").write_text("\n".join(idx_lines) + "\n")
     print(f"packed {arch}, {n_layers} layers, bias={has_bias}, gate={has_gate}, tied={tied}, {off/2**30:.2f} GiB")
+    write_identity(outdir, model=model)
 
 
 MOE_DENSE_Q8 = {"attn_q", "attn_k", "attn_v", "attn_output", "attn_qkv", "attn_gate", "ssm_out"}
@@ -482,6 +502,7 @@ def pack_moe(model, outdir):
         dt = line.split()[1]
         counts[dt] = counts.get(dt, 0) + 1
     print(f"packed {len(names)} tensors, {off/2**30:.2f} GiB, dtypes={counts}")
+    write_identity(outdir, model=model)
 
 
 def main():
@@ -582,6 +603,7 @@ def main():
             off += len(raw)
     (outdir / "index.txt").write_text("\n".join(idx_lines) + "\n")
     print(f"packed {len(order)} tensors, {off/2**30:.2f} GiB")
+    write_identity(outdir, model=model)
 
 
 if __name__ == "__main__":
