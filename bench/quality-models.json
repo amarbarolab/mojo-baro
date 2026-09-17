@@ -50,8 +50,8 @@
   },
   "qwythos-p5b-patched": {
     "engine": "dense",
-    "baro_gguf": "$HOME/Projects/mojo/mojo-baro-lanes/team-b/.work/team-B/sonnet/p5b/train/patched-fixed.gguf",
-    "llama_gguf": "$HOME/Projects/mojo/mojo-baro-lanes/team-b/.work/team-B/sonnet/p5b/train/patched-fixed.gguf",
+    "baro_gguf": "$HOME/Projects/mojo/mojo-baro-lanes/team-b/.work/team-B/sonnet/p5b/train/patched-selfdesc.gguf",
+    "llama_gguf": "$HOME/Projects/mojo/mojo-baro-lanes/team-b/.work/team-B/sonnet/p5b/train/patched-selfdesc.gguf",
     "vram_gb": 20
   },
   "regescore-35b": {
