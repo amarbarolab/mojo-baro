@@ -145,7 +145,7 @@ def reset_and_load(ctx: DeviceContext, mut b: WindowBufs, context: List[Int], tm
         toks_h[i] = 0
     for i in range(len(context)):
         toks_h[i] = Int32(context[i])
-    ctx.enqueue_copy(dst_buf=b.toks_d, src_buf=toks_h)
+    ctx.enqueue_copy(dst_buf=DeviceBuffer[DType.int32](ctx, b.toks_d.unsafe_ptr(), tmax, owning=False), src_buf=toks_h)
     ctx.synchronize()
     var pf_rows = 0
     var pf_tail = 0

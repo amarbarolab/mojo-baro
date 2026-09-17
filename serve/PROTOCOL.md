@@ -214,6 +214,26 @@ Errors are `{"error": {"message", "type", "code"}}` with the HTTP status:
 `400` bad request (empty prompt, over-length, bad JSON), `503` no
 tokenizer / queue full / engine gone, `502` engine error mid-request.
 
+## P3a speech input
+
+`POST /v1/audio/transcriptions` accepts an OpenAI-compatible multipart form. The required
+`file` part is an audio file; `model`, `language`, and `response_format` are optional fields.
+The server accepts `response_format=text` and returns the transcript as plain text, or
+`response_format=json` and returns `{"text":"..."}`. The default model is the coordinator's
+large Whisper model, and the default language is `en`.
+
+The first request starts one `whisper-server` sidecar on loopback with the selected model,
+English language, beam size 5, 8 threads, and GPU enabled when the gate admits it. The server
+proxies the file to the sidecar's `/inference` endpoint, waits for the JSON result, and forwards
+only the requested response shape. The sidecar stops after the idle timeout and is restarted for
+the next request. It never starts an LLM engine for an audio-only gate.
+
+The sidecar's effective model path, language, beam size, thread count, device, and listening
+address are logged before the first transcription and copied into the gate receipt. A malformed
+multipart request is `400`; a sidecar start or request failure is `502`; an unavailable model or
+sidecar capacity failure is `503`. The fixed P3a fixture gate compares the normalized `text`
+field or plain response byte for byte against the same `whisper-cli` model and settings.
+
 ### Tokenizer files (owned by the tokenizer lane)
 
 `<pack>/tokenizer.json` (HF `tokenizers` format; loaded with the Rust

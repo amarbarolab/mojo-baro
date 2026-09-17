@@ -183,6 +183,102 @@ def read_dump(path: str):
     return docs
 
 
+def read_v2_dump(path: str):
+    """Read and validate the frozen P5a draft dump format.
+
+    The v2 header and every document/record boundary are checked before any
+    tensors are returned.  Records are expanded into CPU tensors so the
+    trainer cannot silently pair a hidden row with a different token or
+    target distribution.
+    """
+    with open(path, "rb") as f:
+        data = f.read()
+    off, n = 0, len(data)
+
+    def take_u32(label):
+        nonlocal off
+        if off + 4 > n:
+            raise ValueError(f"v2 dump truncated while reading {label} at offset {off}")
+        (value,) = struct.unpack_from("<I", data, off)
+        off += 4
+        return value
+
+    def take_many(fmt, count, label):
+        nonlocal off
+        size = struct.calcsize(fmt) * count
+        if off + size > n:
+            raise ValueError(f"v2 dump truncated while reading {label} at offset {off}")
+        values = struct.unpack_from(f"<{count}{fmt}", data, off)
+        off += size
+        return values
+
+    version = take_u32("version")
+    if version != 2:
+        raise ValueError(f"unsupported P5a dump version {version}, expected 2")
+
+    docs = []
+    while off < n:
+        doc_index = len(docs)
+        n_tok = take_u32(f"document {doc_index} token count")
+        if n_tok < 2:
+            raise ValueError(f"document {doc_index} has too few tokens: {n_tok}")
+        tokens = list(take_many("I", n_tok, f"document {doc_index} tokens"))
+        n_records = take_u32(f"document {doc_index} record count")
+        expected = n_tok - 2
+        if n_records != expected:
+            raise ValueError(
+                f"document {doc_index} record count {n_records} != n_tok-2 {expected}"
+            )
+        records = []
+        for record_index in range(n_records):
+            pos = take_u32(f"document {doc_index} record {record_index} position")
+            input_token = take_u32(f"document {doc_index} record {record_index} input token")
+            target_argmax = take_u32(f"document {doc_index} record {record_index} target argmax")
+            top8_count = take_u32(f"document {doc_index} record {record_index} top8 count")
+            if top8_count != 8:
+                raise ValueError(f"document {doc_index} record {record_index} top8 count {top8_count} != 8")
+            top8_ids = list(take_many("I", 8, f"document {doc_index} record {record_index} top8 ids"))
+            top8_probs = list(take_many("f", 8, f"document {doc_index} record {record_index} top8 probs"))
+            hidden = list(take_many("f", H, f"document {doc_index} record {record_index} hidden"))
+            if pos != record_index + 1 or not (1 <= pos <= n_tok - 2):
+                raise ValueError(
+                    f"document {doc_index} record {record_index} position {pos} is not {record_index + 1}"
+                )
+            if input_token != tokens[pos]:
+                raise ValueError(
+                    f"document {doc_index} record {record_index} input token {input_token} != tokens[{pos}] {tokens[pos]}"
+                )
+            if len(set(top8_ids)) != 8:
+                raise ValueError(f"document {doc_index} record {record_index} has duplicate top8 IDs")
+            if target_argmax != top8_ids[0]:
+                raise ValueError(
+                    f"document {doc_index} record {record_index} target argmax {target_argmax} != top8_ids[0] {top8_ids[0]}"
+                )
+            if not all(np.isfinite(top8_probs)) or not all(np.isfinite(hidden)):
+                raise ValueError(f"document {doc_index} record {record_index} contains non-finite values")
+            prob_sum = sum(top8_probs)
+            if abs(prob_sum - 1.0) > 1e-5:
+                raise ValueError(
+                    f"document {doc_index} record {record_index} top8 probabilities sum to {prob_sum:.9g}"
+                )
+            if any(p < 0.0 for p in top8_probs):
+                raise ValueError(f"document {doc_index} record {record_index} has negative top8 probability")
+            records.append({
+                "pos": pos,
+                "input_token": input_token,
+                "target_argmax": target_argmax,
+                "top8_ids": torch.tensor(top8_ids, dtype=torch.long),
+                "top8_probs": torch.tensor(top8_probs, dtype=torch.float32),
+                "h": torch.tensor(hidden, dtype=torch.float32),
+            })
+        docs.append({"tokens": tokens, "records": records})
+    if off != n:
+        raise ValueError(f"v2 dump parser stopped at {off} of {n} bytes")
+    if not docs:
+        raise ValueError("v2 dump contains no documents")
+    return docs
+
+
 def read_parity(path: str):
     """bench/draft_dump.mojo --mode parity format: ONE [n_pairs u32] + pairs
     block PER DOCUMENT, back to back (bench/draft_dump.mojo's main() calls

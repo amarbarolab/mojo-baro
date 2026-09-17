@@ -62,6 +62,11 @@ coordinator's answers. Where this file and your conference document differ, this
 - Never idle on a question you have not posted in the room. Blocked on the coordinator:
   `~/iTools/bin/herd tell w82:pC "QUESTION: ..."` and continue with what does not depend on it.
 
+- An item is gated on a clean checkout of its own commit once the next item has started in the
+  same tree (`git worktree add ../team-<T>-<item> <commit>`, `lane-prep`, build, gate there, copy
+  the receipts back, remove the worktree). Never rebuild a gate's binary with the next item's
+  uncommitted edits in the tree, and never narrow a stale-binary guard to make it pass.
+
 ## Done means
 
 One report per item, `exchange/lane-<ITEM>-report.md` on your branch: the gate commands and exit
