@@ -514,11 +514,49 @@ stint (98.3%), was 108.32 before this round.
   PR_SET_PDEATHSIG hardening was added so the child dies within 2 seconds even under SIGKILL or an
   OOM kill of the parent, confirmed live.
 - Chatterbox (speech-out, P3b) is not wired up. NOT RUN, see the audio speech entry above.
-- LatentOS is not exposed as its own HTTP sidecar. Its Unix-socket IPC and HIP IPC handle handoff
-  (`serve/latent.mojo`, `latentos/proto.mojo`) are described as existing with bench-level receipts
-  (E12, E14, E15), but those are not HTTP-gated in this section's scope. What is promoted to an HTTP
-  surface is the P1 state export/import API above. HIDDEN and LOGITS_TOPK streams over HTTP, the
-  IPC sidecar itself, and HMAC enforcement on state transfer are explicitly out of scope for P1.
+- LatentOS is three different mechanisms under one name, with three different statuses. Reading it
+  as a single feature is the main way to get it wrong.
+  - **memfd plus SCM_RIGHTS handle handoff, the sidecar proper: WORKS.** `mint_*` writes a payload
+    (SSM checkpoint, KV pages, or 8-step hidden vectors) into a `memfd_create` region, seals it
+    immutable, and passes the fd with a 256-byte `LatentHeader` over a Unix socket via `sendmsg`
+    (`latentos/ipc.mojo`, pure Mojo `external_call`). The receiver `mmap`s the sealed fd read-only.
+    Wired to the engine by `BARO_LATENT_SOCK` (`serve/latent.mojo`, commit `2e7b5d3`); unset, nothing
+    happens. Proven twice: `test_latent` in `run-tests.sh` round-trips a checkpoint byte-exact
+    in-process, and the L1 gate `tools/latent-gate.sh` does it live across two processes over the
+    real socket (1 handle exported, 1 received, ingested payload byte-identical at 52,690,944 bytes,
+    with a negative control confirming the gate cannot pass vacuously). This moves bytes through
+    host memory, not GPU to GPU.
+  - **HIP IPC handle handoff, GPU to GPU: KILLED** (`47e2896`, confirmed `d060a72`).
+    `hipIpcOpenMemHandle` returns `hipErrorInvalidValue` in the receiving process on every run
+    through Mojo's `external_call`, while a parallel C probe built with `hipcc`
+    (`bench/latentos-ipc-probe.c`) succeeds and sha256-matches every time. Cause isolated to Mojo's
+    FFI not implementing the SysV by-value struct ABI for arguments over 16 bytes, not a driver or
+    permissions problem. Not planned to be revisited in Mojo.
+  - **HTTP `.baro` state files: WORKS on one node**, and is a separate mechanism from the socket
+    sidecar despite reusing the LAT1 header. This is the P1 export/import API above.
+  - `latentos-agent` as a live daemon: NO CHECK FOUND. `agent.mojo`'s `main()` runs a one-shot boot
+    printout and manifest write; `stage_l7_serve_step`, the only method that reads the store or
+    heartbeats, is defined and never called from `main`. Nothing in this repo shows it running as a
+    persistent service. Cross-host transport (`tcp_listen`/`tcp_connect`/`send_tcp_latent`) has no
+    test referencing it.
+  - Measured experiments, kept for their numbers rather than as gate passes: **E12** KV handoff
+    scores identically to full re-prefill on task accuracy at 8k/16k/32k. **E14** one reader with N
+    followers PASSES at N=3 (3/3) and FAILS at N=10 (9/10), the miss diverging at token 62 of 64
+    after both arms already agree on the answer; wall clock beat llama.cpp's own cold total at both
+    sizes (1.68x at N=3, 3.70x at N=10). **E15**, the llama.cpp state bridge, did NOT MEET its own
+    20/20 bar on any of three models (16/20, 13/20, 14/20) against a llama.cpp control that itself
+    only reaches 15/16/16, so it is UNCLASSIFIED rather than a clean failure. The pure layout
+    round-trip underneath it is solid (byte-identical, 32/32 ids).
+  - **Status framing changed on 2026-09-17 (`0eb6ef2`, merged `50f9d34`).** The four P1 gates, their
+    bars, the kill line and the "ids must match" pass/fail rule were removed on the maintainer's call, with
+    nothing put in their place, because that criterion was the wrong test: gate 4 held llama.cpp to a
+    bar llama.cpp misses restoring its own state, and gate 2's ids could not tell a correct restored
+    state from a deliberately K/V-swapped one (2 of 5 wrong states still produced matching ids). The
+    measurements and the falsifiers were kept, since the falsifiers are what caught the real
+    `save_state` cross-prompt export bug. This is a descope of the pass/fail framing, not a proof or
+    a disproof. No plan-level LatentOS gate is PASS-and-live today.
+  - Out of scope for P1 and still absent: HIDDEN and LOGITS_TOPK streams over HTTP, HMAC enforcement
+    on state transfer.
 ## Models, pipeline and verification
 
 Current as of `main` at `2208bdb`, after team A's merge `a01ce69` (P0b CPU
