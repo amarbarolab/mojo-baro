@@ -256,9 +256,67 @@ def cmd_parity(args):
         json.dump(report, f, indent=2)
 
 
+def cmd_verify_writeback(args):
+    """Independent receipt for cmd_writeback, per bench/draft-head-protocol.md's
+    smoke section: read blk.32's 15 tensor byte ranges from the SOURCE gguf
+    (not the writeback code's own bookkeeping), then diff src vs dst
+    byte-for-byte everywhere else (must be zero differing bytes) and inside
+    those 15 ranges (must be non-zero: a no-op patch is also a FAIL, since it
+    would pass the "nothing else changed" check vacuously)."""
+    from gguf import GGUFReader
+    reader = GGUFReader(args.src_gguf)
+    by_name = {t.name: t for t in reader.tensors}
+    ranges = []
+    for suffix in [
+        "attn_norm.weight", "attn_q.weight", "attn_k.weight", "attn_v.weight",
+        "attn_q_norm.weight", "attn_k_norm.weight", "attn_output.weight",
+        "post_attention_norm.weight", "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight",
+        "nextn.eh_proj.weight", "nextn.enorm.weight", "nextn.hnorm.weight", "nextn.shared_head_norm.weight",
+    ]:
+        t = by_name[f"blk.32.{suffix}"]
+        ranges.append((t.data_offset, t.data_offset + t.n_bytes, suffix))
+    ranges.sort()
+
+    import numpy as np
+    src_size = __import__("os").path.getsize(args.src_gguf)
+    dst_size = __import__("os").path.getsize(args.dst_gguf)
+    if src_size != dst_size:
+        raise ValueError(f"file length changed: src {src_size} dst {dst_size}")
+    src_m = np.memmap(args.src_gguf, dtype=np.uint8, mode="r")
+    dst_m = np.memmap(args.dst_gguf, dtype=np.uint8, mode="r")
+
+    def diff_count(a, b, chunk=1 << 28):
+        n = 0
+        for i in range(0, len(a), chunk):
+            n += int(np.count_nonzero(a[i:i + chunk] != b[i:i + chunk]))
+        return n
+
+    outside_diff = 0
+    inside_diff_bytes = {}
+    pos = 0
+    checked_ranges = ranges + [(src_size, src_size, None)]
+    for start, end, suffix in checked_ranges:
+        if pos < start:
+            outside_diff += diff_count(src_m[pos:start], dst_m[pos:start])
+        if suffix is not None:
+            inside_diff_bytes[suffix] = diff_count(src_m[start:end], dst_m[start:end])
+            pos = end
+    report = {
+        "outside_blk32_diff_bytes": outside_diff,
+        "inside_blk32_diff_bytes": inside_diff_bytes,
+        "all_15_tensors_changed": all(v > 0 for v in inside_diff_bytes.values()),
+        "pass": outside_diff == 0 and all(v > 0 for v in inside_diff_bytes.values()),
+    }
+    print(json.dumps(report, indent=2))
+    with open(args.report, "w") as f:
+        json.dump(report, f, indent=2)
+    if not report["pass"]:
+        raise SystemExit("verify-writeback FAIL")
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["extract", "parity", "writeback"], required=True)
+    ap.add_argument("--mode", choices=["extract", "parity", "writeback", "verify-writeback"], required=True)
     ap.add_argument("--gguf")
     ap.add_argument("--out")
     ap.add_argument("--hf-dir", default="$HOME/Models/qwythos-9b-claude-mythos-5-1m-mtp-bf16/hf")
@@ -276,6 +334,8 @@ def main():
         cmd_parity(args)
     elif args.mode == "writeback":
         cmd_writeback(args)
+    elif args.mode == "verify-writeback":
+        cmd_verify_writeback(args)
 
 
 def cmd_writeback(args):

@@ -1,14 +1,19 @@
-# Lane A4 report: trained draft head, PARTIAL, parity gate now supported
+# Lane A4 report: trained draft head, smoke ran, kill line FAILS (large regression)
 
 Brief: `briefs/2026-09-17-A4-draft-head.md`. Plan: `docs/NEXT-PLAN.md` A4.
-Preregistration: `bench/draft-head-protocol.md`. **Not done: no training ran,
-no smoke result exists.** This session's first pass stopped at the parity
-gate because the numbers looked inconclusive; the follow-up below reruns
-against the real 20-prompt gate set through the real, unmodified engine and
-harness, reproduces the documented 65-66% baseline directly, and resolves
-the earlier ambiguity in favor of domain shift over a wiring defect. Still,
-per CLAUDE.md s18, no training has run: that word stays UNVERIFIED until it
-does.
+Preregistration: `bench/draft-head-protocol.md`. This session's first pass
+stopped at the parity gate because the numbers looked inconclusive; the
+first follow-up reran against the real 20-prompt gate set through the real,
+unmodified engine and harness, reproduced the documented 65-66% baseline
+directly, and resolved the earlier ambiguity in favor of domain shift over
+a wiring defect. the maintainer then authorized the smoke (Order step 3); it ran to
+completion this session and its kill line FAILS: the trained head's real
+accepted/drafted rate dropped from 67.78% to 3.06% on the 5-prompt subset
+(-64.7 pp, not the required +4 pp lift), full 20-prompt greedy identity
+stayed 20/20 PASS. Detail in "Order step 3" below. Order step 4 (the full
+preemptible training run) has not started and should not start against
+this recipe. Per CLAUDE.md s18, every number below names the check that
+produced it; nothing is claimed as more than what its own receipt shows.
 
 ## The E13 question, answered
 
@@ -171,3 +176,91 @@ both load-bearing and now behind real receipts. **Still not done: no
 training has run.** The parity gate is now a reasonable basis to proceed to
 Order step 3 (the 10-minute smoke), which stays the maintainer's call, not
 self-authorized here.
+
+## Order step 3: the smoke ran. Kill line FAIL, large regression, not just NO SIGNAL
+
+the maintainer authorized the smoke and restated the kill line against the reproduced
+statistic (`bench/draft-head-protocol.md`, frozen commit `7044828` before
+any training minute): same harness, `bench/mtp-prompts.sh`, 5-prompt quick
+subset, trained head must lift `accepted/drafted` by >= 4 pp over the
+untrained head in the same stint, full-20-prompt greedy identity must stay
+20/20 PASS regardless.
+
+**Data (Order step 2).** `bench/draft_dump.mojo`'s new `A4_TEXT_MODE=gsm8k`
+tokenizes GSM8K `train.jsonl` question+answer text through the engine's own
+tokenizer (genuinely held out from both eval sets used in this lane). 35
+documents dumped, 6,923 total (h, token) pairs available.
+
+**Training (`tools/mtp_train.py`, one optimizer step per document, capped at
+2000 total supervised positions -- blk.32's own attention keeps a KV cache
+across a document, `serve/window.mojo`'s `kc32_d`/`vc32_d`, so shuffling
+individual positions across documents would feed the wrong causal context).**
+Ran via `gpu-wait run --priority 10 --preemptible --vram 22 --timeout 900`.
+9 documents, exactly 2000 pairs, **22.3 s wall** (well under the 10-minute
+budget). AdamW lr 2e-4, `blk.32`'s real GGUF weights as the starting point
+(fine-tune, not from scratch). **Loss went up, not down**: first 6.99, last
+7.97, one step spiked to 24.55 (worse than the ln(248320) ~= 12.4 random-guess
+floor for part of the run) -- recorded, not gated, but a real warning sign
+this session did not act on before the gate. One PyTorch OOM warning at
+peak VRAM (22.15 GB against a 22 GB request, other GPU load present) that
+did not crash the run.
+
+**Write-back receipt (frozen requirement, checked independently of the
+write-back code's own arithmetic).** `tools/mtp_head.py --mode writeback`
+patched a copy of the source GGUF; `--mode verify-writeback` (new this
+session, using `numpy.memmap` after a first attempt that tried to
+byte-compare two 18 GB files with a pure-Python loop and silently produced
+nothing for several minutes) confirms **zero differing bytes outside the 15
+`blk.32` tensor ranges, and all 15 ranges changed** (`.work/a4/writeback-verify.json`,
+`"pass": true`). `tools/engine-pack.py`, UNMODIFIED, repacked the patched
+GGUF: 442 tensors, 6.72 GiB.
+
+**The gate, run.** Untrained pack, `p01`-`p05`, same stint: drafted 270,
+accepted 183, **67.78%**. Trained pack, same 5 prompts, same engine binary,
+same session: drafted 589, accepted 18, **3.06%**. **Lift: -64.7 pp, the
+opposite of the +4 pp the kill line requires.** Full 20-prompt greedy
+identity: **20/20 PASS on the trained pack** (the accept rule's own
+guarantee held: a badly miscalibrated draft still falls back to the
+target's own token on every rejection, so final output is unaffected).
+Full-set aggregate acceptance on the trained pack: 51/2398 = **2.13%**
+against the untrained 65.97%, so the 5-prompt subset's collapse is not a
+small-sample artifact.
+
+**Diagnostic (not part of the frozen gate, run to separate a training-recipe
+problem from a wiring regression): torch replica loaded with the TRAINED
+weights vs the trained-pack engine, same 5 real gate-set prompts.** Argmax
+agreement 31/69 = 45% (down from 71-91% on the untrained head); torch's own
+argmax matches the true next token 4/69 = 5.8%, and the real engine's
+matches 4/69 = 5.8% -- the SAME low number, in the exact-precision torch
+replica as well as the quantized engine. That the degradation shows up
+identically in float32 torch (no q4 quantization involved) is why this
+reads as a genuinely damaged set of weights, not a write-back or repack
+defect layered on top of a fine head: the write-back receipt already showed
+the bytes moved exactly where intended, and now the MEANING of those bytes
+independently checks out as bad in two different numerical paths.
+
+**Read on the training recipe, not verified further this session but named
+because it is the obvious next lever.** `lr = 2e-4` was carried over from
+`e13_train.py` unchanged, which used it under 16-item gradient accumulation
+before every optimizer step; this run's own design does ONE step per
+document (batch effectively 1, no accumulation), so the same learning rate
+is applied to a much noisier, un-averaged gradient every step -- a likely
+mismatch, not a like-for-like reuse of E13's tuned setting. 9 steps on one
+narrow domain (GSM8K math/answer text only) with no warmup and no gradient
+clipping is a plausible recipe for exactly this kind of coarse, uniform,
+damaging update (every one of the 15 tensors' weights moved by the same
+~0.0015-0.0018 max-abs amount, the Adam-at-this-lr-and-step-count
+signature, not a gradient-direction-driven one).
+
+**Verdict, per the frozen rule.** This is NOT a kill of the A4 hypothesis
+(the protocol's own language: a minutes-scale, unconverged, un-tuned probe
+cannot kill it, only say what this specific attempt showed) but it is a
+clear NO SIGNAL, and a starker one than "no lift": this recipe actively
+damaged the head. Before any further training GPU time: lower the learning
+rate and/or restore E13's own multi-item gradient accumulation before an
+optimizer step, add gradient clipping, and widen the training text beyond
+one narrow domain. None of that is done here -- reported, not fixed,
+per the maintainer's own call on whether and how to spend more GPU time on this.
+
+**Still not done: Order step 4 (the full preemptible run) has not started,
+and should not start against this recipe.**
