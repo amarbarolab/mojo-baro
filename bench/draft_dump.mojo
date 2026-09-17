@@ -32,7 +32,7 @@ from max.gpu.host import DeviceContext, HostBuffer, DeviceBuffer
 from registry import H, VOCAB, f32
 from window import WindowBufs, WindowState, WindowCfg, blk32_forward, step_window
 from realign import final_norm_hidden, head_logits
-from bench_latent_handoff import run_to_prompt_end, reset_and_load, make_cfg
+from bench_latent_handoff import run_to_prompt_end, reset_and_load, make_cfg, read_toks
 from harness import load_pack, alloc_bufs, Pack
 from grammar.automaton import Bitset
 from grammar.json_value import parse_json_file, parse_json_bytes
@@ -111,6 +111,20 @@ def dump_document_stepwise(
     var n = len(tokens)
     var pf = reset_and_load(ctx, b, tokens, tmax)
     var cfg = make_cfg(pack_q4, q4_off, e, pf[0], pf[1], n, n + 1)
+    # Coordinator diagnosis, 2026-09-17, two causes: (1) make_cfg's mega=True
+    # takes the m==1 megakernel path once st.pos+1 >= n_prompt
+    # (window.mojo:971), fusing every layer into one kernel that never
+    # writes the standalone hidden buffer final_norm_hidden reads
+    # (window.mojo:1052 skips the host layer loop). (2) prefilled rows write
+    # xp_d, not b.x_d, so a row processed under prefill stays zero even with
+    # mega off. n_prompt=n and pf_rows/pf_tail from `pf` both push most of
+    # the document through one or the other path. Force pure per-token
+    # stepwise decode instead, the path final_norm_hidden actually reads.
+    # Local override only; make_cfg (shared with run_parity, not broken) is
+    # untouched.
+    cfg.mega = False
+    cfg.pf_rows = 0
+    cfg.pf_tail = 0
     wst.reset(0)
     write_u32(out, n)
     for i in range(n):
@@ -125,13 +139,36 @@ def dump_document_stepwise(
     var hbuf = ctx.enqueue_create_host_buffer[f32](H)
     var lgbuf = ctx.enqueue_create_host_buffer[f32](VOCAB)
     for i in range(n_records):
+        # Coordinator, 2026-09-17: step_window batches m = min(MROWS,
+        # n_prompt-1-st.pos) rows per call whenever st.pos+1 < n_prompt,
+        # independent of mega/pf_rows; with n_prompt=n that batched several
+        # loop iterations into one call, and every one of them read the
+        # SAME stale b.x_d row 0 from that call (rows 0 and 5 came back
+        # byte-identical, row 20 in the next batch differed). n_prompt=i+2
+        # forces m=1 for exactly this step while keeping st.pos+1 < n_prompt
+        # true, so the teacher-forced path stays selected -- unlike
+        # n_prompt=0, which was rejected: it takes the >=n_prompt branch
+        # that writes the model's own greedy pick into Toks[pos+1] instead
+        # of reading the true next token, corrupting the document under
+        # teacher forcing.
+        cfg.n_prompt = i + 2
         while wst.pos <= i:
             step_window(ctx, b, cfg, wst)
         var hdev = ctx.enqueue_create_buffer[f32](H)
-        final_norm_hidden(ctx, b, hdev)
-        var lgdev = ctx.enqueue_create_buffer[f32](VOCAB)
-        head_logits(ctx, b, pack_q4, lgdev)
+        final_norm_hidden(ctx, b, hdev)  # h_i = h_(P-1), P = i+1
         ctx.enqueue_copy(dst_buf=hbuf, src_buf=hdev)
+        # codex, 2026-09-17: head_logits from h_i predicts tokens[i+1] (the
+        # standard next-token relationship), but the frozen v2 schema and
+        # blk32_forward's own hsrc=h_{P-1} convention need the MTP-shifted
+        # target, the trunk's prediction for tokens[P+1] -- one more
+        # teacher-forced step ahead, from h_P. Validated: target_argmax
+        # matched tokens[pos] (the P-1-shifted target) 87.76% of 98 records
+        # before this fix, tokens[pos+1] only 1.02%.
+        cfg.n_prompt = i + 3
+        while wst.pos <= i + 1:
+            step_window(ctx, b, cfg, wst)
+        var lgdev = ctx.enqueue_create_buffer[f32](VOCAB)
+        head_logits(ctx, b, pack_q4, lgdev)  # from h_P
         ctx.enqueue_copy(dst_buf=lgbuf, src_buf=lgdev)
         ctx.synchronize()
         var top8 = top8_from_logits(lgbuf, VOCAB)
@@ -147,8 +184,20 @@ def dump_document_stepwise(
         for k in range(8):
             write_f32(out, top8_probs[k])
         write_f32_vec(out, hbuf, H)
+    cfg.n_prompt = n
     while wst.pos < n:
         step_window(ctx, b, cfg, wst)
+    # Invariant, not a diagnostic print: the n_prompt=i+2/i+3 teacher-forced
+    # schedule must never let step_window take the >=n_prompt branch that
+    # writes the model's own greedy pick into Toks[pos+1] -- that would
+    # silently replace the true document with the model's own continuation.
+    # Verified once already (0/100 mismatches); this stays as a hard check
+    # on every future run, since a schedule mistake here corrupts training
+    # data without any other visible symptom.
+    var final_toks = read_toks(ctx, b, 0, n, tmax)
+    for i in range(n):
+        if final_toks[i] != tokens[i]:
+            raise Error("draft_dump: teacher forcing broken, token " + String(i) + " is " + String(final_toks[i]) + ", expected " + String(tokens[i]))
 
 
 def run_parity(
