@@ -11,6 +11,7 @@ whisper_cli=${WHISPER_CLI:-$HOME/Models/whisper.cpp/build/bin/whisper-cli}
 port=${BARO_PORT:-18183}
 whisper_port=${BARO_WHISPER_PORT:-18184}
 idle=${BARO_WHISPER_IDLE_SECS:-2}
+gpu_wait=${GPU_WAIT_BIN:-$HOME/.local/bin/gpu-wait}
 manifest=bench/fixtures/p3a/MANIFEST.tsv
 arm="$out/arm.txt"
 receipt="$out/receipt.log"
@@ -28,6 +29,7 @@ threads=8
 port=$port
 whisper_port=$whisper_port
 baro=$baro
+gpu_wait=$gpu_wait
 EOF
 
 if [ "${GATE_DRYRUN:-0}" = 1 ]; then
@@ -37,7 +39,7 @@ fi
 
 if [ -z "${GPU_WAITING_ROOM_JOB:-}" ]; then
   bench/preflight.sh --check
-  exec gpu-wait run --vram 4 --timeout 1200 -- env P3A_JOB=1 "$0" "$@"
+  exec "$gpu_wait" run --vram 4 --timeout 1200 -- env P3A_JOB=1 "$0" "$@"
 fi
 
 [ -x "$baro" ] || fail "missing baro-serve: $baro"
@@ -51,7 +53,7 @@ echo "model=$model" | tee -a "$receipt"
 echo "language=en beam=5 threads=8 device=gate GPU" | tee -a "$receipt"
 echo "audio fixture manifest=$manifest" | tee -a "$receipt"
 echo "model_sha256=$(sha256sum "$model" | cut -d' ' -f1)" | tee -a "$receipt"
-gpu-wait gpu > "$out/gpu-before.txt" 2>&1 || fail "gpu-wait gpu before snapshot failed"
+"$gpu_wait" gpu > "$out/gpu-before.txt" 2>&1 || fail "gpu-wait gpu before snapshot failed"
 echo "gpu-before=$out/gpu-before.txt" | tee -a "$receipt"
 
 server_out="$out/baro.stdout"
@@ -127,7 +129,7 @@ done < "$manifest" | tee -a "$receipt"
 
 sleep 3
 no_engine_child || fail "audio-only baro-serve spawned an LLM engine after transcription"
-gpu-wait gpu > "$out/gpu-after.txt" 2>&1 || fail "gpu-wait gpu after snapshot failed"
+"$gpu_wait" gpu > "$out/gpu-after.txt" 2>&1 || fail "gpu-wait gpu after snapshot failed"
 echo "gpu-after=$out/gpu-after.txt" | tee -a "$receipt"
 grep -Ei 'whisper|model|language|beam|thread|device|listening' "$server_err" >> "$receipt" || true
 echo "health=$(cat "$out/health.json")" >> "$receipt"
