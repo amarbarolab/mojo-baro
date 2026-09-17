@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
+trap 'echo "FAIL line $LINENO: $BASH_COMMAND"' ERR
+for tool in curl jq python3 cargo; do
+    command -v "$tool" > /dev/null || { echo "FAIL preflight: $tool not installed"; exit 1; }
+done
 
 cd "$(dirname "$0")/.."
 root=$PWD
