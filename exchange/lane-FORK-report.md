@@ -107,8 +107,16 @@ self-target forwarder) are in `docs/P1-FORK-TARGET.md`, sent to `w82:pC`. Each r
 verdict means, so I did not pick one and build it.
 
 `POST /v1/fork` with `"target":"HOST:PORT"` landed (`8ba8294`): `cargo nextest` 75 of 75, including a
-mock node receiving header and file with the exact `Content-Length` and the 409 relay. **It has
-never moved a state between two live nodes. UNVERIFIED end to end.**
+mock node receiving header and file with the exact `Content-Length` and the 409 relay.
+
+**Added the same afternoon: it has now moved state between two live nodes.**
+`bench/fork-live-smoke.sh`, two 9B nodes alive together (TMAX 4096 read back from each engine's
+limits line, cap 10), node B cold (`resident_states 0`) and serving the same pack through a
+different path: 3 of 3 prompts, B reported `cached` equal to the exported position every time (it
+restored the import, it did not re-prefill), 32 ids equal the single-node ids, A saved 3 states and
+B loaded 3, 0.7 to 1.1 s wall for a 61 MB f32 state (`.work/fork/live-smoke`). That is a smoke, not
+gate 2: three short prompts, loopback, no link shaping, f32 not int8, no 32k, no frozen
+predictions, and the smoke has not been fed a known-bad state. **Gate 2 remains NOT RUN.**
 
 ## What I got wrong along the way
 
