@@ -31,7 +31,7 @@ from dattn import amar_dattn_split, amar_dattn_combine, dattn_nsplit
 from attn import (
     amar_head_rmsnorm_rope, amar_kv_append2,
     amar_head_rmsnorm, amar_attn_decode, amar_gate_mul_cast, amar_qgate_split, amar_rope_yarn, amar_kv_append,
-    amar_attn_prefill, amar_attn_prefill_wmma, HD, NQH, NKVH, KVT, TCAP, KVPAGE, KVHSTR, PA_ROWS, PW_ROWS, PW_THREADS,
+    amar_attn_prefill, amar_attn_prefill_wmma, HD, NQH, NKVH, KVQ, KVT, TCAP, KVPAGE, KVHSTR, PA_ROWS, PW_ROWS, PW_THREADS,
 )
 from model import H, FFN, VOCAB, QF, KV, N_LAYERS, N_SSM, N_ATT, MEGA_ALLOWED, IS_MOE
 from moe import amar_moe_down_q6k, amar_moe_router_top8_sig, moe_down_q8_0_res, moe_matmul_q8_0_m1_add

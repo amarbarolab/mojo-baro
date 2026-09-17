@@ -7,7 +7,7 @@ from std.time import perf_counter_ns
 from max.algorithm import parallelize
 from max.gpu.host import DeviceContext, DeviceBuffer
 from layout import TileTensor, TensorLayout, row_major
-from attn import KVT, KVPAGE, KVPAD
+from attn import KVQ, KVT, KVPAGE, KVPAD
 from elementwise import amar_rmsnorm_cast, amar_tok_copy
 from matmul_skinny import ROW_WAVES, ROW_THREADS
 from tokenizer import Tokenizer
@@ -226,6 +226,8 @@ def err_line(id: Int, msg: String) -> String:
 
 
 def main() raises:
+    comptime if KVQ != "f32":
+        raise Error("the spark profile keeps f32 KV; built with BARO_KVQ=" + KVQ)
     comptime assert has_accelerator(), "GPU required"
     var ctx = DeviceContext()
     var packdir = getenv("BARO_PACK", ".work/spark/pack-q8")

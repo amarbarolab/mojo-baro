@@ -9,12 +9,12 @@ from std.utils import StaticTuple
 from max.gpu.memory import AddressSpace
 from max.gpu.sync import barrier
 from layout import TileTensor, TensorLayout, row_major, stack_allocation
-from dattn import dattn_split_body, dattn_combine_body, dattn_nsplit
+from dattn import dattn_split_body, dattn_combine_body, dattn_nsplit, dkv_q, dkv_sc_off
 
 from elementwise import EW_THREADS
 from matmul_skinny import ROW_WAVES, ROW_THREADS, q4_dot_blocks, bf16x16_to_f32
 from ssm import CONV, KDIM, NH_K, NH_V, SSTATE, SSM_EPS
-from attn import HD, NQH, NKVH, KVT, TCAP, KVPAGE, KVPSH, KVHSTR, kv_off, kv_tab_off, NROT, YARN_LOW, YARN_HIGH, FREQ_BASE, FREQ_SCALE, MSCALE, attn_head_body, attn_head_span
+from attn import HD, NQH, NKVH, KVQ8, KVT, TCAP, KVPAGE, KVPSH, KVHSTR, kv_off, kv_tab_off, NROT, YARN_LOW, YARN_HIGH, FREQ_BASE, FREQ_SCALE, MSCALE, attn_head_body, attn_head_span
 from model import H, FFN, QF, KV, N_LAYERS, MEGA_ALLOWED
 
 comptime u32 = DType.uint32
@@ -896,14 +896,39 @@ def attn_phases[
             Kflat[r, h * HD + tid] = rebind[Kflat.ElementType](x0 * cs[0] - x1 * cs[1])
             Kflat[r, h * HD + tid + NROT // 2] = rebind[Kflat.ElementType](x0 * cs[1] + x1 * cs[0])
         barrier()
-        if tid < HD:
-            var kb = kv_tab_off[NAT](tab, pos + r, att_i, Int(h)) + tid
-            Kc.ptr[unsafe_offset=kb] = rebind[Scalar[KVT]](
-                rebind[Scalar[f32]](Kflat[r, h * HD + tid]).cast[KVT]()
-            )
-            Vc.ptr[unsafe_offset=kb] = rebind[Scalar[KVT]](
-                rebind[Scalar[f32]](Vflat[r, h * HD + tid]).cast[KVT]()
-            )
+        comptime if KVQ8:
+            var kx = Float32(0)
+            var vx = Float32(0)
+            if tid < HD:
+                kx = rebind[Scalar[f32]](Kflat[r, h * HD + tid])
+                vx = rebind[Scalar[f32]](Vflat[r, h * HD + tid])
+                var km = warp.max(abs(kx))
+                var vm = warp.max(abs(vx))
+                if lane == 0:
+                    sums[wave] = rebind[sums.ElementType](km)
+                    scores[wave] = rebind[scores.ElementType](vm)
+            barrier()
+            if tid < HD:
+                var km = Float32(0)
+                var vm = Float32(0)
+                comptime for w in range(HD // WARP_SIZE):
+                    km = max(km, rebind[Scalar[f32]](sums[w]))
+                    vm = max(vm, rebind[Scalar[f32]](scores[w]))
+                var rb = kv_tab_off[NAT](tab, pos + r, att_i, Int(h))
+                Kc.ptr[unsafe_offset=rb + tid] = rebind[Scalar[KVT]](dkv_q(kx, Float32(127) / km if km > 0 else Float32(0)))
+                Vc.ptr[unsafe_offset=rb + tid] = rebind[Scalar[KVT]](dkv_q(vx, Float32(127) / vm if vm > 0 else Float32(0)))
+                if tid == 0:
+                    Kc.ptr.unsafe_bitcast[Scalar[f32]]()[unsafe_offset=dkv_sc_off[HD](rb, pos + r)] = km / 127
+                    Vc.ptr.unsafe_bitcast[Scalar[f32]]()[unsafe_offset=dkv_sc_off[HD](rb, pos + r)] = vm / 127
+        else:
+            if tid < HD:
+                var kb = kv_tab_off[NAT](tab, pos + r, att_i, Int(h)) + tid
+                Kc.ptr[unsafe_offset=kb] = rebind[Scalar[KVT]](
+                    rebind[Scalar[f32]](Kflat[r, h * HD + tid]).cast[KVT]()
+                )
+                Vc.ptr[unsafe_offset=kb] = rebind[Scalar[KVT]](
+                    rebind[Scalar[f32]](Vflat[r, h * HD + tid]).cast[KVT]()
+                )
     if not grid_barrier(ctr, gen, fail):
         return False
     stamp(prof, pbase + 3)

@@ -19,7 +19,7 @@ quick=${QUICK:-0}; minpct=${MIN_PCT:-100}
 pack=${BARO_PACK:-.work/engine-pack-q4}
 if [ -z "${GPU_WAITING_ROOM_JOB:-}" ] && command -v gpu-wait >/dev/null; then
   # the queue does not carry this shell's environment: QUICK=3 ran the full gate once (2026-09-16)
-  exec gpu-wait run --timeout 1800 -- env QUICK="$quick" MIN_PCT="$minpct" BARO_PACK="$pack" "$0" "$@"
+  exec gpu-wait run --timeout 1800 -- env QUICK="$quick" MIN_PCT="$minpct" BARO_PACK="$pack" "$0" "$ref" "$cand" "$out" ${envx:+"$envx"}
 fi
 mkdir -p "$out"
 bench/preflight.sh --check

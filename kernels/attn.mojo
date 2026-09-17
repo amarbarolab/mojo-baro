@@ -1,17 +1,21 @@
 from std.gpu import block_idx, global_idx, lane_id, thread_idx, WARP_SIZE
 from std.gpu.primitives import warp
 from std.math import cos, exp, fma, log, rsqrt, sin
+from std.sys import get_defined_string
 from max.gpu.memory import AddressSpace
 from max.gpu.sync import barrier
 from layout import TileTensor, TensorLayout, row_major, stack_allocation
 from layout.tensor_core import mma
+from dattn import dkv_sc, dkv_sc_off, dkv_dq, dkv_q
 from model import HD, NQH, NKVH, NROT, YARN_LOW, YARN_HIGH, FREQ_BASE, FREQ_SCALE, MSCALE
 
 comptime f32 = DType.float32
-comptime KVT = DType.float32
+comptime KVQ = get_defined_string["BARO_KVQ", "f32"]()
+comptime KVQ8 = KVQ == "int8"
+comptime KVT = DType.int8 if KVQ8 else (DType.bfloat16 if KVQ == "bf16" else DType.float32)
 comptime KVPAGE = 128
 comptime KVPSH = 7
-comptime KVPAD = 0
+comptime KVPAD = KVPAGE * 4 if KVQ8 else 0
 comptime KVHSTR = KVPAGE * HD + KVPAD
 comptime TCAP = 1 << 24
 
@@ -88,9 +92,10 @@ def attn_head_span[
             if t < t_hi:
                 var kb = kv_tab_off[NAT, HD_, NKVH_](tab, t, att_i, kvh)
                 var Kr = TileTensor(kp.unsafe_offset(kb), row_major[HD_]()).vectorize[8]()
+                var ksc = dkv_sc[KVT, HD_](kp, kb, t)
                 var acc: Float32 = 0
                 for d8 in range(HD_ // 8):
-                    var k8 = rebind[SIMD[KVT, 8]](Kr[d8]).cast[f32]()
+                    var k8 = dkv_dq[KVT, 8](rebind[SIMD[KVT, 8]](Kr[d8]), ksc)
                     var q8 = rebind[SIMD[f32, 8]](qv[d8])
                     comptime for j in range(8):
                         acc += q8[j] * k8[j]
@@ -130,13 +135,21 @@ def attn_head_span[
                 var v = InlineArray[Float32, 8](uninitialized=True)
                 var sc = InlineArray[Float32, 8](uninitialized=True)
                 comptime for j in range(8):
-                    v[j] = vp[unsafe_offset=kv_tab_off[NAT, HD_, NKVH_](tab, t0 + tt + j, att_i, kvh) + tid].cast[f32]()
+                    comptime if KVQ8:
+                        var vb = kv_tab_off[NAT, HD_, NKVH_](tab, t0 + tt + j, att_i, kvh)
+                        v[j] = vp[unsafe_offset=vb + tid].cast[f32]() * dkv_sc[KVT, HD_](vp, vb, t0 + tt + j)
+                    else:
+                        v[j] = vp[unsafe_offset=kv_tab_off[NAT, HD_, NKVH_](tab, t0 + tt + j, att_i, kvh) + tid].cast[f32]()
                     sc[j] = rebind[Scalar[f32]](scores[tt + j])
                 comptime for j in range(8):
                     o += sc[j] * v[j]
                 tt += 8
             while tt < n:
-                o += rebind[Scalar[f32]](scores[tt]) * vp[unsafe_offset=kv_tab_off[NAT, HD_, NKVH_](tab, t0 + tt, att_i, kvh) + tid].cast[f32]()
+                comptime if KVQ8:
+                    var vb = kv_tab_off[NAT, HD_, NKVH_](tab, t0 + tt, att_i, kvh)
+                    o += rebind[Scalar[f32]](scores[tt]) * vp[unsafe_offset=vb + tid].cast[f32]() * dkv_sc[KVT, HD_](vp, vb, t0 + tt)
+                else:
+                    o += rebind[Scalar[f32]](scores[tt]) * vp[unsafe_offset=kv_tab_off[NAT, HD_, NKVH_](tab, t0 + tt, att_i, kvh) + tid].cast[f32]()
                 tt += 1
         t0 += HD_
     return SIMD[f32, 4](m_run, l_run, o, 0)
@@ -273,6 +286,22 @@ def amar_rope_yarn[
     X[row, j + NROT // 2] = rebind[X.ElementType](x0 * s + x1 * c)
 
 
+@always_inline
+def kv_q8_store(p: MutPointer[Scalar[KVT], MutAnyOrigin], x: Float32, rb: Int, t: Int, d: Int):
+    var mx = stack_allocation[f32, address_space = AddressSpace.SHARED](row_major[HD // WARP_SIZE]())
+    var am = warp.max(abs(x))
+    if lane_id() == 0:
+        mx[d // WARP_SIZE] = rebind[mx.ElementType](am)
+    barrier()
+    var m = Float32(0)
+    comptime for w in range(HD // WARP_SIZE):
+        m = max(m, rebind[Scalar[f32]](mx[w]))
+    var inv = Float32(127) / m if m > 0 else Float32(0)
+    p[unsafe_offset=rb + d] = rebind[Scalar[KVT]](dkv_q(x, inv))
+    if d == 0:
+        p.unsafe_bitcast[Scalar[f32]]()[unsafe_offset=dkv_sc_off[HD](rb, t)] = m / 127
+
+
 def amar_kv_append[
     CLayout: TensorLayout, NLayout: TensorLayout, NAT: Int
 ](
@@ -288,9 +317,12 @@ def amar_kv_append[
     var d = thread_idx.x
     var t = Int(t_idx) + r
     var cb = kv_tab_off[NAT](tab, t, Int(att_i), Int(h)) + Int(d)
-    Cache.ptr[unsafe_offset=cb] = rebind[Scalar[KVT]](
-        rebind[Scalar[f32]](New[r * NKVH + h, d]).cast[KVT]()
-    )
+    comptime if KVQ8:
+        kv_q8_store(Cache.ptr, rebind[Scalar[f32]](New[r * NKVH + h, d]), cb - Int(d), t, Int(d))
+    else:
+        Cache.ptr[unsafe_offset=cb] = rebind[Scalar[KVT]](
+            rebind[Scalar[f32]](New[r * NKVH + h, d]).cast[KVT]()
+        )
 
 
 def amar_head_rmsnorm_rope[
@@ -356,14 +388,20 @@ def amar_kv_append2[
     var d = thread_idx.x
     var t = Int(t_idx) + r
     var cb = kv_tab_off[NAT](tab, t, Int(att_i), Int(h)) + Int(d)
-    if block_idx.z == 0:
-        Kc.ptr[unsafe_offset=cb] = rebind[Scalar[KVT]](
-            rebind[Scalar[f32]](Kn[r * NKVH + h, d]).cast[KVT]()
-        )
+    comptime if KVQ8:
+        if block_idx.z == 0:
+            kv_q8_store(Kc.ptr, rebind[Scalar[f32]](Kn[r * NKVH + h, d]), cb - Int(d), t, Int(d))
+        else:
+            kv_q8_store(Vc.ptr, rebind[Scalar[f32]](Vn[r * NKVH + h, d]), cb - Int(d), t, Int(d))
     else:
-        Vc.ptr[unsafe_offset=cb] = rebind[Scalar[KVT]](
-            rebind[Scalar[f32]](Vn[r * NKVH + h, d]).cast[KVT]()
-        )
+        if block_idx.z == 0:
+            Kc.ptr[unsafe_offset=cb] = rebind[Scalar[KVT]](
+                rebind[Scalar[f32]](Kn[r * NKVH + h, d]).cast[KVT]()
+            )
+        else:
+            Vc.ptr[unsafe_offset=cb] = rebind[Scalar[KVT]](
+                rebind[Scalar[f32]](Vn[r * NKVH + h, d]).cast[KVT]()
+            )
 
 
 comptime PA_TK = 16
@@ -425,10 +463,12 @@ def amar_attn_prefill[
             var pb = kv_tab_off[NAT](tab, p, Int(att_i), kvh)
             var Kr = TileTensor(Kc.ptr.unsafe_offset(pb), row_major[HD]()).vectorize[8]()
             var Vr = TileTensor(Vc.ptr.unsafe_offset(pb), row_major[HD]()).vectorize[8]()
-            ksv[lp, lc] = rebind[ksv.ElementType](rebind[SIMD[KVT, 8]](Kr[lc]).cast[f32]())
-            ksv[lp, lc + 1] = rebind[ksv.ElementType](rebind[SIMD[KVT, 8]](Kr[lc + 1]).cast[f32]())
-            vsv[lp, lc] = rebind[vsv.ElementType](rebind[SIMD[KVT, 8]](Vr[lc]).cast[f32]())
-            vsv[lp, lc + 1] = rebind[vsv.ElementType](rebind[SIMD[KVT, 8]](Vr[lc + 1]).cast[f32]())
+            var ksc = dkv_sc[KVT, HD](Kc.ptr, pb, p)
+            var vsc = dkv_sc[KVT, HD](Vc.ptr, pb, p)
+            ksv[lp, lc] = rebind[ksv.ElementType](dkv_dq[KVT, 8](rebind[SIMD[KVT, 8]](Kr[lc]), ksc))
+            ksv[lp, lc + 1] = rebind[ksv.ElementType](dkv_dq[KVT, 8](rebind[SIMD[KVT, 8]](Kr[lc + 1]), ksc))
+            vsv[lp, lc] = rebind[vsv.ElementType](dkv_dq[KVT, 8](rebind[SIMD[KVT, 8]](Vr[lc]), vsc))
+            vsv[lp, lc + 1] = rebind[vsv.ElementType](dkv_dq[KVT, 8](rebind[SIMD[KVT, 8]](Vr[lc + 1]), vsc))
         else:
             ksv[lp, lc] = rebind[ksv.ElementType](SIMD[f32, 8](0))
             ksv[lp, lc + 1] = rebind[ksv.ElementType](SIMD[f32, 8](0))
@@ -542,8 +582,13 @@ def amar_attn_prefill_wmma[
             var p = t0 + key
             var x = SIMD[f16, 8](0)
             if p < t_blk:
-                var Kr = TileTensor(Kc.ptr.unsafe_offset(kv_tab_off[NAT](tab, p, ai, kvh)), row_major[HD]()).vectorize[8]()
-                x = rebind[SIMD[KVT, 8]](Kr[c]).cast[f16]()
+                comptime if KVQ8:
+                    var kb = kv_tab_off[NAT](tab, p, ai, kvh)
+                    var Kr = TileTensor(Kc.ptr.unsafe_offset(kb), row_major[HD]()).vectorize[8]()
+                    x = (rebind[SIMD[KVT, 8]](Kr[c]).cast[f32]() * dkv_sc[KVT, HD](Kc.ptr, kb, p)).cast[f16]()
+                else:
+                    var Kr = TileTensor(Kc.ptr.unsafe_offset(kv_tab_off[NAT](tab, p, ai, kvh)), row_major[HD]()).vectorize[8]()
+                    x = rebind[SIMD[KVT, 8]](Kr[c]).cast[f16]()
             ksv[key, c] = rebind[ksv.ElementType](x)
         comptime for s in range(PW_TK * HD // 8 // PW_THREADS):
             var v = tid + s * PW_THREADS
@@ -552,8 +597,13 @@ def amar_attn_prefill_wmma[
             var p = t0 + key
             var x = SIMD[f16, 8](0)
             if p < t_blk:
-                var Vr = TileTensor(Vc.ptr.unsafe_offset(kv_tab_off[NAT](tab, p, ai, kvh)), row_major[HD]()).vectorize[8]()
-                x = rebind[SIMD[KVT, 8]](Vr[c]).cast[f16]()
+                comptime if KVQ8:
+                    var vb = kv_tab_off[NAT](tab, p, ai, kvh)
+                    var Vr = TileTensor(Vc.ptr.unsafe_offset(vb), row_major[HD]()).vectorize[8]()
+                    x = (rebind[SIMD[KVT, 8]](Vr[c]).cast[f32]() * dkv_sc[KVT, HD](Vc.ptr, vb, p)).cast[f16]()
+                else:
+                    var Vr = TileTensor(Vc.ptr.unsafe_offset(kv_tab_off[NAT](tab, p, ai, kvh)), row_major[HD]()).vectorize[8]()
+                    x = rebind[SIMD[KVT, 8]](Vr[c]).cast[f16]()
             comptime for i in range(8):
                 vt[c * 8 + i, key] = rebind[vt.ElementType](x[i])
         barrier()
