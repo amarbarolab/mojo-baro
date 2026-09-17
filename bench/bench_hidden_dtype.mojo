@@ -68,7 +68,7 @@ def reset_buffers(ctx: DeviceContext, mut b: WindowBufs, prompt: List[Int], tmax
         toks_h[i] = 0
     for i in range(len(prompt)):
         toks_h[i] = Int32(prompt[i])
-    ctx.enqueue_copy(dst_buf=b.toks_d, src_buf=toks_h)
+    ctx.enqueue_copy(dst_buf=DeviceBuffer[DType.int32](ctx, b.toks_d.unsafe_ptr(), tmax, owning=False), src_buf=toks_h)
     ctx.synchronize()
 
 def read_prompt(path: String) raises -> List[Int]:
