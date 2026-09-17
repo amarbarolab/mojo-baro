@@ -127,67 +127,81 @@ PASS igpu-env: kernel ran on the iGPU (ROCr index 1, gfx1030 objects under the o
 
 `igpu-env --probe` PASS under `gpu-wait` (job admitted, ran, exit 0).
 
-## B1. P4 protocol amendment
+## B1. P4 protocol amendment (round 1, 2026-09-17, then corrected 2026-09-18)
 
-**Step 1, receipts confirmed, not rebuilt.** `exchange/lane-P0B-report.md` "Gate 1 receipt" reports
-`pair-dispatch OK: 20/20 ok through the router`, `placement OK: a=10 b=10`, `identity OK: 20/20
-proxied responses match the single-engine (a) baseline at T=0` at `BARO_TMAX=4096`. Verified from
-the receipts on disk, not the report's words:
-`mojo-baro-lanes/team-a/.work/p0b-gates12/gate1/gate1.log` and `identity.json` (20 rows, all
-`"match": true`); `a.stderr`/`b.stderr` both print `limits Limits { tmax: 4096, ... }`. The gate
-script (`bench/p0b-gate1-placement.sh`) sets no per-engine `ROCR_VISIBLE_DEVICES` override, so
-both engines ran on this box's default ROCm pin. This IS the identity-under-split receipt; it was
-not rebuilt from scratch.
+**Round 1 (this section's original text, kept for the record): WRONG.** I cited team A's
+`bench/p0b-gate1-placement.sh` (5 prompts x 4 repeats of short text answers, about 70 tokens
+compared per run) as "the identity-under-split receipt" and ran it 3 times, all PASS
+(`.work/p4b/gate1-run{1,2,3}/`). Driver review 2026-09-18 caught it: that is P0b's PLACEMENT gate
+with a small identity check bolted on, right for P0b, not a stand-in for P4's own protocol, which
+specifies 20 prompts x 64 tokens (`bench/mtp-prompts/p*.tokens`), about 35x more compared tokens.
+Three passes of the thin check did not put the repeat-rule receipt behind P4; those 3 runs are
+demoted to PLACEMENT receipts only (`a=10 b=10` stands as P0b's own claim, nothing else does).
 
-**Step 2, amendment frozen before any run.** Rewrote `bench/p4-multigpu-protocol.md`: status, what
-each arm proves (iGPU = pinning/wiring receipt, reported not gated; identity gate = two engine
-processes on the XTX), the iGPU finding with a pointer to `exchange/lane-P4-report-round2.md` and
-`[[2026-09-17-p4-igpu-transient-corruption]]`, the repeat rule (3 runs, all 3 must pass, because
-this gate has passed by luck before), and that the state-move gate no longer exists (LatentOS/P1
-is an exploration, ungated, blocking nothing, since `50f9d34`; confirmed the whiteboard card and
-`docs/PLATFORM-PLAN.md`'s P1 section say the same: "EXPLORATION, ungated, blocks nothing").
-Updated `docs/PLATFORM-PLAN.md`'s P4 gates paragraph to match (iGPU reported not gated, identity
-gate two XTX engines, repeat-3x rule, 45-minute GPU budget).
+**Round 2, the real identity gate.**
 
-**Frozen amendment commit: `mojo-baro` (branch `lane-p4b`) `3d3e362`**, committed before any of the
-3 identity runs below.
+1. Amended `bench/p4-multigpu-protocol.md` and `docs/PLATFORM-PLAN.md` again: named the round-1
+   error explicitly, demoted the 3 placement-gate runs, and specified the real gate (20
+   `bench/mtp-prompts/p*.tokens` prompts, token ids, `max_tokens` 64, `temperature` 0, `spec`
+   false, through the router, `cmp` on token ids, placement-spread reverse arm). **Committed
+   before any run: `4d08305`.**
+2. Wrote `bench/p4-router-identity.sh`. Forks (does not source) the launch half of
+   `bench/p0b-gate1-placement.sh` (`start_engine`, router bring-up, health wait): that script is
+   linear, its own calls to `start_engine` and its weaker identity check run immediately after the
+   function definitions, and its `EXIT` trap kills both engines the moment it finishes, so sourcing
+   it would either re-run its own check first or require restructuring team A's file, out of scope
+   here. The `payload`/`tokens`/`request` functions are lifted unchanged from
+   `.work/p4/run-two-engines.sh` in the main checkout (team B).
+3. CPU-only checks before any GPU run: `--selftest` (negative control: identical token files
+   PASS; a one-id difference correctly FAILs with exit 1), `P4_CPU_PREFLIGHT=1` (binaries, pack
+   hash `491de801...` matching, tools, 20 prompt files), `gate-dryrun` (stops at `GATE_DRYRUN=1`
+   before the first real engine launch, arm file read back `tmax_expected=4096`, PASS in 0s).
+4. **Round-1-of-the-real-gate FAILED, live, and the reverse arm is why:** job `mu6417v81osh`,
+   20/20 token-id identity PASS, but `placement OK: a=20 b=0` failed the assertion
+   ("one engine served zero of the 20"). Cause: my dispatch loop sent solo-then-router requests
+   sequentially per prompt, so both engines sat at `pending=0` at every routing decision and
+   `choose()`'s tie-break (`pending`, then engine id, `"a" < "b"`) picked `a` every time. Not a
+   router bug: team A's own gate uses `pair-dispatch --mode parallel` specifically to create real
+   concurrent pending load. Fixed by firing all 20 router requests in the background and waiting
+   on them (solo baselines against engine a stay sequential, no router involved). Fix committed
+   (`7db134d`) before re-running, same discipline as the frozen amendment itself.
+5. **3 real runs, all PASS**, `gpu-wait run --priority 20 --timeout 600`, team A's already-built
+   and sha256-verified binaries (`engine` sha256 `e4ad47f2...`, matching the P0B receipt exactly),
+   this worktree's own pack (sha256 `491de801...`, byte-identical to team A's copy):
 
-**Step 3, 3 identity-gate runs.** CPU preflight (no GPU): confirmed
-`team-a/.work/engine` sha256 `e4ad47f2...` matches the P0B receipt exactly, `team-a`'s built
-`baro-serve`/`router` release binaries present, this worktree's `.work/engine-pack-q4/pack.bin`
-sha256 `491de801...` byte-identical to team-a's copy, `~/iTools/bin/pair-dispatch` present,
-`bash -n` clean on the gate script. Ran team A's own `bench/p0b-gate1-placement.sh`, unchanged,
-3 times via `gpu-wait run --priority 20 --timeout 600`, pointed at team A's already-built and
-sha256-verified binaries (`BARO_ENGINE`/`BARO_SERVE_BIN`/`ROUTER_BIN` env overrides), this
-worktree's own pack, `COUNT=20`:
+| run | receipts | identity | placement | device read-back |
+|---|---|---|---|---|
+| 1 | `.work/p4b/router-identity-run1/` | 20/20 token-id match | a=10 b=10 | both engine PIDs in `rocm-smi-showpids.log`; `MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_SIZE_PERCENT=10`, `BARO_TMAX=4096` in `device-readback.txt` |
+| 2 | `.work/p4b/router-identity-run2/` | 20/20 token-id match | a=10 b=10 | same, both files present |
+| 3 | `.work/p4b/router-identity-run3/` | 20/20 token-id match | a=10 b=10 | same, both files present |
 
-| run | receipts | engine sha256 | TMAX (both engines) | pair-dispatch | placement | identity |
-|---|---|---|---|---|---|---|
-| 1 | `.work/p4b/gate1-run1/` | `e4ad47f2...` (matches) | 4096 | 20/20 | a=10 b=10, rank | 20/20 match |
-| 2 | `.work/p4b/gate1-run2/` | `e4ad47f2...` (matches) | 4096 | 20/20 | a=10 b=10, rank | 20/20 match |
-| 3 | `.work/p4b/gate1-run3/` | `e4ad47f2...` (matches) | 4096 | 20/20 | a=10 b=10, rank | 20/20 match |
+Device pin: `rocm-smi-showpids.log` (a real file on disk this time, not prose) shows both engines'
+GPU-touching child PIDs (found via `pgrep -P` on the tracked `baro-serve` PID, matched by
+`/proc/PID/comm` == `engine`) under `GPU(s)=1`; `rocm-smi --showproductname` reports `Node ID: 1` =
+XTX, `Node ID: 2` = iGPU/gfx1036, so this is the KFD node id, not the display index, confirmed also
+by VRAM (~11.2-11.26 GB each, matching the 10.7 GB/engine measured for two 9B engines at
+`BARO_TMAX=4096` on the XTX). `MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_SIZE_PERCENT` and `BARO_TMAX`
+read from each engine child's own `/proc/PID/environ`, not the launch command line: `10` and
+`4096` on both engines, all 3 runs. No stray `router`/`baro-serve`/`engine` processes after any run
+(`pgrep` checked clean). GPU time used: 4 short jobs (the caught FAIL plus 3 real PASSes), well
+inside the 30-minute follow-up budget (`gpu-wait stats --days 1`: queue wait 0s all day).
 
-Device pin read back mid-run-2 with `rocm-smi --showpids`: two `engine` processes, `GPU(s)=1`
-(`--showproductname` reports `Node ID: 1` = XTX, `Node ID: 2` = iGPU/gfx1036, so this is the KFD
-node id, not the display index; confirmed also by VRAM: ~11.2 GB and ~11.25 GB each, matching the
-10.7 GB/engine measured for two 9B engines at `BARO_TMAX=4096` on the XTX, and by wall time: the
-whole gate, including 20 dispatched requests plus 40 identity completions, finished in well under
-a minute, impossible on the 2-CU iGPU at its measured 2.8 tok/s). No stray `router`/`baro-serve`/
-`engine` processes after any run (`pgrep` checked clean). GPU time used: 3 short jobs, well inside
-the 45-minute budget (`gpu-wait stats --days 1` shows queue wait 0s all day).
-
-**Verdict: 3 of 3 PASS. P4's identity gate now has the repeat-rule receipt behind it.** This does
-not reverse the round-2 report's FAILED status for the iGPU arm (still not gated, still not
-bit-reproducible, still reported only); it establishes the gate the amendment actually asks for.
+**Verdict: 3 of 3 PASS on the actual protocol gate** (20 prompts, 64 tokens each, token ids, real
+placement spread, device pin and memory-manager cap read from `/proc/PID/environ` files on disk).
+This does not reverse the round-2 report's FAILED status for the iGPU arm (still not gated, still
+not bit-reproducible, still reported only); it is the repeat-rule receipt the amendment actually
+asks for, this time against the fixture the protocol specifies.
 
 ## Suite
 
-`bench/p4-multigpu-protocol.md` and `docs/PLATFORM-PLAN.md` (B1) are both covered by
-`tools/ci-checks.sh`'s referenced-path and doc checks, so both suites ran:
+Both re-run after the B1 follow-up's changes (new `bench/p4-router-identity.sh`, amended
+`bench/p4-multigpu-protocol.md` and `docs/PLATFORM-PLAN.md`), all covered by `tools/ci-checks.sh`'s
+referenced-path and build checks:
 
-- `tools/ci-checks.sh`: exit 0, `.work/p4b/ci-checks.out`, "all non-GPU checks passed" (788
-  referenced paths resolve, 33 bench sources build, vendored `uregex`/`minja`/`latentos` in sync,
-  kernel census 105/58/0 orphans, `docs/KERNELS.md` current).
+- `tools/ci-checks.sh`: exit 0, `.work/p4b/ci-checks2.out`, "all non-GPU checks passed" (792
+  referenced paths resolve, up from 788, the new script's path among them; 33 bench sources build;
+  vendored `uregex`/`minja`/`latentos` in sync; kernel census 105/58/0 orphans; `docs/KERNELS.md`
+  current).
 - `./run-tests.sh`: exit 0 (no `FAIL` line, ends with `PASS` / census 105 kernels, 58 in registry,
-  0 orphans, matching ci-checks' own census), `.work/p4b/run-tests.out`. Includes the spark
+  0 orphans, matching ci-checks' own census), `.work/p4b/run-tests2.out`. Includes the spark
   attention parity (HD 64/128/256) and LatentOS mint/ingest round-trip suites, both PASS.
