@@ -209,12 +209,31 @@ request() {
   tokens "$response" > "${response%.json}.tokens"
 }
 
+# Solo baselines direct to engine a: sequential is fine, correctness only, no router involved.
+for prompt in bench/mtp-prompts/p*.tokens; do
+  name=$(basename "$prompt" .tokens)
+  request "$url_a" "$prompt" "$out/$name.solo.json"
+done
+
+# Router requests IN PARALLEL: choose()'s tie-break is (pending, !preferred, engine id), so
+# with every request issued sequentially both engines sit at pending=0 at every decision and
+# the id tie-break ("a" < "b") picks engine a for all 20, every time -- not a router bug, a
+# gate bug (round 1 caught this live: a=20 b=0). Real concurrent load, like team A's own
+# pair-dispatch --mode parallel, is what actually produces differing pending counts.
+router_pids=()
+for prompt in bench/mtp-prompts/p*.tokens; do
+  name=$(basename "$prompt" .tokens)
+  request "$router_url" "$prompt" "$out/$name.router.json" &
+  router_pids+=($!)
+done
+for p in "${router_pids[@]}"; do
+  wait "$p" || fail identity "a parallel router request (pid $p) failed"
+done
+
 echo "prompt,match" > "$out/identity.csv"
 i=0
 for prompt in bench/mtp-prompts/p*.tokens; do
   name=$(basename "$prompt" .tokens)
-  request "$url_a" "$prompt" "$out/$name.solo.json"
-  request "$router_url" "$prompt" "$out/$name.router.json"
   if cmp_tokens "$out/$name.solo.tokens" "$out/$name.router.tokens"; then
     echo "$name,PASS" >> "$out/identity.csv"
   else
