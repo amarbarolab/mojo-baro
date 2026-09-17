@@ -48,6 +48,12 @@
     "llama_gguf": "$HOME/Models/qwythos-9b-claude-mythos-5-1m-mtp-bf16/Qwythos-9B-Claude-Mythos-5-1M-MTP-BF16-BARO-04867e2.gguf",
     "vram_gb": 20
   },
+  "qwythos-p5b-patched": {
+    "engine": "dense",
+    "baro_gguf": "$HOME/Projects/mojo/mojo-baro-lanes/team-b/.work/team-B/sonnet/p5b/train/patched-fixed.gguf",
+    "llama_gguf": "$HOME/Projects/mojo/mojo-baro-lanes/team-b/.work/team-B/sonnet/p5b/train/patched-fixed.gguf",
+    "vram_gb": 20
+  },
   "regescore-35b": {
     "engine": "moe",
     "baro_gguf": "$HOME/Models/RegesCore-1.0-35/RegesCore-1.0-35B-UD-Q4_K_S-BARO-e340ee1.gguf",
