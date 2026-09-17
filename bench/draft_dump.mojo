@@ -22,15 +22,16 @@
 # next token Toks[P+1]. tools/mtp_head.py --mode parity compares its torch
 # replica's argmax against this file before any training gradient is
 # trusted.
+from std.math import exp
 from std.memory import bitcast
 from std.os import getenv
 from std.sys import argv, has_accelerator
 
 from max.gpu.host import DeviceContext, HostBuffer, DeviceBuffer
 
-from registry import H, f32
+from registry import H, VOCAB, f32
 from window import WindowBufs, WindowState, WindowCfg, blk32_forward, step_window
-from realign import final_norm_hidden
+from realign import final_norm_hidden, head_logits
 from bench_latent_handoff import run_to_prompt_end, reset_and_load, make_cfg
 from harness import load_pack, alloc_bufs, Pack
 from grammar.automaton import Bitset
@@ -58,6 +59,50 @@ def write_f32_vec(mut f: FileHandle, v: HostBuffer[f32], n: Int) raises:
     f.write_bytes(Span(b))
 
 
+def write_f32(mut f: FileHandle, v: Float32) raises:
+    var bits = bitcast[DType.uint32, 1](v)[0]
+    var b = List[UInt8]()
+    b.append(UInt8(bits & 0xFF)); b.append(UInt8((bits >> 8) & 0xFF))
+    b.append(UInt8((bits >> 16) & 0xFF)); b.append(UInt8((bits >> 24) & 0xFF))
+    f.write_bytes(Span(b))
+
+
+def top8_from_logits(
+    lg: HostBuffer[f32], n: Int
+) -> Tuple[List[Int], List[Float32]]:
+    """Top-8 by raw logit, descending, ties broken by the lower token id;
+    `top8_probs` is softmax restricted to these eight logits (equal to a
+    full-vocab softmax's top-8 renormalized over their own subsum -- the
+    full-vocab denominator cancels between the two, so this is not an
+    approximation, and it needs no VOCAB-wide softmax kernel at all)."""
+    var ids = List[Int]()
+    var vals = List[Float32]()
+    for _ in range(8):
+        ids.append(-1)
+        vals.append(Float32(-3.4e38))
+    for idx in range(n):
+        var v = Float32(lg[idx])
+        if v > vals[7] or (v == vals[7] and idx < ids[7]):
+            var pos = 7
+            while pos > 0 and (v > vals[pos - 1] or (v == vals[pos - 1] and idx < ids[pos - 1])):
+                vals[pos] = vals[pos - 1]
+                ids[pos] = ids[pos - 1]
+                pos -= 1
+            vals[pos] = v
+            ids[pos] = idx
+    var maxv = vals[0]
+    var exps = List[Float32]()
+    var sum_exp = Float32(0)
+    for k in range(8):
+        var e = exp(vals[k] - maxv)
+        exps.append(e)
+        sum_exp += e
+    var probs = List[Float32]()
+    for k in range(8):
+        probs.append(exps[k] / sum_exp)
+    return (ids^, probs^)
+
+
 def dump_document_stepwise(
     ctx: DeviceContext, mut b: WindowBufs, mut wst: WindowState,
     pack_q4: Bool, q4_off: Int, e: Int, tokens: List[Int], tmax: Int,
@@ -70,17 +115,37 @@ def dump_document_stepwise(
     write_u32(out, n)
     for i in range(n):
         write_u32(out, tokens[i])
+    # Records use 1 <= P <= n-2 (bench/p5a-smoke-protocol.md): P = i + 1, so
+    # i ranges 0..n-3, n_records = n - 2 (one fewer than the old hidden-only
+    # loop's n - 1, which wrote a last row with no valid tokens[P+1]).
+    var n_records = n - 2
+    if n_records < 0:
+        n_records = 0
+    write_u32(out, n_records)
     var hbuf = ctx.enqueue_create_host_buffer[f32](H)
-    var n_rows = n - 1
-    if n_rows < 0:
-        n_rows = 0
-    for i in range(n_rows):
+    var lgbuf = ctx.enqueue_create_host_buffer[f32](VOCAB)
+    for i in range(n_records):
         while wst.pos <= i:
             step_window(ctx, b, cfg, wst)
         var hdev = ctx.enqueue_create_buffer[f32](H)
         final_norm_hidden(ctx, b, hdev)
+        var lgdev = ctx.enqueue_create_buffer[f32](VOCAB)
+        head_logits(ctx, b, pack_q4, lgdev)
         ctx.enqueue_copy(dst_buf=hbuf, src_buf=hdev)
+        ctx.enqueue_copy(dst_buf=lgbuf, src_buf=lgdev)
         ctx.synchronize()
+        var top8 = top8_from_logits(lgbuf, VOCAB)
+        var top8_ids = top8[0].copy()
+        var top8_probs = top8[1].copy()
+        var pos = i + 1
+        write_u32(out, pos)
+        write_u32(out, tokens[pos])
+        write_u32(out, top8_ids[0])
+        write_u32(out, 8)
+        for k in range(8):
+            write_u32(out, top8_ids[k])
+        for k in range(8):
+            write_f32(out, top8_probs[k])
         write_f32_vec(out, hbuf, H)
     while wst.pos < n:
         step_window(ctx, b, cfg, wst)
@@ -165,6 +230,12 @@ def main() raises:
     var text_mode = getenv("A4_TEXT_MODE", "json")
 
     with open(out_path, "w") as out:
+        if mode == "dump":
+            # bench/p5a-smoke-protocol.md's frozen v2 dump format: the file
+            # opens with this one version marker, then one [n, tokens,
+            # n_records, records...] block per document. Parity mode's
+            # format is untouched and carries no such marker.
+            write_u32(out, 2)
         if text_mode == "gsm8k":
             # GSM8K train.jsonl, real natural-language text (question +
             # worked answer), genuinely held out: distinct from
