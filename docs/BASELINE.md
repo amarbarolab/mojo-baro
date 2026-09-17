@@ -400,6 +400,13 @@ the indirection is live). Forced agreement 60/60 at 8k/16k/32k under both tables
 (`bench/a2-gate.sh`), decode after 32k 100.7 vs 101.6 unpaged, short context 0.994x, state files
 saved in logical page order. `serve/kvpage.mojo` holds the allocator A3 will use.
 
+**int8 KV since 2026-09-17 (lane-a2s2, `80d4b2c`, opt-in `-D BARO_KVQ=int8`):** per-row int8 with
+page-tail scales, 16640 bytes per token against 65536 f32. Bar (P14) from llama.cpp q8_0 KV (min
+93.8%) and our bf16 (min 96.9%): `MIN_PCT` 93.75. int8 forced agreement min 96.9% at 8k/16k/32k under
+identity AND reverse tables, decode after 32k **117.69 vs 100.54 f32 (1.171x)**, short context
+1.011x, RULER niah_single 100.0 at 64k and 128k, `BARO_STATE_SAVE` refuses int8 (step 3). The default
+f32 build is ISA-identical to the pre-merge engine. Report `exchange/lane-A2S2-report.md`.
+
 **q4 m=1 champion since 2026-09-11 (`3824e20`, merge of lane-dattn): 136.37
 tok/s_gen no-spec, 20-prompt median** (was 133.9). Post-merge A/B against
 pre-merge main (`.work/engine-premerge`, same pack and env): 127.98 -> 136.37
