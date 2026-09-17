@@ -188,38 +188,65 @@ non-zero argmax gap is expected regardless; how much of the residual gap is
 that versus domain shift versus a remaining bug is exactly what the
 gate-set rerun would settle.
 
-## Smoke (frozen, Order step 3)
+## Smoke (frozen, Order step 3): kill line RESTATED against the reproduced
+## statistic (2026-09-17, before any training minute)
 
-10-minute training run, 2000 (h, token) pairs, must lift acceptance on 5
-held-out prompts above the untrained 42% to at least 50%, or the item is
-killed. Acceptance is measured the same way `bench/mtp-protocol.md` measures
-it today (real q4 engine, `bench/mtp-prompts.sh`-class harness), against the
-head written back into a patched copy of the GGUF (`tools/mtp_head.py
---mode writeback`: same 15 tensors, same shapes, same "+1" norm convention
-inverted, byte-identical offsets in a copy of the source GGUF, then the
-UNMODIFIED `tools/engine-pack.py` repacks it), never a torch-side proxy
-metric standing in for the real acceptance number, per this project's own
-rule that a reference implementation is not a reference until it is checked
-against the artifact under test.
+The first version of this section framed the bar as "42% -> 50%", a
+per-position figure this session's own real-engine rerun (`exchange/lane-A4-report.md`)
+showed is not what `bench/mtp-prompts.sh` measures (that harness reports
+`accepted`/`drafted` over full spec-decode windows, aggregate 65.97% on the
+real 20 prompts, not a 42% per-token rate measured against literal prompt
+text). The kill line is restated against the statistic that is now actually
+reproduced, not the one that was never directly measured:
+
+**Kill line.** Same harness, `bench/mtp-prompts.sh`, unmodified. Quick
+5-prompt subset (`p01` through `p05`, `k=2`), untrained head and trained
+head measured in the SAME STINT (one script invocation per arm, same
+engine binary, same session, so neither arm's number is a stale receipt
+from a different build): **the trained head's aggregate `accepted/drafted`
+must be at least 4 percentage points above the untrained head's own
+aggregate on the same 5 prompts, measured in that stint.** SIGNAL is that
+lift; anything less is NO SIGNAL, not a kill of the hypothesis (same logic
+as E13-mini's own verdict: 10 minutes of training cannot converge, so a
+miss here says the probe did not show the effect, not that the effect is
+absent). **Additionally, on the FULL 20-prompt set, greedy identity
+(arm B's `GENERATED` == arm A's) must stay 20/20 PASS**: the accept rule
+guarantees T=0 output is unchanged by construction (a rejected draft always
+falls back to the target's own token), so a FAIL here means the write-back
+or repack broke something structural, not an acceptance-rate question, and
+voids the run regardless of the lift number.
+
+**Void (checked first).** The untrained-head arm of this same stint's
+5-prompt run is more than 5 pp off this session's own reproduced baseline
+per-prompt numbers (`exchange/lane-A4-report.md`: p01 34/59, p02 39/50,
+p03 32/62, aggregate 61.4% on p01-p03; p04/p05 not yet run at 5-prompt
+granularity, recorded when the stint runs): the harness or build drifted,
+rerun before scoring, never compare against a different day's numbers.
 
 **Sequoia frozen prediction (Sequoia 2402.12374), recorded before any
 training step:** expected tokens per verify pass `(1 - a^(K+1)) / (1 - a)`
 over window cost `t(K)`, `a = 0.8`, `K = 2`: `2.44 / 1.45`. This is the
 economic bar the FULL run (Order step 4) is judged against, not the smoke;
-the smoke's own bar is the 50% acceptance floor above, stated separately
-because 150-step training (E13-mini's own scale) cannot reach convergence
-and a miss here does not kill the hypothesis, only this cheap probe of it
-(same logic as E13-mini's own "NO SIGNAL, not KILL" verdict).
+the smoke's own bar is the 4 pp lift above, stated separately because
+150-step-class training (E13-mini's own scale) cannot reach convergence.
 
-**Void (checked first).** Untrained-head baseline acceptance on the same 5
-prompts more than 5 pp off the recorded 42%/0.66 (`bench/mtp-protocol.md`):
-the harness drifted, rerun before scoring.
+**Result: SIGNAL (>= 4 pp lift, identity 20/20 intact) leads to Order step 4
+(preemptible full training, `gpu-wait run --preemptible --priority 10`,
+3 GPU-hour budget, card shared with lane a3's gates which outrank training).
+NO SIGNAL is reported as such, same as E13-mini: this probe cannot kill the
+hypothesis, only say the minutes-scale check did not show the effect; a
+longer run is the maintainer's call. A full-set identity FAIL kills the run
+regardless of the lift number and is diagnosed before anything else, per
+CLAUDE.md's own rule that a gate the candidate can write is not a gate: the
+write-back path is new code this session, unverified until this run
+verifies it.**
 
-**Result: SIGNAL (>= 50%) leads to Order step 4 (preemptible full training,
-`gpu-wait run --preemptible --priority 10`, 3 GPU-hour budget, card shared
-with lane a3's gates which outrank training). NO SIGNAL is reported as such,
-same as E13-mini: this probe cannot kill the hypothesis, only say the
-minutes-scale check did not show the effect; a longer run is the maintainer's call.**
+**Write-back receipt requirement (frozen here, checked at run time):**
+`tools/mtp_head.py --mode writeback`'s patched GGUF must differ from the
+source GGUF ONLY in the byte ranges of `blk.32`'s 15 tensors; every other
+byte identical. Checked by a byte-level diff of the two files restricted to
+outside those 15 offset ranges (zero differing bytes required there), not
+by trusting the writeback code's own offset arithmetic.
 
 ## P1 read-back before any timed run
 

@@ -34,8 +34,9 @@ from realign import final_norm_hidden
 from bench_latent_handoff import run_to_prompt_end, reset_and_load, make_cfg
 from harness import load_pack, alloc_bufs, Pack
 from grammar.automaton import Bitset
-from grammar.json_value import parse_json_file
-from bench_latent_handoff import get_int_list
+from grammar.json_value import parse_json_file, parse_json_bytes
+from bench_latent_handoff import get_int_list, get_str
+from tokenizer import Tokenizer
 
 
 def write_u32(mut f: FileHandle, v: Int) raises:
@@ -164,7 +165,45 @@ def main() raises:
     var text_mode = getenv("A4_TEXT_MODE", "json")
 
     with open(out_path, "w") as out:
-        if text_mode == "tokens":
+        if text_mode == "gsm8k":
+            # GSM8K train.jsonl, real natural-language text (question +
+            # worked answer), genuinely held out: distinct from
+            # bench/data/e8_tasks.json's round-5 items and from
+            # bench/mtp-prompts/*.tokens' fixed 20-prompt gate set. Order
+            # step 2 / the smoke's 2000-sequence data (bench/draft-head-protocol.md).
+            var gsm_path = getenv("GSM8K_PATH", getenv("HOME", "") + "/Models/datasets/gsm8k/main/train.jsonl")
+            var gguf_path = getenv(
+                "BARO_E8_GGUF",
+                getenv("HOME", "") + "/Models/qwythos-9b-claude-mythos-5-1m-mtp-bf16/Qwythos-9B-Claude-Mythos-5-1M-MTP-Q4_0-pure.gguf",
+            )
+            var tok = Tokenizer(gguf_path)
+            var raw = String("")
+            with open(gsm_path, "r") as gf:
+                raw = gf.read()
+            for line in raw.split("\n"):
+                var ln = String(line)
+                if ln.byte_length() < 2:
+                    continue
+                var buf2 = List[UInt8]()
+                for bch in ln.as_bytes():
+                    buf2.append(bch)
+                var jdoc = parse_json_bytes(buf2^)
+                var qi = jdoc.get_field(jdoc.root, "question")
+                var ai = jdoc.get_field(jdoc.root, "answer")
+                if qi < 0 or ai < 0:
+                    continue
+                var text = String("Question: ") + jdoc.get(qi).s + String("\nAnswer: ") + jdoc.get(ai).s
+                var tokens = tok.encode(text, add_special=False)
+                if len(tokens) < 4 or len(tokens) + 2 > tmax:
+                    continue
+                if mode == "dump":
+                    dump_document_stepwise(ctx, buf, wst, pack.pack_q4, pack.q4_off, pack.e, tokens, tmax, out)
+                else:
+                    run_parity(ctx, buf, wst, pack.pack_q4, pack.q4_off, pack.e, draft_q4, pack.q4_off, tokens, tmax, out)
+                n_written += 1
+                if limit > 0 and n_written >= limit:
+                    break
+        elif text_mode == "tokens":
             # bench/mtp-prompts/*.tokens: the real 20-prompt gate set (space-
             # separated decimal ids), same files bench/mtp-prompts.sh reads,
             # comma-separated in A4_TOKENS_FILES (this session's real-gate-set
