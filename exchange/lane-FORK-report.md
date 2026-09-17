@@ -1,4 +1,4 @@
-# Lane FORK report: neither gate passed
+# Lane FORK report: no gate passed, and the byte check found an engine bug
 
 Gate 4 is NOT MET on all three models (16, 13 and 14 of 20), against a bar llama.cpp cannot clear
 when it hands state to ITSELF (15, 16 and 16 of 20). Gate 2 did not run. What the lane did
@@ -18,7 +18,9 @@ Date 2026-09-17. Branch `lane-fork`, 11 commits ahead of `main`, builder fable. 
 
 | gate | result | receipt |
 |---|---|---|
-| Gate 2, cross-node fork over the veth rig | **NOT RUN.** Identity half has a literal rig at TMAX 4096 (found late); the 32k timing half's rig is still the coordinator's or the maintainer's choice | `docs/P1-FORK-TARGET.md` |
+| Gate 2, identity half (two live 9B nodes, veth at 100 Mbit, 1 Gbit, 10 Gbit) | **RAN: FAIL by the frozen falsifier rule.** f32 20/20 at every rate, int8 16/20 at every rate, but 2 of 5 K/V-swapped states still gave the right ids, so the ids cannot certify a state | `bench/p1-fork-protocol.md`, `.work/fork/g2-gate-fixed` |
+| Gate 2, 32k timing half | **NOT RUN.** Two engines do not fit at 32k; rig choice is the coordinator's or the maintainer's | `docs/P1-FORK-TARGET.md` |
+| Engine bug found and fixed | `save_state` could export another prompt's conv and SSM state; fixed `511cdb4` | `.work/fork/bytes-check`, `.work/fork/bytes-check-fixed` |
 | Gate 4, E15's three models continue from our state | **NOT MET** on all three; UNCLASSIFIED by the frozen rule | `.work/fork/g4-gate/{lily,qwen25,ornith}` |
 | Kill line | **Not decided by this lane.** See "The kill line" below | |
 
@@ -117,6 +119,40 @@ restored the import, it did not re-prefill), 32 ids equal the single-node ids, A
 B loaded 3, 0.7 to 1.1 s wall for a 61 MB f32 state (`.work/fork/live-smoke`). That is a smoke, not
 gate 2: three short prompts, loopback, no link shaping, f32 not int8, no 32k, no frozen
 predictions, and the smoke has not been fed a known-bad state. **Gate 2 remains NOT RUN.**
+
+## Gate 2's identity half ran, and what it found was an engine bug
+
+Added 2026-09-17 evening, after the maintainer asked for the run. Protocol `bench/p1-fork-protocol.md`,
+frozen at `b499cfb` before any gate data, two amendments after. Two live 9B nodes, node B restarted
+cold before every rate, link read back at 96, 957 and 9610 Mbit/s, 20 prompts, 0 voids. Numbers from
+the fixed engine `aee16f63`; the first run on the old engine gave the same ones.
+
+| | control S | 100 Mbit | 1 Gbit | 10 Gbit | rate-dependent prompts | flip refused | swapkv restored / wrong ids |
+|---|---|---|---|---|---|---|---|
+| f32 | 20 | 20 | 20 | 20 | 0 | 5 of 5 | 5 of 5 / **3 of 5** |
+| int8 (the plan's format) | 20 | 16 | 16 | 16 | 0 | 5 of 5 | 5 of 5 / **3 of 5** |
+
+**Verdict, as the frozen scorer prints it: FAIL, the harness did not prove itself.** I froze "at
+least 4 of 5 K/V-swapped states give wrong ids", and two strongly determined short prompts still
+gave the right 32 ids. I left the verdict and moved no threshold, and I do not report the f32 row
+as a pass. My int8 prediction (17 to 20) missed: 16, the same four prompts at every rate, all
+attributed to int8 quantization because the f32 arm matched each. The plan's own export format does
+not meet the plan's identity bar on prompts of 16 to 32 tokens.
+
+Since the ids could not certify a state, I compared bytes (`bench/fork-bytes-check.sh`): node B
+re-exports what it imported, and a second arm sends a K/V-swapped state on purpose so that only a
+node which kept the imported bytes can produce the expected result. **Its first run found a
+pre-existing bug in `serve/engine.mojo`:** `save_state` chose the checkpoint by position alone, so
+`p05-math`'s export carried `p02-python-fib`'s conv and SSM state (both at `pos 14`), 52 of the 61
+MB, under a valid sha and passing identity checks. One conversation's state leaking into another's
+export, accepted by any receiver. Fixed in `511cdb4`; reproduced first (6 of 7), then 7 of 7
+bit-identical including deliberately swapped states; `ci-checks` exit 0, nextest 75 of 75.
+
+Established by checks that do not rest on ids: the transport is byte-exact (node B's sha256 on
+every import), a corrupted state comes back as the 409 path relayed by node A, and node B keeps and
+places every imported byte of conv, SSM and K/V. Established by ids only, and so weakly: that 32
+tokens continue the same. Control S is 20 of 20, so our engine's restored run reproduces its cold
+run on these prompts, which llama.cpp's does not.
 
 ## What I got wrong along the way
 

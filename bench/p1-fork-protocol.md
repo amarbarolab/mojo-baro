@@ -155,3 +155,44 @@ the prompt, not of the defect. **Untested entirely: corruption of the conv and S
 A detector with real power exists and is not part of this freeze: have node B RE-EXPORT the
 imported prefix and compare the bytes with node A's export (f32: header, tokens, conv, SSM, and K/V
 for positions below `pos`). That tests where every byte landed, not what 32 tokens happened to say.
+
+## Amendment 2, 2026-09-17: a byte-level check, the bug it found, and the re-run on the fixed engine
+
+Post hoc. None of this is part of the freeze and none of it changes the verdict above, which stays
+FAIL by the frozen falsifier rule.
+
+**The byte check.** `bench/fork-bytes-check.sh` with `tools/state-bytes-diff.py`: node A exports a
+prefix, forks it to node B, node B re-exports it, and the two f32 files are compared bit for bit
+(salt, tokens, conv, SSM, and the K/V rows below `pos`). Plain equality cannot prove the import was
+used, since a node that re-prefilled would reproduce A's own bytes. So a second arm sends a
+re-signed K/V-swapped state and requires B's re-export to hold A's V where K belongs and A's K
+where V belongs, which only the imported bytes can produce. That arm runs on p02 and p04, the two
+prompts the ids were blind to. The comparator was calibrated first on a real export, including one
+flipped bit in the conv section, which it catches.
+
+**It found an engine bug on its first run (6 of 7).** Node B's export of `p05-math` carried p05's
+tokens and K/V together with `p02-python-fib`'s conv and SSM state (hashes `478cb7a07d93` and
+`1ed7c187561f`, both prompts at `pos 14`). `save_state` in `serve/engine.mojo` chose the checkpoint
+to serialize by position alone and took the last match. Any export could therefore carry another
+conversation's recurrent state, 52 of the 61 MB, whenever two resident checkpoints shared a
+position, with a valid `payload_sha` and passing identity checks. Pre-existing, not from this lane.
+Fixed in `511cdb4` by matching the salted prefix hash, as `Chain.lookup` already did. Reproduced on
+engine `aca4c9e0` (`.work/fork/bytes-check`), then 7 of 7 on engine `aee16f63`
+(`.work/fork/bytes-check-fixed`): 4 plain and 3 swapped, up to `pos 58`. `tools/ci-checks.sh` exit 0
+and `cargo nextest` 75 of 75 after the fix.
+
+**No ids gate had caught it, and none could be trusted to.** That is the practical meaning of the
+3 of 5 above.
+
+**Re-run on the fixed engine** (`.work/fork/g2-gate-fixed`, engine `aee16f63`), because the first
+runs' exports were streamed and deleted, so whether the bug touched them cannot be checked from
+bytes. Every number reproduces: f32 control S 20, forks 20, 20, 20, equal to control S 20, 20, 20;
+int8 control S 20, forks 16, 16, 16 with the same four misses at the same indices (p07 at 1, p12 at
+3, p15 at 14, p16 at 9); zero rate-dependent prompts; flip 5 of 5; swapkv 5 of 5 restored and 3 of 5
+wrong ids. Same verdict. These are the numbers to cite.
+
+**What is now established, by checks that do not rest on ids:** the transport is byte-exact (node
+B's sha256 on every import); a corrupted state is refused with the 409 path; node B keeps and
+places every imported byte of conv, SSM and K/V (the byte check, including deliberately swapped
+states). **What is established by ids only, and therefore weakly:** that 32 tokens continue the
+same. **What is not met:** the plan's identity bar in the plan's own int8 format, 16 of 20.
