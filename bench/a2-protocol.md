@@ -174,3 +174,18 @@ model at these lengths, the code stays opt-in off, and that is the result. Decod
 the lane reports the miss with the split kernel's VGPR and the loads per token, and the int8 arm is
 not recommended as a default for long context. Receipts on every timed run: engine sha256,
 `BARO_KVQ:` and `BARO_KVTAB:` lines, `TMAX:`, arm file, power cap.
+
+## Result (2026-09-17, code `80d4b2c`, engines int8 `dcf1564e082c5286`, f32 `829c25a55d4c5421`)
+
+Report `exchange/lane-A2S2-report.md`; receipts `.work/a2s2/`. Preflight PASS before every gate.
+- P-S2a PASS: identity table min 96.9 at 8k/16k/32k, means 99.3 / 99.2 / 99.5, restored 59/60,
+  `kv bytes/token: 16640`.
+- P-S2b PASS: reverse table per-prompt counts identical to P-S2a on all 60.
+- P-S2c PASS: decode after 32k 117.69 (reverse 118.17) vs f32 default 100.54, 1.171x.
+- P-S2d MISS on the frozen band (faster): ref 136.07, int8 137.62, ratio 1.011, inside +-2%.
+- P-S2e PASS: f32 default 60/60 at 100%, decode after 32k 100.54; ISA identical to the reference.
+- P-S2f PASS: run-tests exit 0, preflight (ci-checks, MoE and spark builds) PASS, int8 state save
+  exits 1 with the f32-only error.
+- P-S2g PASS on what ran: niah_single N=5 int8 100.0 at 65536 and 131072, f32 100.0 at 65536; f32 at
+  131072 fits (started, 8.7 GB pool) and its prompts were not run (int8 at the ceiling, the maintainer's call).
+Kill line not reached; arm 2 not run.
