@@ -70,6 +70,9 @@ int main(int argc, char ** argv) {
 
     std::vector<int> sets = quick ? std::vector<int>{32768} : std::vector<int>{8192, 16384, 32768};
     int nprompt = quick ? quick : 20;
+    // a `sets` file in the prompt dir (one L per line) overrides the a2 layout; a set with doclen 0 is a
+    // flat set of standalone prompts (short-prompt bars for models whose tokenizer is not the 9B's)
+    if (fs::exists(dir / "sets")) { sets.clear(); std::ifstream f(dir / "sets"); int v; while (f >> v) sets.push_back(v); }
 
     std::map<std::string, ids_t> refids;
     if (mode == "force") {
@@ -113,7 +116,7 @@ int main(int argc, char ** argv) {
     llama_batch b = llama_batch_init(2048, 0, 1);
     printf("LLAMA_FORCE: kv=%s mode=%s n_ctx=%u fa=on quick=%d model=%s\n", kvs.c_str(), mode.c_str(), llama_n_ctx(ctx), quick, model_path.c_str());
 
-    ids_t doc = read_ids(dir / "L32768" / "p01-water.tokens");
+    ids_t doc = fs::exists(dir / "L32768" / "p01-water.tokens") ? read_ids(dir / "L32768" / "p01-water.tokens") : ids_t{};
     FILE * out = mode == "gen" ? fopen(ref.c_str(), "w") : nullptr;
     if (mode == "gen" && !out) die("cannot write " + ref.string());
     int have = 0, total_a = 0, total_n = 0;
@@ -121,8 +124,8 @@ int main(int argc, char ** argv) {
         ids_t dl = read_ids(dir / ("L" + std::to_string(L)) / "doclen");
         if (dl.empty()) die("doclen missing for L" + std::to_string(L));
         int d = dl[0];
-        if (d <= have) die("doclen not increasing at L" + std::to_string(L));
-        decode(ctx, b, doc.data() + have, d - have, have, 0, false);
+        if (d < have || (d == have && d != 0)) die("doclen not increasing at L" + std::to_string(L));
+        if (d > have) decode(ctx, b, doc.data() + have, d - have, have, 0, false);
         have = d;
         std::vector<fs::path> files;
         for (auto & e : fs::directory_iterator(dir / ("L" + std::to_string(L))))
