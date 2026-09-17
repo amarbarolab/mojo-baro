@@ -10,3 +10,7 @@ python3 "$R/tools/spirv-probe/air2spv.py" ew_elementwise_amar_swiglu_*.ll swiglu
 clang --target=spirv64 -c swiglu.ll -o swiglu.spv 2> clang.log || { echo "FAIL spirv: $W/clang.log"; exit 1; }
 scp -q "$R/tools/spirv-probe/host.c" swiglu.spv root@lab-host.example:/root/
 ssh -o BatchMode=yes root@lab-host.example 'cd /root && gcc -O2 host.c -o host -lOpenCL -lm && RUSTICL_ENABLE=radeonsi ./host swiglu.spv'
+python3 "$R/tools/spirv-probe/rms2spv.py" ew_elementwise_amar_rmsnorm_*.ll rms.ll
+clang --target=spirv64 -c rms.ll -o rms.spv 2> clang-rms.log || { echo "FAIL spirv rmsnorm: $W/clang-rms.log"; exit 1; }
+scp -q "$R/tools/spirv-probe/host_rms.c" rms.spv root@lab-host.example:/root/
+ssh -o BatchMode=yes root@lab-host.example 'cd /root && gcc -O2 host_rms.c -o host_rms -lOpenCL -lm && RUSTICL_ENABLE=radeonsi ./host_rms rms.spv'
