@@ -153,6 +153,8 @@ async fn main() {
         .route("/api/generate", post(ollama::generate))
         .route("/api/embeddings", post(embeddings::embeddings))
         .route("/v1/embeddings", post(embeddings::embeddings))
+        // P1: cross-node state API (docs/P1-STATE-API.md).
+        .route("/v1/state", get(state::list))
         .with_state(app.clone())
         .layer(middleware::from_fn(access_log));
 

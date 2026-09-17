@@ -94,6 +94,10 @@ pub struct Identity {
     pub pack: String,
     pub runtime: String,
     pub tokenizer_sha: Option<String>,
+    /// True when `pack` came from a validated `identity.json` (CONTRACT 2's
+    /// `pack_sha256`), false when it fell back to a hash of the pack PATH
+    /// string. `GET /v1/state` reports the false case as `"portable":false`.
+    pub portable: bool,
 }
 
 /// `<pack>/identity.json`'s shape (`tools/engine-pack.py`); only the fields
@@ -114,6 +118,12 @@ struct PackIdentityFile {
 fn read_pack_sha256(pack: &Path) -> Option<String> {
     let text = std::fs::read_to_string(pack.join("identity.json")).ok()?;
     let parsed: PackIdentityFile = serde_json::from_str(&text).ok()?;
+    // A sha256 hex digest is always exactly 64 ASCII hex chars; reject
+    // anything else here rather than let a hand-edited or truncated file
+    // panic later at `Identity::weights_uuid_hex`'s `&self.pack[..32]`.
+    if parsed.pack_sha256.len() != 64 || !parsed.pack_sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
     let meta = std::fs::metadata(pack.join("pack.bin")).ok()?;
     let mtime_ns = meta.modified().ok()?.duration_since(UNIX_EPOCH).ok()?.as_nanos() as u64;
     if meta.len() != parsed.pack_bytes || mtime_ns != parsed.pack_mtime_ns {
@@ -139,8 +149,18 @@ impl Identity {
                 .unwrap_or_else(|| "unknown".into())
         });
         let tokenizer_sha = std::fs::read(tokenizer).ok().map(|b| hex(&sha256(&b)));
-        let pack_field = read_pack_sha256(pack).unwrap_or_else(|| hex(&sha256(pack_s.as_bytes())));
-        Identity { pack: pack_field, runtime, tokenizer_sha }
+        let recorded_pack_sha256 = read_pack_sha256(pack);
+        let portable = recorded_pack_sha256.is_some();
+        let pack_field = recorded_pack_sha256.unwrap_or_else(|| hex(&sha256(pack_s.as_bytes())));
+        Identity { pack: pack_field, runtime, tokenizer_sha, portable }
+    }
+
+    /// CONTRACT 2 LAT1 mapping: `weights_uuid` (16 B) is `pack_sha256`'s
+    /// first 16 bytes, as hex -- only meaningful when `portable` (a
+    /// path-hash fallback is not a content identity, so it must not be
+    /// dressed up as one).
+    pub fn weights_uuid_hex(&self) -> Option<&str> {
+        self.portable.then(|| &self.pack[..32])
     }
 
     fn json(&self) -> Value {
@@ -451,6 +471,11 @@ mod tests {
         meta.modified().unwrap().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64
     }
 
+    // sha256(b"hello world"), verified with Python's hashlib, not guessed
+    // (the same lesson as state.rs's fabricated-then-corrected test vector):
+    //   python3 -c "import hashlib; print(hashlib.sha256(b'hello world').hexdigest())"
+    const HELLO_WORLD_SHA256: &str = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
+
     #[test]
     fn read_pack_sha256_returns_the_recorded_hash_when_stat_matches() {
         let dir = std::env::temp_dir().join(format!("baro-identity-test-{}", std::process::id()));
@@ -458,10 +483,10 @@ mod tests {
         let mtime_ns = write_pack_fixture(&dir, b"hello world");
         std::fs::write(
             dir.join("identity.json"),
-            format!(r#"{{"pack_sha256":"deadbeef","pack_bytes":11,"pack_mtime_ns":{mtime_ns}}}"#),
+            format!(r#"{{"pack_sha256":"{HELLO_WORLD_SHA256}","pack_bytes":11,"pack_mtime_ns":{mtime_ns}}}"#),
         )
         .unwrap();
-        assert_eq!(read_pack_sha256(&dir), Some("deadbeef".to_string()));
+        assert_eq!(read_pack_sha256(&dir), Some(HELLO_WORLD_SHA256.to_string()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -472,7 +497,7 @@ mod tests {
         let mtime_ns = write_pack_fixture(&dir, b"hello world");
         std::fs::write(
             dir.join("identity.json"),
-            format!(r#"{{"pack_sha256":"deadbeef","pack_bytes":999,"pack_mtime_ns":{mtime_ns}}}"#),
+            format!(r#"{{"pack_sha256":"{HELLO_WORLD_SHA256}","pack_bytes":999,"pack_mtime_ns":{mtime_ns}}}"#),
         )
         .unwrap();
         assert_eq!(read_pack_sha256(&dir), None);
@@ -486,6 +511,36 @@ mod tests {
         write_pack_fixture(&dir, b"hello world");
         assert_eq!(read_pack_sha256(&dir), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_pack_sha256_rejects_a_malformed_hash_instead_of_panicking_later() {
+        let dir = std::env::temp_dir().join(format!("baro-identity-test-malformed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mtime_ns = write_pack_fixture(&dir, b"hello world");
+        // Too short: weights_uuid_hex's &pack[..32] would panic on this if
+        // it were ever accepted.
+        std::fs::write(
+            dir.join("identity.json"),
+            format!(r#"{{"pack_sha256":"short","pack_bytes":11,"pack_mtime_ns":{mtime_ns}}}"#),
+        )
+        .unwrap();
+        assert_eq!(read_pack_sha256(&dir), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn weights_uuid_hex_is_none_when_not_portable() {
+        let me = Identity { pack: "p".into(), runtime: "r".into(), tokenizer_sha: None, portable: false };
+        assert_eq!(me.weights_uuid_hex(), None);
+    }
+
+    #[test]
+    fn weights_uuid_hex_is_the_first_32_hex_chars_when_portable() {
+        let first_half = "a".repeat(32);
+        let pack = first_half.clone() + &"b".repeat(32);
+        let me = Identity { pack, runtime: "r".into(), tokenizer_sha: None, portable: true };
+        assert_eq!(me.weights_uuid_hex(), Some(first_half.as_str()));
     }
 
     #[test]
@@ -511,7 +566,7 @@ mod tests {
 
     #[test]
     fn identity_mismatch_names_the_first_field() {
-        let me = Identity { pack: "p".into(), runtime: "r".into(), tokenizer_sha: Some("t".into()) };
+        let me = Identity { pack: "p".into(), runtime: "r".into(), tokenizer_sha: Some("t".into()), portable: false };
         assert_eq!(me.first_mismatch(&json!({"pack": "p", "runtime": "x"})), Some("runtime".into()));
         assert_eq!(me.first_mismatch(&json!({"tokenizer_sha": null})), None);
         assert_eq!(me.first_mismatch(&json!({})), None);
