@@ -155,6 +155,7 @@ async fn main() {
         .route("/v1/embeddings", post(embeddings::embeddings))
         // P1: cross-node state API (docs/P1-STATE-API.md).
         .route("/v1/state", get(state::list))
+        .route("/v1/state/export", post(state::export))
         .with_state(app.clone())
         .layer(middleware::from_fn(access_log));
 
