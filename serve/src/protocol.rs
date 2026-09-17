@@ -66,6 +66,14 @@ pub struct Request {
     /// the engine when `schema` is also set.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<bool>,
+    /// P0a-e (`serve/PROTOCOL.md`): ask for the last-prompt-token hidden
+    /// state as an extra `{"id","embed":[...]}` line between the first
+    /// token and `done`. Absent (not `Some(false)`) on every request that
+    /// does not ask, which is every request before this lane. The caller
+    /// still sends `n:1, spec:false`; the engine does not infer them from
+    /// this flag.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embed: Option<bool>,
 }
 
 /// The line that cancels the request currently decoding, if its id matches.
@@ -118,6 +126,9 @@ pub enum EngineMsg {
     /// briefs/2026-09-16-sampling-all-models-lane.md); absent on every
     /// other line, including every line before this feature existed.
     Tok { id: u64, tok: u32, logprob: Option<f64>, top_logprobs: Vec<(u32, f64)> },
+    /// P0a-e: the requested embedding vector for request `id`, sent once
+    /// between the first `Tok` line and `Done`. Does not end the request.
+    Embed { id: u64, vector: Vec<f32> },
     /// Request `id` finished; no more `Tok` lines follow for it.
     Done { id: u64, stats: DoneStats },
     /// Request `id` was rejected before any token was produced.
@@ -204,6 +215,17 @@ pub fn parse_line(line: &str) -> EngineMsg {
         }
         return EngineMsg::Log(raw.to_string());
     }
+    if let Some(vector) = v.get("embed") {
+        return match vector.as_array() {
+            Some(arr) => match arr.iter().map(|e| e.as_f64()).collect::<Option<Vec<f64>>>() {
+                Some(floats) if floats.iter().all(|f| f.is_finite()) => {
+                    EngineMsg::Embed { id, vector: floats.into_iter().map(|f| f as f32).collect() }
+                }
+                _ => EngineMsg::Log(raw.to_string()),
+            },
+            None => EngineMsg::Log(raw.to_string()),
+        };
+    }
     if let Some(tok) = get_u32(&v, "tok") {
         let logprob = get_f64(&v, "logprob");
         let top_logprobs = v
@@ -239,6 +261,7 @@ mod tests {
             sample: SampleParams::default(),
             schema: None,
             reasoning: None,
+            embed: None,
         };
         assert_eq!(r.line(), "{\"id\":7,\"prompt\":[760,6511,314],\"n\":64,\"spec\":false,\"stop\":[],\"ckpt\":[]}\n");
     }
@@ -257,6 +280,7 @@ mod tests {
             sample: SampleParams::default(),
             schema: None,
             reasoning: None,
+            embed: None,
         };
         assert_eq!(
             r.line(),
@@ -278,6 +302,7 @@ mod tests {
             sample: SampleParams::default(),
             schema: None,
             reasoning: None,
+            embed: None,
         };
         assert_eq!(
             r.line(),
@@ -308,6 +333,7 @@ mod tests {
             },
             schema: None,
             reasoning: None,
+            embed: None,
         };
         assert_eq!(
             r.line(),
@@ -332,11 +358,31 @@ mod tests {
             },
             schema: Some(json!({"type": "object", "properties": {"a": {"type": "string"}}})),
             reasoning: Some(false),
+            embed: None,
         };
         assert_eq!(
             r.line(),
             "{\"id\":4,\"prompt\":[1],\"n\":8,\"spec\":false,\"stop\":[],\"ckpt\":[],\"temperature\":0.7,\"schema\":{\"properties\":{\"a\":{\"type\":\"string\"}},\"type\":\"object\"},\"reasoning\":false}\n"
         );
+    }
+
+    #[test]
+    fn request_line_carries_embed_only_when_set() {
+        let r = Request {
+            id: 6,
+            prompt: vec![1],
+            n: 1,
+            spec: false,
+            stop: vec![],
+            ckpt: vec![],
+            state_save: None,
+            state_load: None,
+            sample: SampleParams::default(),
+            schema: None,
+            reasoning: None,
+            embed: Some(true),
+        };
+        assert_eq!(r.line(), "{\"id\":6,\"prompt\":[1],\"n\":1,\"spec\":false,\"stop\":[],\"ckpt\":[],\"embed\":true}\n");
     }
 
     #[test]
@@ -402,6 +448,15 @@ mod tests {
     }
 
     #[test]
+    fn embed_line() {
+        assert_eq!(
+            parse_line("{\"id\":6,\"embed\":[0.1,0.2,-0.3]}"),
+            EngineMsg::Embed { id: 6, vector: vec![0.1, 0.2, -0.3] }
+        );
+        assert_eq!(parse_line("{\"id\":6,\"embed\":[]}"), EngineMsg::Embed { id: 6, vector: vec![] });
+    }
+
+    #[test]
     fn error_line() {
         assert_eq!(
             parse_line("{\"id\":9,\"error\":\"prompt+n exceeds TMAX 128\"}"),
@@ -434,6 +489,8 @@ mod tests {
             "{\"ready\":true}",                      // ready without limits
             "[1,2,3]",                               // not an object
             "{\"id\":1,\"done\":true,\"n\":1,\"prefill_s\":1e999,\"decode_s\":0,\"tok_s\":0}",
+            "{\"id\":1,\"embed\":\"x\"}",             // embed not an array
+            "{\"id\":1,\"embed\":[\"x\"]}",           // embed element not a number
         ] {
             assert!(matches!(parse_line(bad), EngineMsg::Log(_)), "{bad} must not parse");
         }
