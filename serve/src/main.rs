@@ -14,6 +14,7 @@ mod embeddings;
 mod engine;
 mod ollama;
 mod protocol;
+mod state;
 mod text;
 
 use std::convert::Infallible;
