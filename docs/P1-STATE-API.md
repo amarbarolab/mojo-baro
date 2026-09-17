@@ -5,9 +5,16 @@ salt is the hash of a directory path. P1 fixes that one identity rule, wraps the
 in the LAT1 header, and puts three routes in front of it. It adds no kernel and does not touch
 `serve/window.mojo`.
 
-Status: DESIGN, frozen for the build 2026-09-17 (coordinator). Item P1 of `docs/PLATFORM-PLAN.md`.
-Builders: team A (sonnet builds, codex gates). A change to anything marked CONTRACT goes through the
-coordinator, because P0b's rank term, P4's gate 2 and P6's clients are written against it.
+Status: NOT A SPEC ANY MORE. Unfrozen 2026-09-17 on the maintainer's word: the six CONTRACT sections were
+removed, and nothing replaced them. What is left below is a description of what exists and a sketch
+of where it was heading, and any part of it may change without asking anyone.
+
+Why: these contracts were written the way we write them for a normal model, where the artifact has
+one right answer and the job is to pin it down before building. State moving between nodes is not
+that. Freezing the container, the identity rule and the routes before we know what the thing is for
+meant every question became "does this reproduce the same tokens", which is the question that made
+the lane's gates fail on something nobody wanted to know. LatentOS is an exploration now. Nothing
+downstream depends on this document: P0b's rank, P4's gate 2 and P6's clients no longer read it.
 
 ## What exists and is reused
 
@@ -22,7 +29,7 @@ coordinator, because P0b's rank term, P4's gate 2 and P6's clients are written a
   `runtime`, `pos_lo/pos_hi`, `prefix_hash` (u64), `payload_len`, `payload_sha`, `hmac`.
 - `POST /v1/fork` (branches on one node), the E12/E14/E15 harnesses, `bench/b4-cross-host.sh`.
 
-## CONTRACT 1: the container (`.baro` state stream)
+## The container today (`.baro` state stream), not fixed
 
 ```
 LAT1 header (256 B, kind = KV_PAGES, dtype = f32 or the new DTYPE_I8_BLOCK = 3)
@@ -38,7 +45,7 @@ BAROST01 or BAROST02 body, unchanged
 - Media type `application/vnd.baro.state`. Streams are written and read in 8 MiB chunks; no route
   buffers a whole 32k state in the HTTP layer.
 
-## CONTRACT 2: identity (amended 2026-09-17 after team A's finding)
+## Identity as it stands today, not fixed
 
 The pack salt today is `sha256(packdir)`. Two nodes holding the same pack under different paths
 refuse each other's state ("saved from a different pack"). The first draft of this spec keyed the
@@ -70,7 +77,7 @@ algorithm. The identity is therefore the thing the engine actually runs:
   "ours":...,"theirs":...}` and nothing is restored. A differing `runtime` is reported
   (`"runtime_differs":true`), not refused: the identity gate judges it.
 
-## CONTRACT 3: routes on `baro-serve`
+## Routes as they stand today, not fixed
 
 | route | request | response |
 |---|---|---|
@@ -91,12 +98,12 @@ algorithm. The identity is therefore the thing the engine actually runs:
 - Export and import are ordinary queued requests on the wire (`n = 0`), never a side channel into a
   running generation.
 
-## CONTRACT 4: what the router reads (P0b)
+## What the router reads today, not fixed
 
 `/v1/node-info` carries, per engine, the `GET /v1/state` object verbatim. The locality term: a
 request whose unsalted `prefix_hash` at any role boundary matches a resident state on engine E gets
 E's rank improved by the equivalent of one pending job. The router computes the hash from the
-rendered prompt through `POST /tokenize` and the rule in CONTRACT 1. Nothing else about state is
+rendered prompt through `POST /tokenize` and the rule in the container section. Nothing else about state is
 visible to the router.
 
 ## Out of scope for P1
@@ -104,29 +111,18 @@ visible to the router.
 HIDDEN and LOGITS_TOPK streams over HTTP, the Unix-socket IPC sidecar, HIP IPC handles, delta
 states, hmac enforcement, MoE packs (MoE export answers 501 until measured).
 
-## Build order (each step lands with its gate, in the team's item template)
+## Where it was heading (no gates, no order, no kill line)
 
-1. **Salt and container.** `identity.json` writer in `tools/engine-pack.py`, the salt read from it, LAT1 wrap and unwrap, the 409 paths. Gate:
-   `bench/checkpoint-api.sh` still green; a state saved under pack path A loads under a symlinked
-   path B (show it failing before the change); a flipped body byte is a 409.
-2. **Routes.** `GET /v1/state`, export, import, in a NEW `serve/src/state.rs`; `main.rs` lines in one
-   window. Plan gate 1: export then import on one node reproduces the 20-prompt identity and the
-   restore band (2.2 to 4.3 ms), both formats, int8 bytes at most 0.30 of f32.
-3. **Cross-node rig.** Two `baro-serve` processes cannot share the XTX (22 GB each), so the rig is
-   sequential on one GPU: serve A exports to a file and exits, the file crosses the veth link of
-   `bench/b4-cross-host.sh` at 100 Mbit, 1 Gbit and 10 Gbit, serve B (other pack path, same bake)
-   imports and continues. Plan gate 2: ids equal the single-node ids; payload arm against recipe arm
-   at each rate, prediction frozen in a NEW protocol note, `p1-state-protocol.md` in the bench folder, before the run.
-4. **Fanout.** `POST /v1/fanout` on one node. Plan gate 3: N=3 identity 3/3, N=10 at least 9/10 with
-   the E14 discordance named, tok/s within 5% of the E14 receipt.
-5. **llama.cpp bridge, forward direction** (LAT1 KV to a llama.cpp slot file, Mojo, beside
-   `tools/llama-slot-to-state.mojo`). Plan gate 4: E15's three models continue with the first 32
-   tokens identical. May be split off as P1b if steps 1 to 4 fill the M budget; say so in the
-   report, never drop it silently.
+The five steps that used to live here each carried a gate and a bar: 20-prompt identity, a restore
+band of 2.2 to 4.3 ms, an int8 ratio, ids equal to single-node ids, E14 discordance counts, the
+first 32 tokens identical through the llama.cpp bridge. All of it is removed. So is the kill line.
 
-Kill line (plan): an identity miss outside the documented E14 one, or a cross-node move slower than
-re-prefill at 1 Gbit for 32k. GPU: about 30 minutes, one resident engine per step, every job
-through `gpu-wait run --timeout`.
+What remains worth knowing, as facts rather than requirements: the salt came from a directory path
+and had to read `identity.json` instead, or no state could cross a machine; two `baro-serve`
+processes were thought not to share the XTX, which turned out to be false at TMAX 4096 and true at
+32k; the llama.cpp bridge exists and has no layout defect; a fanout shape (one reader, N followers)
+ran in E14. Where to go next is open, and the first question is what the state is FOR, not whether
+it reproduces a token sequence.
 
 ## Check these first, not last
 
