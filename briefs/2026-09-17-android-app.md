@@ -52,3 +52,16 @@ it and ship the remote client alone.
 Global CLAUDE.md binds: no em dashes, loud failures, commit as work lands with pathspec, DONE only
 with the gate receipt named, no self-tagging commits. Report: what passed, what is UNVERIFIED, APK
 path and sha256, size. Reply to the coordinator only "written to <path>".
+
+## Required reading before the first file (the maintainer: "be sure he loads our apk skills")
+
+Load every one of these in full, then list them in the report under "Skills and tools read":
+
+- Skills (`~/Brain/Skills/<name>/SKILL.md`): `adb-transport`, `android-clean-architecture`,
+  `android-ui-fitness`, `compose-multiplatform-patterns`, `kotlin-patterns`,
+  `kotlin-coroutines-flows`, `kotlin-testing`, `local-models`.
+- iTools (read each `tool.toml` and README under `~/iTools/*/<name>/`, use them instead of hand
+  rolling): `android-new` (scaffold), `gradle-verify` (build gate), `apk-ship` and `apk-sync`
+  (signing, install, versioning), `adb-wifi` (device pairing), `android-ui-audit` (gate 4),
+  `android-exit-info-pull` and `android-thermal-log` (on-device crashes and thermal during gate 3),
+  `android-tokens` (theme tokens).
