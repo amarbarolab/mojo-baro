@@ -289,6 +289,7 @@ pub async fn create(State(app): State<Shared>, Json(r): Json<CreateReq>) -> Resu
         sample: r.sampler.to_sample_params(None),
         schema: None,
         reasoning: None,
+        embed: None,
     };
     let n_prompt = g.prompt.len();
     let (req_id, rx) = check_and_submit(&app, &g)?;
@@ -383,6 +384,7 @@ pub async fn fork(State(app): State<Shared>, UrlPath(id): UrlPath<String>, Json(
             sample: b.sampler.to_sample_params(None),
             schema: None,
             reasoning: None,
+            embed: None,
         };
         let n_prompt = g.prompt.len();
         let (req_id, rx) = check_and_submit(&app, &g)?;

@@ -133,6 +133,7 @@ fn build_gen(app: &App, t: &Text, msgs: &[ChatMessage], max_tokens: Option<i64>,
         sample: opts.to_sample_params(),
         schema: None,
         reasoning: None,
+        embed: None,
     })
 }
 
@@ -151,6 +152,8 @@ fn ndjson_stream(app: Shared, rx: mpsc::UnboundedReceiver<Event>, mut chunk: imp
                 let delta = acc.take(app.text.as_ref(), tok, logprob, top_logprobs)?;
                 chunk(&app, ChunkKind::Delta { text: delta, token: tok, logprob: None })
             }
+            // No Ollama route sets embed; embeddings.rs collects it separately.
+            Event::Embed(_) => return None,
             Event::Done(s) => {
                 ended = true;
                 let reason = acc.finish_reason(s.finish.as_deref());

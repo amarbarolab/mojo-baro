@@ -300,6 +300,9 @@ struct Gen {
     schema: Option<Value>,
     /// Item 2: `chat_template_kwargs.enable_thinking`, default true.
     reasoning: Option<bool>,
+    /// P0a-e: ask the engine for the last-prompt-token embedding. `None` on
+    /// every endpoint but `/api/embeddings` and `/v1/embeddings`.
+    embed: Option<bool>,
 }
 
 /// OpenAI's `stop`: a single string or an array of strings.
@@ -347,7 +350,10 @@ fn check_and_submit(app: &App, g: &Gen) -> Result<(u64, mpsc::UnboundedReceiver<
         return Err(ApiError::exceed_context(g.prompt.len() as u64, tmax as u64));
     }
     app.engine
-        .submit(g.prompt.clone(), g.n, g.spec, g.stop.clone(), g.ckpt.clone(), g.sample.clone(), g.schema.clone(), g.reasoning, g.state.clone())
+        .submit(
+            g.prompt.clone(), g.n, g.spec, g.stop.clone(), g.ckpt.clone(), g.sample.clone(), g.schema.clone(), g.reasoning,
+            g.state.clone(), g.embed,
+        )
         .map_err(|e| ApiError::Plain(StatusCode::SERVICE_UNAVAILABLE, e))
 }
 
@@ -452,6 +458,9 @@ async fn collect(app: &App, mut rx: mpsc::UnboundedReceiver<Event>) -> Result<(A
                     text_out.push_str(&d);
                 }
             }
+            // P0a-e: no OpenAI/Ollama endpoint sets `embed`, so this never
+            // fires on those paths; embeddings.rs collects it separately.
+            Event::Embed(_) => {}
             Event::Done(s) => {
                 stats = stats_json(&s);
                 break;
@@ -485,6 +494,7 @@ fn sse_stream(
                     let delta = acc.take(app.text.as_ref(), tok, logprob, top_logprobs)?;
                     chunk(&app, ChunkKind::Delta { text: delta, token: tok, logprob: lp })
                 }
+                Event::Embed(_) => return None,
                 Event::Done(s) => {
                     ended = true;
                     let reason = acc.finish_reason(s.finish.as_deref());
@@ -637,6 +647,7 @@ async fn completions(State(app): State<Shared>, Json(r): Json<CompletionReq>) ->
         sample: r.sampler.to_sample_params(r.logprobs),
         schema: None,
         reasoning: None,
+        embed: None,
     };
     let model = r.model.unwrap_or_else(|| app.model.clone());
     let (req_id, rx) = check_and_submit(&app, &g)?;
@@ -723,6 +734,7 @@ async fn fork(State(app): State<Shared>, Json(r): Json<ForkReq>) -> Result<Respo
             sample: b.sampler.to_sample_params(None),
             schema: None,
             reasoning: None,
+            embed: None,
         };
         let n_prompt = g.prompt.len();
         let (req_id, rx) = check_and_submit(&app, &g)?;
@@ -1013,6 +1025,7 @@ async fn chat_completions(State(app): State<Shared>, Json(r): Json<ChatReq>) -> 
         sample: r.sampler.to_sample_params(if r.logprobs == Some(true) { Some(r.top_logprobs.unwrap_or(1)) } else { r.top_logprobs }),
         schema,
         reasoning,
+        embed: None,
     };
     let model = r.model.unwrap_or_else(|| app.model.clone());
     let (req_id, rx) = check_and_submit(&app, &g)?;
