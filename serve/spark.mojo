@@ -2,7 +2,7 @@ from std.ffi import c_ssize_t, external_call
 from std.math import ceildiv
 from std.math import log
 from std.os import getenv
-from std.sys import has_accelerator
+from std.sys import has_accelerator, get_defined_int
 from std.time import perf_counter_ns
 from max.algorithm import parallelize
 from max.gpu.host import DeviceContext, DeviceBuffer
@@ -16,6 +16,7 @@ from sample import amar_sample_row, amar_topn_probs, SAMP_THREADS
 from serve_proto import read_line, parse_request, default_sample_params, json_key, json_int
 from spark_kernels import (
     amar_embed_lookup_f32, amar_gemv_q8, amar_argmax_part, amar_argmax_final, amar_rope_kv_append, amar_attn_decode_swa_gated, amar_rope_plain, amar_bias_add,
+    amar_trace_sum,
 )
 from profile import (
     H, FFN, VOCAB, N_LAYERS, NQH, NKVH, HD, NORM_EPS, NROT_FULL, BASE_FULL, NROT_SWA, BASE_SWA,
@@ -43,6 +44,14 @@ comptime OFF_FFN_GATE = OFF_O + 2
 comptime OFF_FFN_UP = OFF_O + 3
 comptime OFF_DOWN = OFF_O + 4
 comptime LSTRIDE = OFF_O + 5
+# -D BARO_TRACE_SUM=1 (diagnostic build, bench/p4-trace-soak.sh): one FNV checksum per
+# (position, layer, stage) written on the device with no host sync, dumped per request to
+# BARO_TRACE_SUM_DIR. Stages per layer: 0 = QKV after bias, 1 = residual after attention,
+# 2 = residual after FFN; the last slot of a position is the logits row. Two runs of the same
+# prompt must produce the same table, and the first differing cell names the kernel group
+# that produced a transient wrong value. Off (the default) compiles to nothing.
+comptime TRACE_SUM = get_defined_int["BARO_TRACE_SUM", 0]() == 1
+comptime TRACE_STRIDE = 3 * N_LAYERS + 1
 
 comptime x_l = row_major[1, H]()
 comptime xb_l = row_major[1, H]()
@@ -304,6 +313,10 @@ def main() raises:
     var dummy_d = ctx.enqueue_create_buffer[bf16](1)
     var logits_d = ctx.enqueue_create_buffer[f32](VOCAB)
     var pred_d = ctx.enqueue_create_buffer[DType.int32](TMAX)
+    var trace_n = TMAX * TRACE_STRIDE if TRACE_SUM else 1
+    var trace_d = ctx.enqueue_create_buffer[DType.uint32](trace_n)
+    var trace_h = ctx.enqueue_create_host_buffer[DType.uint32](trace_n)
+    var trace_dir = getenv("BARO_TRACE_SUM_DIR", "")
     ctx.synchronize()
 
     var Emb = wf(ctx, wbuf, off[0], VOCAB * H, emb_l)
@@ -455,6 +468,10 @@ def main() raises:
         for i in range(TMAX):
             toks_h[i] = Int32(prompt[i]) if i < n_prompt else Int32(0)
         ctx.enqueue_copy(dst_buf=toks_d, src_buf=toks_h)
+        comptime if TRACE_SUM:
+            for i in range(trace_n):
+                trace_h[i] = 0
+            ctx.enqueue_copy(dst_buf=trace_d, src_buf=trace_h)
 
         var t_gen_start: Int = 0
         var generated_ids = List[Int]()
@@ -477,6 +494,8 @@ def main() raises:
                 comptime if QKV_BIAS:
                     var QkvBias = wf(ctx, wbuf, off[e + OFF_QKV_BIAS], QKV, qkv1_l)
                     ctx.enqueue_function[k_bias](Qkv1, QkvBias, Int32(QKV), grid_dim=ceildiv(QKV, 256), block_dim=256)
+                comptime if TRACE_SUM:
+                    ctx.enqueue_function[amar_trace_sum](qkv_d.unsafe_ptr(), trace_d.unsafe_ptr(), Int32(QKV), Int32(pos * TRACE_STRIDE + 3 * i), grid_dim=1, block_dim=1)
                 if swa:
                     ctx.enqueue_function[k_rope_swa](Q, Int32(pos), Int32(NQH), BASE_SWA, grid_dim=(NQH, 1), block_dim=NROT_SWA // 2)
                     ctx.enqueue_function[k_kv_swa](Kc, Vc, K, V, kvtab_d.unsafe_ptr(), Int32(pos), BASE_SWA, Int32(i), grid_dim=(NKVH, 2), block_dim=HD)
@@ -487,13 +506,19 @@ def main() raises:
                     ctx.enqueue_function[k_gate](Xb, wq(ctx, wbuf, off[e + OFF_GATE], NQH * H, q_gate), ws(ctx, wbuf, off[e + OFF_GATE], NQH * H, s_gate), Gate, Dummy, Int32(NQH), Int32(H), grid_dim=ceildiv(NQH, ROW_WAVES), block_dim=ROW_THREADS)
                 ctx.enqueue_function[k_att](Q, Kc, Vc, Gate, AoB2, kvtab_d.unsafe_ptr(), Int32(pos + 1), Int32(SWA_WIN if swa else 0), ATTN_SCALE, Int32(i), grid_dim=(NQH, 1), block_dim=HD)
                 ctx.enqueue_function[k_o](AoB, wq(ctx, wbuf, off[e + OFF_O], H * QDIM, q_o), ws(ctx, wbuf, off[e + OFF_O], H * QDIM, s_o), X1, Dummy, Int32(H), Int32(QDIM), grid_dim=ceildiv(H, ROW_WAVES), block_dim=ROW_THREADS)
+                comptime if TRACE_SUM:
+                    ctx.enqueue_function[amar_trace_sum](x_d.unsafe_ptr(), trace_d.unsafe_ptr(), Int32(H), Int32(pos * TRACE_STRIDE + 3 * i + 1), grid_dim=1, block_dim=1)
                 ctx.enqueue_function[k_rms](X, FfnNorm, Xb, Int32(H), NORM_EPS, grid_dim=1, block_dim=256)
                 ctx.enqueue_function[k_ffn_gate](Xb, wq(ctx, wbuf, off[e + OFF_FFN_GATE], FFN * H, q_ffn), ws(ctx, wbuf, off[e + OFF_FFN_GATE], FFN * H, s_ffn), G1, Dummy, Int32(FFN), Int32(H), grid_dim=ceildiv(FFN, ROW_WAVES), block_dim=ROW_THREADS)
                 ctx.enqueue_function[k_ffn_up](Xb, wq(ctx, wbuf, off[e + OFF_FFN_UP], FFN * H, q_ffn), ws(ctx, wbuf, off[e + OFF_FFN_UP], FFN * H, s_ffn), G1, Fgb1, Int32(FFN), Int32(H), grid_dim=ceildiv(FFN, ROW_WAVES), block_dim=ROW_THREADS)
                 ctx.enqueue_function[k_down](Fgb, wq(ctx, wbuf, off[e + OFF_DOWN], H * FFN, q_down), ws(ctx, wbuf, off[e + OFF_DOWN], H * FFN, s_down), X1, Dummy, Int32(H), Int32(FFN), grid_dim=ceildiv(H, ROW_WAVES), block_dim=ROW_THREADS)
+                comptime if TRACE_SUM:
+                    ctx.enqueue_function[amar_trace_sum](x_d.unsafe_ptr(), trace_d.unsafe_ptr(), Int32(H), Int32(pos * TRACE_STRIDE + 3 * i + 2), grid_dim=1, block_dim=1)
             if pos >= n_prompt - 1:
                 ctx.enqueue_function[k_rms](X, OutNorm, Xb, Int32(H), NORM_EPS, grid_dim=1, block_dim=256)
                 ctx.enqueue_function[k_head](Xb, Woq, Wos, Logits1, Dummy, Int32(VOCAB), Int32(H), grid_dim=ceildiv(VOCAB, ROW_WAVES), block_dim=ROW_THREADS)
+                comptime if TRACE_SUM:
+                    ctx.enqueue_function[amar_trace_sum](logits_d.unsafe_ptr(), trace_d.unsafe_ptr(), Int32(VOCAB), Int32(pos * TRACE_STRIDE + 3 * N_LAYERS), grid_dim=1, block_dim=1)
                 if dump_logits_path != "" and pos == n_total - 2:
                     var lg_h = ctx.enqueue_create_host_buffer[f32](VOCAB)
                     ctx.enqueue_copy(
@@ -584,6 +609,13 @@ def main() raises:
         for i in range(n_prompt, n_prompt + n_gen):
             s += String(Int(toks_h[i])) + " "
         print("generated:", s)
+        comptime if TRACE_SUM:
+            if trace_dir != "":
+                ctx.enqueue_copy(dst_buf=trace_h, src_buf=trace_d)
+                ctx.synchronize()
+                with open(trace_dir + "/trace-" + String(req_id) + ".bin", "w") as f:
+                    f.write_bytes(Span[UInt8](unsafe_ptr=trace_h.unsafe_ptr().unsafe_bitcast[UInt8](), length=(n_prompt + n_gen - 1) * TRACE_STRIDE * 4))
+                print("trace sums:", trace_dir + "/trace-" + String(req_id) + ".bin", " positions", n_prompt + n_gen - 1, " stride", TRACE_STRIDE)
         if len(force) > 0:
             ctx.enqueue_copy(dst_buf=toks_h, src_buf=pred_d)
             ctx.synchronize()

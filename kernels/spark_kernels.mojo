@@ -2,6 +2,7 @@ from std.gpu import block_dim, block_idx, global_idx, lane_id, thread_idx, WARP_
 from std.gpu.primitives import warp
 from max.gpu.sync import barrier
 from std.math import cos, exp, log, sin, tanh
+from std.memory import bitcast
 from max.gpu.memory import AddressSpace
 from layout import TileTensor, TensorLayout, row_major, stack_allocation
 from attn import KVT, HD, NQH, NKVH, attn_head_span, kv_off, kv_tab_off
@@ -288,3 +289,26 @@ def amar_argmax_final[
             bi = ix
     Pred[Int(wpos)] = rebind[Pred.ElementType](bi)
     Out[Int(wpos)] = rebind[Out.ElementType](forced if forced >= 0 else bi)
+
+
+def amar_trace_sum(
+    src: MutPointer[Scalar[f32], MutAnyOrigin],
+    dst: MutPointer[Scalar[DType.uint32], MutAnyOrigin],
+    n: Int32,
+    slot: Int32,
+):
+    if global_idx.x != 0:
+        return
+    var acc = SIMD[DType.uint32, 8](2166136261)
+    var i = 0
+    while i + 8 <= Int(n):
+        acc = (acc ^ bitcast[DType.uint32, 8](src.load[width=8](i))) * 16777619
+        i += 8
+    var tail = UInt32(2166136261)
+    while i < Int(n):
+        tail = (tail ^ bitcast[DType.uint32, 1](src.load[width=1](i))) * 16777619
+        i += 1
+    var folded = tail
+    comptime for j in range(8):
+        folded = (folded ^ acc[j]) * 16777619
+    dst[Int(slot)] = folded
