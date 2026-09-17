@@ -44,10 +44,13 @@ assigned by the dispatcher and compares the resulting token ids with that engine
 the same engine, pack, prompt, seed, and T=0. It must report 20/20 per-process identity and the
 engine assignment for every prompt. No comparison is made between the XTX and iGPU models.
 
-The timed invocation is:
+The timed invocation is from the lane root, using an absolute script path and an explicit
+runtime `PATH`. `gpu-wait` admits jobs with a clean environment and may not preserve the caller's
+cwd, so the short relative form is not a valid submission receipt:
 
 ```text
-gpu-wait run --priority 20 --timeout 3600 --vram 22 -- .work/p4/run-two-engines.sh
+cd $HOME/Projects/mojo/mojo-baro-lanes/team-b
+$HOME/.local/bin/gpu-wait run --priority 20 --timeout 3600 --vram 22 -- env PATH=/opt/rocm/bin:$HOME/iTools/bin:/usr/bin:/bin $HOME/Projects/mojo/mojo-baro-lanes/team-b/.work/p4/run-two-engines.sh
 ```
 
 The full harness is one serialized GPU job. The iGPU is included in the queue. No nested
