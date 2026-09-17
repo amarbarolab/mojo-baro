@@ -92,8 +92,11 @@ NGEN=64; REPS=5; [ "$MODE" = verify ] && { NGEN=4; REPS=1; }
 step bench-radeon "$REFF" env GGML_VK_VISIBLE_DEVICES=$VKIDX llama.cpp/build/bin/llama-bench -m "$MODEL" -ngl 99 -p 0 -n $NGEN -r $REPS
 echo "pm levels seen during llama-bench on the Radeon: $(cut -d' ' -f2- timing/pm-samples.log | sort | uniq -c | tr '\n' ';')"
 if [ "$MODE" = run ]; then
-    echo "-- context arm: same model on the CPU (i5-6200U), no GPU offload"
-    step bench-cpu "$REFF" llama.cpp/build/bin/llama-bench -m "$MODEL" -ngl 0 -p 0 -n $NGEN -r $REPS
+    # -dev none, not -ngl 0: on a Vulkan build -ngl 0 measured 38 tok/s against 54 here (2026-09-17, cause not established)
+    : > timing/pm-samples.log
+    echo "-- context arm: same model on the CPU (i5-6200U), every GPU device off"
+    step bench-cpu "$REFF" llama.cpp/build/bin/llama-bench -m "$MODEL" -dev none -p 0 -n $NGEN -r $REPS
+    echo "pm levels seen on the Radeon during the CPU arm: $(cut -d' ' -f2- timing/pm-samples.log | sort | uniq -c | tr '\n' ';')"
 fi
 echo "gpu after: $(grep 'power level' $PM)"
 [ -z "$fails" ] || { echo "FAIL $(echo $fails | wc -w) steps:$fails"; exit 1; }
