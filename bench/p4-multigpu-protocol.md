@@ -23,7 +23,9 @@ Before any prompt is sent, the receipt must contain all of:
 
 1. `igpu-env --probe` exit 0 and its printed `ROCR_VISIBLE_DEVICES`, unset
    `HIP_VISIBLE_DEVICES`, and `HSA_OVERRIDE_GFX_VERSION=10.3.0`.
-2. `rocm-smi --showpids` for every running engine process, with PID-to-device mapping.
+2. `rocminfo` supplies the gfx1100 `Uuid: GPU-*` selector for the XTX; the bare hex
+   `rocm-smi --showuniqueid` value is retained as a suffix cross-check. `rocm-smi --showpids`
+   covers every running engine process, with PID-to-device mapping.
 3. The iGPU process's engine log showing the expected HIP API path, plus external
    `rocminfo`/`rocm-smi` output naming the gfx1030 object and mapping the running PID to it.
    MAX's `DeviceContext.name()` is not accepted as the device identity: under this override it
