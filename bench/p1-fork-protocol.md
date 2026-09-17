@@ -114,3 +114,44 @@ Two hosts or two GPUs. Any context beyond a few dozen tokens: the states here ar
 52 MB of conv and SSM slots, so the int8 arm exercises little quantized KV, and a long prefix could
 behave differently. The 32k timing claim. Any model but the 9B dense q4 pack. Router placement,
 which waits for P0b.
+
+## Amendment 1, 2026-09-17, after the full f32 and int8 runs: the ids are a weak detector here
+
+Results as the frozen scorer printed them (`.work/fork/g2-gate/{f32,int8}`, 20 prompts, 0 voids,
+rates read back at 96, 957 and 9610 Mbit/s, both engines `tmax 4096`, node B cold at every rate):
+
+| | control S | 100 Mbit | 1 Gbit | 10 Gbit | fork equals control S | rate-dependent prompts | flip refused | swapkv restored / wrong ids |
+|---|---|---|---|---|---|---|---|---|
+| f32 | 20 | 20 | 20 | 20 | 20, 20, 20 | 0 | 5 of 5 | 5 of 5 / **3 of 5** |
+| int8 | 20 | 16 | 16 | 16 | 16, 16, 16 | 0 | 5 of 5 | 5 of 5 / **3 of 5** |
+
+**Both runs are `RESULT: FAIL, the harness did not prove itself`, and I am leaving that verdict in
+place.** I froze "at least 4 of 5 swapped states give wrong ids". Two did not: `p02-python-fib` and
+`p04-list-planets`, the same two in both formats. Their continuations are strongly determined (a
+fibonacci function, a list of planets), the prompts are 15 and 16 tokens, and 24 of the model's 32
+layers are recurrent, so a state whose attention K and V are fully exchanged still yields the same
+32 ids. No threshold is changed. A gate that lets two grossly wrong states through has not shown
+that 20 of 20 means the state is right, and I will not report the f32 row as a pass.
+
+What held, stated without the word pass: both sharp predictions (an f32 fork equals a local restore
+on 20 of 20 at every rate; zero prompts depend on the link rate); every one of 65 imports per run
+was accepted only after node B recomputed sha256 over the received body, so the TRANSPORT is
+byte-exact by a check that does not depend on ids; a flipped byte is refused 5 of 5 with 409
+`state_identity` `payload_sha`, relayed by node A. Control S is 20 of 20, so on OUR engine a
+restored run reproduces the cold run on these prompts, unlike llama.cpp in gate 4.
+
+What did not hold: my int8 prediction was 17 to 20, measured 16. All four misses (p07 at 1, p12 at
+3, p15 at 14, p16 at 9) are attributed by the frozen order to int8 quantization, because the f32 arm
+matched each of them at each rate, and they are the same four at every rate. So the plan's own
+export format does NOT meet the plan's identity bar even on prompts of 16 to 32 tokens.
+
+What the falsifier result means, which I had the evidence for and did not use: gate 4 had already
+shown the K/V swap is gentle on the hybrid (one preflight state held until index 3). Here it is
+gentler still. The same detector is flipped by int8 rounding on 4 of 20 near-tie prompts and is
+blind to a full K/V exchange on 2 of 5 strongly determined ones. Its sensitivity is a property of
+the prompt, not of the defect. **Untested entirely: corruption of the conv and SSM state**, which is
+52 of the 61 MB; I have no evidence the ids would or would not catch it.
+
+A detector with real power exists and is not part of this freeze: have node B RE-EXPORT the
+imported prefix and compare the bytes with node A's export (f32: header, tokens, conv, SSM, and K/V
+for positions below `pos`). That tests where every byte landed, not what 32 tokens happened to say.
