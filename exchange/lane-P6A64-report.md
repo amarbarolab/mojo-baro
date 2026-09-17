@@ -17,7 +17,7 @@ No download or GPU work was performed.
   not started because no `aarch64-linux-gnu-gcc` linker is installed.
 - **Gate:** On an aarch64 guest, build `baro-serve`, the router, and CPU-only
   Mojo tools, then run `tools/ci-checks.sh` and tokenizer parity. This gate is
-  UNVERIFIED because the guest rig was not found.
+  UNVERIFIED because the available guest rig is x86_64-only and unrelated.
 - **Receipts:** `.work/team-C/codex/p6-aarch64/environment.md` and
   `.work/team-C/codex/p6-aarch64/vm-rig.md`.
 - **Kill line:** missing linker stops Step 1; missing guest rig stops Step 2.
@@ -43,17 +43,18 @@ system packages requires coordinator approval.
 
 ## Step 2: VM rig
 
-`qemu-system-aarch64` is present at version 11.1.1. `brain-ask`,
-`brain-recall labiso qemu aarch64 --and`, targeted `iTools/INDEX.md` and
-`Brain/OS` search, and targeted filesystem search found no `labiso` launcher,
-guest image, or rig directory. Brain recall returned only unrelated archived
-references to a `labiso` research PDF.
+`qemu-system-aarch64` is present at version 11.1.1. The available
+`~/AMDHQ/labiso/vm/boot-test.sh` is an unrelated latent-os rig: it invokes
+`qemu-system-x86_64`, UEFI boots `kairos-core-amd64-v4.2.0.iso` (314,179,584
+bytes), and uses x86_64-specific firmware. Brain recall, targeted
+`iTools/INDEX.md` and `Brain/OS` search, and direct inspection found no
+aarch64 guest or launcher. The labiso path is real, but has zero aarch64
+relevance for this item.
 
-An aarch64 guest would need a Linux aarch64 image, the Modular Linux aarch64
-package, the repo checkout, and enough storage for the CPU-only tool builds.
-The exact image and package download sizes are not known from the local rig
-because the rig is absent. Do not download until the coordinator names the
-image, URL, and size.
+An aarch64 guest would need a Linux aarch64 image, matching firmware, the
+Modular Linux aarch64 package, the repo checkout, and enough storage for the
+CPU-only tool builds. The exact image and package download sizes are not known
+locally. Do not download until the coordinator names the image, URL, and size.
 
 ## Commits and suite
 
