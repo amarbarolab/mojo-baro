@@ -5,6 +5,7 @@ are baked into the IR as strides, so the shape defines in `host.c` must match th
 """
 from std.math import ceildiv
 from std.sys import has_accelerator
+from std.sys import get_defined_int
 
 from max.gpu.host import DeviceContext
 from layout import TileTensor, row_major
@@ -17,7 +18,7 @@ from elementwise import (
 
 comptime R = 8
 comptime H = 4096
-comptime V = 5003
+comptime V = get_defined_int["V", 5003]()
 comptime TV = 1024
 comptime K = 64
 comptime QM = 8

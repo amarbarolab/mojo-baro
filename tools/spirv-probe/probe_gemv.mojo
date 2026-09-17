@@ -1,18 +1,19 @@
 """Emit-only instantiation of the engine's m=1 q4 GEMV pair (G1 scouting, not part of run.sh).
 
 `amar_matmul_skinny_q4rowb[2, 1]` + `amar_skinny_reduce[.., 1]`, the dispatch gemm_q4 uses at
-m == 1 (serve/registry.mojo). Built with `--target-accelerator apple-m1 --emit asm`, never run.
+m == 1 (serve/registry.mojo). Shape from `-D N=<rows> -D K=<cols>` (K a multiple of 1024, N of 8). Built with `--target-accelerator apple-m1 --emit asm`, never run.
 """
 from std.math import ceildiv
 from std.sys import has_accelerator
+from std.sys import get_defined_int
 
 from max.gpu.host import DeviceContext
 from layout import TileTensor, row_major
 
 from matmul_skinny import amar_matmul_skinny_q4rowb, amar_skinny_reduce, ROW_WAVES, ROW_THREADS
 
-comptime N = 1024
-comptime K = 4096
+comptime N = get_defined_int["N", 1024]()
+comptime K = get_defined_int["K", 4096]()
 
 
 def main() raises:
