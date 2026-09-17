@@ -179,3 +179,46 @@ Criterion (b)'s minimum, 89.06% on `p09-explain-gpu`, is the only unresolved num
 the frozen bars. Everything else (write-back byte isolation, aggregate forced agreement,
 quality table, identity) clears cleanly. Base bake and pack are untouched throughout; nothing
 here has modified `qwythos-champion`'s own files.
+
+## Control run (coordinator, 2026-09-17): the bar is unpassable by the base
+
+The open item above is resolved as a gate defect, not a LoRA failure. The control
+that decides it had never been run: every earlier p09 receipt was ours-vs-ours
+spec identity, never the unpatched base against its own q4 llama.cpp reference.
+
+Control arm built like-for-like: the unpatched base bf16 gguf packed with the
+identical unmodified `tools/engine-pack.py --q4`, giving `pack_bytes`
+6639194112, byte-size identical to the patched arm's pack, so the LoRA delta is
+the only difference between arms. (The pre-existing `.work/engine-pack-q4` is
+7211323392 bytes, a different bake config, and would have made the comparison
+invalid.) Same `forced-agreement-run.sh`, same 20 prompts, run under
+`gpu-wait run --priority 90 --vram 16 --timeout 900`, exit 0.
+
+| | control (unpatched) | patched |
+|---|---|---|
+| minimum | `p03-story` 89.06% | `p09-explain-gpu` 89.06% |
+| aggregate | 1230/1264 = 97.31% | 1216/1255 = 96.89% |
+
+The unpatched base fails the same 90% floor, on a different prompt. Two
+structural reasons rather than bad luck:
+
+1. Both minima are exactly 57/64 = 89.06%. At `n_predict` 64 the achievable grid
+   steps from 57/64 (89.06%) to 58/64 (90.63%); there is no 90%. The floor is
+   unreachable by construction at this generation length.
+2. The prompt holding the minimum is not a stable property of the model.
+   `p03-story` is the worst prompt unpatched (89.06%) and the third-best patched
+   (96.88%); `p09` moves the other way (95.31% to 89.06%). Min-over-20 is
+   measuring sampling noise; the aggregate moved -0.42 pp.
+
+This is the same class as the FORK lane's gate 4, where the plan's 20/20 bar was
+unreachable even llama-to-llama (control L 15/16/16), and as llama.cpp's own
+f16-KV config failing its own f32 ref at 5/7 lengths.
+
+Consequence: the allowed repair round was NOT spent, because it would have been
+chasing noise on a floor the base itself cannot clear. Whether to amend the bar
+(aggregate over 20, or min-over-20 stated against the measured control) is the
+coordinator's protocol call; no threshold has been moved here.
+
+Receipts: `.work/team-B/sonnet/p5b/control/forced/results.txt`,
+`.work/team-B/sonnet/p5b/control/unpatched-pack/identity.json`,
+`.work/team-B/sonnet/p5b/control/pack.log`, `.work/team-B/sonnet/p5b/control/gate.log`.
