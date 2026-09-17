@@ -172,6 +172,37 @@ makes): about 0.5% of tok/s_gen on the 5-token receipt prompt.
 | `POST /tokenize` | `{"content": "...", "add_special": false}` | `{"tokens": [...]}` |
 | `POST /detokenize` | `{"tokens": [...]}` | `{"content": "..."}` |
 
+### Ollama compatibility surface (P0a)
+
+The Ollama routes share the existing `baro-serve` listener and model selected by
+`--pack`; there is no second Ollama port.  The compatibility surface is:
+
+| route | request and response contract |
+|---|---|
+| `GET /api/tags` | Returns one loaded model in Ollama's `models` array. |
+| `GET /api/ps` | Returns the loaded model while its engine is alive, otherwise an empty `models` array. |
+| `GET /api/version` | Returns the baro compatibility version. |
+| `POST /api/show` | Accepts `model` or `name`; returns model metadata for the loaded pack. |
+| `POST /api/pull` | Returns `501` with the model-import command. Model import is not an inference-server operation. |
+| `POST /api/chat` | Accepts Ollama `messages`, `options`, and `stream`. The default stream is `true`; streamed responses are newline-delimited JSON. `stream: false` returns one final JSON object. |
+| `POST /api/generate` | Accepts `prompt`, optional `system`, `raw`, `options`, and `stream`. The default stream is `true`; streamed responses are newline-delimited JSON. `stream: false` returns one final JSON object. |
+| `POST /api/embeddings` | Returns `501` with `embeddings_pending` and `see: P0a-e` until the coordinator-owned engine wire is landed. |
+| `POST /v1/embeddings` | Same pending response as `/api/embeddings`; OpenAI route retained for client discovery. |
+
+The supported Ollama `options` mapping is `num_predict` to maximum generated
+tokens, `temperature`, `top_p`, `top_k`, `min_p`, `seed`, and `stop` to the
+existing sampler and stop fields. `repeat_penalty` and `num_ctx` are accepted
+for client compatibility but are not applied. `images`, tools, and format are
+accepted where present but are not implemented by this item. A client must not
+infer that an accepted option took effect without a read-back contract.
+
+Ollama stream chunks use `content-type: application/x-ndjson`, one JSON object
+per line, and finish with `done: true`, counts, durations, and the generated
+context. OpenAI routes continue to use SSE and are otherwise unchanged. The
+embeddings gate is intentionally deferred from P0a until P0a-e supplies a
+hidden-state field on the engine protocol; no embedding vector is promised by
+the pending response.
+
 `stream: true` returns SSE: one `data:` chunk per token (`text` delta and
 `tokens: [id]`), a final chunk with `finish_reason` + `usage` + `timings`
 (+ the full `tokens` list on completions), then `data: [DONE]`.
