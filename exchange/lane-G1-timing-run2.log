@@ -1,0 +1,262 @@
+== receipt: host
+2026-09-17T08:21:08Z
+7.2.4-arch1-2
+mesa 1:26.2.2-1 opencl-mesa 1:26.2.2-1 vulkan-radeon 1:26.2.2-1 
+llama.cpp source ca3d5a3e1 + llama-perf-shapes.patch; build flags: CMAKE_BUILD_TYPE:STRING=Release GGML_VULKAN:BOOL=ON 
+cpu governor powersave, loadavg 0.09 0.41 1.54
+gpu idle: power level 0    sclk: 30000 mclk: 30000 vddc: 900 vddci: 0 pcie gen: 3
+e0e0c7ca3f7249b8  host
+00e5b39316d9b5fb  llama.cpp/build/bin/test-backend-ops
+679a82fe5c302964  llama.cpp/build/bin/llama-bench
+09bd622fe138dbbb  /root/g0/qwen2.5-0.5b-instruct-q4_0-pure.gguf
+vulkan index of the Radeon: 1
+== ours: rmsnorm H=4096, lowered vs host-reduction
+device: AMD Radeon R5 M330 (radeonsi, hainan, ACO, DRM 3.64, 7.2.4-arch1-2) | driver 26.2.2-arch1.1 | OpenCL 3.1  | shapes R=1 H=4096 V=5003 GN=1024 GK=4096
+TIME amar_rmsnorm global=256x1 local=256 max_wg=256 | sync_us med 145.4 min 130.8 max 209.6 | batch_us(B=32) med 42.7 min 41.3 max 63.3 | readback: a0=16384B a1=16384B a2=16384B a3=i4096/f5.73972e-42 a4=i897988541/f1e-06
+PASS amar_rmsnorm x1  max rel err 9.989e-08
+TIME amar_rmsnorm_hostreduce global=256x1 local=256 rows=1 n=4096 dispatches=2 blocking_reads=1 | sync_us med 184.5 min 179.6 max 197.4 | batch_us n/a (the read is a sync)
+PASS amar_rmsnorm_hostreduce x1  max rel err 9.989e-08
+PASS 2/2
+device: AMD Radeon R5 M330 (radeonsi, hainan, ACO, DRM 3.64, 7.2.4-arch1-2) | driver 26.2.2-arch1.1 | OpenCL 3.1  | shapes R=2 H=4096 V=5003 GN=1024 GK=4096
+TIME amar_rmsnorm global=512x1 local=256 max_wg=256 | sync_us med 188.0 min 164.9 max 308.6 | batch_us(B=32) med 64.3 min 41.6 max 75.7 | readback: a0=32768B a1=16384B a2=32768B a3=i4096/f5.73972e-42 a4=i897988541/f1e-06
+PASS amar_rmsnorm x1  max rel err 1.135e-07
+TIME amar_rmsnorm_hostreduce global=512x1 local=256 rows=2 n=4096 dispatches=2 blocking_reads=1 | sync_us med 225.1 min 219.5 max 236.4 | batch_us n/a (the read is a sync)
+PASS amar_rmsnorm_hostreduce x1  max rel err 1.135e-07
+PASS 2/2
+device: AMD Radeon R5 M330 (radeonsi, hainan, ACO, DRM 3.64, 7.2.4-arch1-2) | driver 26.2.2-arch1.1 | OpenCL 3.1  | shapes R=4 H=4096 V=5003 GN=1024 GK=4096
+TIME amar_rmsnorm global=1024x1 local=256 max_wg=256 | sync_us med 201.5 min 170.0 max 345.2 | batch_us(B=32) med 62.9 min 38.2 max 80.0 | readback: a0=65536B a1=16384B a2=65536B a3=i4096/f5.73972e-42 a4=i897988541/f1e-06
+PASS amar_rmsnorm x1  max rel err 1.235e-07
+TIME amar_rmsnorm_hostreduce global=1024x1 local=256 rows=4 n=4096 dispatches=2 blocking_reads=1 | sync_us med 222.4 min 187.2 max 238.9 | batch_us n/a (the read is a sync)
+PASS amar_rmsnorm_hostreduce x1  max rel err 1.235e-07
+PASS 2/2
+device: AMD Radeon R5 M330 (radeonsi, hainan, ACO, DRM 3.64, 7.2.4-arch1-2) | driver 26.2.2-arch1.1 | OpenCL 3.1  | shapes R=8 H=4096 V=5003 GN=1024 GK=4096
+TIME amar_rmsnorm global=2048x1 local=256 max_wg=256 | sync_us med 224.8 min 196.1 max 346.9 | batch_us(B=32) med 74.4 min 52.3 max 93.9 | readback: a0=131072B a1=16384B a2=131072B a3=i4096/f5.73972e-42 a4=i897988541/f1e-06
+PASS amar_rmsnorm x1  max rel err 1.432e-07
+TIME amar_rmsnorm_hostreduce global=2048x1 local=256 rows=8 n=4096 dispatches=2 blocking_reads=1 | sync_us med 231.2 min 204.3 max 280.0 | batch_us n/a (the read is a sync)
+PASS amar_rmsnorm_hostreduce x1  max rel err 1.432e-07
+PASS 2/2
+device: AMD Radeon R5 M330 (radeonsi, hainan, ACO, DRM 3.64, 7.2.4-arch1-2) | driver 26.2.2-arch1.1 | OpenCL 3.1  | shapes R=16 H=4096 V=5003 GN=1024 GK=4096
+TIME amar_rmsnorm global=4096x1 local=256 max_wg=256 | sync_us med 487.1 min 170.4 max 519.6 | batch_us(B=32) med 87.8 min 85.0 max 105.4 | readback: a0=262144B a1=16384B a2=262144B a3=i4096/f5.73972e-42 a4=i897988541/f1e-06
+PASS amar_rmsnorm x1  max rel err 1.764e-07
+TIME amar_rmsnorm_hostreduce global=4096x1 local=256 rows=16 n=4096 dispatches=2 blocking_reads=1 | sync_us med 266.5 min 259.2 max 282.3 | batch_us n/a (the read is a sync)
+PASS amar_rmsnorm_hostreduce x1  max rel err 1.445e-07
+PASS 2/2
+device: AMD Radeon R5 M330 (radeonsi, hainan, ACO, DRM 3.64, 7.2.4-arch1-2) | driver 26.2.2-arch1.1 | OpenCL 3.1  | shapes R=32 H=4096 V=5003 GN=1024 GK=4096
+TIME amar_rmsnorm global=8192x1 local=256 max_wg=256 | sync_us med 370.2 min 219.4 max 599.4 | batch_us(B=32) med 151.1 min 148.3 max 157.8 | readback: a0=524288B a1=16384B a2=524288B a3=i4096/f5.73972e-42 a4=i897988541/f1e-06
+PASS amar_rmsnorm x1  max rel err 1.756e-07
+TIME amar_rmsnorm_hostreduce global=8192x1 local=256 rows=32 n=4096 dispatches=2 blocking_reads=1 | sync_us med 927.1 min 824.3 max 1081.3 | batch_us n/a (the read is a sync)
+PASS amar_rmsnorm_hostreduce x1  max rel err 1.492e-07
+PASS 2/2
+device: AMD Radeon R5 M330 (radeonsi, hainan, ACO, DRM 3.64, 7.2.4-arch1-2) | driver 26.2.2-arch1.1 | OpenCL 3.1  | shapes R=64 H=4096 V=5003 GN=1024 GK=4096
+TIME amar_rmsnorm global=16384x1 local=256 max_wg=256 | sync_us med 461.2 min 364.4 max 549.6 | batch_us(B=32) med 292.5 min 274.2 max 302.5 | readback: a0=1048576B a1=16384B a2=1048576B a3=i4096/f5.73972e-42 a4=i897988541/f1e-06
+PASS amar_rmsnorm x1  max rel err 1.829e-07
+TIME amar_rmsnorm_hostreduce global=16384x1 local=256 rows=64 n=4096 dispatches=2 blocking_reads=1 | sync_us med 1523.3 min 1192.6 max 1597.6 | batch_us n/a (the read is a sync)
+PASS amar_rmsnorm_hostreduce x1  max rel err 1.555e-07
+PASS 2/2
+== ours: softmax, one vocab row
+device: AMD Radeon R5 M330 (radeonsi, hainan, ACO, DRM 3.64, 7.2.4-arch1-2) | driver 26.2.2-arch1.1 | OpenCL 3.1  | shapes R=1 H=4096 V=151936 GN=1024 GK=4096
+TIME amar_softmax_rows global=256x1 local=256 max_wg=256 | sync_us med 1892.6 min 1835.2 max 1918.9 | batch_us(B=32) med 1622.2 min 1607.2 max 1624.5 | readback: a0=607744B a1=i151936/f2.12908e-40
+PASS amar_softmax_rows x1  max rel err 2.382e-06
+PASS 1/1
+== ours: q4 GEMV + reduce
+device: AMD Radeon R5 M330 (radeonsi, hainan, ACO, DRM 3.64, 7.2.4-arch1-2) | driver 26.2.2-arch1.1 | OpenCL 3.1  | shapes R=8 H=4096 V=5003 GN=1024 GK=4096
+TIME amar_matmul_skinny_q4rowb global=32768x1 local=256 max_wg=256 | sync_us med 592.2 min 521.6 max 682.1 | batch_us(B=32) med 372.2 min 357.2 max 389.0 | readback: a0=8192B a1=2097152B a2=262144B a3=4096B a4=i1/f1.4013e-45 a5=i1024/f1.43493e-42 a6=i4096/f5.73972e-42
+TIME amar_skinny_reduce global=1024x1 local=256 max_wg=256 | sync_us med 226.0 min 220.9 max 276.5 | batch_us(B=32) med 46.7 min 37.9 max 47.6 | readback: a0=4096B a1=4096B a2=i1/f1.4013e-45 a3=i1024/f1.43493e-42
+PASS amar_skinny_reduce x1  GEMV max err relative to sum|terms|, reduce an exact copy 9.114e-09
+PASS 1/1
+device: AMD Radeon R5 M330 (radeonsi, hainan, ACO, DRM 3.64, 7.2.4-arch1-2) | driver 26.2.2-arch1.1 | OpenCL 3.1  | shapes R=8 H=4096 V=5003 GN=2048 GK=1024
+TIME amar_matmul_skinny_q4rowb global=65536x1 local=256 max_wg=256 | sync_us med 432.8 min 336.1 max 560.2 | batch_us(B=32) med 248.6 min 236.3 max 263.3 | readback: a0=2048B a1=1048576B a2=131072B a3=8192B a4=i1/f1.4013e-45 a5=i2048/f2.86986e-42 a6=i1024/f1.43493e-42
+TIME amar_skinny_reduce global=2048x1 local=256 max_wg=256 | sync_us med 305.4 min 230.6 max 416.4 | batch_us(B=32) med 46.6 min 43.3 max 50.5 | readback: a0=8192B a1=8192B a2=i1/f1.4013e-45 a3=i2048/f2.86986e-42
+PASS amar_skinny_reduce x1  GEMV max err relative to sum|terms|, reduce an exact copy 1.773e-08
+PASS 1/1
+device: AMD Radeon R5 M330 (radeonsi, hainan, ACO, DRM 3.64, 7.2.4-arch1-2) | driver 26.2.2-arch1.1 | OpenCL 3.1  | shapes R=8 H=4096 V=5003 GN=1024 GK=1024
+TIME amar_matmul_skinny_q4rowb global=32768x1 local=256 max_wg=256 | sync_us med 256.4 min 204.6 max 346.4 | batch_us(B=32) med 139.1 min 136.4 max 147.0 | readback: a0=2048B a1=524288B a2=65536B a3=4096B a4=i1/f1.4013e-45 a5=i1024/f1.43493e-42 a6=i1024/f1.43493e-42
+TIME amar_skinny_reduce global=1024x1 local=256 max_wg=256 | sync_us med 230.5 min 211.2 max 348.3 | batch_us(B=32) med 44.9 min 40.8 max 48.1 | readback: a0=4096B a1=4096B a2=i1/f1.4013e-45 a3=i1024/f1.43493e-42
+PASS amar_skinny_reduce x1  GEMV max err relative to sum|terms|, reduce an exact copy 1.365e-08
+PASS 1/1
+device: AMD Radeon R5 M330 (radeonsi, hainan, ACO, DRM 3.64, 7.2.4-arch1-2) | driver 26.2.2-arch1.1 | OpenCL 3.1  | shapes R=8 H=4096 V=5003 GN=1024 GK=2048
+TIME amar_matmul_skinny_q4rowb global=32768x1 local=256 max_wg=256 | sync_us med 491.9 min 428.9 max 534.8 | batch_us(B=32) med 211.4 min 205.8 max 238.4 | readback: a0=4096B a1=1048576B a2=131072B a3=4096B a4=i1/f1.4013e-45 a5=i1024/f1.43493e-42 a6=i2048/f2.86986e-42
+TIME amar_skinny_reduce global=1024x1 local=256 max_wg=256 | sync_us med 284.1 min 223.4 max 444.7 | batch_us(B=32) med 48.3 min 43.2 max 50.9 | readback: a0=4096B a1=4096B a2=i1/f1.4013e-45 a3=i1024/f1.43493e-42
+PASS amar_skinny_reduce x1  GEMV max err relative to sum|terms|, reduce an exact copy 1.358e-08
+PASS 1/1
+device: AMD Radeon R5 M330 (radeonsi, hainan, ACO, DRM 3.64, 7.2.4-arch1-2) | driver 26.2.2-arch1.1 | OpenCL 3.1  | shapes R=8 H=4096 V=5003 GN=3072 GK=1024
+TIME amar_matmul_skinny_q4rowb global=98304x1 local=256 max_wg=256 | sync_us med 579.3 min 530.1 max 689.0 | batch_us(B=32) med 351.2 min 336.3 max 364.9 | readback: a0=2048B a1=1572864B a2=196608B a3=12288B a4=i1/f1.4013e-45 a5=i3072/f4.30479e-42 a6=i1024/f1.43493e-42
+TIME amar_skinny_reduce global=3072x1 local=256 max_wg=256 | sync_us med 232.5 min 199.2 max 323.5 | batch_us(B=32) med 50.5 min 39.4 max 53.3 | readback: a0=12288B a1=12288B a2=i1/f1.4013e-45 a3=i3072/f4.30479e-42
+PASS amar_skinny_reduce x1  GEMV max err relative to sum|terms|, reduce an exact copy 1.474e-08
+PASS 1/1
+device: AMD Radeon R5 M330 (radeonsi, hainan, ACO, DRM 3.64, 7.2.4-arch1-2) | driver 26.2.2-arch1.1 | OpenCL 3.1  | shapes R=8 H=4096 V=5003 GN=1024 GK=3072
+TIME amar_matmul_skinny_q4rowb global=32768x1 local=256 max_wg=256 | sync_us med 602.9 min 534.4 max 650.7 | batch_us(B=32) med 315.6 min 296.6 max 326.4 | readback: a0=6144B a1=1572864B a2=196608B a3=4096B a4=i1/f1.4013e-45 a5=i1024/f1.43493e-42 a6=i3072/f4.30479e-42
+TIME amar_skinny_reduce global=1024x1 local=256 max_wg=256 | sync_us med 304.6 min 223.3 max 458.9 | batch_us(B=32) med 47.9 min 41.3 max 49.9 | readback: a0=4096B a1=4096B a2=i1/f1.4013e-45 a3=i1024/f1.43493e-42
+PASS amar_skinny_reduce x1  GEMV max err relative to sum|terms|, reduce an exact copy 1.050e-08
+PASS 1/1
+device: AMD Radeon R5 M330 (radeonsi, hainan, ACO, DRM 3.64, 7.2.4-arch1-2) | driver 26.2.2-arch1.1 | OpenCL 3.1  | shapes R=8 H=4096 V=5003 GN=151936 GK=1024
+TIME amar_matmul_skinny_q4rowb global=4861952x1 local=256 max_wg=256 | sync_us med 15157.7 min 14972.5 max 15205.4 | batch_us(B=32) med 14488.5 min 14479.3 max 14501.3 | readback: a0=2048B a1=77791232B a2=9723904B a3=607744B a4=i1/f1.4013e-45 a5=i151936/f2.12908e-40 a6=i1024/f1.43493e-42
+TIME amar_skinny_reduce global=152064x1 local=256 max_wg=256 | sync_us med 786.5 min 670.2 max 834.2 | batch_us(B=32) med 511.1 min 489.3 max 517.2 | readback: a0=607744B a1=607744B a2=i1/f1.4013e-45 a3=i151936/f2.12908e-40
+PASS amar_skinny_reduce x1  GEMV max err relative to sum|terms|, reduce an exact copy 2.216e-08
+PASS 1/1
+device: AMD Radeon R5 M330 (radeonsi, hainan, ACO, DRM 3.64, 7.2.4-arch1-2) | driver 26.2.2-arch1.1 | OpenCL 3.1  | shapes R=8 H=4096 V=5003 GN=896 GK=1024
+TIME amar_matmul_skinny_q4rowb global=28672x1 local=256 max_wg=256 | sync_us med 206.7 min 169.1 max 249.0 | batch_us(B=32) med 137.0 min 128.2 max 138.4 | readback: a0=2048B a1=458752B a2=57344B a3=3584B a4=i1/f1.4013e-45 a5=i896/f1.25556e-42 a6=i1024/f1.43493e-42
+TIME amar_skinny_reduce global=1024x1 local=256 max_wg=256 | sync_us med 243.4 min 199.3 max 303.6 | batch_us(B=32) med 38.1 min 36.1 max 40.8 | readback: a0=3584B a1=3584B a2=i1/f1.4013e-45 a3=i896/f1.25556e-42
+PASS amar_skinny_reduce x1  GEMV max err relative to sum|terms|, reduce an exact copy 1.634e-08
+PASS 1/1
+device: AMD Radeon R5 M330 (radeonsi, hainan, ACO, DRM 3.64, 7.2.4-arch1-2) | driver 26.2.2-arch1.1 | OpenCL 3.1  | shapes R=8 H=4096 V=5003 GN=128 GK=1024
+TIME amar_matmul_skinny_q4rowb global=4096x1 local=256 max_wg=256 | sync_us med 105.4 min 100.3 max 122.3 | batch_us(B=32) med 54.6 min 33.9 max 56.3 | readback: a0=2048B a1=65536B a2=8192B a3=512B a4=i1/f1.4013e-45 a5=i128/f1.79366e-43 a6=i1024/f1.43493e-42
+TIME amar_skinny_reduce global=256x1 local=256 max_wg=256 | sync_us med 159.9 min 124.6 max 195.7 | batch_us(B=32) med 34.8 min 27.0 max 36.8 | readback: a0=512B a1=512B a2=i1/f1.4013e-45 a3=i128/f1.79366e-43
+PASS amar_skinny_reduce x1  GEMV max err relative to sum|terms|, reduce an exact copy 9.814e-09
+PASS 1/1
+device: AMD Radeon R5 M330 (radeonsi, hainan, ACO, DRM 3.64, 7.2.4-arch1-2) | driver 26.2.2-arch1.1 | OpenCL 3.1  | shapes R=8 H=4096 V=5003 GN=4864 GK=1024
+TIME amar_matmul_skinny_q4rowb global=155648x1 local=256 max_wg=256 | sync_us med 735.2 min 650.5 max 823.0 | batch_us(B=32) med 532.7 min 507.6 max 536.6 | readback: a0=2048B a1=2490368B a2=311296B a3=19456B a4=i1/f1.4013e-45 a5=i4864/f6.81592e-42 a6=i1024/f1.43493e-42
+TIME amar_skinny_reduce global=4864x1 local=256 max_wg=256 | sync_us med 235.7 min 208.4 max 334.7 | batch_us(B=32) med 51.4 min 47.4 max 54.2 | readback: a0=19456B a1=19456B a2=i1/f1.4013e-45 a3=i4864/f6.81592e-42
+PASS amar_skinny_reduce x1  GEMV max err relative to sum|terms|, reduce an exact copy 1.818e-08
+PASS 1/1
+device: AMD Radeon R5 M330 (radeonsi, hainan, ACO, DRM 3.64, 7.2.4-arch1-2) | driver 26.2.2-arch1.1 | OpenCL 3.1  | shapes R=8 H=4096 V=5003 GN=896 GK=5120
+TIME amar_matmul_skinny_q4rowb global=28672x1 local=256 max_wg=256 | sync_us med 625.5 min 513.5 max 719.6 | batch_us(B=32) med 420.8 min 397.3 max 424.9 | readback: a0=10240B a1=2293760B a2=286720B a3=3584B a4=i1/f1.4013e-45 a5=i896/f1.25556e-42 a6=i5120/f7.17465e-42
+TIME amar_skinny_reduce global=1024x1 local=256 max_wg=256 | sync_us med 237.4 min 224.5 max 294.5 | batch_us(B=32) med 47.1 min 41.2 max 50.9 | readback: a0=3584B a1=3584B a2=i1/f1.4013e-45 a3=i896/f1.25556e-42
+PASS amar_skinny_reduce x1  GEMV max err relative to sum|terms|, reduce an exact copy 7.925e-09
+PASS 1/1
+device: AMD Radeon R5 M330 (radeonsi, hainan, ACO, DRM 3.64, 7.2.4-arch1-2) | driver 26.2.2-arch1.1 | OpenCL 3.1  | shapes R=8 H=4096 V=5003 GN=2048 GK=2048
+TIME amar_matmul_skinny_q4rowb global=65536x1 local=256 max_wg=256 | sync_us med 615.7 min 568.9 max 665.5 | batch_us(B=32) med 394.3 min 367.7 max 396.9 | readback: a0=4096B a1=2097152B a2=262144B a3=8192B a4=i1/f1.4013e-45 a5=i2048/f2.86986e-42 a6=i2048/f2.86986e-42
+TIME amar_skinny_reduce global=2048x1 local=256 max_wg=256 | sync_us med 259.8 min 212.6 max 311.8 | batch_us(B=32) med 46.5 min 42.0 max 50.5 | readback: a0=8192B a1=8192B a2=i1/f1.4013e-45 a3=i2048/f2.86986e-42
+PASS amar_skinny_reduce x1  GEMV max err relative to sum|terms|, reduce an exact copy 1.476e-08
+PASS 1/1
+device: AMD Radeon R5 M330 (radeonsi, hainan, ACO, DRM 3.64, 7.2.4-arch1-2) | driver 26.2.2-arch1.1 | OpenCL 3.1  | shapes R=8 H=4096 V=5003 GN=6144 GK=2048
+TIME amar_matmul_skinny_q4rowb global=196608x1 local=256 max_wg=256 | sync_us med 1393.4 min 1160.2 max 1429.1 | batch_us(B=32) med 1015.4 min 995.6 max 1019.8 | readback: a0=4096B a1=6291456B a2=786432B a3=24576B a4=i1/f1.4013e-45 a5=i6144/f8.60958e-42 a6=i2048/f2.86986e-42
+TIME amar_skinny_reduce global=6144x1 local=256 max_wg=256 | sync_us med 249.9 min 198.3 max 289.4 | batch_us(B=32) med 55.7 min 54.5 max 58.6 | readback: a0=24576B a1=24576B a2=i1/f1.4013e-45 a3=i6144/f8.60958e-42
+PASS amar_skinny_reduce x1  GEMV max err relative to sum|terms|, reduce an exact copy 1.603e-08
+PASS 1/1
+device: AMD Radeon R5 M330 (radeonsi, hainan, ACO, DRM 3.64, 7.2.4-arch1-2) | driver 26.2.2-arch1.1 | OpenCL 3.1  | shapes R=8 H=4096 V=5003 GN=2048 GK=6144
+TIME amar_matmul_skinny_q4rowb global=65536x1 local=256 max_wg=256 | sync_us med 2009.2 min 1752.4 max 2681.7 | batch_us(B=32) med 938.0 min 902.6 max 940.2 | readback: a0=12288B a1=6291456B a2=786432B a3=8192B a4=i1/f1.4013e-45 a5=i2048/f2.86986e-42 a6=i6144/f8.60958e-42
+TIME amar_skinny_reduce global=2048x1 local=256 max_wg=256 | sync_us med 291.0 min 216.7 max 369.6 | batch_us(B=32) med 47.9 min 45.9 max 50.2 | readback: a0=8192B a1=8192B a2=i1/f1.4013e-45 a3=i2048/f2.86986e-42
+PASS amar_skinny_reduce x1  GEMV max err relative to sum|terms|, reduce an exact copy 6.156e-09
+PASS 1/1
+device: AMD Radeon R5 M330 (radeonsi, hainan, ACO, DRM 3.64, 7.2.4-arch1-2) | driver 26.2.2-arch1.1 | OpenCL 3.1  | shapes R=8 H=4096 V=5003 GN=151936 GK=2048
+TIME amar_matmul_skinny_q4rowb global=4861952x1 local=256 max_wg=256 | sync_us med 23728.1 min 23500.4 max 23788.4 | batch_us(B=4) med 23125.5 min 23087.6 max 23144.4 | readback: a0=4096B a1=155582464B a2=19447808B a3=607744B a4=i1/f1.4013e-45 a5=i151936/f2.12908e-40 a6=i2048/f2.86986e-42
+TIME amar_skinny_reduce global=152064x1 local=256 max_wg=256 | sync_us med 779.6 min 667.4 max 826.1 | batch_us(B=32) med 507.8 min 484.4 max 511.1 | readback: a0=607744B a1=607744B a2=i1/f1.4013e-45 a3=i151936/f2.12908e-40
+PASS amar_skinny_reduce x1  GEMV max err relative to sum|terms|, reduce an exact copy 1.796e-08
+PASS 1/1
+pm levels seen during ours:       5 power level 0    sclk: 30000 mclk: 30000 vddc: 900 vddci: 0 pcie gen: 3;      1 power level 1    sclk: 40000 mclk: 100000 vddc: 900 vddci: 0 pcie gen: 3;      1 power level 3    sclk: 75000 mclk: 100000 vddc: 1150 vddci: 0 pcie gen: 3;     39 power level 4    sclk: 75000 mclk: 100000 vddc: 1150 vddci: 0 pcie gen: 3;
+== reference: llama.cpp Vulkan, op level (test-backend-ops perf, backend Vulkan1)
+ggml_vulkan: Found 2 Vulkan devices:
+ggml_vulkan: 0 = Intel(R) HD Graphics 520 (SKL GT2) (Intel open-source Mesa driver) | uma: 1 | fp16: 1 | bf16: 0 | fp4: 0 | warp size: 32 | shared memory: 49152 | int dot: 0 | matrix cores: none
+ggml_vulkan: 1 = AMD Radeon R5 M330 (RADV HAINAN) (radv) | uma: 0 | fp16: 0 | bf16: 0 | fp4: 0 | warp size: 64 | shared memory: 32768 | int dot: 0 | matrix cores: none
+Testing 3 devices
+Backend 1/3: Vulkan0
+  Skipping
+Backend 2/3: Vulkan1
+  Device description: AMD Radeon R5 M330 (RADV HAINAN)
+  Device memory: 2048 MB (2046 MB free)
+  RMS_NORM(type=f32,ne=[4096,1,1,1],v=0,eps=0.000001,inplace=0):               24573 runs -    40.94 us/run -       32 kB/run -    0.75 GB/s
+    G0 RMS_NORM(type=f32,ne=[4096,1,1,1],v=0,eps=0.000001,inplace=0) ops_per_graph=8191 graphs=3 us_per_op med 41.0 min 40.8 max 41.1
+  RMS_NORM(type=f32,ne=[4096,2,1,1],v=0,eps=0.000001,inplace=0):               24573 runs -    41.40 us/run -       64 kB/run -    1.47 GB/s
+    G0 RMS_NORM(type=f32,ne=[4096,2,1,1],v=0,eps=0.000001,inplace=0) ops_per_graph=8191 graphs=3 us_per_op med 41.4 min 41.1 max 41.7
+  RMS_NORM(type=f32,ne=[4096,4,1,1],v=0,eps=0.000001,inplace=0):               24573 runs -    42.25 us/run -      128 kB/run -    2.89 GB/s
+    G0 RMS_NORM(type=f32,ne=[4096,4,1,1],v=0,eps=0.000001,inplace=0) ops_per_graph=8191 graphs=3 us_per_op med 42.3 min 41.9 max 42.6
+  RMS_NORM(type=f32,ne=[4096,8,1,1],v=0,eps=0.000001,inplace=0):               24573 runs -    49.64 us/run -      256 kB/run -    4.92 GB/s
+    G0 RMS_NORM(type=f32,ne=[4096,8,1,1],v=0,eps=0.000001,inplace=0) ops_per_graph=8191 graphs=3 us_per_op med 49.6 min 49.6 max 49.7
+  RMS_NORM(type=f32,ne=[4096,16,1,1],v=0,eps=0.000001,inplace=0):              16382 runs -    83.30 us/run -      512 kB/run -    5.86 GB/s
+    G0 RMS_NORM(type=f32,ne=[4096,16,1,1],v=0,eps=0.000001,inplace=0) ops_per_graph=8191 graphs=2 us_per_op med 83.6 min 83.0 max 83.6
+  RMS_NORM(type=f32,ne=[4096,32,1,1],v=0,eps=0.000001,inplace=0):               8191 runs -   149.09 us/run -     1024 kB/run -    6.55 GB/s
+    G0 RMS_NORM(type=f32,ne=[4096,32,1,1],v=0,eps=0.000001,inplace=0) ops_per_graph=8191 graphs=1 us_per_op med 149.1 min 149.1 max 149.1
+  RMS_NORM(type=f32,ne=[4096,64,1,1],v=0,eps=0.000001,inplace=0):               8191 runs -   281.00 us/run -     2048 kB/run -    6.95 GB/s
+    G0 RMS_NORM(type=f32,ne=[4096,64,1,1],v=0,eps=0.000001,inplace=0) ops_per_graph=8191 graphs=1 us_per_op med 281.0 min 281.0 max 281.0
+  SOFT_MAX(type=f32,ne=[151936,1,1,1],mask=0,sinks=0,m_prec=f32,nr23=[1,1],scale=1.000000,max_bias=0.000000,inplace=0):                 8191 runs -   304.08 us/run -     1187 kB/run -    3.72 GB/s
+    G0 SOFT_MAX(type=f32,ne=[151936,1,1,1],mask=0,sinks=0,m_prec=f32,nr23=[1,1],scale=1.000000,max_bias=0.000000,inplace=0) ops_per_graph=8191 graphs=1 us_per_op med 304.1 min 304.1 max 304.1
+  MUL_MAT(type_a=q4_0,type_b=f32,m=1024,n=1,k=4096,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0):                    8192 runs -   210.54 us/run -   8.39 MFLOP/run -  39.84 GFLOPS
+    G0 MUL_MAT(type_a=q4_0,type_b=f32,m=1024,n=1,k=4096,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0) ops_per_graph=8192 graphs=1 us_per_op med 210.5 min 210.5 max 210.5
+  MUL_MAT(type_a=q4_0,type_b=f32,m=2048,n=1,k=1024,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0):                    8192 runs -   124.96 us/run -   4.19 MFLOP/run -  33.57 GFLOPS
+    G0 MUL_MAT(type_a=q4_0,type_b=f32,m=2048,n=1,k=1024,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0) ops_per_graph=8192 graphs=1 us_per_op med 125.0 min 125.0 max 125.0
+  MUL_MAT(type_a=q4_0,type_b=f32,m=1024,n=1,k=1024,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0):                   16384 runs -    77.40 us/run -   2.10 MFLOP/run -  27.09 GFLOPS
+    G0 MUL_MAT(type_a=q4_0,type_b=f32,m=1024,n=1,k=1024,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0) ops_per_graph=8192 graphs=2 us_per_op med 82.0 min 72.8 max 82.0
+  MUL_MAT(type_a=q4_0,type_b=f32,m=1024,n=1,k=2048,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0):                    8192 runs -   129.85 us/run -   4.19 MFLOP/run -  32.30 GFLOPS
+    G0 MUL_MAT(type_a=q4_0,type_b=f32,m=1024,n=1,k=2048,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0) ops_per_graph=8192 graphs=1 us_per_op med 129.8 min 129.8 max 129.8
+  MUL_MAT(type_a=q4_0,type_b=f32,m=3072,n=1,k=1024,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0):                    8192 runs -   167.32 us/run -   6.29 MFLOP/run -  37.60 GFLOPS
+    G0 MUL_MAT(type_a=q4_0,type_b=f32,m=3072,n=1,k=1024,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0) ops_per_graph=8192 graphs=1 us_per_op med 167.3 min 167.3 max 167.3
+  MUL_MAT(type_a=q4_0,type_b=f32,m=1024,n=1,k=3072,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0):                    8192 runs -   178.83 us/run -   6.29 MFLOP/run -  35.18 GFLOPS
+    G0 MUL_MAT(type_a=q4_0,type_b=f32,m=1024,n=1,k=3072,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0) ops_per_graph=8192 graphs=1 us_per_op med 178.8 min 178.8 max 178.8
+  MUL_MAT(type_a=q4_0,type_b=f32,m=151936,n=1,k=1024,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0):                   322 runs -  6341.92 us/run - 311.16 MFLOP/run -  49.06 GFLOPS
+    G0 MUL_MAT(type_a=q4_0,type_b=f32,m=151936,n=1,k=1024,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0) ops_per_graph=322 graphs=1 us_per_op med 6341.9 min 6341.9 max 6341.9
+  MUL_MAT(type_a=q4_0,type_b=f32,m=896,n=1,k=1024,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0):                    16384 runs -    73.04 us/run -   1.84 MFLOP/run -  25.12 GFLOPS
+    G0 MUL_MAT(type_a=q4_0,type_b=f32,m=896,n=1,k=1024,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0) ops_per_graph=8192 graphs=2 us_per_op med 77.7 min 68.3 max 77.7
+  MUL_MAT(type_a=q4_0,type_b=f32,m=128,n=1,k=1024,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0):                    32768 runs -    35.66 us/run - 262.14 kFLOP/run -   7.35 GFLOPS
+    G0 MUL_MAT(type_a=q4_0,type_b=f32,m=128,n=1,k=1024,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0) ops_per_graph=8192 graphs=4 us_per_op med 32.8 min 32.5 max 44.6
+  MUL_MAT(type_a=q4_0,type_b=f32,m=4864,n=1,k=1024,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0):                    8192 runs -   241.72 us/run -   9.96 MFLOP/run -  41.21 GFLOPS
+    G0 MUL_MAT(type_a=q4_0,type_b=f32,m=4864,n=1,k=1024,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0) ops_per_graph=8192 graphs=1 us_per_op med 241.7 min 241.7 max 241.7
+  MUL_MAT(type_a=q4_0,type_b=f32,m=896,n=1,k=5120,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0):                     8192 runs -   229.90 us/run -   9.18 MFLOP/run -  39.91 GFLOPS
+    G0 MUL_MAT(type_a=q4_0,type_b=f32,m=896,n=1,k=5120,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0) ops_per_graph=8192 graphs=1 us_per_op med 229.9 min 229.9 max 229.9
+  MUL_MAT(type_a=q4_0,type_b=f32,m=2048,n=1,k=2048,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0):                    8192 runs -   214.24 us/run -   8.39 MFLOP/run -  39.16 GFLOPS
+    G0 MUL_MAT(type_a=q4_0,type_b=f32,m=2048,n=1,k=2048,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0) ops_per_graph=8192 graphs=1 us_per_op med 214.2 min 214.2 max 214.2
+  MUL_MAT(type_a=q4_0,type_b=f32,m=6144,n=1,k=2048,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0):                    3974 runs -   551.35 us/run -  25.17 MFLOP/run -  45.64 GFLOPS
+    G0 MUL_MAT(type_a=q4_0,type_b=f32,m=6144,n=1,k=2048,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0) ops_per_graph=3974 graphs=1 us_per_op med 551.4 min 551.4 max 551.4
+  MUL_MAT(type_a=q4_0,type_b=f32,m=2048,n=1,k=6144,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0):                    3974 runs -   552.06 us/run -  25.17 MFLOP/run -  45.59 GFLOPS
+    G0 MUL_MAT(type_a=q4_0,type_b=f32,m=2048,n=1,k=6144,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0) ops_per_graph=3974 graphs=1 us_per_op med 552.1 min 552.1 max 552.1
+  MUL_MAT(type_a=q4_0,type_b=f32,m=151936,n=1,k=2048,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0):                   161 runs - 12497.50 us/run - 622.33 MFLOP/run -  49.80 GFLOPS
+    G0 MUL_MAT(type_a=q4_0,type_b=f32,m=151936,n=1,k=2048,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0) ops_per_graph=161 graphs=1 us_per_op med 12497.5 min 12497.5 max 12497.5
+  MUL_MAT(type_a=q4_0,type_b=f32,m=896,n=1,k=896,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0):             16384 runs -    80.89 us/run -   1.61 MFLOP/run -  19.85 GFLOPS
+    G0 MUL_MAT(type_a=q4_0,type_b=f32,m=896,n=1,k=896,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0) ops_per_graph=8192 graphs=2 us_per_op med 85.5 min 76.2 max 85.5
+  MUL_MAT(type_a=q4_0,type_b=f32,m=128,n=1,k=896,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0):             24576 runs -    43.27 us/run - 229.38 kFLOP/run -   5.30 GFLOPS
+    G0 MUL_MAT(type_a=q4_0,type_b=f32,m=128,n=1,k=896,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0) ops_per_graph=8192 graphs=3 us_per_op med 39.6 min 39.0 max 51.2
+  MUL_MAT(type_a=q4_0,type_b=f32,m=4864,n=1,k=896,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0):                     8192 runs -   260.11 us/run -   8.72 MFLOP/run -  33.51 GFLOPS
+    G0 MUL_MAT(type_a=q4_0,type_b=f32,m=4864,n=1,k=896,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0) ops_per_graph=8192 graphs=1 us_per_op med 260.1 min 260.1 max 260.1
+  MUL_MAT(type_a=q4_0,type_b=f32,m=896,n=1,k=4864,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0):                     8192 runs -   232.55 us/run -   8.72 MFLOP/run -  37.48 GFLOPS
+    G0 MUL_MAT(type_a=q4_0,type_b=f32,m=896,n=1,k=4864,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0) ops_per_graph=8192 graphs=1 us_per_op med 232.6 min 232.6 max 232.6
+  MUL_MAT(type_a=q4_0,type_b=f32,m=151936,n=1,k=896,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0):                    368 runs -  6683.69 us/run - 272.27 MFLOP/run -  40.74 GFLOPS
+    G0 MUL_MAT(type_a=q4_0,type_b=f32,m=151936,n=1,k=896,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0) ops_per_graph=368 graphs=1 us_per_op med 6683.7 min 6683.7 max 6683.7
+  Backend Vulkan1: OK
+Backend 3/3: CPU
+  Skipping
+3/3 backends passed
+OK
+== reference: same, one op per graph (submit + sync per op)
+Backend 1/3: Vulkan0
+Backend 2/3: Vulkan1
+  Device description: AMD Radeon R5 M330 (RADV HAINAN)
+    G0 RMS_NORM(type=f32,ne=[4096,1,1,1],v=0,eps=0.000001,inplace=0) ops_per_graph=1 graphs=11234 us_per_op med 88.0 min 76.0 max 519.0
+    G0 RMS_NORM(type=f32,ne=[4096,2,1,1],v=0,eps=0.000001,inplace=0) ops_per_graph=1 graphs=11229 us_per_op med 78.0 min 76.0 max 597.0
+    G0 RMS_NORM(type=f32,ne=[4096,4,1,1],v=0,eps=0.000001,inplace=0) ops_per_graph=1 graphs=10839 us_per_op med 82.0 min 79.0 max 865.0
+    G0 RMS_NORM(type=f32,ne=[4096,8,1,1],v=0,eps=0.000001,inplace=0) ops_per_graph=1 graphs=7393 us_per_op med 135.0 min 84.0 max 492.0
+    G0 RMS_NORM(type=f32,ne=[4096,16,1,1],v=0,eps=0.000001,inplace=0) ops_per_graph=1 graphs=6780 us_per_op med 143.0 min 117.0 max 538.0
+    G0 RMS_NORM(type=f32,ne=[4096,32,1,1],v=0,eps=0.000001,inplace=0) ops_per_graph=1 graphs=4766 us_per_op med 202.0 min 185.0 max 660.0
+    G0 RMS_NORM(type=f32,ne=[4096,64,1,1],v=0,eps=0.000001,inplace=0) ops_per_graph=1 graphs=2813 us_per_op med 352.0 min 303.0 max 725.0
+    G0 SOFT_MAX(type=f32,ne=[151936,1,1,1],mask=0,sinks=0,m_prec=f32,nr23=[1,1],scale=1.000000,max_bias=0.000000,inplace=0) ops_per_graph=1 graphs=2586 us_per_op med 377.0 min 325.0 max 500.0
+    G0 MUL_MAT(type_a=q4_0,type_b=f32,m=1024,n=1,k=4096,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0) ops_per_graph=1 graphs=3878 us_per_op med 253.0 min 229.0 max 390.0
+    G0 MUL_MAT(type_a=q4_0,type_b=f32,m=2048,n=1,k=1024,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0) ops_per_graph=1 graphs=5218 us_per_op med 190.0 min 148.0 max 515.0
+    G0 MUL_MAT(type_a=q4_0,type_b=f32,m=1024,n=1,k=1024,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0) ops_per_graph=1 graphs=6839 us_per_op med 143.0 min 104.0 max 515.0
+    G0 MUL_MAT(type_a=q4_0,type_b=f32,m=1024,n=1,k=2048,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0) ops_per_graph=1 graphs=5101 us_per_op med 195.0 min 154.0 max 476.0
+    G0 MUL_MAT(type_a=q4_0,type_b=f32,m=3072,n=1,k=1024,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0) ops_per_graph=1 graphs=4199 us_per_op med 243.0 min 188.0 max 602.0
+    G0 MUL_MAT(type_a=q4_0,type_b=f32,m=1024,n=1,k=3072,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0) ops_per_graph=1 graphs=4073 us_per_op med 244.0 min 201.0 max 660.0
+    G0 MUL_MAT(type_a=q4_0,type_b=f32,m=151936,n=1,k=1024,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0) ops_per_graph=1 graphs=155 us_per_op med 6474.0 min 6393.0 max 6582.0
+    G0 MUL_MAT(type_a=q4_0,type_b=f32,m=896,n=1,k=1024,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0) ops_per_graph=1 graphs=6993 us_per_op med 141.0 min 101.0 max 675.0
+    G0 MUL_MAT(type_a=q4_0,type_b=f32,m=128,n=1,k=1024,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0) ops_per_graph=1 graphs=11049 us_per_op med 83.0 min 79.0 max 531.0
+    G0 MUL_MAT(type_a=q4_0,type_b=f32,m=4864,n=1,k=1024,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0) ops_per_graph=1 graphs=3279 us_per_op med 301.0 min 266.0 max 647.0
+    G0 MUL_MAT(type_a=q4_0,type_b=f32,m=896,n=1,k=5120,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0) ops_per_graph=1 graphs=3352 us_per_op med 298.0 min 253.0 max 386.0
+    G0 MUL_MAT(type_a=q4_0,type_b=f32,m=2048,n=1,k=2048,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0) ops_per_graph=1 graphs=3512 us_per_op med 267.0 min 239.0 max 710.0
+    G0 MUL_MAT(type_a=q4_0,type_b=f32,m=6144,n=1,k=2048,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0) ops_per_graph=1 graphs=1504 us_per_op med 664.0 min 578.0 max 756.0
+    G0 MUL_MAT(type_a=q4_0,type_b=f32,m=2048,n=1,k=6144,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0) ops_per_graph=1 graphs=1520 us_per_op med 655.0 min 582.0 max 1998.0
+    G0 MUL_MAT(type_a=q4_0,type_b=f32,m=151936,n=1,k=2048,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0) ops_per_graph=1 graphs=80 us_per_op med 12602.0 min 12518.0 max 12664.0
+    G0 MUL_MAT(type_a=q4_0,type_b=f32,m=896,n=1,k=896,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0) ops_per_graph=1 graphs=6455 us_per_op med 149.0 min 109.0 max 1788.0
+    G0 MUL_MAT(type_a=q4_0,type_b=f32,m=128,n=1,k=896,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0) ops_per_graph=1 graphs=11261 us_per_op med 78.0 min 76.0 max 513.0
+    G0 MUL_MAT(type_a=q4_0,type_b=f32,m=4864,n=1,k=896,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0) ops_per_graph=1 graphs=3068 us_per_op med 314.0 min 284.0 max 632.0
+    G0 MUL_MAT(type_a=q4_0,type_b=f32,m=896,n=1,k=4864,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0) ops_per_graph=1 graphs=3345 us_per_op med 295.0 min 253.0 max 656.0
+    G0 MUL_MAT(type_a=q4_0,type_b=f32,m=151936,n=1,k=896,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0) ops_per_graph=1 graphs=147 us_per_op med 6819.0 min 6749.0 max 6884.0
+  Backend Vulkan1: OK
+Backend 3/3: CPU
+pm levels seen during reference ops:      14 power level 0    sclk: 30000 mclk: 30000 vddc: 900 vddci: 0 pcie gen: 3;      1 power level 1    sclk: 40000 mclk: 100000 vddc: 900 vddci: 0 pcie gen: 3;    175 power level 4    sclk: 75000 mclk: 100000 vddc: 1150 vddci: 0 pcie gen: 3;
+== reference: llama-bench end to end, /root/g0/qwen2.5-0.5b-instruct-q4_0-pure.gguf
+ggml_vulkan: Found 1 Vulkan devices:
+ggml_vulkan: 0 = AMD Radeon R5 M330 (RADV HAINAN) (radv) | uma: 0 | fp16: 0 | bf16: 0 | fp4: 0 | warp size: 64 | shared memory: 32768 | int dot: 0 | matrix cores: none
+| model                          |       size |     params | backend    | ngl |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | --: | --------------: | -------------------: |
+| qwen2 1B Q4_0                  | 265.25 MiB |   494.03 M | Vulkan     |  99 |            tg64 |         29.72 ± 0.05 |
+build: unknown (0)
+pm levels seen during llama-bench on the Radeon:      23 power level 4    sclk: 75000 mclk: 100000 vddc: 1150 vddci: 0 pcie gen: 3;
+-- context arm: same model on the CPU (i5-6200U), every GPU device off
+ggml_vulkan: Found 2 Vulkan devices:
+ggml_vulkan: 0 = Intel(R) HD Graphics 520 (SKL GT2) (Intel open-source Mesa driver) | uma: 1 | fp16: 1 | bf16: 0 | fp4: 0 | warp size: 32 | shared memory: 49152 | int dot: 0 | matrix cores: none
+ggml_vulkan: 1 = AMD Radeon R5 M330 (RADV HAINAN) (radv) | uma: 0 | fp16: 0 | bf16: 0 | fp4: 0 | warp size: 64 | shared memory: 32768 | int dot: 0 | matrix cores: none
+| model                          |       size |     params | backend    | ngl | dev          |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | --: | ------------ | --------------: | -------------------: |
+| qwen2 1B Q4_0                  | 265.25 MiB |   494.03 M | Vulkan     |  -1 | none         |            tg64 |         54.39 ± 0.08 |
+build: unknown (0)
+pm levels seen on the Radeon during the CPU arm:       4 power level 0    sclk: 30000 mclk: 30000 vddc: 900 vddci: 0 pcie gen: 3;      9 power level 4    sclk: 75000 mclk: 100000 vddc: 1150 vddci: 0 pcie gen: 3;
+gpu after: power level 0    sclk: 30000 mclk: 30000 vddc: 900 vddci: 0 pcie gen: 3
+PASS timing-run

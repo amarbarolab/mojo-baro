@@ -1,6 +1,9 @@
 /* One harness for every amar_* elementwise kernel: load <dir>/<name>.spv, run it on the
    Radeon through rusticl, check against a CPU reference of the kernel's formula.
-   usage: host <spv-dir> [kernel...]     last line: PASS N/N  or  FAIL k/N <names>
+   usage: host <spv-dir> [--time] [R=n V=n GN=n GK=n] [kernel...]   last line: PASS N/N or FAIL k/N <names>
+   --time: before the parity pass, every dispatch is timed on the host clock (CLOCK_MONOTONIC around
+   enqueue + clFinish): 3 warmups, 11 single dispatches (sync), 11 batches of B enqueues and one clFinish
+   (batch, per dispatch). Each TIME line carries the read-back of the arm: sizes, scalar args, buffer bytes.
    Shapes mirror tools/spirv-probe/probe_all.mojo (layout strides are baked into the IR).
    Bars: float outputs max rel err <= 1e-5 vs an fp64 reference; integer outputs, bf16 -> f32
    and q8 codes/scales exact; f32 -> bf16 outputs must be the correct rounding of a value
@@ -14,9 +17,9 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define R 8
+#include <time.h>
+static int R = 8, V = 5003, GN = 1024, GK = 4096, TIME = 0;
 #define H 4096
-#define V 5003
 #define TV 1024
 #define K 64
 #define QM 8
@@ -25,7 +28,10 @@
 #define REPS 3
 #define TOL 1e-5
 
-typedef struct { cl_context ctx; cl_command_queue q; cl_device_id dev; const char *dir; char why[256]; } Env;
+typedef struct { cl_context ctx; cl_command_queue q; cl_device_id dev; const char *dir; char why[256]; int timing; } Env;
+static double now_us(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e6 + t.tv_nsec / 1e3; }
+static int cmp_d(const void *a, const void *b) { double x = *(const double *)a, y = *(const double *)b; return (x > y) - (x < y); }
+static void stats(double *t, int n, char *out, size_t cap) { qsort(t, n, sizeof *t, cmp_d); snprintf(out, cap, "med %.1f min %.1f max %.1f", t[n / 2], t[0], t[n - 1]); }
 
 static uint32_t rng = 12345;
 static float rnd(void) { rng = rng * 1664525u + 1013904223u; return (float)(rng >> 8) / 8388608.0f - 1.0f; }
@@ -57,6 +63,21 @@ static int launch(Env *e, const char *name, int n, cl_mem *a, size_t groups_x, s
     cl_kernel k = load(e, name); if (!k) return 1;
     for (int i = 0; i < n; i++) { cl_int err = clSetKernelArg(k, i, sizeof(cl_mem), &a[i]); if (err) return fail(e, "clSetKernelArg %g = %g", i, err); }
     size_t g[2] = {groups_x * local, groups_y}, l[2] = {local, 1};
+    if (e->timing) {
+        double ts[11], tb[11]; char a1[96], a2[96], args[512] = ""; size_t kwg = 0;
+        for (int w = 0; w < 3; w++) if (clEnqueueNDRangeKernel(e->q, k, 2, NULL, g, l, 0, NULL, NULL) || clFinish(e->q)) return fail(e, "timing warmup failed", 0, 0);
+        for (int r = 0; r < 11; r++) { double t0 = now_us(); if (clEnqueueNDRangeKernel(e->q, k, 2, NULL, g, l, 0, NULL, NULL) || clFinish(e->q)) return fail(e, "timed dispatch failed", 0, 0); ts[r] = now_us() - t0; }
+        stats(ts, 11, a1, sizeof a1); int B = ts[5] < 20000 ? 32 : 4;
+        for (int r = 0; r < 11; r++) { double t0 = now_us(); for (int b = 0; b < B; b++) if (clEnqueueNDRangeKernel(e->q, k, 2, NULL, g, l, 0, NULL, NULL)) return fail(e, "batched enqueue failed", 0, 0); if (clFinish(e->q)) return fail(e, "batched finish failed", 0, 0); tb[r] = (now_us() - t0) / B; }
+        stats(tb, 11, a2, sizeof a2);
+        clGetKernelWorkGroupInfo(k, e->dev, CL_KERNEL_WORK_GROUP_SIZE, sizeof kwg, &kwg, NULL);
+        for (int i = 0; i < n; i++) {
+            size_t sz = 0; clGetMemObjectInfo(a[i], CL_MEM_SIZE, sizeof sz, &sz, NULL); size_t len = strlen(args);
+            if (sz == 4) { union { int32_t i; float f; } v; clEnqueueReadBuffer(e->q, a[i], CL_TRUE, 0, 4, &v, 0, NULL, NULL); snprintf(args + len, sizeof args - len, " a%d=i%d/f%g", i, v.i, v.f); }
+            else snprintf(args + len, sizeof args - len, " a%d=%zuB", i, sz);
+        }
+        printf("TIME %s global=%zux%zu local=%zu max_wg=%zu | sync_us %s | batch_us(B=%d) %s | readback:%s\n", name, g[0], g[1], l[0], kwg, a1, B, a2, args);
+    }
     cl_int err = clEnqueueNDRangeKernel(e->q, k, 2, NULL, g, l, 0, NULL, NULL); if (err) return fail(e, "enqueue %g", err, 0);
     err = clFinish(e->q); if (err) return fail(e, "clFinish %g", err, 0);
     return 0;
@@ -80,7 +101,7 @@ static void rms_inputs(int n) {
     }
 }
 static int t_rmsnorm(Env *e, double *w) {
-    int n = 4001; rms_inputs(n);
+    int n = TIME ? H : 4001; rms_inputs(n);
     float *o = malloc(4 * R * H); for (int i = 0; i < R * H; i++) o[i] = SENT;
     cl_mem bo = buf(e, 4 * R * H, o), a[5] = {buf(e, 4 * R * H, X), buf(e, 4 * H, G), bo, ci(e, n), cf(e, 1e-6f)};
     if (launch(e, "amar_rmsnorm", 5, a, R, 1, EW) || rd(e, bo, 4 * R * H, o)) return 1;
@@ -90,8 +111,37 @@ static int t_rmsnorm(Env *e, double *w) {
     }
     return *w > TOL ? fail(e, "max rel err %.3e > %.0e", *w, TOL) : 0;
 }
+/* Barrier-cost control arm: the same rmsnorm with no barrier and no local memory. Kernel 1 writes the 256
+   per-thread partial sums per row, the host reads them back, reduces on the CPU and uploads one scale per
+   row, kernel 2 applies it. Two dispatches, one blocking read, one write per call. */
+static const char *HR_SRC =
+    "kernel void hr_part(global const float *x, global float *part, int n) { size_t row = get_group_id(0), tid = get_local_id(0); float s = 0;"
+    "  for (size_t i = tid; i < (size_t)n; i += 256) s += x[row * 4096 + i] * x[row * 4096 + i]; part[row * 256 + tid] = s; }"
+    "kernel void hr_apply(global const float *x, global const float *g, global float *o, global const float *scale, int n) { size_t row = get_group_id(0);"
+    "  for (size_t i = get_local_id(0); i < (size_t)n; i += 256) o[row * 4096 + i] = x[row * 4096 + i] * scale[row] * g[i]; }";
+static int t_rmsnorm_hostreduce(Env *e, double *w) {
+    int n = TIME ? H : 4001; rms_inputs(n); cl_int err;
+    cl_program p = clCreateProgramWithSource(e->ctx, 1, &HR_SRC, NULL, &err); if (err || clBuildProgram(p, 1, &e->dev, "", NULL, NULL)) return fail(e, "hostreduce build failed", 0, 0);
+    cl_kernel k1 = clCreateKernel(p, "hr_part", &err), k2 = clCreateKernel(p, "hr_apply", &err); if (err) return fail(e, "hostreduce kernels", 0, 0);
+    float *o = malloc(4 * R * H), *part = malloc(4 * R * 256), *scale = malloc(4 * R); for (int i = 0; i < R * H; i++) o[i] = SENT;
+    cl_mem bx = buf(e, 4 * R * H, X), bg = buf(e, 4 * H, G), bo = buf(e, 4 * R * H, o), bp = buf(e, 4 * R * 256, NULL), bs = buf(e, 4 * R, NULL);
+    clSetKernelArg(k1, 0, sizeof bx, &bx); clSetKernelArg(k1, 1, sizeof bp, &bp); clSetKernelArg(k1, 2, 4, &n);
+    clSetKernelArg(k2, 0, sizeof bx, &bx); clSetKernelArg(k2, 1, sizeof bg, &bg); clSetKernelArg(k2, 2, sizeof bo, &bo); clSetKernelArg(k2, 3, sizeof bs, &bs); clSetKernelArg(k2, 4, 4, &n);
+    size_t g = (size_t)R * 256, l = 256; double ts[11]; char a1[96];
+    for (int r = -3; r < (e->timing ? 11 : -2); r++) {
+        double t0 = now_us();
+        if (clEnqueueNDRangeKernel(e->q, k1, 1, NULL, &g, &l, 0, NULL, NULL) || clEnqueueReadBuffer(e->q, bp, CL_TRUE, 0, 4 * R * 256, part, 0, NULL, NULL)) return fail(e, "hostreduce phase 1", 0, 0);
+        for (int row = 0; row < R; row++) { double ss = 0; for (int t = 0; t < 256; t++) ss += part[row * 256 + t]; scale[row] = (float)(1.0 / sqrt(ss / n + (double)1e-6f)); }
+        if (clEnqueueWriteBuffer(e->q, bs, CL_FALSE, 0, 4 * R, scale, 0, NULL, NULL) || clEnqueueNDRangeKernel(e->q, k2, 1, NULL, &g, &l, 0, NULL, NULL) || clFinish(e->q)) return fail(e, "hostreduce phase 2", 0, 0);
+        if (r >= 0) ts[r] = now_us() - t0;
+    }
+    if (e->timing) { stats(ts, 11, a1, sizeof a1); printf("TIME amar_rmsnorm_hostreduce global=%zux1 local=%zu rows=%d n=%d dispatches=2 blocking_reads=1 | sync_us %s | batch_us n/a (the read is a sync)\n", g, l, R, n, a1); }
+    if (rd(e, bo, 4 * R * H, o)) return 1;
+    for (int r = 0; r < R; r++) for (int i = 0; i < n; i++) { double x = rel(o[r * H + i], REF[r * H + i]); if (x > *w) *w = x; }
+    return *w > TOL ? fail(e, "max rel err %.3e > %.0e", *w, TOL) : 0;
+}
 static int rms_cast(Env *e, double *w, int two) {
-    int n = 4001; rms_inputs(n);
+    int n = TIME ? H : 4001; rms_inputs(n);
     uint16_t *o = malloc(2 * R * H); for (int i = 0; i < R * H; i++) o[i] = 0xABCD;
     float *f = malloc(4 * H); for (int i = 0; i < H; i++) f[i] = SENT;
     cl_mem bo = buf(e, 2 * R * H, o), bf = buf(e, 4 * H, f), a[6] = {buf(e, 4 * R * H, X), buf(e, 4 * H, G), bo};
@@ -217,8 +267,6 @@ static int t_quantize_q8_rows(Env *e, double *w) {
 }
 
 /* G1 scouting, not part of the default 13: the engine's m = 1 q4 GEMV (ggml Q4_0 layout) and its reduce. */
-#define GN 1024
-#define GK 4096
 static int gemv(Env *e, double *w, int reduce) {
     uint16_t *a = malloc(2 * GK), *sc = malloc(2 * GN * (GK / 32)); uint8_t *q = malloc(GN * (GK / 2)); float *p = malloc(4 * GN), *c = malloc(4 * GN);
     for (int i = 0; i < GK; i++) a[i] = to_bf16(rnd() * 2);
@@ -231,7 +279,6 @@ static int gemv(Env *e, double *w, int reduce) {
         cl_mem r[4] = {bp, bc, ci(e, 1), ci(e, GN)};
         if (launch(e, "amar_skinny_reduce", 4, r, (GN + EW - 1) / EW, 1, EW) || rd(e, bc, 4 * GN, c)) return 1;
         for (int i = 0; i < GN; i++) if (c[i] != p[i]) return fail(e, "C[%g] = %g is not Cp", i, c[i]);
-        return 0;
     }
     for (int row = 0; row < GN; row++) {
         double dot = 0, mag = 0;
@@ -259,28 +306,37 @@ static const struct { const char *name; int (*run)(Env *, double *); const char 
     {"amar_argmax_pos", t_argmax_pos, "exact, err"}, {"amar_argmax_row", t_argmax_row, "exact, err"},
     {"amar_tok_copy", t_tok_copy, "exact, err"}, {"amar_tok_remap", t_tok_remap, "exact, err"},
     {"amar_quantize_q8_rows", t_quantize_q8_rows, "codes and f16 scales exact, err"},
-    {"amar_matmul_skinny_q4rowb", t_q4rowb, "max err relative to sum|terms|"}, {"amar_skinny_reduce", t_reduce, "exact copy of the GEMV partials, err"},
+    {"amar_rmsnorm_hostreduce", t_rmsnorm_hostreduce, "max rel err"},
+    {"amar_matmul_skinny_q4rowb", t_q4rowb, "max err relative to sum|terms|"}, {"amar_skinny_reduce", t_reduce, "GEMV max err relative to sum|terms|, reduce an exact copy"},
 };
 
 int main(int argc, char **argv) {
-    if (argc < 2) { printf("FAIL usage: host <spv-dir> [kernel...]\n"); return 2; }
+    if (argc < 2) { printf("FAIL usage: host <spv-dir> [--time] [R=n V=n GN=n GK=n] [kernel...]\n"); return 2; }
+    int named = 0;
+    for (int i = 2; i < argc; i++) {
+        if (!strcmp(argv[i], "--time")) TIME = 1;
+        else if (sscanf(argv[i], "R=%d", &R) == 1 || sscanf(argv[i], "V=%d", &V) == 1 || sscanf(argv[i], "GN=%d", &GN) == 1 || sscanf(argv[i], "GK=%d", &GK) == 1) continue;
+        else named++;
+    }
     Env e = {.dir = argv[1]}; cl_platform_id p; cl_device_id devs[8]; cl_uint nd = 0; cl_int err; char name[256] = "";
     if (clGetPlatformIDs(1, &p, NULL) || clGetDeviceIDs(p, CL_DEVICE_TYPE_GPU, 8, devs, &nd) || !nd) { printf("FAIL device: no OpenCL GPU (RUSTICL_ENABLE=radeonsi set?)\n"); return 1; }
     e.dev = NULL;
     for (cl_uint i = 0; i < nd; i++) { clGetDeviceInfo(devs[i], CL_DEVICE_NAME, sizeof name, name, NULL); if (strstr(name, "Radeon")) { e.dev = devs[i]; break; } }
     if (!e.dev) { printf("FAIL device: no Radeon among %u GPU devices (last: %s)\n", nd, name); return 1; }
-    printf("device: %s\n", name);
+    char drv[128] = "", ver[128] = ""; clGetDeviceInfo(e.dev, CL_DRIVER_VERSION, sizeof drv, drv, NULL); clGetDeviceInfo(e.dev, CL_DEVICE_VERSION, sizeof ver, ver, NULL);
+    printf("device: %s | driver %s | %s | shapes R=%d H=%d V=%d GN=%d GK=%d\n", name, drv, ver, R, H, V, GN, GK);
     e.ctx = clCreateContext(NULL, 1, &e.dev, NULL, NULL, &err); if (err) { printf("FAIL context: %d\n", err); return 1; }
     e.q = clCreateCommandQueueWithProperties(e.ctx, e.dev, NULL, &err); if (err) { printf("FAIL queue: %d\n", err); return 1; }
     X = malloc(4 * R * H); G = malloc(4 * H); REF = malloc(8 * R * H);
     int total = 0, bad = 0; char names[1024] = "";
     for (size_t c = 0; c < sizeof CASES / sizeof CASES[0]; c++) {
-        int want = argc == 2 && c < DEFAULT_CASES; for (int i = 2; i < argc; i++) want |= !strcmp(argv[i], CASES[c].name);
+        int want = !named && c < DEFAULT_CASES; for (int i = 2; i < argc; i++) want |= !strcmp(argv[i], CASES[c].name);
         if (!want) continue;
         total++; int failed = 0; double worst = 0;
-        for (int rep = 0; rep < REPS && !failed; rep++) { double w = 0; rng = 12345 + 977 * rep; failed = CASES[c].run(&e, &w); if (w > worst) worst = w; }
+        if (TIME) { double w = 0; rng = 12345; e.timing = 1; CASES[c].run(&e, &w); e.timing = 0; }
+        for (int rep = 0; rep < (TIME ? 1 : REPS) && !failed; rep++) { double w = 0; rng = 12345 + 977 * rep; failed = CASES[c].run(&e, &w); if (w > worst) worst = w; }
         if (failed) { bad++; strcat(names, " "); strcat(names, CASES[c].name); printf("FAIL %s: %s\n", CASES[c].name, e.why); }
-        else printf("PASS %s x%d  %s %.3e\n", CASES[c].name, REPS, CASES[c].metric, worst);
+        else printf("PASS %s x%d  %s %.3e\n", CASES[c].name, TIME ? 1 : REPS, CASES[c].metric, worst);
     }
     if (!total) { printf("FAIL no kernel matched\n"); return 1; }
     if (bad) { printf("FAIL %d/%d%s\n", bad, total, names); return 1; }
