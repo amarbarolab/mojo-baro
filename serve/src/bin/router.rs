@@ -51,6 +51,8 @@ impl DiscoveryAdvertisement {
         let mut txt = BTreeMap::new();
         txt.insert("v".into(), "1".into());
         txt.insert("ni".into(), port.to_string());
+        // PAIR keys its directory by the UUID in the consolidated node record.
+        txt.insert("uuid".into(), node_id.into());
         txt.insert("node_id".into(), node_id.into());
         Self {
             instance: format!("baro-{node_id}"),
@@ -321,6 +323,10 @@ async fn node_info(State(Shared(state)): State<Shared>) -> Json<Value> {
     Json(json!({
         "schema": 1,
         "node_id": state.node_id,
+        "hostUuid": state.node_id,
+        "GPUs": [],
+        "telemetryValid": false,
+        "msSince": 0,
         "http_port": state.http_port,
         "engines": engines,
         "pending": engines.iter().map(|e| e.pending).sum::<usize>(),
