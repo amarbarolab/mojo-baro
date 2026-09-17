@@ -1,3 +1,8 @@
+# VENDORED COPY. Upstream is ~/iTools/lib/mojo/gguf-reader.mojo; this repo keeps
+# a real file rather than a symlink, because a clone must build without anything
+# outside it. Sync by hand if the upstream changes; tools/ci-checks.sh compares
+# the two when the upstream is present and says so when they drift.
+#
 # Generic GGUF v3 header reader for Mojo tools that need a model's own metadata
 # and tensor shapes (dims, dtype, offset) -- not just the tokenizer.* keys.
 # Self-contained: no dependency on any other project's tokenizer/parser code.
