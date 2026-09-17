@@ -203,3 +203,12 @@ the timed run specifically so a live number near it is not later read as a
 surprise. Kill line unchanged: any identity miss, or a live shrink worse
 than the offline number (would mean the hot store is not being reached,
 P8).
+
+## Pinned store by default (2026-09-17, the maintainer's decision, `5ad2e2d`)
+
+`BARO_TIER_PINNED` defaults to 1. Receipt on the merged main (`.work/tier-pinned-default/`, engine
+`-D BARO_MODEL=qwen35moe`, cap 64, `BARO_MEGA=0 BARO_SPEC=0`, 20 prompts, one stint under
+`bench/clock-probe.sh`, sclk median 3279 MHz): page-cache arm (`BARO_TIER_PINNED=0`) 48.99 tok/s_gen,
+default arm 67.54, ratio 1.379, identity 20/20, each arm's own start-up line reading `mode page-cache`
+and `mode pinned` respectively (P1). Matches stage 3 item 0 (48.57 / 67.12). Cost: 18.3 GB of locked
+host RAM for the engine's lifetime; `=0` restores the page cache.
