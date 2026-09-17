@@ -8,12 +8,13 @@
 
 use super::*;
 
-/// The coordinator's literal contract (room A, 2026-09-17): `{"error":
-/// "embeddings_pending", "see": "P0a-e"}`, not `ApiError::Plain`'s generic
-/// `{"error": {"message": ..., "type": ..., "code": ...}}` shape -- a gate
-/// or client parsing `error` as a string would otherwise see an object.
-fn pending() -> Response {
-    (StatusCode::NOT_IMPLEMENTED, Json(json!({"error": "embeddings_pending", "see": "P0a-e"}))).into_response()
+/// Coordinator's answer (room A, 2026-09-17): keep the repo-wide
+/// `ApiError::Plain` shape (`{"error": {"message", "type", "code"}}`); the
+/// earlier literal `{"error":"embeddings_pending",...}` was shorthand, not
+/// a contract. `embeddings_pending` and `P0a-e` stay in the message text so
+/// a gate can still assert on them.
+fn pending() -> ApiError {
+    ApiError::Plain(StatusCode::NOT_IMPLEMENTED, "embeddings_pending: see P0a-e (engine wire addition for the hidden state)".into())
 }
 
 #[derive(Deserialize)]
@@ -29,8 +30,8 @@ pub struct EmbeddingsReq {
     prompt: Option<Value>,
 }
 
-pub async fn embeddings(State(_app): State<Shared>, Json(_r): Json<EmbeddingsReq>) -> Response {
-    pending()
+pub async fn embeddings(State(_app): State<Shared>, Json(_r): Json<EmbeddingsReq>) -> Result<Json<Value>, ApiError> {
+    Err(pending())
 }
 
 #[cfg(test)]
@@ -38,11 +39,13 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn pending_response_is_501_with_the_coordinators_literal_shape() {
-        let resp = pending();
+    async fn pending_response_is_501_naming_embeddings_pending_and_p0a_e() {
+        let resp = pending().into_response();
         assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let v: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(v, json!({"error": "embeddings_pending", "see": "P0a-e"}));
+        let msg = v["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("embeddings_pending") && msg.contains("P0a-e"), "{msg}");
+        assert_eq!(v["error"]["code"], 501);
     }
 }
