@@ -136,3 +136,39 @@ What this changes, and what it does not:
   independent producer's file, `n_restored`, `cache_n`, 32 tokens generated) and prints
   `restored_equals_cold` as its own line. That line was a hard failure until it failed on bytes the
   tool did not author. The change was made after that failure, which is why it is written down here.
+
+## Amendment 2, 2026-09-17, after one QUICK GPU run of 2 prompts and before any full run
+
+I have now seen GPU data: lily, 2 prompts, falsifier on (`.work/fork/g4-gate/lily-quick`). It is a
+QUICK run and is no claim (P18). Everything below was decided after looking at it, so it is listed
+as such. **No threshold, no prediction and no verdict rule changes.**
+
+What the quick run showed: no voids; the K/V-swapped falsifier failed 0 of 2 at index 0 while
+llama.cpp accepted and reused the swapped files, so the gate can see the bridge on the GPU route
+too. p02 was identical on every arm. p01 diverged from the cold reference at index 27 on control L,
+control N and the primary alike, and those three agree with each other on all 32 tokens. The only
+outlier on that prompt is llama.cpp's cold one-batch run. Two prompts is an observation, not a
+finding.
+
+1. **A reported-only column: the primary against control L.** Both arms restore at `|P| - 1` and
+   evaluate one token, so that comparison carries no batch-shape difference, unlike anything
+   measured against cold. It asks the bridge's own question: does our state make llama.cpp produce
+   what its own state makes it produce? It is printed beside the verdict and read by no verdict
+   rule. I am adding it because p01 made the need obvious, which is exactly why it cannot be a
+   gate: a metric chosen after seeing data is a description. The plan's bar stays the primary.
+2. **The read-back reads what the running systems wrote.** This build's llama-server log is silent
+   on KV type and flash attention, and my first read-back printed `flash_attn=?`. By P1 that is no
+   receipt. The slot files llama.cpp itself writes for control L carry the K/V type code, the row
+   bytes and `v_trans`, which llama.cpp sets to 0 only with flash attention on;
+   `tools/slot-readback.py` requires one stream, `v_trans 0` and f16 on every file or the gate
+   FAILS. Offload is read from control L's decode rate (108.9 tok/s on the GPU run against 9.7 in
+   the CPU preflight, same model, same machine). Ours: `GET /v1/state` reporting `kv f32` is
+   baro-serve echoing an environment variable, so it is NOT a read-back and is not used as one; the
+   receipt is the tool accepting every exported file by its `BAROST01` magic and exact length, and
+   one `state saved` line per prompt in the engine log, both hard checks.
+3. **A deviation of mine from this note, corrected.** The note says prompts are tokenized with our
+   tokenizer as `bench/dense-run.sh` does. My first harness asked baro-serve's `/tokenize` instead;
+   a spark pack carries no `tokenizer.json`, so that route is 503, and the first GPU job died in
+   seconds (loudly, nothing left running). The harness now runs `tools/baro-tokenize encode` from
+   the GGUF on the CPU before any GPU job. On p01 our ids equal llama.cpp's own tokenization
+   exactly (17 ids).

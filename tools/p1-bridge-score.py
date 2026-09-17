@@ -43,6 +43,9 @@ for p in names:
             # reuse is reported and leaves that prompt UNATTRIBUTED, it does not void the gate
             (voids if arm != "ctrlL" else row.setdefault("notes", [])).append(msg)
         row[arm] = first_div(cold["tokens"], d["tokens"]) if reused else "void"
+    a, b = load(p, "primary"), load(p, "ctrlL")
+    if a is not None and b is not None and row.get("primary") != "void" and row.get("ctrlL") != "void":
+        row["vsL"] = first_div(b["tokens"], a["tokens"])
     ours = load(p, "ours")
     if ours is not None:
         row["ctrlN"] = first_div(cold["tokens"], ours["choices"][0]["tokens"][:32])
@@ -59,6 +62,11 @@ for r in rows:
         print(f"    control L not usable: {n}")
 prim, ctl = same("primary"), same("ctrlL")
 print(f"identical of {N}: control L {ctl}, control N {same('ctrlN') if have_n else 'n/a'}, primary {prim}" + (f", falsifier {same('falsify')}" if falsify else ""))
+# Reported, never gated (amendment 2): does OUR state make llama.cpp produce what ITS OWN state
+# at the same position makes it produce? Both arms restore at |P|-1 and evaluate one token, so
+# this comparison has no batch-shape difference in it, unlike anything measured against cold.
+vs = [r for r in rows if "vsL" in r]
+print(f"reported only: primary identical to control L on {sum(1 for r in vs if r['vsL'] is None)} of {len(vs)}" + "".join(f"; {r['p']} differs at {r['vsL']}" for r in vs if r["vsL"] is not None))
 
 if voids:
     print(f"RESULT {model}: VOID, {len(voids)} void(s); a void is a failure (P10)")

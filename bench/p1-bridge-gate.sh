@@ -3,7 +3,8 @@
 #
 # P1 gate 4 (bench/p1-bridge-protocol.md, frozen 599d8fd + amendment 1): E15's three models
 # continue in llama.cpp from OUR exported state.
-#   ours     (GPU job)  baro-serve: our tokenizer, our cold 32 ids (control N), LAT1 state export
+#   tokenize (CPU)      our tokenizer from the GGUF (tools/baro-tokenize), before any GPU job
+#   ours     (GPU job)  baro-serve: our cold 32 ids (control N), LAT1 state export
 #   convert  (CPU)      tools/state-to-llama-slot per state; K/V-swapped copies for the falsifier
 #   llama    (GPU job)  llama-server: cold ids (refcache, P17), control L, primary, falsifier
 #   score    (CPU)      verdict by the frozen rules; a void is a failure
@@ -26,6 +27,7 @@ server=${LLAMA_SERVER:-$HOME/llama.cpp/build/bin/llama-server}
 serve=serve/target/release/baro-serve
 fwd=.work/fork/state-to-llama-slot
 rev=.work/fork/llama-slot-to-state
+tok=.work/fork/baro-tokenize
 refcache=$HOME/iTools/harness/refcache/refcache.sh
 py=./.venv/bin/python
 case "$name" in
@@ -71,7 +73,7 @@ start_llama() {  # TAG; sets $lurl
   done
   curl -sf "$lurl/health" >/dev/null 2>&1 || fail "llama-$1" "no /health in 600 s"
   curl -sf "$lurl/props" > "$out/llama-props-$1.json" || fail "llama-$1" "/props"
-  echo "llama readback ($1): $($py -c "import json;d=json.load(open('$out/llama-props-$1.json'));print('n_ctx',d['default_generation_settings']['n_ctx'],'model',d.get('model_path'))") $(grep -m1 -oE 'flash_attn *= *[a-z0-9]+' "$out/llama-$1.log" || echo 'flash_attn=?') $(grep -m1 -oE 'type_k *= *[^,]+' "$out/llama-$1.log" || echo 'type_k=?')" | tee -a "$out/arm.txt"
+  echo "llama readback ($1): $($py -c "import json;d=json.load(open('$out/llama-props-$1.json'));print('n_ctx',d['default_generation_settings']['n_ctx'],'build',d.get('build_info'),'model',d.get('model_path'))")" | tee -a "$out/arm.txt"
 }
 
 phase_standin() {  # PREFLIGHT only: llama.cpp's own state at |P|-1 stands in for ours
@@ -107,8 +109,7 @@ phase_ours() {
   local ourl; ourl=$(grep -m1 -oE 'http://[0-9.:]+' "$out/ours.stdout") || fail ours "no listening line in 1200 s"
   echo "ours readback: engine_sha=$(sha256sum "$engine" | cut -c1-16) pack=$pack pack_sha=$($py -c "import json;print(json.load(open('$pack/identity.json'))['pack_sha256'][:16])") state=$(curl -sf "$ourl/v1/state" | $py -c "import json,sys;d=json.load(sys.stdin);print('portable',d['portable'],'kv',d['kv'])")" | tee -a "$out/arm.txt"
   for p in "${names[@]}"; do
-    $py -c "import json,sys;print(json.dumps({'content':open(sys.argv[1]).read()}))" "bench/mtp-prompts/$p.txt" > "$out/req.json"
-    post "$ourl/tokenize" "$out/req.json" | $py -c "import json,sys;print(','.join(str(x) for x in json.load(sys.stdin)['tokens']))" > "$out/ids/$p.ids" || fail ours "$p tokenize"
+    [ -s "$out/ids/$p.ids" ] || fail ours "$p has no ids (tokenized on the CPU before this job)"
     ids=$(cat "$out/ids/$p.ids")
     printf '{"prompt":[%s],"max_tokens":32,"temperature":0,"spec":false}' "$ids" > "$out/req.json"
     post "$ourl/v1/completions" "$out/req.json" > "$out/ids/$p.ours.json" || fail ours "$p completion"
@@ -116,7 +117,9 @@ phase_ours() {
     curl -sS --fail-with-body -X POST "$ourl/v1/state/export" -H 'content-type: application/json' --data @"$out/req.json" -o "$out/states/$p.state" || fail ours "$p export: $(head -c 300 "$out/states/$p.state")"
   done
   stop
-  echo "ours readback: $(grep -c 'state saved:' "$out/ours.stderr") state-saved lines for ${#names[@]} prompts; $(grep -m1 -i 'kv dtype' "$out/ours.stderr" || echo 'no kv dtype line in the engine log')" | tee -a "$out/arm.txt"
+  local ns; ns=$(grep -c 'state saved:' "$out/ours.stderr" || true)
+  [ "$ns" = "${#names[@]}" ] || fail ours "$ns state-saved lines for ${#names[@]} prompts"
+  echo "ours readback: $ns/${#names[@]} state-saved lines in the engine log" | tee -a "$out/arm.txt"
 }
 
 phase_llama() {
@@ -151,6 +154,16 @@ job() { gpu-wait run --priority 50 --vram 23 --timeout 1500 -- env HOME="$HOME" 
 if [ "$pre" = 1 ]; then phase_standin
 else
   [ -f "$pack/identity.json" ] || $py tools/engine-pack.py --identity "$pack" > "$out/identity.log" 2>&1 || fail identity "engine-pack.py --identity, $out/identity.log"
+  # Our tokenizer, on the CPU, from the GGUF (the protocol's wording; bench/dense-run.sh does the
+  # same). Not baro-serve's /tokenize: a spark pack carries no tokenizer.json, so that route is 503,
+  # and tokenizing is not GPU work anyway.
+  [ -x "$tok" ] || ./.venv/bin/mojo build tools/baro-tokenize.mojo -I . -I serve -o "$tok" > "$out/build-tok.log" 2>&1 || fail build "baro-tokenize, $out/build-tok.log"
+  badt=()
+  for p in "${names[@]}"; do
+    "$tok" encode "bench/mtp-prompts/$p.txt" "$gguf" 2> "$out/ids/$p.tok.log" | paste -sd, - > "$out/ids/$p.ids"
+    grep -qE '^[0-9]+(,[0-9]+)+$' "$out/ids/$p.ids" || badt+=("$p")
+  done
+  [ "${#badt[@]}" = 0 ] || fail tokenize "${#badt[@]}/${#names[@]} ${badt[*]}"
   job ours
 fi
 
@@ -163,4 +176,13 @@ done
 [ "${#badc[@]}" = 0 ] || fail convert "${#badc[@]}/${#names[@]} ${badc[*]}"
 
 if [ "$pre" = 1 ]; then phase_llama; else job llama; fi
+
+# Read-back from what the running systems WROTE, not from the flags passed (P1). This build's
+# llama-server log is silent on KV type and flash attention, but the slot files it writes are not.
+rb=$($py tools/slot-readback.py $(for p in "${names[@]}"; do echo "$out/slots/ctrlL-$p.slot"; done)) || fail readback "$rb"
+echo "llama readback (slot files it wrote): $rb" | tee -a "$out/arm.txt"
+echo "llama readback (offload, from timings): $($py tools/slot-readback.py --decode-rate "$out" "${names[@]}")" | tee -a "$out/arm.txt"
+nb=$(grep -l 'BAROST0[12] pos' "$out"/slots/*.convert.log | wc -l)
+[ "$nb" = "${#names[@]}" ] || fail readback "only $nb/${#names[@]} states were read as BAROST by the tool"
+echo "ours readback (state files it wrote): $nb/${#names[@]} accepted by the tool's magic and length checks ($(grep -ho 'BAROST0[12]' "$out"/slots/*.convert.log | sort -u | tr '\n' ' '))" | tee -a "$out/arm.txt"
 $py tools/p1-bridge-score.py "$out" "$name" "$pre" "$falsify" "${names[@]}"
