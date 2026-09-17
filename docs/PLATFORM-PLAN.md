@@ -96,8 +96,9 @@ on 11434 as Ollama and routes a request to it; receipt is PAIR's workload log na
 **Kill line:** any mismatch in gate 1 or 2. Gate 3 does not void the item, but it is the plan's first
 falsifier: a failure is reported to the coordinator the moment it is seen, as its own message, and the
 teams keep building with `baro-router` as the primary path (team A). Gate 3 needs PAIR's own node, which
-`pair-dispatch` does not build: `services/build.sh` in the PAIR checkout builds the engine manager, node
-scanner and Ollama proxy; the iTool `pair-node-up` wraps it. **GPU:** minutes.
+`pair-dispatch` does not build: `services/build.sh` in the PAIR checkout builds all 13 service binaries into `services/build/bin/`
+(measured 2026-09-17: exit 0 on this box, Go 1.27, log `.work/pair/build.log`); the engine manager adopts
+whatever already answers on an engine's fixed port when `engine:start` runs (its README, Adoption). **GPU:** minutes.
 
 ## P1. LatentOS as a standard ability (M)
 
