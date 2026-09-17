@@ -189,9 +189,10 @@ two of the three live candidates are outside the engine.
   First run (`.work/p4/trace-soak1/`, 60 requests of p08-sql in one process): 60 of 60 tables
   identical over 89 positions x 85 cells, token stream identical to the untraced engine's, so
   the trace build is identity-checked against the untraced build on that prompt and it caught
-  nothing because nothing happened. The DEFAULT build of the edited `spark.mojo` (trace off)
-  compiles (`.work/p4/bin-default-check/`) but has NOT been run on the GPU since the edit:
-  UNVERIFIED, re-run the gate before merging this branch anywhere.
+  nothing because nothing happened. The DEFAULT build of the edited `spark.mojo` (trace off),
+  rebuilt from the tree with main merged in (`.work/p4/bin-merged/`), was then run on the iGPU:
+  5 of 5 p08-sql streams identical to the pre-edit engine's stream and no trace file written
+  (`.work/p4/default-verify/`), so the edit is inert when the define is off.
 
 ## 6. Exactly what is unresolved
 
@@ -215,3 +216,10 @@ gate run outside the queue, which I stopped by hand. The watcher now guards the 
 kills its child on exit, and was exercised on CPU against a stub gate body before the re-submit.
 Machine-wide for the day: `gpu-wait stats --days 1` = 278 jobs, 180 ok, 85 failed, 13 cancelled,
 421 min busy.
+
+## 8. Merge receipts (2026-09-17, after merging `main` into `lane-p4`, `e49c726`)
+
+- `./run-tests.sh` under `gpu-wait` on the lane worktree: rc=0, log `.work/run-tests-lane-p4.log`.
+- `tools/ci-checks.sh` on the merged tree: exit 0, "all non-GPU checks passed" (`.work/p4/ci-merged.out`).
+- Default-build identity check above: `.work/p4/default-verify/SUMMARY.txt`, 5 requests, 0 glitched.
+- P4 itself stays FAILED: what merges is the diagnosis, the instruments and the trace define, not a pass.
