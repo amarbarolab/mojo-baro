@@ -390,6 +390,67 @@ def q4k_dot_blocks[
     return warp.sum(acc.reduce_add())
 
 
+@always_inline
+def q4k_dot_blocks_fill[
+    XLayout: TensorLayout,
+](
+    X: TileTensor[bf16, XLayout, MutAnyOrigin],
+    W: MutPointer[Scalar[u8], MutAnyOrigin],
+    F: MutPointer[Scalar[u8], MutAnyOrigin],
+    x_row: Int,
+    row_base: Int,
+    fill_base: Int,
+    k_dim: Int,
+) -> Scalar[f32]:
+    comptime assert X.flat_rank == 2
+    var lane = Int(lane_id())
+    var Xv = X.vectorize[1, 16]()
+    var nb = k_dim // Q4K
+    var acc = SIMD[f32, 16](0)
+    var b = lane // 8
+    var s = lane % 8
+    var pair = s // 2
+    var half = (s % 2) * 16
+    while b < nb:
+        var base = row_base + b * Q4K_BYTES
+        var hdr = W.unsafe_offset(base).load[width=16]()
+        var fbase = fill_base + b * Q4K_BYTES
+        if s == 0:
+            F.unsafe_offset(fbase).store(hdr)
+        var d = bitcast[f16, 1](SIMD[u16, 1](UInt16(Int(hdr[0]) | (Int(hdr[1]) << 8))))[0].cast[f32]()
+        var dm = bitcast[f16, 1](SIMD[u16, 1](UInt16(Int(hdr[2]) | (Int(hdr[3]) << 8))))[0].cast[f32]()
+        var g0 = 2 * pair
+        var g1 = g0 + 1
+        var sc0: Int
+        var mn0: Int
+        var sc1: Int
+        var mn1: Int
+        if g0 < 4:
+            sc0 = Int(hdr[4 + g0]) & 0x3F
+            mn0 = Int(hdr[8 + g0]) & 0x3F
+            sc1 = Int(hdr[4 + g1]) & 0x3F
+            mn1 = Int(hdr[8 + g1]) & 0x3F
+        else:
+            var md0 = Int(hdr[12 + g0 - 4])
+            var md1 = Int(hdr[12 + g1 - 4])
+            sc0 = (md0 & 0x0F) | ((Int(hdr[4 + g0 % 4]) >> 2) & 0x30)
+            mn0 = (md0 >> 4) | ((Int(hdr[8 + g0 % 4]) >> 2) & 0x30)
+            sc1 = (md1 & 0x0F) | ((Int(hdr[4 + g1 % 4]) >> 2) & 0x30)
+            mn1 = (md1 >> 4) | ((Int(hdr[8 + g1 % 4]) >> 2) & 0x30)
+        var qb = W.unsafe_offset(base + 16 + pair * 32 + half).load[width=16]()
+        F.unsafe_offset(fbase + 16 + pair * 32 + half).store(qb)
+        var lo = (qb & 0x0F).cast[f32]()
+        var hi = (qb >> 4).cast[f32]()
+        var v0 = (SIMD[f32, 16](d * Scalar[f32](sc0)) * lo - SIMD[f32, 16](dm * Scalar[f32](mn0))).cast[bf16]().cast[f32]()
+        var v1 = (SIMD[f32, 16](d * Scalar[f32](sc1)) * hi - SIMD[f32, 16](dm * Scalar[f32](mn1))).cast[bf16]().cast[f32]()
+        var k0 = b * Q4K + g0 * 32 + half
+        var a0 = rebind[SIMD[bf16, 16]](Xv[x_row, k0 // 16]).cast[f32]()
+        var a1 = rebind[SIMD[bf16, 16]](Xv[x_row, (k0 + 32) // 16]).cast[f32]()
+        acc = fma(v0, a0, fma(v1, a1, acc))
+        b += 4
+    return warp.sum(acc.reduce_add())
+
+
 def q4k_decode_vector[
     OLayout: TensorLayout,
 ](
@@ -689,6 +750,43 @@ def moe_gate_up_q4k_pack[
         HO[wid] = rebind[HO.ElementType]((g / (Scalar[f32](1) + exp(-g)) * u).cast[out_dt]())
 
 
+def moe_gate_up_q4k_zc[
+    NSEL: Int, FFN: Int,
+    XLayout: TensorLayout, ILayout: TensorLayout, HLayout: TensorLayout, out_dt: DType = f32
+](
+    Xb: TileTensor[bf16, XLayout, MutAnyOrigin],
+    W: MutPointer[Scalar[u8], MutAnyOrigin],
+    IDX: TileTensor[i32, ILayout, MutAnyOrigin],
+    HE: TileTensor[i32, ILayout, MutAnyOrigin],
+    HG: MutPointer[Scalar[u8], MutAnyOrigin],
+    HO: TileTensor[out_dt, HLayout, MutAnyOrigin],
+    k_dim: Int32,
+    up_offset: Int32,
+    h_up_offset: Int32,
+):
+    comptime assert Xb.flat_rank == 2 and IDX.flat_rank == 1 and HO.flat_rank == 1
+    var wid = Int(block_idx.x) * MOE_WAVES + Int(thread_idx.x) // WARP_SIZE
+    if wid >= NSEL * FFN:
+        return
+    var j = wid // FFN
+    var r = wid % FFN
+    var e = Int(rebind[Scalar[i32]](IDX[j]))
+    var row_bytes = (Int(k_dim) // Q4K) * Q4K_BYTES
+    var row_base = e * FFN * row_bytes + r * row_bytes
+    var he = Int(rebind[Scalar[i32]](HE[j]))
+    var g: Scalar[f32]
+    var u: Scalar[f32]
+    if he >= 0:
+        var hbase = he * FFN * row_bytes + r * row_bytes
+        g = q4k_dot_blocks_fill(Xb, HG, W, 0, hbase, row_base, Int(k_dim))
+        u = q4k_dot_blocks_fill(Xb, HG, W, 0, hbase + Int(h_up_offset), row_base + Int(up_offset), Int(k_dim))
+    else:
+        g = q4k_dot_blocks(Xb, W, 0, row_base, Int(k_dim))
+        u = q4k_dot_blocks(Xb, W, 0, row_base + Int(up_offset), Int(k_dim))
+    if lane_id() == 0:
+        HO[wid] = rebind[HO.ElementType]((g / (Scalar[f32](1) + exp(-g)) * u).cast[out_dt]())
+
+
 def amar_moe_down_q4k[
     NSEL: Int, FFN: Int,
     HLayout: TensorLayout, ILayout: TensorLayout, WLayout: TensorLayout,
@@ -713,6 +811,42 @@ def amar_moe_down_q4k[
         var e = Int(rebind[Scalar[i32]](IDX[j]))
         var row_base = e * N * row_bytes + c * row_bytes
         var dot = q4k_dot_blocks(Hb, WD, j, row_base, FFN)
+        out += rebind[Scalar[f32]](WT[j]) * dot
+    if lane == 0:
+        O[c] = rebind[O.ElementType](out)
+
+
+def amar_moe_down_q4k_zc[
+    NSEL: Int, FFN: Int,
+    HLayout: TensorLayout, ILayout: TensorLayout, WLayout: TensorLayout,
+    OLayout: TensorLayout
+](
+    Hb: TileTensor[bf16, HLayout, MutAnyOrigin],
+    WD: MutPointer[Scalar[u8], MutAnyOrigin],
+    IDX: TileTensor[i32, ILayout, MutAnyOrigin],
+    HE: TileTensor[i32, ILayout, MutAnyOrigin],
+    HD: MutPointer[Scalar[u8], MutAnyOrigin],
+    WT: TileTensor[f32, WLayout, MutAnyOrigin],
+    O: TileTensor[f32, OLayout, MutAnyOrigin],
+    n: Int32,
+):
+    comptime assert Hb.flat_rank == 2 and IDX.flat_rank == 1 and WT.flat_rank == 1 and O.flat_rank == 1
+    var c = Int(block_idx.x) * MOE_WAVES + Int(thread_idx.x) // WARP_SIZE
+    var N = Int(n)
+    if c >= N:
+        return
+    var lane = Int(lane_id())
+    var out = Scalar[f32](0)
+    var row_bytes = (FFN // Q4K) * Q4K_BYTES
+    for j in range(NSEL):
+        var e = Int(rebind[Scalar[i32]](IDX[j]))
+        var row_base = e * N * row_bytes + c * row_bytes
+        var he = Int(rebind[Scalar[i32]](HE[j]))
+        var dot: Scalar[f32]
+        if he >= 0:
+            dot = q4k_dot_blocks_fill(Hb, HD, WD, j, he * N * row_bytes + c * row_bytes, row_base, FFN)
+        else:
+            dot = q4k_dot_blocks(Hb, WD, j, row_base, FFN)
         out += rebind[Scalar[f32]](WT[j]) * dot
     if lane == 0:
         O[c] = rebind[O.ElementType](out)

@@ -69,6 +69,7 @@ must be reachable from `serve/registry.mojo`, a bench, or a test.
 | `amar_mega_moe_token` | `mega_moe.mojo` | `CsL: TensorLayout, SsL: TensorLayout, NL: Int, NAT: Int,` | mega_moe_k | serve/registry.mojo |
 | `amar_moe_down` | `moe.mojo` | `NSEL: Int, FFN: Int, HLayout: TensorLayout, DLayout: TensorLayout, ILayout: TensorLayout, WLayout: TensorLayout, OLayout: TensorLayout` |  | kernels/test_moe_block.mojo |
 | `amar_moe_down_q4k` | `moe.mojo` | `NSEL: Int, FFN: Int, HLayout: TensorLayout, ILayout: TensorLayout, WLayout: TensorLayout, OLayout: TensorLayout` |  | kernels/test_moe_block.mojo |
+| `amar_moe_down_q4k_zc` | `moe.mojo` | `NSEL: Int, FFN: Int, HLayout: TensorLayout, ILayout: TensorLayout, WLayout: TensorLayout, OLayout: TensorLayout` |  | kernels/test_moe_block.mojo |
 | `amar_moe_down_q6k` | `moe.mojo` | `NSEL: Int, FFN: Int, HLayout: TensorLayout, ILayout: TensorLayout, WLayout: TensorLayout, OLayout: TensorLayout` |  | serve/registry.mojo |
 | `amar_moe_gate_up` | `moe.mojo` | `NSEL: Int, FFN: Int, XLayout: TensorLayout, GLayout: TensorLayout, ULayout: TensorLayout, ILayout: TensorLayout, HLayout: TensorLayout` |  | kernels/test_moe_block.mojo |
 | `amar_moe_gate_up_q4k` | `moe.mojo` | `NSEL: Int, FFN: Int, XLayout: TensorLayout, ILayout: TensorLayout, HLayout: TensorLayout` |  | kernels/test_moe_block.mojo |

@@ -12,7 +12,7 @@ Run tools/moe-ref.py first to write the fixtures into .work/gguf/.
 from std.math import ceildiv
 from std.memory import alloc, unsafe_memcpy
 from std.os import getenv
-from std.sys import has_accelerator
+from std.sys import exit, has_accelerator
 from std.time import perf_counter_ns
 
 from max.gpu.host import DeviceContext, DeviceBuffer
@@ -23,6 +23,7 @@ from ssm import amar_cast_bf16
 from moe import (
     amar_moe_router_top8, amar_moe_sig_gate, amar_moe_gate_up, amar_moe_down,
     amar_moe_gate_up_q4k, amar_moe_down_q4k, q4k_decode_vector,
+    moe_gate_up_q4k_zc, amar_moe_down_q4k_zc,
     N_EXP, TOPK, E_FFN, SH_FFN, MOE_H, MOE_WAVES, MOE_THREADS,
 )
 
@@ -79,6 +80,16 @@ def check(name: String, got: MutPointer[Float32, MutUntrackedOrigin],
     )
     if worst > gate:
         raise Error("parity failure: " + name)
+
+
+def bytes_differ(
+    a: MutPointer[UInt8, MutUntrackedOrigin], b: MutPointer[UInt8, MutUntrackedOrigin], n: Int
+) -> Int:
+    var bad = 0
+    for i in range(n):
+        if a[unsafe_offset=i] != b[unsafe_offset=i]:
+            bad += 1
+    return bad
 
 
 def check_i32(name: String, got: MutPointer[Int32, MutUntrackedOrigin],
@@ -349,6 +360,101 @@ def main() raises:
     check("q4k routed", routed_q4_got.unsafe_ptr(), routed_ref, MOE_H)
     check("q4k y", y_q4, y_ref, MOE_H)
     print("PASS: raw Q4_K routed experts match the bf16-rounded GGUF oracle")
+
+    # Zero-copy arm (bench/moe-tier-protocol.md): the same eight experts read
+    # from the pinned host buffers by the _zc kernels, which fill a slot cache
+    # as they go. Three checks: the routed output is bit-identical to the
+    # device-resident q4k arm; every filled slot equals its source bytes; a
+    # hit-only relaunch from the filled cache reproduces the output again.
+    comptime E_G = E_FFN * (MOE_H // 256) * Q4K_BYTES
+    comptime E_D = MOE_H * (E_FFN // 256) * Q4K_BYTES
+    var hg_h = ctx.enqueue_create_host_buffer[u8](2 * Q4_G_BYTES)
+    ctx.synchronize()
+    unsafe_memcpy(dest=hg_h.unsafe_ptr(), src=qg_h.unsafe_ptr(), count=Q4_G_BYTES)
+    unsafe_memcpy(dest=hg_h.unsafe_ptr().unsafe_offset(Q4_G_BYTES), src=qu_h.unsafe_ptr(), count=Q4_G_BYTES)
+    var cg_d = ctx.enqueue_create_buffer[u8](2 * TOPK * E_G)
+    var cd_d = ctx.enqueue_create_buffer[u8](TOPK * E_D)
+    var slots_h = ctx.enqueue_create_host_buffer[i32](TOPK)
+    var hoste_h = ctx.enqueue_create_host_buffer[i32](TOPK)
+    var hits_h = ctx.enqueue_create_host_buffer[i32](TOPK)
+    ctx.synchronize()
+    for j in range(TOPK):
+        slots_h[j] = Int32(j)
+        hoste_h[j] = idx_got[j]
+        hits_h[j] = Int32(-1)
+    var slots_d = ctx.enqueue_create_buffer[i32](TOPK)
+    var hoste_d = ctx.enqueue_create_buffer[i32](TOPK)
+    var hits_d = ctx.enqueue_create_buffer[i32](TOPK)
+    ctx.enqueue_copy(dst_buf=slots_d, src_buf=slots_h)
+    ctx.enqueue_copy(dst_buf=hoste_d, src_buf=hoste_h)
+    ctx.enqueue_copy(dst_buf=hits_d, src_buf=hits_h)
+    var slots = TileTensor(slots_d, idx_1)
+    var hoste = TileTensor(hoste_d, idx_1)
+    var hits = TileTensor(hits_d, idx_1)
+    var routed_zc_d = ctx.enqueue_create_buffer[f32](MOE_H)
+    var routed_zc = TileTensor(routed_zc_d, o_1)
+    comptime k_gu_zc = moe_gate_up_q4k_zc[
+        TOPK, E_FFN, type_of(x_2), type_of(idx_1), type_of(h_1)
+    ]
+    comptime k_down_zc = amar_moe_down_q4k_zc[
+        TOPK, E_FFN, type_of(h_2), type_of(idx_1), type_of(wt_1), type_of(o_1)
+    ]
+    ctx.enqueue_function[k_gu_zc](
+        xb2, cg_d.unsafe_ptr(), slots, hoste, hg_h.unsafe_ptr(), h1, Int32(MOE_H),
+        Int32(TOPK * E_G), Int32(Q4_G_BYTES),
+        grid_dim=ceildiv(TOPK * E_FFN, MOE_WAVES), block_dim=MOE_THREADS,
+    )
+    ctx.enqueue_function[k_cast_h](
+        TileTensor(h_d, h_1), TileTensor(hb_d, h_1), Int32(TOPK * E_FFN),
+        grid_dim=ceildiv(TOPK * E_FFN, 256), block_dim=256,
+    )
+    ctx.enqueue_function[k_down_zc](
+        hb2, cd_d.unsafe_ptr(), slots, hoste, qd_h.unsafe_ptr(), wt, routed_zc, Int32(MOE_H),
+        grid_dim=ceildiv(MOE_H, MOE_WAVES), block_dim=MOE_THREADS,
+    )
+    ctx.synchronize()
+    var routed_zc_got = ctx.enqueue_create_host_buffer[f32](MOE_H)
+    ctx.enqueue_copy(dst_buf=routed_zc_got, src_buf=routed_zc_d)
+    var cg_got = ctx.enqueue_create_host_buffer[u8](2 * TOPK * E_G)
+    var cd_got = ctx.enqueue_create_host_buffer[u8](TOPK * E_D)
+    ctx.enqueue_copy(dst_buf=cg_got, src_buf=cg_d)
+    ctx.enqueue_copy(dst_buf=cd_got, src_buf=cd_d)
+    ctx.synchronize()
+    var zc_bad = 0
+    for i in range(MOE_H):
+        if routed_zc_got[i] != routed_q4_got[i]:
+            zc_bad += 1
+    var fill_bad = 0
+    for j in range(TOPK):
+        var e = Int(hoste_h[j])
+        fill_bad += bytes_differ(cg_got.unsafe_ptr().unsafe_offset(j * E_G), qg_h.unsafe_ptr().unsafe_offset(e * E_G), E_G)
+        fill_bad += bytes_differ(cg_got.unsafe_ptr().unsafe_offset((TOPK + j) * E_G), qu_h.unsafe_ptr().unsafe_offset(e * E_G), E_G)
+        fill_bad += bytes_differ(cd_got.unsafe_ptr().unsafe_offset(j * E_D), qd_h.unsafe_ptr().unsafe_offset(e * E_D), E_D)
+    ctx.enqueue_function[k_gu_zc](
+        xb2, cg_d.unsafe_ptr(), slots, hits, hg_h.unsafe_ptr(), h1, Int32(MOE_H),
+        Int32(TOPK * E_G), Int32(Q4_G_BYTES),
+        grid_dim=ceildiv(TOPK * E_FFN, MOE_WAVES), block_dim=MOE_THREADS,
+    )
+    ctx.enqueue_function[k_cast_h](
+        TileTensor(h_d, h_1), TileTensor(hb_d, h_1), Int32(TOPK * E_FFN),
+        grid_dim=ceildiv(TOPK * E_FFN, 256), block_dim=256,
+    )
+    ctx.enqueue_function[k_down_zc](
+        hb2, cd_d.unsafe_ptr(), slots, hits, qd_h.unsafe_ptr(), wt, routed_zc, Int32(MOE_H),
+        grid_dim=ceildiv(MOE_H, MOE_WAVES), block_dim=MOE_THREADS,
+    )
+    ctx.synchronize()
+    ctx.enqueue_copy(dst_buf=routed_zc_got, src_buf=routed_zc_d)
+    ctx.synchronize()
+    var hit_bad = 0
+    for i in range(MOE_H):
+        if routed_zc_got[i] != routed_q4_got[i]:
+            hit_bad += 1
+    print("zc: routed mismatches", zc_bad, " fill byte mismatches", fill_bad, " hit-relaunch mismatches", hit_bad)
+    if zc_bad != 0 or fill_bad != 0 or hit_bad != 0:
+        print("FAIL: zero-copy arm differs from the device-resident q4k arm")
+        exit(1)
+    print("PASS: zero-copy q4k experts read from pinned host memory match, and the slots are filled byte-exact")
     print("PASS: qwen35moe sparse-MoE block matches numpy reference (m=1)")
 
     # Feasibility measurement, NOT a preregistered perf claim (CLAUDE.md /

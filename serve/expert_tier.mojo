@@ -178,6 +178,10 @@ struct ExpertTier(Copyable, Movable):
     var hot_store: HostBuffer[DType.uint8]
     var hot_slot_of: List[Dict[Int, Int]]
     var hot_next: List[Int]
+    var zc: Bool
+    var hoste_h: HostBuffer[DType.int32]
+    var hoste_d: DeviceBuffer[DType.int32]
+    var bytes_zc: Int
 
     def __init__(
         out self, ctx: DeviceContext, packdir: String, cap: Int, n_layers: Int
@@ -188,6 +192,10 @@ struct ExpertTier(Copyable, Movable):
         self.cap = cap
         self.n_layers = n_layers
         self.pinned = getenv("BARO_TIER_PINNED", "1") == "1"
+        self.zc = self.pinned and getenv("BARO_TIER_ZC", "0") == "1"
+        self.bytes_zc = 0
+        self.hoste_h = ctx.enqueue_create_host_buffer[DType.int32](TOPK)
+        self.hoste_d = ctx.enqueue_create_buffer[DType.int32](TOPK)
         self.hot_active = (not self.pinned) and getenv("BARO_TIER_HOT", "0") == "1"
         self.hot_cap = Int(getenv("BARO_TIER_HOTCAP", "128"))
         self.geom = List[LayerGeom]()
@@ -257,7 +265,9 @@ struct ExpertTier(Copyable, Movable):
                         raise Error("expert tier: short read of experts.bin")
                     got += Int(n)
         var mode = String("page-cache")
-        if self.pinned:
+        if self.zc:
+            mode = String("pinned+zc")
+        elif self.pinned:
             mode = String("pinned")
         elif self.hot_active:
             mode = String("hot ") + String(self.hot_cap)
@@ -275,6 +285,10 @@ struct ExpertTier(Copyable, Movable):
         self.active = False
         self.cap = 0
         self.pinned = False
+        self.zc = False
+        self.bytes_zc = 0
+        self.hoste_h = ctx.enqueue_create_host_buffer[DType.int32](1)
+        self.hoste_d = ctx.enqueue_create_buffer[DType.int32](1)
         self.n_layers = 0
         self.geom = List[LayerGeom]()
         self.lru = List[LayerLru]()
@@ -443,6 +457,8 @@ struct ExpertTier(Copyable, Movable):
         var up_store = self.geom[layer].up_off
         var down_store = self.geom[layer].down_off
         for j in range(TOPK):
+            self.hoste_h[j] = Int32(-1)
+        for j in range(TOPK):
             var e = Int(self.slots_h[j])
             if e < 0 or e >= N_EXP:
                 raise Error("expert tier: router returned expert id " + String(e))
@@ -475,22 +491,41 @@ struct ExpertTier(Copyable, Movable):
                     if hot_off >= 0:
                         hot_up = hot_off + eb
                         hot_down = hot_off + 2 * eb
-                    self._fetch_piece(
-                        ctx, fd, gate_store + e * eb, lbase + slot * eb, eb, layer, hot_off,
-                    )
-                    self._fetch_piece(
-                        ctx, fd, up_store + e * eb, lbase + self.cap * eb + slot * eb, eb, layer, hot_up,
-                    )
-                    self._fetch_piece(
-                        ctx, fd, down_store + e * ebd,
-                        lbase + 2 * self.cap * eb + slot * ebd, ebd, layer, hot_down,
-                    )
+                    if self.zc:
+                        # Zero-copy miss: the gate/up kernel reads this expert
+                        # from the pinned store and fills the slot itself. The
+                        # down piece too when it is q4_k (ebd == eb); the q6_k
+                        # layers keep the DMA for down, their kernel is unchanged.
+                        self.hoste_h[j] = Int32(e)
+                        self.bytes_zc += 2 * eb
+                        self.bytes_fetched += 2 * eb
+                        if ebd == eb:
+                            self.bytes_zc += ebd
+                            self.bytes_fetched += ebd
+                        else:
+                            self._fetch_piece(
+                                ctx, fd, down_store + e * ebd,
+                                lbase + 2 * self.cap * eb + slot * ebd, ebd, layer, hot_down,
+                            )
+                    else:
+                        self._fetch_piece(
+                            ctx, fd, gate_store + e * eb, lbase + slot * eb, eb, layer, hot_off,
+                        )
+                        self._fetch_piece(
+                            ctx, fd, up_store + e * eb, lbase + self.cap * eb + slot * eb, eb, layer, hot_up,
+                        )
+                        self._fetch_piece(
+                            ctx, fd, down_store + e * ebd,
+                            lbase + 2 * self.cap * eb + slot * ebd, ebd, layer, hot_down,
+                        )
             self.slots_h[j] = Int32(slot)
         var tw0 = perf_counter_ns()
         ctx.enqueue_copy(
             dst_buf=DeviceBuffer[DType.int32](ctx, idx_d.unsafe_ptr(), TOPK, owning=False),
             src_buf=self.slots_h,
         )
+        if self.zc:
+            ctx.enqueue_copy(dst_buf=self.hoste_d, src_buf=self.hoste_h)
         self.b_writeback[layer] = self.b_writeback[layer] + Int(perf_counter_ns() - tw0)
         var tc1 = perf_counter_ns()
         fh.close()
@@ -503,6 +538,7 @@ struct ExpertTier(Copyable, Movable):
             "expert tier: refs", self.refs, " hits", self.hits,
             " hit_rate", rate,
             " bytes_fetched", self.bytes_fetched,
+            " bytes_zc", self.bytes_zc,
             " bytes_per_token", Float64(self.bytes_fetched) / Float64(tokens) if tokens > 0 else 0.0,
             " fetch_s", Float64(self.fetch_ns) / 1e9,
         )

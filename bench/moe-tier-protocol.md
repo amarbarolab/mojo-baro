@@ -243,3 +243,12 @@ number. **Kill line:** any identity miss, or a ratio under 1.00.
 **Gate.** `bench/ab-prompts.sh` on `.work/engine-moe`, arms `BARO_PACK=.work/moe-tier BARO_TIER=64
 BARO_MEGA=0 BARO_SPEC=0` with `BARO_TIER_ZC=0` (A) and `=1` (B), 20 prompts one stint under
 `bench/clock-probe.sh`, identity per prompt, both start-up lines read back. Dry-run on CPU first.
+
+**Result (2026-09-17, `.work/tier-zc/`, one stint under `bench/clock-probe.sh`, sclk median 3276 MHz,
+engA = engB sha `b9f5b2f11819bdfc`, start-up lines `mode pinned` and `mode pinned+zc` read back):**
+zc0 median **67.71** tok/s_gen, zc1 median **72.02**, ratio **1.064**, identity 20/20 (`ab.log`). Inside the
+frozen band (+4% to +10%), below the point prediction (+7%). Parity (`kernels/test_moe_block.mojo`, zc arm):
+routed output bit-identical to the device-resident q4k arm, every filled slot byte-equal to its source,
+hit-only relaunch from the filled cache identical. A first, inadmissible run happened bare on the GPU
+under another lane's job (the dry-run tool ran the harness for real; fixed in iTools `dcd1ecb`): it read
+1.068 with identity clean, consistent with the queued run. `BARO_TIER_ZC` stays opt-in until decided.

@@ -20,6 +20,7 @@ from moe import (
     moe_embed_q8_0_pos, moe_matmul_q8_0_m1, moe_matmul_q8_0_m1_add,
     amar_moe_router_top8_sig, moe_gate_up_q4k_pack,
     amar_moe_down_q4k, amar_moe_down_q6k, moe_gate_up_q8_0, moe_down_q8_0_res,
+    moe_gate_up_q4k_zc, amar_moe_down_q4k_zc,
     MOE_WAVES, MOE_THREADS, N_EXP, TOPK, E_FFN, SH_FFN,
 )
 from matmul_skinny import amar_matmul_skinny_m1_row, amar_matmul_skinny_m1_row2
@@ -787,7 +788,18 @@ def moe_ffn(ctx: DeviceContext, mut b: WindowBufs, Xm: TileTensor[f32, type_of(x
     # instead of the pack, and Idx holds cache SLOTS instead of expert ids
     # (prepare rewrites it in place, after fetching any miss). The kernels are
     # untouched: their expert stride is a runtime argument.
-    if b.tier.active:
+    var He = TileTensor[DType.int32, type_of(moe_idx_layout), MutAnyOrigin](b.tier.hoste_d, moe_idx_layout)
+    if b.tier.active and b.tier.zc:
+        # Zero-copy misses (bench/moe-tier-protocol.md): rows of a missed
+        # expert come straight from the pinned store and the wave fills the
+        # cache slot with what it read; hits are the same bytes as before.
+        b.tier.prepare(ctx, layer, b.hidx_d)
+        ctx.enqueue_function[moe_gate_up_q4k_zc[TOPK, E_FFN, type_of(xm_layout), type_of(moe_idx_layout), type_of(moe_expert_flat_layout), bf16]](
+            CurBm, b.tier.cache.unsafe_ptr().unsafe_offset(b.tier.gate_base(layer)), Idx, He,
+            b.tier.store.unsafe_ptr().unsafe_offset(b.tier.geom[layer].gate_off), routed_h_flat, Int32(H),
+            Int32(b.tier.up_offset(layer)), Int32(b.tier.geom[layer].up_off - b.tier.geom[layer].gate_off),
+            grid_dim=ceildiv(TOPK * E_FFN, MOE_WAVES), block_dim=MOE_THREADS)
+    elif b.tier.active:
         b.tier.prepare(ctx, layer, b.hidx_d)
         ctx.enqueue_function[moe_gate_up_q4k_pack[TOPK, E_FFN, type_of(xm_layout), type_of(moe_idx_layout), type_of(moe_expert_flat_layout), bf16]](
             CurBm, b.tier.cache.unsafe_ptr().unsafe_offset(b.tier.gate_base(layer)), Idx, routed_h_flat, Int32(H), Int32(b.tier.up_offset(layer)), grid_dim=ceildiv(TOPK * E_FFN, MOE_WAVES), block_dim=MOE_THREADS)
@@ -798,6 +810,11 @@ def moe_ffn(ctx: DeviceContext, mut b: WindowBufs, Xm: TileTensor[f32, type_of(x
     if layer == 34 or layer == 38 or layer == 39:
         ctx.enqueue_function[amar_moe_down_q6k[TOPK, E_FFN, type_of(moe_expert_layout), type_of(moe_idx_layout), type_of(moe_idx_layout), type_of(moe_vec_layout)]](
             routed_h, (b.tier.cache.unsafe_ptr().unsafe_offset(b.tier.down_base(layer)) if b.tier.active else b.wbuf.unsafe_ptr().unsafe_offset(b.off[routed_base + 2])), Idx, Wt, routed, Int32(H), grid_dim=ceildiv(H, MOE_WAVES), block_dim=MOE_THREADS)
+    elif b.tier.active and b.tier.zc:
+        ctx.enqueue_function[amar_moe_down_q4k_zc[TOPK, E_FFN, type_of(moe_expert_layout), type_of(moe_idx_layout), type_of(moe_idx_layout), type_of(moe_vec_layout)]](
+            routed_h, b.tier.cache.unsafe_ptr().unsafe_offset(b.tier.down_base(layer)), Idx, He,
+            b.tier.store.unsafe_ptr().unsafe_offset(b.tier.geom[layer].down_off), Wt, routed, Int32(H),
+            grid_dim=ceildiv(H, MOE_WAVES), block_dim=MOE_THREADS)
     else:
         ctx.enqueue_function[amar_moe_down_q4k[TOPK, E_FFN, type_of(moe_expert_layout), type_of(moe_idx_layout), type_of(moe_idx_layout), type_of(moe_vec_layout)]](
             routed_h, (b.tier.cache.unsafe_ptr().unsafe_offset(b.tier.down_base(layer)) if b.tier.active else b.wbuf.unsafe_ptr().unsafe_offset(b.off[routed_base + 2])), Idx, Wt, routed, Int32(H), grid_dim=ceildiv(H, MOE_WAVES), block_dim=MOE_THREADS)
