@@ -17,9 +17,10 @@ struct PageTable(Movable):
     def __init__(out self, n: Int):
         self.n = n
         self.phys = List[Int](capacity=n)
-        self.free = List[Int]()
+        self.free = List[Int](capacity=n)
         for i in range(n):
             self.phys.append(i)
+            self.free.append(i)
 
     def identity(mut self):
         for i in range(self.n):

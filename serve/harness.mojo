@@ -251,7 +251,7 @@ def alloc_bufs(ctx: DeviceContext, pack: Pack, tmax: Int) raises -> WindowBufs:
     var aq_d = ctx.enqueue_create_buffer[DType.int8](MROWS * FFN)
     var asc_d = ctx.enqueue_create_buffer[DType.float16](MROWS * (FFN // 32))
     var logits_d = ctx.enqueue_create_buffer[f32](MROWS * VOCAB)
-    var toks_d = ctx.enqueue_create_buffer[DType.int32](tmax)
+    var toks_d = ctx.enqueue_create_buffer[DType.int32](SEQ_CAP * tmax)
     var hn_d = ctx.enqueue_create_buffer[f32](MROWS * H)
     var de_d = ctx.enqueue_create_buffer[f32](MROWS * H)
     var hd_d = ctx.enqueue_create_buffer[f32](MROWS * H)
@@ -289,16 +289,17 @@ def alloc_bufs(ctx: DeviceContext, pack: Pack, tmax: Int) raises -> WindowBufs:
     var up_d = ctx.enqueue_create_buffer[f32](CP * FFN)
     var fgbp_d = ctx.enqueue_create_buffer[bf16](CP * FFN)
 
-    var convstate_d = ctx.enqueue_create_buffer[f32](SLOTS * CONV_SLOT)
-    var sstate_d = ctx.enqueue_create_buffer[f32](SLOTS * SSM_SLOT)
-    var kc_d = ctx.enqueue_create_buffer[KVT](kvpool)
-    var vc_d = ctx.enqueue_create_buffer[KVT](kvpool)
-    var kc32_d = ctx.enqueue_create_buffer[KVT](kvpool1)
-    var vc32_d = ctx.enqueue_create_buffer[KVT](kvpool1)
-    var kvtab_h = ctx.enqueue_create_host_buffer[DType.int32](tpages)
-    for i in range(tpages):
-        kvtab_h[i] = Int32(i)
-    var kvtab_d = ctx.enqueue_create_buffer[DType.int32](tpages)
+    var convstate_d = ctx.enqueue_create_buffer[f32](SEQ_CAP * SLOTS * CONV_SLOT)
+    var sstate_d = ctx.enqueue_create_buffer[f32](SEQ_CAP * SLOTS * SSM_SLOT)
+    var kc_d = ctx.enqueue_create_buffer[KVT](SEQ_CAP * kvpool)
+    var vc_d = ctx.enqueue_create_buffer[KVT](SEQ_CAP * kvpool)
+    var kc32_d = ctx.enqueue_create_buffer[KVT](SEQ_CAP * kvpool1)
+    var vc32_d = ctx.enqueue_create_buffer[KVT](SEQ_CAP * kvpool1)
+    var kvtab_h = ctx.enqueue_create_host_buffer[DType.int32](SEQ_CAP * tpages)
+    for seq in range(SEQ_CAP):
+        for i in range(tpages):
+            kvtab_h[seq * tpages + i] = Int32(seq * tpages + i)
+    var kvtab_d = ctx.enqueue_create_buffer[DType.int32](SEQ_CAP * tpages)
     ctx.enqueue_copy(dst_buf=kvtab_d, src_buf=kvtab_h)
     ctx.enqueue_memset(convstate_d, 0)
     ctx.enqueue_memset(sstate_d, 0)
@@ -381,3 +382,19 @@ def alloc_bufs(ctx: DeviceContext, pack: Pack, tmax: Int) raises -> WindowBufs:
     var gmask_d = ctx.enqueue_create_buffer[DType.uint64]((VOCAB + 63) // 64)
     var dump_row_h = ctx.enqueue_create_host_buffer[f32](VOCAB)
     return WindowBufs(wbuf=wbuf.copy(), off=off.copy(), dtok_h=dtok_h.copy(), win_h=win_h.copy(), x_d=x_d.copy(), curb_d=curb_d.copy(), qkv_d=qkv_d.copy(), z_d=z_d.copy(), eg_d=eg_d.copy(), beta_d=beta_d.copy(), conv_d=conv_d.copy(), so_d=so_d.copy(), resb_d=resb_d.copy(), qf_d=qf_d.copy(), q_d=q_d.copy(), gate_d=gate_d.copy(), k_d=k_d.copy(), v_d=v_d.copy(), ao_d=ao_d.copy(), fgb_d=fgb_d.copy(), aq_d=aq_d.copy(), asc_d=asc_d.copy(), logits_d=logits_d.copy(), toks_d=toks_d.copy(), hn_d=hn_d.copy(), de_d=de_d.copy(), hd_d=hd_d.copy(), cc_d=cc_d.copy(), dtok_d=dtok_d.copy(), p_qf_d=p_qf_d.copy(), p_h_d=p_h_d.copy(), p_kv_d=p_kv_d.copy(), p_32_d=p_32_d.copy(), p_32b_d=p_32b_d.copy(), p_ffn_d=p_ffn_d.copy(), p_ffn2_d=p_ffn2_d.copy(), p_v_d=p_v_d.copy(), xp_d=xp_d.copy(), curbp_d=curbp_d.copy(), qkvp_d=qkvp_d.copy(), zp_d=zp_d.copy(), arp_d=arp_d.copy(), brp_d=brp_d.copy(), egp_d=egp_d.copy(), betap_d=betap_d.copy(), convp_d=convp_d.copy(), sop_d=sop_d.copy(), resbp_d=resbp_d.copy(), qfp_d=qfp_d.copy(), qp_d=qp_d.copy(), gatep_d=gatep_d.copy(), kp_d=kp_d.copy(), vp_d=vp_d.copy(), aop_d=aop_d.copy(), gp_d=gp_d.copy(), up_d=up_d.copy(), fgbp_d=fgbp_d.copy(), convstate_d=convstate_d.copy(), sstate_d=sstate_d.copy(), kvpool=kvpool, kc_d=kc_d.copy(), vc_d=vc_d.copy(), kvtab_d=kvtab_d.copy(), kvtab_h=kvtab_h.copy(), tpages=tpages, kc32_d=kc32_d.copy(), vc32_d=vc32_d.copy(), off_d=off_d.copy(), araw_d=araw_d.copy(), braw_d=braw_d.copy(), ctr_d=ctr_d.copy(), prof_d=prof_d.copy(), dbg_d=dbg_d.copy(), hmax_d=hmax_d.copy(), hidx_d=hidx_d.copy(), dump_h=dump_h.copy(), stream_h=stream_h.copy(), pt_d=pt_d.copy(), pd_d=pd_d.copy(), tier=tier^, etrace_d=etrace_d.copy(), etrace_h=etrace_h.copy(), zidx_d=zidx_d.copy(), dids_d=dids_d.copy(), sout_d=sout_d.copy(), sacc_d=sacc_d.copy(), sout_h=sout_h.copy(), sacc_h=sacc_h.copy(), pen_hist_h=pen_hist_h.copy(), pen_ids_h=pen_ids_h.copy(), pen_ids_d=pen_ids_d.copy(), pen_cnt_h=pen_cnt_h.copy(), pen_cnt_d=pen_cnt_d.copy(), pen_npen_h=pen_npen_h.copy(), pen_npen_d=pen_npen_d.copy(), topn_ids_d=topn_ids_d.copy(), topn_ids_h=topn_ids_h.copy(), topn_probs_d=topn_probs_d.copy(), topn_probs_h=topn_probs_h.copy(), samp_prob_h=samp_prob_h.copy(), dump_row_h=dump_row_h.copy(), gmask_h=gmask_h.copy(), gmask_d=gmask_d.copy())
+
+
+def sequence_bufs(ctx: DeviceContext, b: WindowBufs, seq: Int, tmax: Int) raises -> WindowBufs:
+    var v = b.copy()
+    var state_span = SLOTS * CONV_SLOT
+    var ssm_span = SLOTS * SSM_SLOT
+    var kv_span = b.kvpool // SEQ_CAP
+    v.convstate_d = DeviceBuffer[f32](ctx, b.convstate_d.unsafe_ptr().unsafe_offset(seq * state_span), state_span, owning=False)
+    v.sstate_d = DeviceBuffer[f32](ctx, b.sstate_d.unsafe_ptr().unsafe_offset(seq * ssm_span), ssm_span, owning=False)
+    v.kc_d = DeviceBuffer[KVT](ctx, b.kc_d.unsafe_ptr().unsafe_offset(seq * kv_span), kv_span, owning=False)
+    v.vc_d = DeviceBuffer[KVT](ctx, b.vc_d.unsafe_ptr().unsafe_offset(seq * kv_span), kv_span, owning=False)
+    v.kvtab_d = DeviceBuffer[DType.int32](ctx, b.kvtab_d.unsafe_ptr().unsafe_offset(seq * b.tpages), b.tpages, owning=False)
+    v.kvtab_h = b.kvtab_h.create_sub_buffer[DType.int32](seq * b.tpages, b.tpages)
+    v.toks_d = DeviceBuffer[DType.int32](ctx, b.toks_d.unsafe_ptr().unsafe_offset(seq * tmax), tmax, owning=False)
+    v.kvpool = kv_span
+    return v^

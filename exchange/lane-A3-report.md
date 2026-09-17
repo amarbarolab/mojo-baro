@@ -64,3 +64,42 @@ Relevant guidance read before implementation: `lane-dispatch`,
 `mojo-nightly-lane-builder`, `inference-kernels`, `kernel-parity`,
 `kernel-arm-round`, `persistent-kernel-gfx11`, `gate-authoring`,
 `reverse-arm-gates`, `llm-benchmark-method`, and `perf-writeup`.
+
+## A3(b) resident-state result
+
+Protocol was frozen before the live run in
+`bench/a3-b-protocol.md`. The item 0 VRAM precondition remains inherited from
+`exchange/lane-COMFY-report.md`, item 0: MAX holds about 22 GB per engine
+process for both the 5.3 GB and 6.8 GB packs. It is process-fixed, not
+sequence-scaled, so the A3 N=4 budget is one current engine reservation minus
+the trunk. No duplicate VRAM measurement was run.
+
+Implementation gives two resident sequence slots in one process. Each slot
+has private token history, KV page-table region, physical KV pages, convolution
+state, and SSM state. `serve/kvpage.mojo` now allocates from the full physical
+page pool, and `serve/harness.mojo` exposes per-sequence buffer views. The
+normal single-request path remains on plane 0 of the expanded token buffer.
+
+## A3(b) verification
+
+- `bench/a3-b-gate.sh`: frozen identity and reverse-page arms, each using 20
+  cyclic pairs from `.work/a2-prompts/L8192` with `n=64`, `temperature=0`,
+  `BARO_SPEC=0`, `BARO_CKPT=0`, and `BARO_MEGA=0`.
+- Dry-run: PASS, stopped at `FAIL GPU step: dry-run reached engine startup`
+  before reference or resident arms.
+- Engine rebuilt after merge and source changes through
+  `gpu-wait run --vram 24`; `.work/engine` sha256 is
+  `ccc041dd06a778b0b42f30202785424a2a39524fd7503774ad8777d710a2a6ba`.
+- `gpu-wait run --vram 1 -- bench/preflight.sh`: PASS, final stamp
+  `97d97ebfb680`.
+- Live receipt: `.work/a3-b/receipt.md`, refcache key
+  `2482e1c1766c1aea19e486c6`.
+- Identity mapping: 20/20 A and 20/20 B, 40/40 terminal responses.
+- Reverse mapping: 20/20 A and 20/20 B, 40/40 terminal responses; 20
+  non-identity mapping receipts.
+- Every pair printed distinct slots `0,1`, resident boundary receipts were
+  present, and both arms exited cleanly with status 0.
+
+This proves resident KV, convolution, SSM, token, and page-table isolation for
+the serial two-sequence greedy path. It makes no A3(c) launch-batching or
+throughput claim. A3(c) and A3(d) remain open.
