@@ -31,7 +31,9 @@ py=./.venv/bin/python
 NS=b4fork; VA=veth-f4a; VB=veth-f4b; HOST_IP=10.99.8.1; PEER_IP=10.99.8.2
 bport=${BPORT:-18472}; fbase=${FBASE:-19470}
 mkdir -p "$out"
-exec > >(tee -a "$out/gate.log") 2>&1
+# The nodes phase runs inside the orchestrator's gpu-wait job, whose output the orchestrator already
+# tees into gate.log; teeing there too doubled every line.
+[ "${PHASE:-all}" = nodes ] || exec > >(tee -a "$out/gate.log") 2>&1
 fail() { echo "FAIL $1: $2 (log $out/gate.log)"; exit 1; }
 
 if [ "$phase" = nodes ]; then
