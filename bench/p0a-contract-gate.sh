@@ -151,7 +151,10 @@ def post(path, body):
 rows = []
 for i in range(count):
     prompt = prompts[i % len(prompts)]
-    ollama = post("/api/generate", {"model": model, "prompt": prompt, "stream": False,
+    # Gate 1 compares the raw Ollama prompt with OpenAI completions. Without
+    # raw=true, /api/generate deliberately applies the chat template and the
+    # prompt token counts are not comparable.
+    ollama = post("/api/generate", {"model": model, "prompt": prompt, "raw": True, "stream": False,
                                     "options": {"temperature": 0, "seed": 0, "num_predict": 8}})
     openai = post("/v1/completions", {"model": model, "prompt": prompt, "stream": False,
                                       "temperature": 0, "seed": 0, "max_tokens": 8})
