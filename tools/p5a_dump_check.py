@@ -21,6 +21,13 @@ def inspect(path):
         for doc in docs
         for r in doc["records"]
     )
+    greedy_next_fractions_by_doc = [
+        sum(
+            int(r["target_argmax"]) == int(doc["tokens"][r["pos"] + 1])
+            for r in doc["records"]
+        ) / len(doc["records"])
+        for doc in docs
+    ]
     report = {
         "dump": path,
         "documents": len(docs),
@@ -36,6 +43,8 @@ def inspect(path):
         "distinct_argmax_all_docs_gt1": all(n > 1 for n in distinct_argmax_by_doc),
         "greedy_next_matches": greedy_next_matches,
         "greedy_next_fraction": greedy_next_matches / len(records),
+        "greedy_next_fractions_by_doc": greedy_next_fractions_by_doc,
+        "greedy_next_fraction_min": min(greedy_next_fractions_by_doc),
         "input_alignment": sum(
             r["input_token"] == docs[di]["tokens"][r["pos"]]
             for di, doc in enumerate(docs)
@@ -46,10 +55,12 @@ def inspect(path):
     report["input_alignment_all"] = report["input_alignment"] == report["records"]
     report["normalization_pass"] = report["max_top8_sum_error"] <= 1e-5
     report["greedy_next_pass"] = report["greedy_next_fraction"] > 0.30
+    report["greedy_next_min_doc_pass"] = report["greedy_next_fraction_min"] > 0.30
     report["pass"] = all((
         report["finite_values"], report["argmax_consistent_all"],
         report["input_alignment_all"], report["normalization_pass"],
         report["distinct_argmax_all_docs_gt1"], report["greedy_next_pass"],
+        report["greedy_next_min_doc_pass"],
     ))
     return report
 
