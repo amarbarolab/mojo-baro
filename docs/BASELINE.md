@@ -534,3 +534,19 @@ engine and pack `tools/baro serve` caches.
 - Not run this round: Ornith-1.5-9B, Qwythos-9B-v2, Spark-X2.5-4B (cut for time), Granite-4.2-3B (harness
   script edited mid-run, row void). Spark-family perplexity waits on a rerun now that `serve/spark.mojo`
   has logprobs.
+
+## Dense imports through `model-import` (2026-09-17, `bench/dense-run.sh`, forced agreement vs llama.cpp)
+
+`bench/dense-run.sh` judges `MIN_PCT` (default 90) since `b4271cd`; before that PASS meant "ran" and it
+printed PASS on 0/64. Teacher-forced agreement, 20 prompts, min / mean.
+
+| model | ours q4 vs llama q4 | notes |
+|---|---|---|
+| Qwen2.5-7B-Instruct | 96.9 / 99.4 PASS | bake `qwen2.5-7b-instruct-q4_K_M-BARO-b4271cd.gguf` verifies 64/64 from the file |
+| Qwen2.5-0.5B-Instruct | 68.8 / 85.0 UNVERIFIED | was 0 before the q8 GEMV tail fix `2d1ebbe` (H=896 is not a multiple of the 512-lane tail step) |
+
+The 0.5B gap is not the quant: llama.cpp's own q4_K_M against its bf16 reads 82.8 / 91.4 on the same
+prompts (the class bar), and our pack built from the bf16 GGUF against llama.cpp bf16 reads 75.0 / 86.4.
+The remaining 5 to 6 points are our numerics (bf16 activations; the 1B floor was 95.3, the 7B 96.9) or a
+shape-specific defect on NQH 14 / NKVH 2 / H 896. Next step if wanted: the per-layer oracle comparison
+(`tools/llama-oracle.py`) on one prompt. No 0.5B bake until then. Receipts: `~/Models/qwen2.5-0.5b-instruct-import{,2,3}/gate/`.
