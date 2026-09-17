@@ -2,7 +2,7 @@
 
 Date: 2026-09-17
 Branch: `lane-team-a`
-Status: preflight complete; live gates 1-3 UNVERIFIED
+Status: gates 1-3 PASS; embeddings gate 4 deferred to coordinator P0a-e wire
 
 ## Landed
 
@@ -16,6 +16,12 @@ Status: preflight complete; live gates 1-3 UNVERIFIED
   until the coordinator-owned engine wire is gated.
 - `978de8d` adds the contract gate and the Ollama protocol note. It is the only
   Codex-owned commit in this report.
+- `46f4a01` corrects gate 1 to compare `raw: true` Ollama generation with the
+  raw OpenAI completions prompt; default Ollama generation is chat-templated and
+  remains covered by gate 2.
+- `9572069` adds the PAIR engine-manager adoption and routed-request check.
+- `b7f521f` changes gate 3 to explicit `engine:start` adoption with absolute
+  isolated PAIR user paths, then routes through `engine:action`.
 
 ## Checks and receipts
 
@@ -44,15 +50,15 @@ embeddings.
 
 Sonnet reported release cargo build, clippy with `-D warnings`, and nextest
 `36/36` passing for the Rust source commit. The live HTTP and PAIR receipts
-below are intentionally not claimed from that code-level check.
+below are from the separate gpu-wait receipt, not that code-level check.
 
 ## Gates
 
 | gate | result | reason or receipt |
 |---|---|---|
-| 1, PAIR parallel count and token parity | UNVERIFIED | Requires one resident GPU engine. |
-| 2, Ollama Python client, 20 prompts, stream and non-stream | UNVERIFIED | Requires one resident GPU engine. |
-| 3, PAIR engine-manager adoption | UNVERIFIED | Requires PAIR workload log naming the baro node. |
+| 1, PAIR parallel count and token parity | PASS | `p0a-live-r4/contract.log`: PAIR 5/5 and token counts 5/5 equal. |
+| 2, Ollama Python client, 20 prompts, stream and non-stream | PASS | `p0a-live-r4/contract.log`: 20/20 chat/generate stream and non-stream equal. |
+| 3, PAIR engine-manager adoption | PASS | `p0a-live-r4/pair-manager.json`: running and healthy on 11434, routed response done; stderr names external adoption. |
 | 4, embeddings vector parity | DEFERRED | Coordinator owns P0a-e: request `embed:true`, one extra `{"id": ID, "embed": [H floats]}` line, last-prompt-token post-final-norm hidden state, engine-side L2 normalization. |
 
 The required live invocation is:
@@ -62,19 +68,28 @@ gpu-wait run --vram 24 --timeout 3600 -- \
   env BARO_ENGINE=$HOME/Projects/mojo/mojo-baro/.work/engine \
       BARO_PACK=$HOME/Projects/mojo/mojo-baro/.work/engine-pack-q4 \
       BARO_SERVE_BIN=.work/team-A/sonnet/target/release/baro-serve \
-  bench/p0a-contract-gate.sh .work/team-A/codex/p0a 5 0
+      PAIR_MANAGER_BIN=$HOME/Projects/imports/Personal-AI-Router/services/build/bin/nvpair-engine-manager \
+  bench/p0a-contract-gate.sh .work/team-A/codex/p0a-live-r4 5 11434
 ```
 
-This was not launched bare. At report time `gpu-wait list` exits 1 because its
-daemon socket is unavailable:
-`$HOME/.local/run/gpu-waiting-room.sock`; it suggests starting the user
-unit `gpu-waitd`. No GPU job was submitted by Team A.
+Receipt: gpu-wait job `mu51onyvoq8l`, exit code 0. The socket fix required
+`GPUWR_SOCKET=/run/user/1000/gpu-waiting-room.sock`. No bare GPU job was
+submitted by Team A.
+
+The first live attempt `p0a-live` correctly killed on a gate-script comparison
+bug: default `/api/generate` applied the chat template while `/v1/completions`
+used a raw prompt (8 versus 3 completion tokens). The corrected r2 passed gates
+1 and 2. The r3 gate3 probe used `engine:get-installed`, which timed out during
+PAIR's unrelated LM Studio sweep after Ollama adoption; its manager stderr and
+state notification still prove adoption. The r4 gate3 uses explicit
+`engine:start` and passed the adoption plus routed-request check.
 
 ## Kill lines and next action
 
 Any gate 1 or 2 mismatch kills the P0a claim. Gate 3 failure must be reported
-immediately while work continues. Do not start P1 from this report until the
-coordinator restores the gpu-wait daemon and grants the live gate window, or
-explicitly accepts gates 1-3 as UNVERIFIED. P0a-e remains coordinator-owned.
+immediately while work continues. P0a gates 1-3 are complete. Sonnet may build
+the Rust P0a-e side after the coordinator merges the passed engine-wire lane.
+Do not claim embeddings parity until that side is built and gated. P0a-e
+remains coordinator-owned.
 
-UNVERIFIED: live gates 1-3, PAIR engine-manager adoption, and embeddings gate 4.
+UNVERIFIED: embeddings gate 4 on this Team A branch.
