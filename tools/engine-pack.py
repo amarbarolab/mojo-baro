@@ -303,8 +303,7 @@ def write_identity(outdir, model=None):
 
     Called two ways that see different files: at pack time (this function,
     right after pack.bin is written, `model` given) tokenizer.json does not
-    exist yet in the real pipeline (model-import.sh runs the tokenizer
-    export step after packing) so tokenizer_sha256 is null; `--identity
+    exist yet in the real pipeline (the tokenizer export step runs after packing) so tokenizer_sha256 is null; `--identity
     PACKDIR` (`ensure_identity`, `model=None`) runs later once it does. A
     prior identity.json's `source`/`general_uuid`/`tokenizer_sha256` are
     kept when this call cannot recompute them, so either order converges on
