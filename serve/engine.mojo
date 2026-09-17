@@ -368,6 +368,109 @@ def run_a3b_pair(
     print("{\"id\":" + String(id_b) + ",\"done\":true,\"n\":" + String(generated_b) + ",\"prefill_s\":0.0,\"decode_s\":0.0,\"tok_s\":0.0,\"cached\":0,\"prefill_rows\":0,\"restore_s\":0.0,\"checkpoints\":0,\"finish\":\"length\"}")
 
 
+def run_a3c_serial_row(
+    ctx: DeviceContext, mut bufs: WindowBufs, mut page_alloc: PageTable,
+    line: String, seq: Int, pack_q4: Bool, draft_q4: Bool, q4_off: Int, e: Int,
+    kcfg: Int, spec_dbg: Bool, expert_trace: Bool, att_split: Int, dot3: Bool,
+    pf_chunk: Int, pf_on: Bool, mega: Bool, mega_win: Bool, fr_k: Int,
+    fr_off: Int, fr_ids_off: Int, tmax: Int, kvtab_mode: String,
+) raises:
+    var req_id = 0
+    var prompt = List[Int]()
+    var gen_n = 0
+    var sample = default_sample_params()
+    var err = parse_a3b_request(line, tmax, req_id, prompt, gen_n, sample)
+    if err != "":
+        print(err_line(req_id, err))
+        return
+    var pages = page_alloc.alloc(bufs.tpages)
+    var view = sequence_bufs(ctx, bufs, seq, tmax)
+    for p in range(bufs.tpages):
+        var phys = pages[p]
+        if kvtab_mode == "reverse":
+            phys = pages[bufs.tpages - 1 - p]
+        bufs.kvtab_h[seq * bufs.tpages + p] = Int32(phys)
+    ctx.enqueue_memset(view.convstate_d, 0)
+    ctx.enqueue_memset(view.sstate_d, 0)
+    ctx.enqueue_memset(view.kc_d, 0)
+    ctx.enqueue_memset(view.vc_d, 0)
+    ctx.enqueue_memset(view.toks_d, 0)
+    ctx.enqueue_copy(
+        dst_buf=view.kvtab_d,
+        src_buf=bufs.kvtab_h.create_sub_buffer[DType.int32](seq * bufs.tpages, bufs.tpages),
+    )
+    var toks = ctx.enqueue_create_host_buffer[DType.int32](tmax)
+    for i in range(len(prompt)):
+        toks[i] = Int32(prompt[i])
+    ctx.enqueue_copy(dst_buf=view.toks_d, src_buf=toks)
+    ctx.synchronize()
+    print("A3C serial row: id", req_id, "slot", seq, "pages", pages[0], "..", pages[len(pages) - 1], "mapping", kvtab_mode)
+    var pf_rows = len(prompt) - 1 if pf_on and len(prompt) - 1 >= PF_MIN else 0
+    var pf_tail = pf_rows % MROWS if pf_rows > 0 else 0
+    if pf_tail == 0 and pf_rows > 0:
+        pf_tail = MROWS
+    var cfg = WindowCfg(pack_q4=pack_q4, draft_q4=draft_q4, q4_off=q4_off, fr_k=fr_k, fr_off=fr_off, fr_ids_off=fr_ids_off, e=e, kcfg=kcfg, spec=False, spec_dbg=spec_dbg, expert_trace=expert_trace, serve=True, req_id=req_id, prof=False, pf2=False, pf3=False, pf4=False, dump=False, dump4=False, dump_layer=0, mega=mega, att_split=att_split, mega_win=mega_win, dot3=dot3, pf_chunk=pf_chunk, pf_rows=pf_rows, pf_tail=pf_tail, n_total=len(prompt) + gen_n, n_prompt=len(prompt), sample=sample.copy(), dump_pen=False)
+    var st = a3b_state()
+    var t0 = perf_counter_ns()
+    while st.pos < cfg.n_total - 1:
+        step_window(ctx, view, cfg, st)
+        ctx.synchronize()
+    var elapsed = Float64(perf_counter_ns() - t0) / 1e9
+    var generated = st.pos + 1 - len(prompt)
+    print("A3C serial done: id", req_id, "n", generated, "wall_s", elapsed)
+    print("{\"id\":" + String(req_id) + ",\"done\":true,\"n\":" + String(generated) + ",\"a3c_mode\":\"serial\",\"wall_s\":" + String(elapsed) + ",\"finish\":\"length\"}")
+
+
+def run_a3c_serial(
+    ctx: DeviceContext, mut bufs: WindowBufs, line0: String, line1: String,
+    line2: String, line3: String, pack_q4: Bool, draft_q4: Bool, q4_off: Int,
+    e: Int, kcfg: Int, spec_dbg: Bool, expert_trace: Bool, att_split: Int,
+    dot3: Bool, pf_chunk: Int, pf_on: Bool, mega: Bool, mega_win: Bool,
+    fr_k: Int, fr_off: Int, fr_ids_off: Int, tmax: Int, kvtab_mode: String,
+) raises:
+    var page_alloc = PageTable(SEQ_CAP * bufs.tpages)
+    print("A3C batch: mode serial rows 4")
+    run_a3c_serial_row(ctx, bufs, page_alloc, line0, 0, pack_q4, draft_q4, q4_off, e, kcfg, spec_dbg, expert_trace, att_split, dot3, pf_chunk, pf_on, mega, mega_win, fr_k, fr_off, fr_ids_off, tmax, kvtab_mode)
+    run_a3c_serial_row(ctx, bufs, page_alloc, line1, 1, pack_q4, draft_q4, q4_off, e, kcfg, spec_dbg, expert_trace, att_split, dot3, pf_chunk, pf_on, mega, mega_win, fr_k, fr_off, fr_ids_off, tmax, kvtab_mode)
+    run_a3c_serial_row(ctx, bufs, page_alloc, line2, 2, pack_q4, draft_q4, q4_off, e, kcfg, spec_dbg, expert_trace, att_split, dot3, pf_chunk, pf_on, mega, mega_win, fr_k, fr_off, fr_ids_off, tmax, kvtab_mode)
+    run_a3c_serial_row(ctx, bufs, page_alloc, line3, 3, pack_q4, draft_q4, q4_off, e, kcfg, spec_dbg, expert_trace, att_split, dot3, pf_chunk, pf_on, mega, mega_win, fr_k, fr_off, fr_ids_off, tmax, kvtab_mode)
+    print("A3C batch done: mode serial rows 4")
+
+
+def run_a3c_serial_pair(
+    ctx: DeviceContext, mut bufs: WindowBufs, line0: String, line1: String,
+    pack_q4: Bool, draft_q4: Bool, q4_off: Int, e: Int, kcfg: Int,
+    spec_dbg: Bool, expert_trace: Bool, att_split: Int, dot3: Bool,
+    pf_chunk: Int, pf_on: Bool, mega: Bool, mega_win: Bool, fr_k: Int,
+    fr_off: Int, fr_ids_off: Int, tmax: Int, kvtab_mode: String,
+) raises:
+    var page_alloc = PageTable(SEQ_CAP * bufs.tpages)
+    print("A3C batch: mode serial rows 2")
+    var id0 = 0
+    var id1 = 0
+    var probe0 = List[Int]()
+    var probe1 = List[Int]()
+    var n0 = 0
+    var n1 = 0
+    var sp0 = default_sample_params()
+    var sp1 = default_sample_params()
+    var err0 = parse_a3b_request(line0, tmax, id0, probe0, n0, sp0)
+    var err1 = parse_a3b_request(line1, tmax, id1, probe1, n1, sp1)
+    if err0 != "":
+        print(err_line(id0, err0))
+        return
+    if err1 != "":
+        print(err_line(id1, err1))
+        return
+    if id0 == id1:
+        print(err_line(id1, "A3C request ids must be distinct"))
+        return
+    print("A3C step: mode serial ids", id0, id1, "slots 0,1")
+    run_a3c_serial_row(ctx, bufs, page_alloc, line0, 0, pack_q4, draft_q4, q4_off, e, kcfg, spec_dbg, expert_trace, att_split, dot3, pf_chunk, pf_on, mega, mega_win, fr_k, fr_off, fr_ids_off, tmax, kvtab_mode)
+    run_a3c_serial_row(ctx, bufs, page_alloc, line1, 1, pack_q4, draft_q4, q4_off, e, kcfg, spec_dbg, expert_trace, att_split, dot3, pf_chunk, pf_on, mega, mega_win, fr_k, fr_off, fr_ids_off, tmax, kvtab_mode)
+    print("A3C batch done: mode serial rows 2")
+
+
 def main() raises:
     comptime assert has_accelerator(), "Requires a GPU"
     var ctx = DeviceContext()
@@ -623,6 +726,22 @@ def main() raises:
                 line_in = read_line(0)
             if not line_in:
                 break
+            if json_key(line_in.value(), "a3c2") >= 0:
+                var line1 = read_line(0)
+                if not line1:
+                    print(err_line(0, "A3C two-row batch ended before its second row"))
+                    continue
+                run_a3c_serial_pair(ctx, bufs, line_in.value(), line1.value(), pack_q4, draft_q4, q4_off, e, kcfg, spec_dbg, expert_trace, att_split, dot3, pf_chunk, pf_on, mega, mega_win, fr_k, fr_off, fr_ids_off, tmax, kvtab_mode)
+                continue
+            if json_key(line_in.value(), "a3c") >= 0:
+                var line1 = read_line(0)
+                var line2 = read_line(0)
+                var line3 = read_line(0)
+                if not line1 or not line2 or not line3:
+                    print(err_line(0, "A3C batch ended before four rows"))
+                    continue
+                run_a3c_serial(ctx, bufs, line_in.value(), line1.value(), line2.value(), line3.value(), pack_q4, draft_q4, q4_off, e, kcfg, spec_dbg, expert_trace, att_split, dot3, pf_chunk, pf_on, mega, mega_win, fr_k, fr_off, fr_ids_off, tmax, kvtab_mode)
+                continue
             if json_key(line_in.value(), "a3b") >= 0:
                 var line_b = Optional[String](None)
                 if len(pending) > 0:

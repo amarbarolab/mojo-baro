@@ -103,3 +103,43 @@ normal single-request path remains on plane 0 of the expanded token buffer.
 This proves resident KV, convolution, SSM, token, and page-table isolation for
 the serial two-sequence greedy path. It makes no A3(c) launch-batching or
 throughput claim. A3(c) and A3(d) remain open.
+
+## A3(c) staged host contract and kernel handoff
+
+Protocol was frozen before implementation in `bench/a3-c-protocol.md` and
+committed as `474143b`, then amended into the staged pre-kernel form in
+`477fea2`. The inherited row-scaling prerequisite is the round-2 receipt in
+`bench/ssm-mrow-protocol.md`, commit `75db5f1`: mode-1 totals 11.322 ms at m=1
+and 19.584 ms at m=4, aggregate ceiling 2.31x, with N=4 selected. Item 0's
+VRAM receipt remains `exchange/lane-COMFY-report.md`, item 0: MAX reserves
+about 22 GB per engine process regardless of pack size, so N=4 stays within
+one process minus the trunk.
+
+The host side is committed in `477fea2`: `SEQ_CAP=4`, a seven-field row
+descriptor contract (`req_id`, `pos`, `ring`, `kvtab_base`, `kv_base`,
+`conv_base`, `ssm_base`), per-row page/state/token views, and `a3c2` serial
+fallback dispatch in `serve/engine.mojo`. Each staged batch prints both ids,
+slots 0,1, page mapping, and per-row terminal timing. The live receipt is
+`.work/a3-c-serial/receipt.md`: refcache key `22f415c5a1a79176c14f65d6`,
+20/20 identity, 10/10 id-per-launch receipts, 20/20 terminals, clean EOF.
+This is the required P6 harness-before-kernel check; it is explicitly not a
+one-launch batching or throughput result.
+
+The exact coordinator-owned kernel seam is requested in
+`exchange/lane-A3-c-kernel-request.md`, committed in `477fea2`: per-row
+position/page-table/KV bases for attention append/decode, per-row ring and
+conv/SSM bases for the SSM kernels, and row-wise sampler state. The frozen
+four-row throughput gate remains `bench/a3-c-gate.sh`; it cannot be promoted
+until those kernels produce one target launch with four distinct ids.
+
+## A3(d) admission start
+
+Protocol was frozen first in `bench/a3-d-protocol.md`; the gate and note are
+committed as `44a167f`. `bench/a3-d-admission-gate.sh` sends five mixed-length
+clients through one `baro-serve` process. Live receipt:
+`.work/a3-d-admission/receipt.md`: 5/5 identity, 5/5 terminal responses,
+five distinct response ids, health queue read-back 5, four wire-admission
+receipts while request 1 was in flight, and clean server exit. This proves
+current queue admission/id routing. Preemption and throughput remain scoped
+until the A3(c) per-row kernel seam is available; no speedup number is
+claimed.
