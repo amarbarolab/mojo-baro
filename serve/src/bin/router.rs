@@ -5,7 +5,7 @@
 //! placement decision. It provides the contracts around which the later proxy
 //! and state moves fit, rather than making an empty locality field look done.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -16,6 +16,7 @@ use axum::http::{Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
 use axum::{Json, Router};
+use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::net::TcpStream;
@@ -30,6 +31,7 @@ struct RouterState {
     node_id: String,
     http_port: u16,
     discovery: DiscoveryAdvertisement,
+    _mdns: Option<MdnsRuntime>,
     engines: EngineRegistry,
     workloads: WorkloadCatalog,
     next_request: AtomicU64,
@@ -63,6 +65,46 @@ impl DiscoveryAdvertisement {
     fn browse_services(&self) -> [&'static str; 2] {
         [BARO_SERVICE, PAIR_SERVICE]
     }
+}
+
+struct MdnsRuntime {
+    // Holding the daemon handle keeps its worker and both registrations alive.
+    _daemon: ServiceDaemon,
+}
+
+fn start_mdns(advertisement: &DiscoveryAdvertisement, node_id: &str) -> Result<MdnsRuntime, String> {
+    let daemon = ServiceDaemon::new().map_err(|e| format!("mDNS daemon: {e}"))?;
+    let host = format!("baro-{node_id}.local.");
+    let mut properties = HashMap::new();
+    for (key, value) in &advertisement.txt {
+        properties.insert(key.clone(), value.clone());
+    }
+    for service in advertisement.browse_services() {
+        let service_type = format!("{service}.local.");
+        let info = ServiceInfo::new(
+            &service_type,
+            &advertisement.instance,
+            &host,
+            "127.0.0.1",
+            advertisement.port,
+            properties.clone(),
+        )
+        .map_err(|e| format!("mDNS service {service}: {e}"))?;
+        daemon.register(info).map_err(|e| format!("mDNS register {service}: {e}"))?;
+    }
+    let browse_type = format!("{}.local.", advertisement.pair_service);
+    let receiver = daemon.browse(&browse_type).map_err(|e| format!("mDNS browse: {e}"))?;
+    std::thread::Builder::new()
+        .name("baro-router-mdns".into())
+        .spawn(move || {
+            while let Ok(event) = receiver.recv() {
+                if let ServiceEvent::ServiceResolved(service) = event {
+                    eprintln!("mDNS discovered {}:{}", service.get_hostname(), service.get_port());
+                }
+            }
+        })
+        .map_err(|e| format!("mDNS browse thread: {e}"))?;
+    Ok(MdnsRuntime { _daemon: daemon })
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -380,10 +422,18 @@ async fn main() {
     let engines = EngineRegistry::from_env();
     let discovery = DiscoveryAdvertisement::new(&node_id, port);
     eprintln!("discovery advertise={} browse={:?} txt={:?}", discovery.service, discovery.browse_services(), discovery.txt);
+    let mdns = match start_mdns(&discovery, &node_id) {
+        Ok(runtime) => Some(runtime),
+        Err(error) => {
+            eprintln!("baro-router: mDNS unavailable: {error}");
+            None
+        }
+    };
     let state = Arc::new(RouterState {
         node_id,
         http_port: port,
         discovery,
+        _mdns: mdns,
         engines: engines.clone(),
         workloads: WorkloadCatalog::new(),
         next_request: AtomicU64::new(1),
