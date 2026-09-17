@@ -41,7 +41,7 @@ use tokio_stream::wrappers::ReceiverStream;
 /// and Rust share no struct-layout mechanism). This is the HTTP layer's
 /// own reader/writer: Mojo never touches LAT1, only the raw BAROST0x body
 /// it wraps (`serve/engine.mojo`'s `save_state`/`load_state`).
-mod lat1 {
+pub mod lat1 {
     pub const MAGIC: u32 = 0x3154_414C; // 'LAT1'
     pub const VERSION: u16 = 1;
     pub const HEADER_LEN: usize = 256;
@@ -479,6 +479,33 @@ async fn export_to_path(app: &Shared, r: &ExportReq, path: String) -> Result<Val
 /// written by the engine and is almost certainly still page-cache-hot, so
 /// the second read is not a second disk trip in practice.
 async fn export_stream(app: &Shared, r: &ExportReq) -> Result<Response, ApiError> {
+    let (path, header) = export_lat1_file(app, r).await?;
+    let header_bytes = header.to_bytes();
+    let (tx, rx_ch) = mpsc::channel::<Result<Bytes, std::io::Error>>(2);
+    if tx.send(Ok(Bytes::copy_from_slice(&header_bytes))).await.is_err() {
+        let _ = std::fs::remove_file(&path);
+        return Err(ApiError::Plain(StatusCode::INTERNAL_SERVER_ERROR, "client closed the connection before the header was sent".into()));
+    }
+    tokio::spawn(stream_file_chunks(path, tx));
+    let body = Body::from_stream(ReceiverStream::new(rx_ch));
+    let mut resp = Response::new(body);
+    resp.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("application/vnd.baro.state"));
+    Ok(resp)
+}
+
+impl ExportReq {
+    /// The export `/v1/fork`'s `target` form runs: the fork prompt's own
+    /// token ids, `pos` left to `default_pos` (the prompt end minus one,
+    /// which is also the only position `save_state` writes).
+    pub fn for_tokens(tokens: Vec<u32>) -> ExportReq {
+        ExportReq { prompt: None, messages: None, tokens: Some(tokens), pos: None, format: None, path: None }
+    }
+}
+
+/// The prefill, the scratch BAROST0x file and its filled LAT1 header, shared
+/// by the stream response above and `fork_target` (which sends the same
+/// bytes to another node's import route). The caller owns the scratch file.
+pub async fn export_lat1_file(app: &Shared, r: &ExportReq) -> Result<(std::path::PathBuf, lat1::Header), ApiError> {
     let server_format = state_file_format();
     let path = scratch_path(app, "lat1-export");
     std::fs::create_dir_all(&app.ckpts.dir).map_err(|e| ApiError::Plain(StatusCode::INTERNAL_SERVER_ERROR, format!("{}: {e}", app.ckpts.dir.display())))?;
@@ -522,17 +549,7 @@ async fn export_stream(app: &Shared, r: &ExportReq) -> Result<Response, ApiError
         payload_len,
         payload_sha,
     };
-    let header_bytes = header.to_bytes();
-    let (tx, rx_ch) = mpsc::channel::<Result<Bytes, std::io::Error>>(2);
-    if tx.send(Ok(Bytes::copy_from_slice(&header_bytes))).await.is_err() {
-        let _ = std::fs::remove_file(&path);
-        return Err(ApiError::Plain(StatusCode::INTERNAL_SERVER_ERROR, "client closed the connection before the header was sent".into()));
-    }
-    tokio::spawn(stream_file_chunks(path, tx));
-    let body = Body::from_stream(ReceiverStream::new(rx_ch));
-    let mut resp = Response::new(body);
-    resp.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("application/vnd.baro.state"));
-    Ok(resp)
+    Ok((path, header))
 }
 
 /// `(pos, tokens[0:pos])` embedded in a `BAROST01`/`BAROST02` file
