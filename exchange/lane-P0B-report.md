@@ -1,9 +1,13 @@
 # Team A P0b report
 
 Date: 2026-09-17
-Item: P0b CPU router skeleton and gate 3 fixture
-Status: **gate 3 PASS** (2/2 clean runs). Gates 1, 2, 4 not started (blocked
-on gate 3 until now; team A takes those next).
+Item: P0b CPU router skeleton, gate 3, and gates 1/2/4's real proxy + state
+locality
+Status: **gate 3 PASS** (2/2 clean runs). Gates 1/2/4's mechanism is built
+and live-proven with one real engine; the two-engine placement-spread and
+live-failover claims those gates actually ask for are **BLOCKED on P4**
+(multi-GPU wiring, XTX + iGPU, a separate platform item nobody has built
+yet). See "Gates 1/2/4" below for exactly what is proven and what is not.
 
 ## Landed
 
@@ -27,6 +31,11 @@ on gate 3 until now; team A takes those next).
   mDNS goodbyes on shutdown, cleans up three orphaned test processes, and
   (with the user's explicit approval) opens inbound mDNS on the `public`
   firewalld zone. Diagnosis and fix below.
+- `65d59a8` (sonnet): real proxy pass-through (`reqwest`, streaming,
+  connect-failure retry) and CONTRACT 4 state locality (`choose()`'s
+  preferred-engine bonus, `probe_loop`'s `GET /v1/state` poll,
+  `locality_preference()`'s `POST /tokenize` + hash match). "Gates 1/2/4"
+  below.
 
 ## The original failure (codex, kept for the record)
 
@@ -122,15 +131,91 @@ both exit 0. `node-info.json` in both receipts: `hostUuid` matches, no
 `state_locality` key (CONTRACT 4's term is still absent, as designed until
 gate 4).
 
+## Gates 1/2/4
+
+The plan's own text for all three names "two engines on this box (P4's
+rig)" or a live kill of one of two. P4 (multi-GPU wiring: `baro-serve` on
+the XTX plus a second one on the Raphael iGPU under the HSA override, a
+small Qwen2.5-0.5B pack) is its own platform item and nobody has built it
+yet (`exchange/` has no P4 report; no iGPU pack exists under `.work/`). That
+is a real, single, cross-item blocker for all three gates' literal claims,
+not a per-gate list -- named here once rather than three times.
+
+What is genuinely built and what a live single-engine smoke can and cannot
+prove:
+
+- **`proxy()` forwards for real now.** It answered 501 before this commit.
+  It now forwards via a pooled `reqwest::Client`, streams the response body
+  straight through (`Body::from_stream` over `bytes_stream()`, so SSE
+  token-by-token output reaches the client as it arrives), and on a
+  connect/timeout failure *before* any response arrives, demotes the engine
+  immediately and retries the next-ranked one (not waiting for
+  `probe_loop`'s next 5 s cycle) -- gate 2's "new ones route to the other,"
+  minus the "kill a real engine mid-generation, in-flight requests fail
+  loudly" half, which needs a second real engine to demonstrate without
+  faking it.
+- **CONTRACT 4 (P1-STATE-API.md) is wired end to end**, not just at the
+  unit level: `choose()` takes a preferred engine id and treats its pending
+  count as one lower, breaking ties in its favor; `probe_loop` polls each
+  engine's own `GET /v1/state` every cycle and caches both the raw response
+  (`node_info` embeds it per engine, CONTRACT 4's literal wording) and the
+  prefix-hash list; `locality_preference()` computes CONTRACT 1's hash via
+  `POST /tokenize`, scoped to `/v1/completions` and `/api/generate`'s raw
+  `prompt` string (already-rendered text) -- a `messages`-shaped chat
+  request would need this process to apply the chat template itself to get
+  a "rendered prompt" at all, which only the engine's own tokenizer+template
+  pipeline can do, so it falls back to plain rank honestly rather than
+  faking a hash. Caught live, before trusting the mechanism: the hash was
+  first computed at the full token length, but a checkpoint's `pos` is
+  `len - 1` (the same reservation `checkpoints::create`'s own `c.pos`,
+  `state.rs::default_pos`'s fallback, and `Chain::lookup` on the engine side
+  all use, room A 2026-09-17's P1 fix) -- fixed to check `len - 1` first,
+  `len` too.
+- **Gate 1's placement-spread across two engines** and **gate 2's live
+  "kill one engine mid-generation, in-flight fails loudly, new routes to
+  the survivor"** genuinely need two real engines and are not claimed here.
+
+### Live receipt (one real engine)
+
+```text
+bench/p0b-proxy-smoke.sh
+gate1 mechanism OK: proxied text matches direct byte-for-byte: ' Paris.\nThe capital of France is'
+SSE streaming pass-through OK: 10 data frames, terminal [DONE] reached
+catalog OK: 1 completions row(s), last one engine=real placement=rank
+resident prefix_hash after checkpoint: 524c3fca17fd65ee
+gate4 OK: locality-prefixed request placed with placement=locality
+PASS p0b-proxy-smoke
+```
+
+`node-info` before the checkpoint existed: `real` healthy, `dead` (an
+intentionally-unlistened port, to prove `choose()`'s health filter and the
+retry-exclude path have something to skip) not, `resident_state` already
+present (an empty `GET /v1/state` response, since nothing was checkpointed
+yet). After a real `POST /v1/checkpoints`, the same engine's
+`resident_prefix_hashes` carries the new hash and a following
+`/v1/completions` request for that exact prompt is placed with
+`placement=locality`, not `rank` -- the full wire path fires, not just its
+pieces.
+
+### Unit coverage
+
+11 router tests (6 new this commit): `choose_plain_rank_picks_the_lowest_pending`,
+`choose_locality_bonus_breaks_a_tie_in_the_preferred_engines_favor`,
+`choose_locality_bonus_never_overrides_a_genuinely_worse_engine`,
+`choose_excludes_listed_ids`, `choose_returns_none_when_every_engine_is_excluded_or_unhealthy`,
+`is_hop_by_hop_strips_connection_framing_not_ordinary_headers`, plus the
+`prefix_hash` module's own test against `state.rs`'s exact vector (must
+agree with the engine's own number, not just be internally consistent).
+
 ## Checks
 
 ```text
 cargo clippy --workspace -- -D warnings   clean
-cargo nextest run --workspace             72 tests run: 72 passed, 0 skipped
+cargo nextest run --workspace             73 tests run: 73 passed, 0 skipped
 ```
 
-No stray `router` or `nvpair-node-scanner` processes remain (`ps` checked
-clean after every run in this session).
+No stray `router`, `baro-serve`, or `nvpair-node-scanner` processes remain
+(`ps` checked clean after every run in this session).
 
 ## Suite and readiness
 
@@ -140,8 +225,13 @@ gate's own work but nothing since has touched Mojo sources.
 
 ## Next action
 
-Gates 1 and 2 need real proxy pass-through (`proxy()` in `router.rs` still
-answers 501 `"proxy transport pending"`); gate 4 needs the P1 state-locality
-term wired into `choose_engine`. Coordinator assigned these to team A next,
-now that gate 3 is green. `lane-team-a` is current with `main` (merged
-2026-09-17, `be9a002`) so this can proceed without re-conflicting.
+Everything buildable without a second engine is built and live-proven.
+What remains for gates 1/2/4 is P4 itself: `baro-serve` on the iGPU
+(Qwen2.5-0.5B, WMMA-free kernel set, `HSA_OVERRIDE_GFX_VERSION=10.3.0` --
+`igpu-env --probe` already confirms the device works, `vadd mismatches 0`)
+plus the pack bake for it. Once that exists, `bench/p0b-proxy-smoke.sh`'s
+shape (one real engine, a `dead` port to exercise the exclude path) extends
+directly to a genuine two-engine `pair-dispatch --count 20` run for gate 1
+and a real kill-mid-generation for gate 2; nothing in this commit needs
+rework for that, it only needs a second `BARO_ROUTER_ENGINES` entry that
+answers. `lane-team-a` is current with `main` (merged 2026-09-17, `be9a002`).
