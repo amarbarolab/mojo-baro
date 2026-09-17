@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
-# P1 POST /v1/state/export smoke (path variant): resident engine, one real
-# export request, checks the file landed and the response fields agree with
-# it. Not the full plan gate (that needs the cross-node rig and both
-# formats); this proves the route is reachable and correct on one node.
+# P1 export-then-import round trip (path variant, one node): what the plan's
+# own gate 1 asks for in miniature ("export then import on one node
+# reproduces the identity and the restore band"). Resident engine, one real
+# export, one real import of the file it wrote, checks the file landed, the
+# import found it (not a silent cold-path fallthrough), and both routes'
+# prefix_hash agree on the same prompt. Not the full plan gate (that needs
+# 20 prompts, both KV formats, and the cross-node rig); this proves the pair
+# is reachable and self-consistent on one node.
 # GPU: minutes. Run through gpu-wait, never bare.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-out=${1:-.work/p1-export-smoke}
+out=${1:-.work/p1-roundtrip-smoke}
 engine=${BARO_ENGINE:-.work/engine}
 pack=${BARO_PACK:-.work/engine-pack-q4}
 serve=${BARO_SERVE_BIN:-.work/team-A/sonnet/target/release/baro-serve}
@@ -37,6 +41,8 @@ url=$(python3 -c "import re,sys; print(re.search(r'https?://\S+', open(sys.argv[
   || fail start "no listening URL"
 
 curl -fsS "$url/health" > "$out/health.json" || fail health "GET /health failed"
+
+# ---- export -----------------------------------------------------------------
 
 state_path="$PWD/$out/exported.baro"
 rm -f "$state_path"
@@ -71,4 +77,34 @@ curl -sS -X POST "$url/v1/state/export" -H 'content-type: application/json' \
   -d '{"prompt":"hi"}' > "$out/export-no-path.json" 2>&1
 grep -q "not built yet" "$out/export-no-path.json" || fail falsify "export with no path did not 501 as expected"
 
-echo "PASS p1-state-export-smoke"
+# ---- import -------------------------------------------------------------------
+
+curl -fsS -X POST "$url/v1/state/import" -H 'content-type: application/json' \
+  -d "$(python3 -c 'import json; print(json.dumps({"path": "'"$state_path"'"}))')" \
+  > "$out/import.json" || fail import "POST /v1/state/import failed"
+
+python3 - "$out/export.json" "$out/import.json" <<'PY'
+import json, sys
+exp = json.load(open(sys.argv[1]))
+imp = json.load(open(sys.argv[2]))
+for k in ("prefix_hash", "pos", "restore_ms", "runtime_differs"):
+    assert k in imp, f"missing field {k}: {imp}"
+assert imp["prefix_hash"] == exp["prefix_hash"], (imp["prefix_hash"], exp["prefix_hash"])
+assert imp["pos"] == exp["pos"], (imp["pos"], exp["pos"])
+assert imp["restore_ms"] >= 0, imp["restore_ms"]
+assert imp["runtime_differs"] is None, "a raw BAROST0x file carries no runtime field; must be null, not a guessed bool"
+print(f"import OK: pos={imp['pos']} prefix_hash={imp['prefix_hash']} restore_ms={imp['restore_ms']:.2f}")
+print(f"round trip: export and import agree on prefix_hash and pos for the same prompt")
+PY
+
+# a file that is not a state file at all: exercises read_state_header's
+# magic check, never reaching the engine. 72+ bytes (the fixed header size)
+# so this hits the magic check, not the separate too-short refusal.
+bad_path="$PWD/$out/not-a-state-file"
+head -c 128 /dev/zero | tr '\0' 'x' > "$bad_path"
+curl -sS -X POST "$url/v1/state/import" -H 'content-type: application/json' \
+  -d "$(python3 -c 'import json; print(json.dumps({"path": "'"$bad_path"'"}))')" \
+  > "$out/import-bad-file.json" 2>&1
+grep -q "not a BAROST01/BAROST02" "$out/import-bad-file.json" || fail falsify "import of a non-state file did not refuse as expected"
+
+echo "PASS p1-state-roundtrip-smoke"

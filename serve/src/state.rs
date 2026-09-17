@@ -276,8 +276,20 @@ pub struct ImportReq {
 /// (`read_state_header`) to build the request `chain.lookup` needs to find
 /// the checkpoint `state_load` just brought in (`serve/engine.mojo:852-867`:
 /// load happens, THEN the request's own prompt is looked up against the
-/// chain by salted hash) -- the caller does not supply a prompt for this
-/// route, the file already carries the only prompt that can match itself.
+/// chain by salted hash).
+///
+/// `Chain::lookup` (`serve/prefix.mojo:337`) only accepts a checkpoint at
+/// `pos <= n - 1`, n the request's prompt length: it always reserves the
+/// prompt's last token as the live decode seed (confirmed against
+/// `checkpoints::create`/`fork` above, which always submit `pos + 1`
+/// tokens -- the checkpoint's own defining prompt plus a suffix). The file
+/// embeds exactly `pos` tokens, so a request built from them alone always
+/// has `n == pos` and can never clear that bar -- a live smoke against this
+/// route 502'd every time before this fix (room A, 2026-09-17). The request
+/// sent to the engine repeats the file's own last token once, giving
+/// `n == pos + 1`; `exact_prefix_hash` below and the checkpoint's own
+/// registered hash both still only read `tokens[0:pos]`, so the repeat
+/// changes nothing that is checked, it only clears the reservation.
 pub async fn import(State(app): State<Shared>, Json(r): Json<ImportReq>) -> Result<Json<Value>, ApiError> {
     let Some(path) = r.path.clone() else {
         return Err(ApiError::Plain(
@@ -289,8 +301,10 @@ pub async fn import(State(app): State<Shared>, Json(r): Json<ImportReq>) -> Resu
     if pos == 0 {
         return Err(bad(format!("{path}: pos is 0, nothing to import")));
     }
+    let mut request_prompt = tokens.clone();
+    request_prompt.push(tokens[pos - 1]);
     let g = Gen {
-        prompt: tokens.clone(),
+        prompt: request_prompt,
         n: 1,
         spec: false,
         stream: false,
