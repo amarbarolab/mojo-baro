@@ -40,7 +40,7 @@ import torch
 import torch.nn.functional as F
 
 sys.path.insert(0, "tools")
-from mtp_head import MTPHead, build_causal_mask, load_trunk, H, read_dump  # noqa: E402
+from mtp_head import MTPHead, build_causal_mask, load_trunk, H, read_v2_dump  # noqa: E402
 
 
 def flatten_document(doc):
@@ -57,17 +57,36 @@ def flatten_document(doc):
     return h, input_ids, labels
 
 
-def forward_loss(head, embed, lm_head, rotary, h, input_ids, labels, device):
+def flatten_v2_document(doc):
+    """Make aligned CPU tensors from validated P5a records."""
+    records = doc["records"]
+    if not records:
+        return None
+    h = torch.stack([r["h"] for r in records])
+    input_ids = torch.tensor([r["input_token"] for r in records], dtype=torch.long)
+    labels = torch.tensor([doc["tokens"][r["pos"] + 1] for r in records], dtype=torch.long)
+    top8_ids = torch.stack([r["top8_ids"] for r in records])
+    top8_probs = torch.stack([r["top8_probs"] for r in records])
+    return h, input_ids, labels, top8_ids, top8_probs
+
+
+def forward_loss(head, embed, lm_head, rotary, h, input_ids, labels, top8_ids, top8_probs, device):
     T = h.shape[0]
     h = h.to(device)
     input_ids = input_ids.to(device)
     labels = labels.to(device)
+    top8_ids = top8_ids.to(device)
+    top8_probs = top8_probs.to(device)
     tok_embed_row = embed(input_ids)
     pos_ids = torch.arange(1, 1 + T, device=device).view(1, 1, -1).expand(4, 1, -1)
     mask = build_causal_mask(T, torch.float32, device)
     out = head(tok_embed_row, h, rotary, pos_ids, mask)
     logits = lm_head(out.to(lm_head.weight.dtype)).float()
-    return F.cross_entropy(logits, labels), T
+    ce = F.cross_entropy(logits, labels)
+    restricted = logits.gather(dim=-1, index=top8_ids)
+    log_p8 = F.log_softmax(restricted, dim=-1)
+    kl = F.kl_div(log_p8, top8_probs, reduction="batchmean")
+    return ce + kl, ce.detach(), kl.detach(), T
 
 
 def lr_multiplier(step_1indexed, n_steps, warmup_steps):
@@ -81,7 +100,7 @@ def lr_multiplier(step_1indexed, n_steps, warmup_steps):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dump", required=True, help="bench/draft_dump.mojo --mode dump output")
+    ap.add_argument("--dump", required=True, help="bench/draft_dump.mojo P5a v2 output")
     ap.add_argument("--extracted", required=True, help="tools/mtp_head.py --mode extract output")
     ap.add_argument("--hf-dir", default="$HOME/Models/qwythos-9b-claude-mythos-5-1m-mtp-bf16/hf")
     ap.add_argument("--lr", type=float, default=2e-5)
@@ -111,8 +130,8 @@ def main():
     head.train()
     opt = torch.optim.AdamW(head.parameters(), lr=args.lr)
 
-    docs = read_dump(args.dump)
-    flat_docs = [flatten_document(d) for d in docs]
+    docs = read_v2_dump(args.dump)
+    flat_docs = [flatten_v2_document(d) for d in docs]
     flat_docs = [d for d in flat_docs if d is not None]
     n_needed = args.accum * args.n_steps
     if len(flat_docs) < n_needed:
@@ -122,6 +141,8 @@ def main():
 
     warmup_steps = max(1, math.ceil(args.warmup_ratio * args.n_steps))
     step_losses = []
+    step_ce = []
+    step_kl = []
     doc_losses = []
     n_docs_used = 0
     n_pairs_used = 0
@@ -134,12 +155,19 @@ def main():
             g["lr"] = args.lr * mult
         opt.zero_grad(set_to_none=True)
         window_losses = []
+        window_ce = []
+        window_kl = []
         for i in range(args.accum):
             idx = perm[(step - 1) * args.accum + i]
-            h, input_ids, labels = flat_docs[idx]
-            loss, t = forward_loss(head, embed, lm_head, rotary, h, input_ids, labels, device)
+            h, input_ids, labels, top8_ids, top8_probs = flat_docs[idx]
+            loss, ce, kl, t = forward_loss(
+                head, embed, lm_head, rotary, h, input_ids, labels,
+                top8_ids, top8_probs, device
+            )
             (loss / args.accum).backward()
             window_losses.append(loss.item())
+            window_ce.append(ce.item())
+            window_kl.append(kl.item())
             n_docs_used += 1
             n_pairs_used += t
             if device == "cuda":
@@ -149,6 +177,8 @@ def main():
         opt.step()
         doc_losses.extend(window_losses)
         step_losses.append(sum(window_losses) / len(window_losses))
+        step_ce.append(sum(window_ce) / len(window_ce))
+        step_kl.append(sum(window_kl) / len(window_kl))
 
     is_void = not (step_losses[-1] < step_losses[0])
     torch.save(head.state_dict(), args.out)
@@ -158,6 +188,8 @@ def main():
         "grad_clip": args.grad_clip, "warmup_steps": warmup_steps,
         "n_docs_used": n_docs_used, "n_pairs_used": n_pairs_used,
         "step_losses": step_losses,
+        "step_ce": step_ce,
+        "step_kl": step_kl,
         "grad_norms": grad_norms,
         "first_step_loss": step_losses[0],
         "last_step_loss": step_losses[-1],
