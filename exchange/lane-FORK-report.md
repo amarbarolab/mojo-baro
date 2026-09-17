@@ -1,16 +1,24 @@
 # Lane FORK report: neither gate passed
 
 Gate 4 is NOT MET on all three models (16, 13 and 14 of 20), against a bar llama.cpp cannot clear
-when it hands state to ITSELF (15, 16 and 16 of 20). Gate 2 did not run, because the rig it needs
-cannot be built on one XTX: two of our engines do not fit, and MAX's memory cap does not change
-that. What the lane did establish is narrower and solid: the forward bridge has no layout defect.
+when it hands state to ITSELF (15, 16 and 16 of 20). Gate 2 did not run. What the lane did
+establish is narrower and solid: the forward bridge has no layout defect.
+
+**Correction, 2026-09-17 afternoon, after this report was first committed (`856f6da`).** That version
+said gate 2's rig "cannot be built on one XTX: two of our engines do not fit, and MAX's memory cap
+does not change that". Wrong as a general claim. I had tested the 9B at `BARO_TMAX=33024` only and
+generalised. the maintainer asked whether 1B models could be tried, and the probe then showed two 1B engines
+live together (11.3 + 6.2 GB) and, at TMAX 4096 with the cap at 10, **two 9B engines live together,
+10.7 GB each, 23.5 GB total, identical answers**. Gate 2's identity half therefore HAS a literal rig;
+only its 32k timing half does not. Details in `docs/P1-FORK-TARGET.md`. I had already routed the
+wrong claim to the board, a Brain note and memory; all three are corrected.
 
 Date 2026-09-17. Branch `lane-fork`, 11 commits ahead of `main`, builder fable. Brief
 `briefs/2026-09-17-latentos-cross-node-fork.md`. Receipts under `.work/fork/`.
 
 | gate | result | receipt |
 |---|---|---|
-| Gate 2, cross-node fork over the veth rig | **NOT RUN.** Rig choice open, coordinator's or the maintainer's | `docs/P1-FORK-TARGET.md` |
+| Gate 2, cross-node fork over the veth rig | **NOT RUN.** Identity half has a literal rig at TMAX 4096 (found late); the 32k timing half's rig is still the coordinator's or the maintainer's choice | `docs/P1-FORK-TARGET.md` |
 | Gate 4, E15's three models continue from our state | **NOT MET** on all three; UNCLASSIFIED by the frozen rule | `.work/fork/g4-gate/{lily,qwen25,ornith}` |
 | Kill line | **Not decided by this lane.** See "The kill line" below | |
 
@@ -86,12 +94,13 @@ exactly at the margin (13 against control N 15). The verdict is UNCLASSIFIED, an
 fires the kill line, and whether the plan's bar is amended under `PROTOCOL-RULES.md` P14, belongs
 to the coordinator.
 
-## Gate 2: the literal rig does not exist on this machine
+## Gate 2: a literal rig exists at 4k, not at 32k (corrected, see the top)
 
 `bench/fork-cap-probe.sh`, dense q4 pack, `BARO_TMAX=33024`. With
 `MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_SIZE_PERCENT` at 45, 25 and 10, node A held 19.5, 21.5 and
-18.9 GB and node B died with `hipErrorOutOfMemory` each time. The hold is not monotonic in the
-knob, so the knob does not govern it. The whiteboard's "untested" lever is tested and closed.
+18.9 GB and node B died with `hipErrorOutOfMemory` each time. I concluded "the knob does not govern
+it" and called the lever closed. It is closed at 32k only: at that context one engine needs about
+19 GB and grows past any pool the cap sets. At TMAX 4096 two 9B engines fit (table in the doc).
 
 Four runnable rigs, what each cannot judge, and my recommendation (sequential XTX plus a
 self-target forwarder) are in `docs/P1-FORK-TARGET.md`, sent to `w82:pC`. Each rig changes what the
@@ -102,6 +111,12 @@ mock node receiving header and file with the exact `Content-Length` and the 409 
 never moved a state between two live nodes. UNVERIFIED end to end.**
 
 ## What I got wrong along the way
+
+- **I declared the two-node rig impossible from one operating point.** I varied the memory cap and
+  never the context length, wrote "cannot be built" into a doc, this report, the board, a Brain
+  note and memory, and recommended substitute rigs on that basis. It took the maintainer asking about 1B
+  models to find that two 9B engines fit at TMAX 4096. This is the most expensive mistake in the
+  lane: it is why gate 2's identity half, which could have run today, did not.
 
 - **I blocked the GPU queue for 9 minutes in front of a priority-90 job.** The cap probe started
   its servers in a command substitution, lost their pids, and hung after node B's OOM. Cancelled

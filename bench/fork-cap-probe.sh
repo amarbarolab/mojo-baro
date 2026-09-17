@@ -6,6 +6,9 @@
 # MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_SIZE_PERCENT? Starts node A, reads VRAM, starts node B
 # beside it, reads VRAM, then runs one completion on each. The answer picks the gate 2 rig
 # (two live nodes, or time-sliced engines), so it is a receipt, not a smoke.
+# PROBE_PROMPT='[1,2,3]' sends token ids instead of text: a spark pack carries no tokenizer.json,
+# so baro-serve's text route is 503 on it. gpu-wait drops the caller's env, so pass BARO_ENGINE,
+# BARO_PACK and PROBE_PROMPT with `env` INSIDE the job command.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 out=${1:-.work/fork/cap-probe}
@@ -69,7 +72,7 @@ grep -h -m1 'TMAX' "$out/a.stderr" "$out/b.stderr" || true
 
 for u in "$ua" "$ub"; do
   curl -fsS -X POST "$u/v1/completions" -H 'content-type: application/json' \
-    -d '{"prompt":"The capital of France is","max_tokens":8,"temperature":0,"spec":false}' \
+    -d "{\"prompt\":${PROBE_PROMPT:-\"The capital of France is\"},\"max_tokens\":8,\"temperature\":0,\"spec\":false}" \
     > "$out/completion-$(echo "$u" | tr -dc 0-9).json" || fail completion "POST $u/v1/completions"
 done
 python3 - "$out" <<'PY'
