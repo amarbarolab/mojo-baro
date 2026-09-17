@@ -65,9 +65,11 @@ impl Engine {
     /// through); `BARO_SERVE=1` and `BARO_PACK` are set here. `extra_env`
     /// applies on top (P4: `ROCR_VISIBLE_DEVICES`/`HSA_OVERRIDE_GFX_VERSION`
     /// for a device pin explicit in baro-serve's own args, not only in
-    /// whatever launched it), each entry a `(KEY, VALUE)` pair; an empty
-    /// value unsets the key instead of setting it (`igpu-env` needs
-    /// `HIP_VISIBLE_DEVICES` unset, not set to empty).
+    /// whatever launched it -- the same list for every engine this call
+    /// spawns, since `EnginePool` uses it pool-wide, one device per
+    /// process), each entry a `(KEY, VALUE)` pair; an empty value unsets
+    /// the key instead of setting it (`igpu-env` needs `HIP_VISIBLE_DEVICES`
+    /// unset, not set to empty).
     pub async fn spawn(engine: &Path, pack: &Path, extra_env: &[(String, String)]) -> Result<Engine, String> {
         let mut cmd = tokio::process::Command::new(engine);
         cmd.env("BARO_SERVE", "1").env("BARO_PACK", pack);

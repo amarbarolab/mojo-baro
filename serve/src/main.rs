@@ -61,9 +61,13 @@ struct Opts {
     /// no VRAM held for it; `EnginePool::empty()` backs every route that
     /// would otherwise need one with its existing 503 error path.
     audio_only: bool,
-    /// P4: per-engine environment seam so a device pin (`ROCR_VISIBLE_DEVICES`,
-    /// `HSA_OVERRIDE_GFX_VERSION`) is an explicit, logged baro-serve argument
-    /// rather than only whatever launched it. `KEY=` (empty value) unsets KEY.
+    /// P4: per-process (pool-wide) environment seam so a device pin
+    /// (`ROCR_VISIBLE_DEVICES`, `HSA_OVERRIDE_GFX_VERSION`) is an explicit,
+    /// logged baro-serve argument rather than only whatever launched it.
+    /// Applies to every engine this process's pool spawns, since one
+    /// baro-serve process is pinned to one GPU; cross-device is two
+    /// processes, each with its own `--engine-env`. `KEY=` (empty value)
+    /// unsets KEY.
     engine_env: Vec<(String, String)>,
 }
 
@@ -90,6 +94,9 @@ fn parse_opts() -> Result<Opts, String> {
             "--engine-env" => {
                 let kv = val("--engine-env")?;
                 let (k, v) = kv.split_once('=').ok_or_else(|| format!("--engine-env {kv}: needs KEY=VALUE (KEY= to unset)"))?;
+                if k.is_empty() {
+                    return Err(format!("--engine-env {kv}: KEY must not be empty"));
+                }
                 o.engine_env.push((k.to_string(), v.to_string()));
             }
             "-h" | "--help" => {
