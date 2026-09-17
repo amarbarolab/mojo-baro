@@ -248,6 +248,48 @@ byte identical. Checked by a byte-level diff of the two files restricted to
 outside those 15 offset ranges (zero differing bytes required there), not
 by trusting the writeback code's own offset arithmetic.
 
+## Recipe correction (frozen 2026-09-17, before this session's second
+## training minute)
+
+The first smoke's recipe (lr 2e-4, one optimizer step per document, no
+accumulation, no clipping, no warmup) damaged the head: 5-prompt
+`accepted/drafted` went 67.78% -> 3.06% (`exchange/lane-A4-report.md`), and
+the degradation showed up identically in an exact-precision torch replica,
+not only the quantized engine, so it reads as genuinely bad weights, not a
+write-back defect. the maintainer authorized ONE corrected-recipe smoke, same
+frozen kill line (5-prompt `accepted/drafted` lift >= 4 pp, full-20-prompt
+identity 20/20 intact), with this recipe, frozen before any training step:
+
+- **`lr = 2e-5`** (10x lower than the first attempt).
+- **16-document gradient accumulation per optimizer step**
+  (`~/AMDHQ/tools/latent-os/e13_train.py`'s own `--accum 16` convention):
+  each document's loss divided by 16 before `.backward()`, one
+  `optimizer.step()` per 16 documents, not per document. The first
+  attempt's per-document stepping was a mismatch with the `lr` it borrowed
+  from E13 (E13's `lr=2e-4` was always paired with 16-item accumulation;
+  reusing that `lr` without the accumulation applied a step sized for an
+  averaged, low-variance gradient to a single-document, high-variance one).
+- **Gradient-norm clipping at 1.0** (`torch.nn.utils.clip_grad_norm_`,
+  applied to the summed 16-document gradient, before `optimizer.step()`).
+- **10% linear warmup**: the first `ceil(0.1 * n_steps)` optimizer steps
+  scale `lr` linearly up to the target value, full `lr` from the step after
+  that.
+- **8 optimizer steps** (128 documents total, `16 * 8`), not the first
+  smoke's single-pass-to-2000-pairs design: a loss TREND needs more than
+  one or two points, and 16-document accumulation makes the earlier
+  "~2000 pairs" budget too small to produce several real steps. Total
+  supervised positions this time are therefore larger than 2000 (128
+  documents at ~198 pairs/document average, per this session's own GSM8K
+  dump receipt, is roughly 25000), a deliberate, stated departure from the
+  first smoke's data-size framing, in service of the same kill line.
+
+**Void, checked BEFORE the real-engine gate runs at all (frozen, not
+negotiable after the fact): the mean per-document loss at the LAST
+optimizer step must be lower than at the FIRST, or the run is VOID.**
+A VOID run is reported as VOID; the write-back/repack/gate sequence does
+not run against a checkpoint that failed this check, exactly as a bad
+harness build is never scored against the kill line.
+
 ## P1 read-back before any timed run
 
 Engine pack sha256 (patched-GGUF pack, once past the smoke); `BARO_SPEC`,
