@@ -37,6 +37,11 @@ pub struct AudioSidecar {
     /// set, the sidecar is not wrapped in `gpu-wait` at all -- it is not a
     /// GPU workload.
     no_gpu: bool,
+    /// Absolute path, not a bare name: a `gpu-wait run` job does not put
+    /// `~/.local/bin` on the child's `PATH` (found live in the P3a timed
+    /// gate, `bench/p3a-gate.sh` line 54's own nested call hit the same
+    /// thing), so a bare `Command::new("gpu-wait")` fails inside one.
+    gpu_wait_bin: String,
     child: tokio::sync::Mutex<Option<Child>>,
     last_used: AtomicU64,
 }
@@ -52,6 +57,7 @@ impl AudioSidecar {
             port: env_num("BARO_WHISPER_PORT", 8090u16),
             idle_secs: env_num("BARO_WHISPER_IDLE_SECS", 300u64),
             no_gpu: env_str("BARO_WHISPER_NO_GPU", "0") == "1",
+            gpu_wait_bin: env_str("BARO_GPU_WAIT", "$HOME/.local/bin/gpu-wait"),
             child: tokio::sync::Mutex::new(None),
             last_used: AtomicU64::new(0),
         }
@@ -62,10 +68,13 @@ impl AudioSidecar {
 /// port to accept connections, and arm the idle reaper. A resident, not a
 /// one-shot job: spawned through `gpu-wait run --shared`, the daemon's own
 /// pattern for a long-lived service (`gpuwaitingroom` README, "Resident
-/// service"). `GPU_WAITING_ROOM_JOB` inherits into the child's environment,
-/// so if this whole process is itself already running inside a `gpu-wait`
-/// job (the gate script), the inner `gpu-wait run` executes directly
-/// instead of re-queueing -- no nested-queue deadlock.
+/// service"). `gpu-wait run` drops the shell env, so a job's `PATH` does not
+/// carry `~/.local/bin` -- `a.gpu_wait_bin` is always an absolute path,
+/// never a bare name (found live: `bench/p3a-gate.sh`'s own nested snapshot
+/// call hit the same PATH gap). When `GPU_WAITING_ROOM_JOB` is already set,
+/// this process is itself running inside a job, so it spawns the sidecar
+/// bare instead of calling `gpu-wait run` again -- nesting would queue the
+/// sidecar behind the job admitting it.
 async fn ensure_running(app: &Shared) -> Result<(), String> {
     let a = &app.audio;
     {
@@ -100,15 +109,22 @@ async fn ensure_running(app: &Shared) -> Result<(), String> {
         if a.no_gpu {
             whisper_args.push("-ng".into());
         }
+        let job_id = std::env::var("GPU_WAITING_ROOM_JOB").ok();
         let mut cmd = if a.no_gpu {
-            // Not a GPU workload: run directly, no gpu-wait admission needed.
+            eprintln!("audio: whisper sidecar running bare (--no-gpu, not a GPU workload)");
+            let mut c = Command::new(&whisper_args[0]);
+            c.args(&whisper_args[1..]);
+            c
+        } else if let Some(job) = &job_id {
+            eprintln!("audio: whisper sidecar running bare, already admitted (GPU_WAITING_ROOM_JOB={job})");
             let mut c = Command::new(&whisper_args[0]);
             c.args(&whisper_args[1..]);
             c
         } else {
+            eprintln!("audio: whisper sidecar spawned via {} run --shared", a.gpu_wait_bin);
             let mut gpu_wait_args = vec!["run".to_string(), "--shared".into(), "--vram".into(), "4".into(), "--".into()];
             gpu_wait_args.extend(whisper_args);
-            let mut c = Command::new("gpu-wait");
+            let mut c = Command::new(&a.gpu_wait_bin);
             c.args(&gpu_wait_args);
             c
         };
