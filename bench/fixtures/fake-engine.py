@@ -7,6 +7,7 @@ import sys
 
 
 TOKENS = [1, 2, 3]
+TOOL_TOKENS = [4, 5, 6, 7, 8, 9, 10]
 
 
 def emit(value):
@@ -22,7 +23,8 @@ def main():
         except json.JSONDecodeError:
             continue
         request_id = int(request.get("id", 0))
-        for token in TOKENS:
+        tokens = TOOL_TOKENS if request.get("n") == len(TOOL_TOKENS) else TOKENS
+        for token in tokens:
             emit({"id": request_id, "tok": token})
             if request.get("hidden"):
                 emit({"id": request_id, "hidden": [0.1, 0.2]})
@@ -31,7 +33,7 @@ def main():
         emit({
             "id": request_id,
             "done": True,
-            "n": len(TOKENS),
+            "n": len(tokens),
             "prefill_s": 0.0,
             "decode_s": 0.001,
             "tok_s": 3000.0,

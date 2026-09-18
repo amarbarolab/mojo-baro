@@ -48,7 +48,7 @@ tokenizer = {
     "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": True},
     "model": {
         "type": "WordLevel",
-        "vocab": {"<unk>": 0, "hello": 1, "world": 2, "!": 3},
+    "vocab": {"<unk>": 0, "hello": 1, "world": 2, "!": 3, "<tool_call>": 4, "<function=get_weather>": 5, "<parameter=city>": 6, "Paris": 7, "</parameter>": 8, "</function>": 9, "</tool_call>": 10},
         "unk_token": "<unk>",
     },
 }
@@ -102,6 +102,12 @@ curl -fsS -N "$url/v1/completions" -H 'content-type: application/json' \
 grep -q '"hidden"' "$out/latent-sse.txt" || fail latent-sse "SSE hidden chunk missing"
 grep -q '"logits_topk"' "$out/latent-sse.txt" || fail latent-sse "SSE logits_topk chunk missing"
 pass latent-sse "SSE emits hidden and logits_topk chunks"
+curl -fsS -N "$url/v1/chat/completions" -H 'content-type: application/json' \
+    -d '{"messages":[{"role":"user","content":"weather"}],"max_tokens":7,"stream":true,"spec":false}' \
+    > "$out/tool-sse.txt"
+grep -q '"tool_calls"' "$out/tool-sse.txt" || fail tool-sse "SSE tool_calls delta missing"
+grep -q '"arguments"' "$out/tool-sse.txt" || fail tool-sse "SSE tool arguments delta missing"
+pass tool-sse "SSE emits tool-call name and argument deltas"
 
 curl -fsS "$url/" > "$out/index.html" || fail assets "GET / failed"
 python3 - "$url" "$out/index.html" "$out/assets.tsv" <<'PY'

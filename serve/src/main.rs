@@ -1097,6 +1097,111 @@ fn parse_one_tool_call(body: &str) -> Option<ToolCall> {
     Some((name.to_string(), args))
 }
 
+struct ToolDelta {
+    name: Option<String>,
+    arguments: String,
+}
+
+#[derive(Default)]
+struct ToolStream {
+    raw: String,
+    content_sent: usize,
+    marker: Option<usize>,
+    function_end: Option<usize>,
+    scan: usize,
+    params: usize,
+    name_sent: bool,
+    args_open: bool,
+    closed: bool,
+}
+
+impl ToolStream {
+    fn has_tool(&self) -> bool {
+        self.marker.is_some()
+    }
+
+    fn finish_content(&mut self) -> String {
+        if self.marker.is_some() {
+            return String::new();
+        }
+        let content = self.raw[self.content_sent..].to_string();
+        self.content_sent = self.raw.len();
+        content
+    }
+
+    fn push(&mut self, text: &str) -> (String, Option<ToolDelta>) {
+        self.raw.push_str(text);
+        const OPEN: &str = "<tool_call>";
+        if self.marker.is_none() {
+            if let Some(i) = self.raw.find(OPEN) {
+                self.marker = Some(i);
+                let content = self.raw[self.content_sent..i].to_string();
+                self.content_sent = i;
+                return (content, self.next_tool_delta());
+            }
+            let mut safe = self.raw.len().saturating_sub(OPEN.len() - 1);
+            while safe > self.content_sent && !self.raw.is_char_boundary(safe) {
+                safe -= 1;
+            }
+            let content = self.raw[self.content_sent..safe].to_string();
+            self.content_sent = safe;
+            return (content, None);
+        }
+        (String::new(), self.next_tool_delta())
+    }
+
+    fn next_tool_delta(&mut self) -> Option<ToolDelta> {
+        if self.closed {
+            return None;
+        }
+        let start = self.marker? + "<tool_call>".len();
+        if self.function_end.is_none() {
+            let i = self.raw[start..].find("<function=")? + start;
+            let end = self.raw[i..].find('>')? + i;
+            self.function_end = Some(end + 1);
+        }
+        let function_end = self.function_end?;
+        if !self.name_sent {
+            let name_start = self.marker? + "<tool_call><function=".len();
+            let name = self.raw[name_start..function_end - 1].to_string();
+            self.name_sent = true;
+            self.scan = function_end;
+            self.args_open = true;
+            return Some(ToolDelta { name: Some(name), arguments: String::new() });
+        }
+        if let Some(i) = self.raw[self.scan..].find("<parameter=") {
+            let i = self.scan + i;
+            let name_end = self.raw[i..].find('>')? + i;
+            let value_start = name_end + 1;
+            let value_end = self.raw[value_start..].find("</parameter>")? + value_start;
+            let name = &self.raw[i + "<parameter=".len()..name_end];
+            let value = self.raw[value_start..value_end].trim();
+            let parsed: Value = serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.to_string()));
+            self.scan = value_end + "</parameter>".len();
+            let prefix = if self.params == 0 { "{" } else { "," };
+            self.params += 1;
+            let key = serde_json::to_string(name).unwrap_or_else(|_| "\"parameter\"".into());
+            return Some(ToolDelta { name: None, arguments: format!("{prefix}{key}:{parsed}") });
+        }
+        if self.raw[self.scan..].contains("</function>") {
+            self.closed = true;
+            return Some(ToolDelta { name: None, arguments: if self.args_open { "}".into() } else { String::new() } });
+        }
+        None
+    }
+}
+
+fn tool_delta_json(delta: ToolDelta) -> Value {
+    let function = json!({"arguments": delta.arguments});
+    let mut call = json!({"index": 0, "function": function});
+    if let Some(name) = delta.name {
+        call["id"] = json!("call_0");
+        call["type"] = json!("function");
+        call["function"]["name"] = json!(name);
+    }
+    Value::Array(vec![call])
+}
+
 /// `tool_calls` in the OpenAI response shape: `arguments` is a JSON-encoded
 /// string (not an object -- that shape is only for what the template reads,
 /// see `tool_calls_for_template`).
@@ -1184,12 +1289,20 @@ async fn chat_completions(State(app): State<Shared>, Json(r): Json<ChatReq>) -> 
     if g.stream {
         let created = now();
         let mut first = true;
+        let mut tool_stream = ToolStream::default();
         let sse = sse_stream(app.clone(), rx, move |_, kind| match kind {
             ChunkKind::Delta { text, token, logprob } => {
-                let mut delta = json!({"content": text});
+                let (content, tool) = tool_stream.push(&text);
+                let mut delta = json!({"content": content});
                 if first {
                     first = false;
                     delta["role"] = json!("assistant");
+                }
+                if let Some(tool) = tool {
+                    delta["tool_calls"] = tool_delta_json(tool);
+                    if delta["content"] == "" {
+                        delta.as_object_mut().unwrap().remove("content");
+                    }
                 }
                 let lp = logprob.map(|(_, l, top)| json!({"content": [{"id": token, "logprob": l, "top_logprobs": top_logprobs_json(&top)}]}));
                 json!({"id": id, "object": "chat.completion.chunk", "created": created, "model": model,
@@ -1201,21 +1314,25 @@ async fn chat_completions(State(app): State<Shared>, Json(r): Json<ChatReq>) -> 
             ChunkKind::LogitsTopK(values) => json!({
                 "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
                 "logits_topk": logits_topk_json(&values), "choices": []}),
-            ChunkKind::Finish { reason, stats, tokens } => json!({
-                "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": reason}],
-                "usage": usage_json(n_prompt, tokens.len(), &stats),
-                "timings": stats}),
+            ChunkKind::Finish { reason, stats, tokens } => {
+                let mut delta = json!({});
+                let tail = tool_stream.finish_content();
+                if !tail.is_empty() {
+                    delta["content"] = json!(tail);
+                }
+                json!({
+                    "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+                    "choices": [{"index": 0, "delta": delta, "finish_reason": if tool_stream.has_tool() { "tool_calls" } else { &reason }}],
+                    "usage": usage_json(n_prompt, tokens.len(), &stats),
+                    "timings": stats})
+            }
         });
         return Ok(sse.into_response());
     }
     let (acc, text_out, stats) = collect(&app, rx).await?;
     let reason = acc.finish_reason(stats.get("finish").and_then(Value::as_str));
-    // A5: tool_calls parsed out of the generated text, non-streaming path
-    // only -- OpenAI's real streaming tool-call protocol is incremental
-    // per-argument-byte deltas, a separate, larger piece of work than this
-    // lane's round-trip check needs (out of scope, named here rather than
-    // half-built).
+    // A5: tool_calls parsed out of the generated text for the non-streaming
+    // response. The streaming path emits the same calls incrementally.
     let (content, calls) = parse_tool_calls(&text_out);
     let mut message = json!({"role": "assistant", "content": content});
     if !calls.is_empty() {
@@ -1262,6 +1379,25 @@ mod a5_tests {
         let (content, calls) = parse_tool_calls("just an answer, no calls here");
         assert_eq!(content, "just an answer, no calls here");
         assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn streams_tool_name_and_argument_fragments() {
+        let mut stream = ToolStream::default();
+        let (content, name) = stream.push("answer\n<tool_call><function=get_weather>");
+        assert_eq!(content, "answer\n");
+        let name = name.unwrap();
+        assert_eq!(name.name.as_deref(), Some("get_weather"));
+        assert_eq!(stream.push("<parameter=city>Paris</parameter>").1.unwrap().arguments, "{\"city\":\"Paris\"");
+        assert_eq!(stream.push("</function></tool_call>").1.unwrap().arguments, "}");
+        assert!(stream.has_tool());
+    }
+
+    #[test]
+    fn plain_stream_flushes_marker_lookahead() {
+        let mut stream = ToolStream::default();
+        assert_eq!(stream.push("short").0, "");
+        assert_eq!(stream.finish_content(), "short");
     }
 
     #[test]

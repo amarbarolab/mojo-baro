@@ -356,8 +356,8 @@ stint (98.3%), was 108.32 before this round.
   streaming via SSE, minja chat templates, tool calls parsed from the model's `<tool_call>` wire
   format, JSON-schema `response_format` enforcement, logprobs). WORKS: P0a gates 1 to 4 PASS,
   including a real `ollama` Python client and a from-source PAIR build routing a request to it
-  (`exchange/lane-P0A-report.md`). Streaming tool-call deltas are not built (only the non-streaming
-  path returns parsed `tool_calls`).
+  (`exchange/lane-P0A-report.md`). Streaming tool-call deltas now emit OpenAI-shaped function-name
+  and argument fragments from the same `<tool_call>` wire format. Unit gate: `cargo test`.
 - Serves an Ollama-shaped API (`GET /api/tags`, `/api/ps`, `/api/version`, `POST /api/show`,
   `/api/chat`, `/api/generate`, `/api/embeddings`). WORKS: P0a gates 1 to 3 PASS, including PAIR's
   engine-manager adopting `baro-serve` on port 11434 and routing a live request to it. PARTIAL:
