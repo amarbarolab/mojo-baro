@@ -449,6 +449,10 @@ stint (98.3%), was 108.32 before this round.
   rather than only whatever launched it. WORKS as wiring: device read-back confirmed one engine
   pinned to the XTX (`GPU-859baafa301986cb`) and the other to the iGPU
   (`ROCR_VISIBLE_DEVICES=1`, `HSA_OVERRIDE_GFX_VERSION=10.3.0`).
+- `tools/baro multi-serve MODEL.gguf --devices 0,1` prepares one cached engine
+  and pack, launches one pinned `baro-serve` per listed device, and fronts them
+  with `baro-router`. This is the production launch path. The existing two-
+  device identity gate remains the hardware correctness bar.
 - Does not yet run two GPUs in production. FAILS: the P4 multi-GPU gate hit its kill line. Two
   engines (XTX dense q4, iGPU Qwen2.5-7B under the gfx1030 override) split 6 round-robin prompts;
   `p06-translate` on the iGPU matched its solo run for 6 leading tokens and then diverged, evidence
@@ -579,6 +583,11 @@ read that count as "11 validated models." Only **2 of the 11 have both a
 perplexity PASS and a task PASS**: the Qwythos champion and RegesCore-35B.
 Everything else is either perplexity-BLOCKED by construction, VOID from a
 harness accident, or simply not run this round.
+
+The quality harness is exposed as one command: `tools/baro eval MODEL-KEY`
+runs one row, `tools/baro eval-all` runs the roster, and `--dry-run` validates
+the key without reserving a GPU. These commands reuse `bench/quality-run.sh`
+and preserve its per-step `gpu-wait` reservations.
 
 | model | engine | quant | PPL | task | verdict |
 |---|---|---|---|---|---|
