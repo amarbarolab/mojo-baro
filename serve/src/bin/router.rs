@@ -1,9 +1,8 @@
 //! CPU-only `baro-router` skeleton.
 //!
 //! The router owns placement and discovery; `baro-serve` remains the engine
-//! process. This first slice keeps the P1 state-locality term out of the
-//! placement decision. It provides the contracts around which the later proxy
-//! and state moves fit, rather than making an empty locality field look done.
+//! process. Placement uses resident-prefix locality first, rendezvous hashing
+//! second, and pending-count rank as the final fallback.
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
@@ -110,6 +109,12 @@ mod prefix_hash {
         u64::from_le_bytes(digest[..8].try_into().unwrap())
     }
 
+    pub fn rendezvous_score(prefix: u64, engine_id: &str) -> u64 {
+        let mut bytes = prefix.to_le_bytes().to_vec();
+        bytes.extend_from_slice(engine_id.as_bytes());
+        u64::from_le_bytes(sha256(&bytes)[..8].try_into().unwrap())
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -141,6 +146,65 @@ struct RouterState {
     /// reused for every proxied request and every `probe_loop` enrichment
     /// fetch, not one per request.
     http_client: reqwest::Client,
+    prefix_locks: PrefixLocks,
+}
+
+#[derive(Clone)]
+struct PrefixLocks(Arc<tokio::sync::Mutex<HashMap<u64, Arc<PrefixLock>>>>);
+
+struct PrefixLock {
+    done: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+struct PrefixLease {
+    key: u64,
+    entry: Arc<PrefixLock>,
+    locks: PrefixLocks,
+    owner: bool,
+}
+
+impl PrefixLocks {
+    async fn acquire(&self, key: u64) -> PrefixLease {
+        let mut locks = self.0.lock().await;
+        if let Some(entry) = locks.get(&key) {
+            return PrefixLease { key, entry: entry.clone(), locks: self.clone(), owner: false };
+        }
+        let entry = Arc::new(PrefixLock { done: std::sync::atomic::AtomicBool::new(false), notify: tokio::sync::Notify::new() });
+        locks.insert(key, entry.clone());
+        PrefixLease { key, entry, locks: self.clone(), owner: true }
+    }
+}
+
+impl PrefixLease {
+    async fn wait(&self) {
+        while !self.entry.done.load(Ordering::Acquire) {
+            let notified = self.entry.notify.notified();
+            if self.entry.done.load(Ordering::Acquire) {
+                break;
+            }
+            notified.await;
+        }
+    }
+}
+
+impl Drop for PrefixLease {
+    fn drop(&mut self) {
+        if !self.owner {
+            return;
+        }
+        let key = self.key;
+        let entry = self.entry.clone();
+        let locks = self.locks.clone();
+        tokio::spawn(async move {
+            entry.done.store(true, Ordering::Release);
+            entry.notify.notify_waiters();
+            let mut map = locks.0.lock().await;
+            if map.get(&key).is_some_and(|current| Arc::ptr_eq(current, &entry)) {
+                map.remove(&key);
+            }
+        });
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -323,8 +387,18 @@ impl EngineRegistry {
             })
             .map(|e| {
                 let preferred = prefer == Some(e.info.id.as_str());
-                EngineChoice { id: e.info.id.clone(), address: e.info.address.clone(), locality: preferred }
+                EngineChoice { id: e.info.id.clone(), address: e.info.address.clone(), placement: if preferred { "locality" } else { "rank" }.into() }
             })
+    }
+
+    fn choose_consistent(&self, prefix: u64, exclude: &[String]) -> Option<EngineChoice> {
+        self.0
+            .read()
+            .expect("engine registry poisoned")
+            .iter()
+            .filter(|e| e.info.running && e.info.healthy && !exclude.iter().any(|x| x == &e.info.id))
+            .max_by_key(|e| (prefix_hash::rendezvous_score(prefix, &e.info.id), std::cmp::Reverse(e.info.id.clone())))
+            .map(|e| EngineChoice { id: e.info.id.clone(), address: e.info.address.clone(), placement: "hash".into() })
     }
 
     fn len(&self) -> usize {
@@ -450,7 +524,7 @@ struct EngineChoice {
     address: String,
     /// CONTRACT 4: this engine was picked because it holds the request's
     /// resident prefix, not because it was plain-rank best.
-    locality: bool,
+    placement: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -486,8 +560,16 @@ fn request_filter(request: &Request, request_id: String) -> Result<FilteredReque
     Ok(FilteredRequest { method: request.method().clone(), path, request_id })
 }
 
-fn choose_engine(registry: &EngineRegistry, prefer: Option<&str>, exclude: &[String]) -> Result<EngineChoice, String> {
-    registry.choose(prefer, exclude).ok_or_else(|| "no healthy adopted engine".into())
+fn choose_engine(registry: &EngineRegistry, affinity: Option<&PrefixAffinity>, exclude: &[String]) -> Result<EngineChoice, String> {
+    if let Some(affinity) = affinity {
+        if let Some(engine) = affinity.resident.as_deref() {
+            return registry.choose(Some(engine), exclude).ok_or_else(|| "no healthy adopted engine".into());
+        }
+        if let Some(choice) = registry.choose_consistent(affinity.hash, exclude) {
+            return Ok(choice);
+        }
+    }
+    registry.choose(None, exclude).ok_or_else(|| "no healthy adopted engine".into())
 }
 
 fn fail_to_connect(error: String) -> Response {
@@ -543,7 +625,12 @@ fn stream_response(resp: reqwest::Response) -> Response {
 /// Tokenizes against whichever engine plain rank would pick right now (all
 /// engines share one pack's tokenizer by construction), so this adds one
 /// HTTP round trip before the real placement decision, never GPU work.
-async fn locality_preference(state: &RouterState, path: &str, body: &[u8]) -> Option<String> {
+struct PrefixAffinity {
+    hash: u64,
+    resident: Option<String>,
+}
+
+async fn locality_preference(state: &RouterState, path: &str, body: &[u8]) -> Option<PrefixAffinity> {
     if path != "/v1/completions" && path != "/api/generate" {
         return None;
     }
@@ -568,16 +655,19 @@ async fn locality_preference(state: &RouterState, path: &str, body: &[u8]) -> Op
     // in case a resident state was saved at an explicit full-length pos.
     let candidates = [tokens.len().saturating_sub(1), tokens.len()];
     let engines = state.engines.snapshot();
+    let mut fallback = None;
     for pos in candidates {
         if pos == 0 {
             continue;
         }
         let hash = format!("{:016x}", prefix_hash::exact_prefix_hash(&tokens, pos));
+        let hash_value = prefix_hash::exact_prefix_hash(&tokens, pos);
+        fallback = Some(PrefixAffinity { hash: hash_value, resident: None });
         if let Some(engine) = engines.iter().find(|e| e.resident_prefix_hashes.contains(&hash)) {
-            return Some(engine.id.clone());
+            return Some(PrefixAffinity { hash: hash_value, resident: Some(engine.id.clone()) });
         }
     }
-    None
+    fallback
 }
 
 fn log(catalog: &WorkloadCatalog, workload: Workload) {
@@ -640,12 +730,22 @@ async fn proxy(State(Shared(state)): State<Shared>, request: Request) -> Respons
         Err(error) => return error_while_proxy(format!("reading request body: {error}")),
     };
     let path_and_query = parts.uri.path_and_query().map(|p| p.as_str().to_string()).unwrap_or_else(|| filtered.path.clone());
-    let prefer = locality_preference(&state, &filtered.path, &body_bytes).await;
+    let affinity = locality_preference(&state, &filtered.path, &body_bytes).await;
+    let _prefix_lease = match affinity.as_ref().filter(|affinity| affinity.resident.is_none()) {
+        Some(affinity) => {
+            let lease = state.prefix_locks.acquire(affinity.hash).await;
+            if !lease.owner {
+                lease.wait().await;
+            }
+            Some(lease)
+        }
+        None => None,
+    };
 
     let send_state = SendState::NotConnected;
     let mut tried: Vec<String> = Vec::new();
     loop {
-        let choice = match choose_engine(&state.engines, prefer.as_deref(), &tried) {
+        let choice = match choose_engine(&state.engines, affinity.as_ref(), &tried) {
             Ok(value) => value,
             Err(error) => return response_filter(StatusCode::SERVICE_UNAVAILABLE, json!({"error": error})),
         };
@@ -657,7 +757,7 @@ async fn proxy(State(Shared(state)): State<Shared>, request: Request) -> Respons
             state: "connected".into(),
             node_id: state.node_id.clone(),
             engine: Some(choice.id.clone()),
-            placement: if choice.locality { "locality".into() } else { "rank".into() },
+            placement: choice.placement.clone(),
             started_ms: now_ms(),
         };
 
@@ -788,6 +888,7 @@ async fn main() {
         workloads: WorkloadCatalog::new(),
         next_request: AtomicU64::new(1),
         http_client: http_client.clone(),
+        prefix_locks: PrefixLocks(Arc::new(tokio::sync::Mutex::new(HashMap::new()))),
     });
     let state_for_shutdown = state.clone();
     tokio::spawn(probe_loop(engines, http_client));
@@ -894,7 +995,27 @@ mod tests {
         registry.bump_pending("b");
         let choice = registry.choose(None, &[]).unwrap();
         assert_eq!(choice.id, "a");
-        assert!(!choice.locality);
+        assert_eq!(choice.placement, "rank");
+    }
+
+    #[test]
+    fn choose_consistent_is_stable_and_marks_hash_placement() {
+        let registry = healthy_registry(&[("a", "http://127.0.0.1:9001"), ("b", "http://127.0.0.1:9002")]);
+        let first = registry.choose_consistent(42, &[]).unwrap();
+        let second = registry.choose_consistent(42, &[]).unwrap();
+        assert_eq!(first.id, second.id);
+        assert_eq!(first.placement, "hash");
+    }
+
+    #[tokio::test]
+    async fn cold_prefix_lock_releases_waiters() {
+        let locks = PrefixLocks(Arc::new(tokio::sync::Mutex::new(HashMap::new())));
+        let owner = locks.acquire(42).await;
+        let waiter = locks.acquire(42).await;
+        assert!(owner.owner);
+        assert!(!waiter.owner);
+        drop(owner);
+        waiter.wait().await;
     }
 
     #[test]
@@ -907,7 +1028,7 @@ mod tests {
         registry.bump_pending("b");
         let choice = registry.choose(Some("b"), &[]).unwrap();
         assert_eq!(choice.id, "b");
-        assert!(choice.locality);
+        assert_eq!(choice.placement, "locality");
     }
 
     #[test]
@@ -920,7 +1041,7 @@ mod tests {
         registry.bump_pending("b");
         let choice = registry.choose(Some("b"), &[]).unwrap();
         assert_eq!(choice.id, "a");
-        assert!(!choice.locality);
+        assert_eq!(choice.placement, "rank");
     }
 
     #[test]

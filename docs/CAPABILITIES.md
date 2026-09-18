@@ -434,8 +434,10 @@ stint (98.3%), was 108.32 before this round.
   response byte to the next-ranked engine; a request past its first response byte is never retried,
   it fails loudly instead. WORKS: gate 2, a genuinely SIGKILLed engine's in-flight SSE stream fails
   loudly (curl exit 18, no terminal DONE), and the next request lands on the survivor.
-- Does not yet implement the consistent-hashing ring fallback, the stampede lock on a cold prefix,
-  or zero-downtime process handoff. These were staged in the design and are absent from the code.
+- Uses deterministic rendezvous hashing for a prompt prefix with no resident checkpoint, and
+  serializes concurrent cold requests for the same prefix behind one in-flight owner. WORKS,
+  router unit tests cover stable placement and waiter release, and the CPU HTTP gate passes at
+  `.work/p8-router-affinity-gate/SUMMARY.txt`. Zero-downtime process handoff remains absent.
 
 ### Multi-engine and multi-node
 
