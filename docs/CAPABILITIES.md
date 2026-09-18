@@ -554,8 +554,9 @@ stint (98.3%), was 108.32 before this round.
     measurements and the falsifiers were kept, since the falsifiers are what caught the real
     `save_state` cross-prompt export bug. This is a descope of the pass/fail framing, not a proof or
     a disproof. No plan-level LatentOS gate is PASS-and-live today.
-  - Out of scope for P1 and still absent: HIDDEN and LOGITS_TOPK streams over HTTP, HMAC enforcement
-    on state transfer.
+  - Out of scope for P1 and still absent: HIDDEN and LOGITS_TOPK streams over HTTP. State-transfer
+    HMAC is enforced when both nodes set the same non-empty `BARO_STATE_HMAC_KEY`; with a key set,
+    unsigned or wrong-key state is rejected, while keyless mode accepts only unsigned state.
 ## Models, pipeline and verification
 
 Current as of `main` at `2208bdb`, after team A's merge `a01ce69` (P0b CPU

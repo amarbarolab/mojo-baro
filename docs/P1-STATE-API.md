@@ -39,7 +39,8 @@ BAROST01 or BAROST02 body, unchanged
 - `pos_lo = 0`, `pos_hi = pos`, `prefix_hash` = first 8 bytes (little endian) of the UNSALTED
   SHA-256 of the int32 token bytes `tokens[0:pos]`, `payload_len` and `payload_sha` over the body,
   `weights_uuid` and `tokenizer_sha` from the bake's identity block, `runtime` = sha256 of the engine
-  build string, `hmac` zero until P0b pairing supplies a key.
+  build string, `hmac` = HMAC-SHA256 of the zeroed-HMAC header plus body when `BARO_STATE_HMAC_KEY`
+  is set, otherwise zero.
 - One stream carries one prefix. The SSM checkpoint travels inside the BAROST body as today; `kinds`
   accepts only `kv_pages` and answers 400 for the rest, naming P1's scope.
 - Media type `application/vnd.baro.state`. Streams are written and read in 8 MiB chunks; no route
@@ -109,7 +110,7 @@ visible to the router.
 ## Out of scope for P1
 
 HIDDEN and LOGITS_TOPK streams over HTTP, the Unix-socket IPC sidecar, HIP IPC handles, delta
-states, hmac enforcement, MoE packs (MoE export answers 501 until measured).
+states, MoE packs (MoE export answers 501 until measured).
 
 ## Where it was heading (no gates, no order, no kill line)
 

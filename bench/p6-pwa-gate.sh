@@ -10,6 +10,7 @@ root=$PWD
 out=${1:-.work/team-C/codex/p6-pwa}
 pack="$out/fake-pack"
 bin=${BARO_SERVE_BIN:-serve/target/release/baro-serve}
+export BARO_STATE_HMAC_KEY=${BARO_STATE_HMAC_KEY:-p6-gate-state-key}
 mkdir -p "$out" "$pack"
 : > "$out/SUMMARY.txt"
 
@@ -69,6 +70,25 @@ for _ in $(seq 1 200); do
 done
 url=$(grep -m1 -oE 'http://[^ ]+' "$out/server.stdout") || fail start "no listening line"
 pass start "$url"
+
+python3 - "$out/unsigned-state.baro" <<'PY'
+import hashlib
+import pathlib
+import struct
+import sys
+
+b = bytearray(256)
+b[:4] = b"LAT1"
+struct.pack_into("<HBB", b, 4, 1, 1, 1)
+b[192:224] = hashlib.sha256(b"").digest()
+pathlib.Path(sys.argv[1]).write_bytes(b)
+PY
+hmac_status=$(curl -sS -o "$out/hmac-reject.json" -w '%{http_code}' \
+    -H 'content-type: application/vnd.baro.state' --data-binary "@$out/unsigned-state.baro" \
+    "$url/v1/state/import")
+[ "$hmac_status" = 409 ] || fail hmac "unsigned import status=$hmac_status"
+grep -q '"field":"hmac"' "$out/hmac-reject.json" || fail hmac "unsigned import was not rejected by HMAC: $(cat "$out/hmac-reject.json")"
+pass hmac "unsigned state rejected when BARO_STATE_HMAC_KEY is set"
 
 curl -fsS "$url/" > "$out/index.html" || fail assets "GET / failed"
 python3 - "$url" "$out/index.html" "$out/assets.tsv" <<'PY'

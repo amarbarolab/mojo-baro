@@ -34,6 +34,37 @@ use axum::http::{header::CONTENT_TYPE, HeaderValue};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_stream::wrappers::ReceiverStream;
 
+struct HmacSha256 {
+    inner: Sha256,
+    outer: Sha256,
+}
+
+impl HmacSha256 {
+    fn new(key: &[u8]) -> Self {
+        let mut block = [0u8; 64];
+        let key = if key.len() > 64 { sha256(key).to_vec() } else { key.to_vec() };
+        block[..key.len()].copy_from_slice(&key);
+        let mut inner = Sha256::new();
+        let mut outer = Sha256::new();
+        let mut pad = block;
+        pad.iter_mut().for_each(|b| *b ^= 0x36);
+        inner.update(&pad);
+        pad.iter_mut().for_each(|b| *b ^= 0x36 ^ 0x5c);
+        outer.update(&pad);
+        Self { inner, outer }
+    }
+
+    fn update(&mut self, bytes: &[u8]) {
+        self.inner.update(bytes);
+    }
+
+    fn finalize(mut self) -> [u8; 32] {
+        let inner = self.inner.finalize();
+        self.outer.update(&inner);
+        self.outer.finalize()
+    }
+}
+
 /// CONTRACT 1: the LAT1 256-byte container header, byte-for-byte matching
 /// `latentos/proto.mojo::LatentHeader` (upstream `~/AMDHQ/src/latentos`,
 /// vendored read-only in this repo -- offsets copied from that file's own
@@ -69,11 +100,12 @@ pub mod lat1 {
         pub prefix_hash: u64,
         pub payload_len: u64,
         pub payload_sha: [u8; 32],
+        pub hmac: [u8; 32],
     }
 
     impl Header {
         /// Every field this repo does not set (layer_lo/hi, pos_lo, rope_id,
-        /// batch_class/m, hmac) stays zero, matching
+        /// batch_class/m) stays zero, matching
         /// `LatentHeader.__init__`'s own defaults.
         pub fn to_bytes(&self) -> [u8; HEADER_LEN] {
             let mut b = [0u8; HEADER_LEN];
@@ -91,6 +123,7 @@ pub mod lat1 {
             b[176..184].copy_from_slice(&self.prefix_hash.to_le_bytes());
             b[184..192].copy_from_slice(&self.payload_len.to_le_bytes());
             b[192..224].copy_from_slice(&self.payload_sha);
+            b[224..256].copy_from_slice(&self.hmac);
             b
         }
 
@@ -107,6 +140,8 @@ pub mod lat1 {
             tokenizer_sha.copy_from_slice(&b[120..152]);
             let mut payload_sha = [0u8; 32];
             payload_sha.copy_from_slice(&b[192..224]);
+            let mut hmac = [0u8; 32];
+            hmac.copy_from_slice(&b[224..256]);
             Header {
                 magic: u32::from_le_bytes(b[0..4].try_into().unwrap()),
                 version: u16::from_le_bytes(b[4..6].try_into().unwrap()),
@@ -122,6 +157,7 @@ pub mod lat1 {
                 prefix_hash: u64::from_le_bytes(b[176..184].try_into().unwrap()),
                 payload_len: u64::from_le_bytes(b[184..192].try_into().unwrap()),
                 payload_sha,
+                hmac,
             }
         }
     }
@@ -147,6 +183,7 @@ pub mod lat1 {
                 prefix_hash: 0xa3762c148f44e787,
                 payload_len: 61079640,
                 payload_sha: [5u8; 32],
+                hmac: [6u8; 32],
             };
             let bytes = h.to_bytes();
             assert_eq!(bytes.len(), HEADER_LEN);
@@ -164,6 +201,7 @@ pub mod lat1 {
             assert_eq!(back.prefix_hash, h.prefix_hash);
             assert_eq!(back.payload_len, h.payload_len);
             assert_eq!(back.payload_sha, h.payload_sha);
+            assert_eq!(back.hmac, h.hmac);
         }
 
         #[test]
@@ -183,6 +221,7 @@ pub mod lat1 {
                 prefix_hash: 0,
                 payload_len: 0,
                 payload_sha: [0u8; 32],
+                hmac: [0u8; 32],
             };
             assert_eq!(&h.to_bytes()[0..4], b"LAT1");
         }
@@ -195,6 +234,29 @@ const CHUNK_LEN: usize = 8 * 1024 * 1024;
 
 fn hex32_encode(b: &[u8; 32]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+fn state_hmac_key() -> Option<Vec<u8>> {
+    std::env::var("BARO_STATE_HMAC_KEY").ok().filter(|key| !key.is_empty()).map(String::into_bytes)
+}
+
+fn constant_time_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    a.iter().zip(b).fold(0u8, |diff, (x, y)| diff | (x ^ y)) == 0
+}
+
+async fn hmac_file(path: &std::path::Path, header: &lat1::Header, key: &[u8]) -> Result<[u8; 32], ApiError> {
+    let mut hmac = HmacSha256::new(key);
+    let mut bytes = header.to_bytes();
+    bytes[224..].fill(0);
+    hmac.update(&bytes);
+    let mut f = tokio::fs::File::open(path).await.map_err(|e| ApiError::Plain(StatusCode::INTERNAL_SERVER_ERROR, format!("{}: {e}", path.display())))?;
+    let mut buf = vec![0u8; CHUNK_LEN];
+    loop {
+        let n = f.read(&mut buf).await.map_err(|e| ApiError::Plain(StatusCode::INTERNAL_SERVER_ERROR, format!("{}: {e}", path.display())))?;
+        if n == 0 { break; }
+        hmac.update(&buf[..n]);
+    }
+    Ok(hmac.finalize())
 }
 
 /// The inverse of `checkpoints::Identity`'s own hex encoding: `app.identity.pack`
@@ -533,7 +595,7 @@ pub async fn export_lat1_file(app: &Shared, r: &ExportReq) -> Result<(std::path:
     let mut weights_uuid = [0u8; 16];
     weights_uuid.copy_from_slice(&role_sha[..16]);
     let tokenizer_sha = app.identity.tokenizer_sha.as_deref().and_then(hex32_decode).unwrap_or([0u8; 32]);
-    let header = lat1::Header {
+    let mut header = lat1::Header {
         magic: lat1::MAGIC,
         version: lat1::VERSION,
         kind: lat1::KIND_KV_PAGES,
@@ -548,7 +610,11 @@ pub async fn export_lat1_file(app: &Shared, r: &ExportReq) -> Result<(std::path:
         prefix_hash: exact_prefix_hash(&prompt, pos),
         payload_len,
         payload_sha,
+        hmac: [0u8; 32],
     };
+    if let Some(key) = state_hmac_key() {
+        header.hmac = hmac_file(&path, &header, &key).await?;
+    }
     Ok((path, header))
 }
 
@@ -777,6 +843,14 @@ async fn import_stream(app: &Shared, req: AxumRequest) -> Result<Json<Value>, Ap
         cleanup();
         return Err(identity_mismatch("payload_sha", hex32_encode(&header.payload_sha), hex32_encode(&payload_sha)));
     }
+    let expected_hmac = match state_hmac_key() {
+        Some(key) => hmac_file(&path, &header, &key).await.map_err(|e| { cleanup(); e })?,
+        None => [0u8; 32],
+    };
+    if !constant_time_eq(&header.hmac, &expected_hmac) {
+        cleanup();
+        return Err(identity_mismatch("hmac", hex32_encode(&expected_hmac), hex32_encode(&header.hmac)));
+    }
     let role_sha = hex32_decode(&app.identity.pack).unwrap_or([0u8; 32]);
     if header.role_sha != role_sha {
         cleanup();
@@ -817,6 +891,13 @@ mod tests {
     fn hex32_decode_rejects_the_wrong_length_or_non_hex() {
         assert_eq!(hex32_decode("short"), None);
         assert_eq!(hex32_decode(&"g".repeat(64)), None);
+    }
+
+    #[test]
+    fn hmac_sha256_matches_rfc_4231_case_1() {
+        let mut h = HmacSha256::new(&[0x0b; 20]);
+        h.update(b"Hi There");
+        assert_eq!(hex32_encode(&h.finalize()), "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7");
     }
 
     #[test]
