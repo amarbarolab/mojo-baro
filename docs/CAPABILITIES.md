@@ -368,9 +368,8 @@ stint (98.3%), was 108.32 before this round.
   `repeat_penalty` and `num_ctx` are parsed so a real client does not 400, but neither is wired to
   anything on the engine side (no multiplicative penalty exists, and `num_ctx` is only reported via
   the ordinary exceed-context error, never clamped). `images` and `tool_calls` on the Ollama request
-  side are accepted but unused. `POST /api/pull` FAILS by design: it always answers 501. Its message pointed at a
-  nonexistent import script under `tools/` (a `model-import.py` that is not in the
-  tree) until `3444a8d` repointed it at the pipeline section below.
+  side are accepted but unused. `POST /api/pull` confirms the loaded pack with Ollama-compatible NDJSON
+  status frames, or returns 404 for a different model. It does not import or hot-swap packs.
 - Serves embeddings (`POST /v1/embeddings`, `POST /api/embeddings`), last-token hidden state,
   L2-normalized on the engine. WORKS: gated against `llama-embedding --pooling last
   --embd-normalize 2`, cosine minimum 0.9882, retrieval 8/8 (`exchange/lane-P0AE-report.md` gate 2,
@@ -773,10 +772,10 @@ PATH.**
 
 **There is no `model-import` script, under any name. FIXED 2026-09-17.**
 Two places pointed at one: `tools/engine-pack.py`'s comment named a
-`model-import.sh`, and `POST /api/pull`'s user-facing 501 named a
+`model-import.sh`; the historical `POST /api/pull` 501 also named a
 `model-import.py`. Neither file exists in the tree, under `tools/` or anywhere
-else. Both were repointed at the
-documented chain in `3444a8d`. Use that chain: `gen-profile.mojo` /
+else. The endpoint now confirms the loaded pack, while imports use the
+documented chain in `3444a8d`: `gen-profile.mojo` /
 `engine-pack.py` (or `spark-pack.py`) / `embed-files.py` / `gguf-embed.py` /
 `bake.sh`.
 

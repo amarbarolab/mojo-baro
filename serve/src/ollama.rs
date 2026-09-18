@@ -24,10 +24,6 @@ use axum::body::Body;
 
 use super::*;
 
-fn pending_not_impl(msg: &str) -> ApiError {
-    ApiError::Plain(StatusCode::NOT_IMPLEMENTED, msg.to_string())
-}
-
 /// UTC RFC3339 timestamp with no `chrono` dependency (Howard Hinnant's
 /// `civil_from_days`, https://howardhinnant.github.io/date_algorithms.html).
 fn now_rfc3339() -> String {
@@ -222,8 +218,30 @@ pub async fn show(State(_app): State<Shared>, Json(_r): Json<ShowReq>) -> Json<V
     }))
 }
 
-pub async fn pull() -> ApiError {
-    pending_not_impl("see docs/CAPABILITIES.md 'Import and bake pipeline' to add a model to this box (POST /api/pull is not implemented)")
+#[derive(Deserialize)]
+pub struct PullReq {
+    #[serde(alias = "name")]
+    model: String,
+    #[serde(default = "default_stream")]
+    stream: bool,
+}
+
+pub async fn pull(State(app): State<Shared>, Json(r): Json<PullReq>) -> Result<Response, ApiError> {
+    if r.model != app.model {
+        return Err(ApiError::Plain(StatusCode::NOT_FOUND, format!("model {} is not loaded", r.model)));
+    }
+    let digest = format!("sha256:{}", app.identity.pack);
+    let lines = [
+        json!({"status": "verifying digest", "digest": digest}),
+        json!({"status": "success"}),
+    ];
+    if !r.stream {
+        return Ok(Json(lines[1].clone()).into_response());
+    }
+    Ok(Response::builder()
+        .header("content-type", "application/x-ndjson")
+        .body(Body::from(lines.iter().map(Value::to_string).map(|s| s + "\n").collect::<String>()))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()))
 }
 
 // ---- POST /api/chat ---------------------------------------------------------

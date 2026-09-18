@@ -71,6 +71,15 @@ done
 url=$(grep -m1 -oE 'http://[^ ]+' "$out/server.stdout") || fail start "no listening line"
 pass start "$url"
 
+pull_model=$(basename "$pack")
+curl -fsS -N "$url/api/pull" -H 'content-type: application/json' \
+    -d "{\"model\":\"$pull_model\"}" > "$out/pull-stream.ndjson" || fail pull "loaded model pull failed"
+jq -e 'select(.status == "success")' "$out/pull-stream.ndjson" >/dev/null || fail pull "success status missing"
+pull_status=$(curl -sS -o "$out/pull-missing.json" -w '%{http_code}' "$url/api/pull" \
+    -H 'content-type: application/json' -d '{"model":"missing-model","stream":false}')
+[ "$pull_status" = 404 ] || fail pull "missing model status=$pull_status"
+pass pull "loaded model pull streams success; unavailable model returns 404"
+
 python3 - "$out/unsigned-state.baro" <<'PY'
 import hashlib
 import pathlib

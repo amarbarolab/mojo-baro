@@ -86,7 +86,7 @@ frames, a final frame with `done:true`, `eval_count`, `eval_duration`, `prompt_e
 is new work inside the item: last-token pooling of the final hidden state, L2-normalized, about 80 LOC
 (pooling rule confirmed by the maintainer 2026-09-17). Options map: `num_predict`, `temperature`, `top_p`, `top_k`, `seed`, `stop`,
 `repeat_penalty`; `num_ctx` above `BARO_TMAX` is reported, not silently clamped. `--ollama-port 11434`
-opts into PAIR's expected port. `/api/pull` answers 501 with the `model-import` command.
+opts into PAIR's expected port. `/api/pull` confirms the loaded pack but does not import or hot-swap models.
 
 **Gates.** (1) `pair-dispatch --backend ollama --port <ours> --count 5 --mode
 parallel` completes 5/5 with token counts equal to the same prompts through `/v1/completions` (same

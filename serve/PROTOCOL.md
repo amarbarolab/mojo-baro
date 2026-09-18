@@ -191,7 +191,7 @@ The Ollama routes share the existing `baro-serve` listener and model selected by
 | `GET /api/ps` | Returns the loaded model while its engine is alive, otherwise an empty `models` array. |
 | `GET /api/version` | Returns the baro compatibility version. |
 | `POST /api/show` | Accepts `model` or `name`; returns model metadata for the loaded pack. |
-| `POST /api/pull` | Returns `501` with the model-import command. Model import is not an inference-server operation. |
+| `POST /api/pull` | Confirms the already loaded pack using Ollama NDJSON status frames. `stream:false` returns one success object. A different model returns `404`; importing or hot-swapping packs remains outside the server. |
 | `POST /api/chat` | Accepts Ollama `messages`, `options`, and `stream`. The default stream is `true`; streamed responses are newline-delimited JSON. `stream: false` returns one final JSON object. |
 | `POST /api/generate` | Accepts `prompt`, optional `system`, `raw`, `options`, and `stream`. The default stream is `true`; streamed responses are newline-delimited JSON. `stream: false` returns one final JSON object. |
 | `POST /api/embeddings` | Accepts a string `prompt` or `input` and returns one Ollama-shaped embedding vector from the P0a-e wire. Arrays of strings are also accepted. Spark and `BARO_SEQS > 1` refusals return `501` with `embeddings_pending`. |
