@@ -1,7 +1,8 @@
 //! baro-serve: OpenAI-compatible HTTP front for serve/engine.mojo.
 //!
 //!   baro-serve [--engine .work/engine] [--pack .work/engine-pack-q4]
-//!              [--tokenizer <pack>/tokenizer.json] [--host 127.0.0.1] [--port 8080]
+//!              [--tokenizer <pack>/tokenizer.json] [--chat-template-file PATH]
+//!              [--host 127.0.0.1] [--port 8080]
 //!
 //! Endpoints: GET /health, GET /v1/models, POST /v1/completions,
 //! POST /v1/chat/completions (stream:true => SSE), POST /v1/fork
@@ -61,6 +62,7 @@ struct Opts {
     engine: PathBuf,
     pack: PathBuf,
     tokenizer: Option<PathBuf>,
+    chat_template_file: Option<PathBuf>,
     host: String,
     port: u16,
     /// P3a (`docs/PLATFORM-PLAN.md`): no LLM engine spawned, no pack loaded,
@@ -82,6 +84,7 @@ fn parse_opts() -> Result<Opts, String> {
         engine: PathBuf::from(".work/engine"),
         pack: PathBuf::from(std::env::var("BARO_PACK").unwrap_or_else(|_| ".work/engine-pack-q4".into())),
         tokenizer: None,
+        chat_template_file: None,
         host: "127.0.0.1".into(),
         port: 8080,
         audio_only: false,
@@ -94,6 +97,7 @@ fn parse_opts() -> Result<Opts, String> {
             "--engine" => o.engine = PathBuf::from(val("--engine")?),
             "--pack" => o.pack = PathBuf::from(val("--pack")?),
             "--tokenizer" => o.tokenizer = Some(PathBuf::from(val("--tokenizer")?)),
+            "--chat-template-file" => o.chat_template_file = Some(PathBuf::from(val("--chat-template-file")?)),
             "--host" => o.host = val("--host")?,
             "--port" => o.port = val("--port")?.parse().map_err(|e| format!("--port: {e}"))?,
             "--audio-only" => o.audio_only = true,
@@ -106,7 +110,7 @@ fn parse_opts() -> Result<Opts, String> {
                 o.engine_env.push((k.to_string(), v.to_string()));
             }
             "-h" | "--help" => {
-                println!("usage: baro-serve [--engine PATH] [--pack DIR] [--tokenizer tokenizer.json] [--host H] [--port N] [--audio-only] [--engine-env KEY=VALUE]...");
+                println!("usage: baro-serve [--engine PATH] [--pack DIR] [--tokenizer tokenizer.json] [--chat-template-file PATH] [--host H] [--port N] [--audio-only] [--engine-env KEY=VALUE]...");
                 std::process::exit(0);
             }
             other => return Err(format!("unknown argument {other}")),
@@ -129,7 +133,7 @@ async fn main() {
         eprintln!("audio-only: tokenizer not loaded, text endpoints disabled");
         None
     } else if tok_path.exists() {
-        match Text::load(&tok_path) {
+        match Text::load(&tok_path, opts.chat_template_file.as_deref()) {
             Ok(t) => {
                 eprintln!("tokenizer: {} (stop ids {:?})", tok_path.display(), t.stop_ids);
                 Some(t)

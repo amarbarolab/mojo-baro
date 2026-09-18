@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # baro: run or verify a self-describing BARO gguf (B1, docs/NEXT-PLAN.md).
 #
-#   tools/baro run     MODEL.gguf [--port N] [--pack DIR] [--work DIR] [--no-serve]
+#   tools/baro run     MODEL.gguf [--port N] [--chat-template-file PATH] [--pack DIR] [--work DIR] [--no-serve]
 #   tools/baro verify  MODEL.gguf [--append] [--work DIR]
 #   tools/baro receipts MODEL.gguf
-#   tools/baro serve   MODEL.gguf [--port N] [--rebuild]
+#   tools/baro serve   MODEL.gguf [--port N] [--chat-template-file PATH] [--rebuild]
 #
 # THREE MODES.
 #
@@ -52,7 +52,7 @@ model=${1:-}; shift || true
 [ -n "$model" ] && [ -f "$model" ] || die "no such model file: ${model:-<none>}"
 model=$(readlink -f "$model")
 
-port=8080; pack=""; work=""; append=0; serve=1; rebuild=0
+port=8080; pack=""; work=""; append=0; serve=1; rebuild=0; chat_template_file=""
 while [ $# -gt 0 ]; do
   case $1 in
     --port) port=$2; shift 2;;
@@ -61,6 +61,7 @@ while [ $# -gt 0 ]; do
     --append) append=1; shift;;
     --no-serve) serve=0; shift;;
     --rebuild) rebuild=1; shift;;
+    --chat-template-file) chat_template_file=$(readlink -f "$2"); shift 2;;
     *) die "unknown option $1";;
   esac
 done
@@ -265,8 +266,10 @@ PYEOF
   [ -z "$renv" ] || echo "env from the file: $renv"
   echo "self-reported: every tok/s this server prints came from the harness the"
   echo "self-reported: model file carries, not from a harness a verifier chose."
+  server_args=(--engine "$cache/engine" --pack "$packdir" --port "$port")
+  [ -z "$chat_template_file" ] || server_args+=(--chat-template-file "$chat_template_file")
   # shellcheck disable=SC2086
-  exec env $renv "$bs" --engine "$cache/engine" --pack "$packdir" --port "$port"
+  exec env $renv "$bs" "${server_args[@]}"
   ;;
 
 run)
@@ -351,8 +354,10 @@ run)
   echo "self-reported: every tok/s this server prints came from the harness the"
   echo "self-reported: model file carries, not from a harness a verifier chose."
   echo "self-reported: to produce a citable number run: tools/baro verify $model --append"
+  server_args=(--engine "$work/engine" --pack "$pack" --port "$port")
+  [ -z "$chat_template_file" ] || server_args+=(--chat-template-file "$chat_template_file")
   # shellcheck disable=SC2086
-  exec env $renv "$bs" --engine "$work/engine" --pack "$pack" --port "$port"
+  exec env $renv "$bs" "${server_args[@]}"
   ;;
 
 *)

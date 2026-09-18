@@ -243,7 +243,11 @@ field or plain response byte for byte against the same `whisper-cli` model and s
 `eos_token` (strings), `add_bos` (bool). Stop ids = `eos_token_id` plus
 `<|im_end|>` / `<|endoftext|>` when the vocabulary has them. Without
 `tokenizer.json` the server starts anyway and the text endpoints return
-`503`; `--tokenizer PATH` points at a file elsewhere.
+`503`; `--tokenizer PATH` points at a file elsewhere. `--chat-template-file
+PATH` overrides the pack's `tokenizer-meta.json` template for this process.
+The file is UTF-8 raw Jinja. It is validated at startup and receives the same
+render context as an embedded template. Without the flag, the embedded
+template and then the existing ChatML fallback are unchanged.
 
 ## The C-ABI seam
 

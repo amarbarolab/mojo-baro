@@ -45,13 +45,22 @@ pub struct Text {
 }
 
 impl Text {
-    pub fn load(tokenizer_json: &Path) -> Result<Text, String> {
+    pub fn load(tokenizer_json: &Path, template_file: Option<&Path>) -> Result<Text, String> {
         let tok = Tokenizer::from_file(tokenizer_json).map_err(|e| format!("{}: {e}", tokenizer_json.display()))?;
         let meta_path = tokenizer_json.with_file_name("tokenizer-meta.json");
-        let meta: Meta = match std::fs::read_to_string(&meta_path) {
+        let mut meta: Meta = match std::fs::read_to_string(&meta_path) {
             Ok(s) => serde_json::from_str(&s).map_err(|e| format!("{}: {e}", meta_path.display()))?,
             Err(_) => Meta::default(),
         };
+        if let Some(path) = template_file {
+            meta.chat_template = Some(
+                std::fs::read_to_string(path)
+                    .map_err(|e| format!("chat template {}: {e}", path.display()))?,
+            );
+        }
+        if let Some(template) = &meta.chat_template {
+            Self::validate_template(template, template_file.unwrap_or(meta_path.as_path()))?;
+        }
         let mut stop_ids = Vec::new();
         if let Some(e) = meta.eos_token_id {
             stop_ids.push(e);
@@ -64,6 +73,15 @@ impl Text {
             }
         }
         Ok(Text { tok, meta, stop_ids })
+    }
+
+    fn validate_template(template: &str, source: &Path) -> Result<(), String> {
+        let mut env = Environment::new();
+        minijinja_contrib::add_to_environment(&mut env);
+        env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+        env.add_template("chat", template)
+            .map(|_| ())
+            .map_err(|e| format!("chat template {}: {e}", source.display()))
     }
 
     pub fn encode(&self, text: &str, add_special: bool) -> Result<Vec<u32>, String> {
@@ -317,6 +335,29 @@ mod tests {
             )
             .unwrap();
         assert_eq!(s, "<user>hi</><assistant>");
+    }
+
+    #[test]
+    fn custom_template_validation_rejects_invalid_jinja() {
+        let err = Text::validate_template("{% if", Path::new("custom.jinja")).unwrap_err();
+        assert!(err.contains("custom.jinja"));
+        assert!(err.contains("chat template"));
+    }
+
+    #[test]
+    fn custom_template_file_overrides_metadata_template() {
+        let dir = std::env::temp_dir().join(format!("baro-template-test-{}", std::process::id()));
+        let tokenizer_path = dir.join("tokenizer.json");
+        let template_path = dir.join("custom.jinja");
+        std::fs::create_dir_all(&dir).unwrap();
+        let tokenizer = Tokenizer::new(tokenizers::models::bpe::BPE::default());
+        std::fs::write(&tokenizer_path, tokenizer.to_string(false).unwrap()).unwrap();
+        std::fs::write(dir.join("tokenizer-meta.json"), r#"{"chat_template":"metadata"}"#).unwrap();
+        std::fs::write(&template_path, "custom").unwrap();
+
+        let text = Text::load(&tokenizer_path, Some(&template_path)).unwrap();
+        assert_eq!(text.render(&[], false, None, None).unwrap(), "custom");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

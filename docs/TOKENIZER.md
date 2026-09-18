@@ -217,6 +217,18 @@ with that token).
 
 ### Chat templates (2026-09-08)
 
+The server can override the pack template without changing the pack:
+
+```sh
+tools/baro serve MODEL.gguf --chat-template-file custom-chat.jinja
+```
+
+The file is raw UTF-8 Jinja. It takes precedence over `chat_template` in
+`tokenizer-meta.json`; the existing metadata template and ChatML fallback are
+used when no override is supplied. The render context remains
+`messages`, `tools`, `chat_template_kwargs`, `bos_token`, `eos_token`, and
+`add_generation_prompt`.
+
 `serve/spark.mojo` renders `tokenizer.chat_template` in-process with
 `minja/`, vendored at the repo root (`-I .`; upstream is
 [`mojo-minja`](~/Projects/mojo/mojo-minja)):

@@ -9,6 +9,7 @@
 #   matches ref, a rejected over-length request, clean shutdown (SIGINT:
 #   server exit 0, engine gone).
 # Pack: BARO_PACK (default .work/engine-pack-q4); ref = $pack/ref-tokens-64.txt.
+# Set BARO_CHAT_TEMPLATE_FILE to exercise a custom Jinja template file.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 if [ -z "${GPU_WAITING_ROOM_JOB:-}" ] && command -v gpu-wait >/dev/null; then
@@ -32,7 +33,9 @@ fi
 ok build "engine + baro-serve"
 
 # --- start the server on a free port -------------------------------------------
-BARO_PACK=$pack ./serve/target/release/baro-serve --engine .work/engine --pack "$pack" --port 0 \
+template_args=()
+[ -z "${BARO_CHAT_TEMPLATE_FILE:-}" ] || template_args+=(--chat-template-file "$BARO_CHAT_TEMPLATE_FILE")
+BARO_PACK=$pack ./serve/target/release/baro-serve --engine .work/engine --pack "$pack" --port 0 "${template_args[@]}" \
   > "$out/server.stdout" 2> "$out/server.stderr" &
 srv=$!
 cleanup() { kill -9 "$srv" 2>/dev/null; pkill -9 -P "$srv" 2>/dev/null; }
@@ -119,6 +122,10 @@ PY
   [ "$code" = 200 ] || die chat "expected 200, got $code: $(cat "$out/chat.json")"
   python3 -c "import json; d=json.load(open('$out/chat.json')); assert d['choices'][0]['message']['role']=='assistant'; assert 1 <= len(d['choices'][0]['tokens']) <= 16; print(d['choices'][0]['finish_reason'], repr(d['choices'][0]['message']['content'][:60]))" > "$out/chat.check" || die chat "$(cat "$out/chat.json")"
   ok chat "$(cat "$out/chat.check")"
+  if [ -n "${BARO_CHAT_TEMPLATE_FILE:-}" ]; then
+    grep -q 'CUSTOM_TEMPLATE_MARKER' "$out/server.stderr" || die custom-template "chat request did not use $BARO_CHAT_TEMPLATE_FILE"
+    ok custom-template "chat request rendered through $BARO_CHAT_TEMPLATE_FILE"
+  fi
   code=$(curl -s -o "$out/overflow.json" -w '%{http_code}' "$url/v1/chat/completions" -H 'content-type: application/json' \
     -d '{"messages": [{"role": "user", "content": "Say hello."}], "max_tokens": 1000000, "spec": false}')
   [ "$code" = 400 ] || die overflow "expected 400, got $code: $(cat "$out/overflow.json")"

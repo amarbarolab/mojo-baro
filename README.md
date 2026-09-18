@@ -210,7 +210,7 @@ Serving a model, one command, any supported GGUF (self-describing `-BARO-*.gguf`
 bakes; `~/Models/library/INDEX.md` lists the verified ones):
 
 ```sh
-tools/baro serve MODEL.gguf [--port 8080] [--rebuild]
+tools/baro serve MODEL.gguf [--port 8080] [--chat-template-file PATH] [--rebuild]
 ```
 
 Resolves a structural id from the GGUF's own header (`tools/model-id.py`:
@@ -236,6 +236,12 @@ with `tools/engine-pack.py`):
 (cd serve && cargo build --release)
 ./serve/target/release/baro-serve --engine .work/engine --pack .work/engine-pack-q4 --port 8080
 ```
+
+Pass `--chat-template-file PATH` to either command to override the pack's
+`tokenizer-meta.json` chat template for the lifetime of that server. The file
+contains raw Jinja and uses the same `messages`, `tools`,
+`chat_template_kwargs`, `bos_token`, `eos_token`, and `add_generation_prompt`
+context as the embedded template.
 
 `tools/test_server.sh` is the end-to-end gate for that path.
 
