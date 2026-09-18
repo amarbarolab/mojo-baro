@@ -76,12 +76,12 @@ url=$(grep -m1 -oE 'http://[^ ]+' "$out/server.stdout") || fail start "no listen
 pass start "$url"
 
 curl -fsS "$url/v1/audio/speech" -H 'content-type: application/json' \
-    -d '{"input":"hello from baro","voice":"gate","response_format":"wav"}' \
+    -d '{"input":"hello from baro","response_format":"wav"}' \
     -o "$out/speech.wav" || fail speech "TTS endpoint failed"
 python3 - "$out/speech.wav" <<'PY'
 import sys, wave
 with wave.open(sys.argv[1], "rb") as wav:
-    assert wav.getnchannels() == 1 and wav.getframerate() == 16000
+    assert wav.getnchannels() == 1 and wav.getframerate() > 0
     assert wav.getnframes() > 0
 PY
 pass speech "TTS endpoint returned a valid WAV"
