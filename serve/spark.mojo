@@ -411,6 +411,8 @@ def main() raises:
                 perr = "presence_penalty/frequency_penalty are not yet wired for this engine (spark); only the dense/MoE engine (serve/engine.mojo) supports them"
             if perr == "" and sample.embed == 1:
                 perr = "embed is not wired for this engine (spark); only the dense engine (serve/engine.mojo) emits it"
+            if perr == "" and (sample.hidden == 1 or sample.logits_topk > 0):
+                perr = "hidden/logits_topk are not wired for this engine (spark); use the dense engine (serve/engine.mojo)"
             if perr != "":
                 print(err_line(req_id, perr))
                 continue

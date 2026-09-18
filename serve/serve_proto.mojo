@@ -158,6 +158,10 @@ struct SampleParams(Copyable, Movable):
     # matching every other field's convention here. Bounded to
     # kernels/sample.mojo's amar_topn_probs CAP (<= 20) by the caller.
     var top_logprobs: Int
+    # HTTP latent stream extensions: raw post-final-norm hidden rows and
+    # pre-penalty logits, emitted after each generated token.
+    var hidden: Int
+    var logits_topk: Int
     # P0a-e: 1 asks for the last prompt token's post-final-norm hidden row,
     # L2-normalized, as one {"id":ID,"embed":[...]} line before the first
     # token line. Not a sampling knob; it rides here so parse_request keeps
@@ -166,7 +170,7 @@ struct SampleParams(Copyable, Movable):
 
 
 def default_sample_params() -> SampleParams:
-    return SampleParams(temperature=0, top_p=1.0, top_k=0, min_p=0, seed=0, presence_penalty=0, frequency_penalty=0, top_logprobs=0, embed=0)
+    return SampleParams(temperature=0, top_p=1.0, top_k=0, min_p=0, seed=0, presence_penalty=0, frequency_penalty=0, top_logprobs=0, embed=0, hidden=0, logits_topk=0)
 
 
 def parse_request(
@@ -322,6 +326,18 @@ def parse_request(
             sample.embed = 1
         elif line.as_bytes()[fi] != 102:
             return "embed must be true or false"
+    fi = json_key(line, "hidden")
+    if fi >= 0:
+        if line.as_bytes()[fi] == 116:
+            sample.hidden = 1
+        elif line.as_bytes()[fi] != 102:
+            return "hidden must be true or false"
+    fi = json_key(line, "logits_topk")
+    if fi >= 0:
+        var iv4 = 0
+        if not json_int(line, fi, iv4) or iv4 < 0 or iv4 > 20:
+            return "logits_topk must be an integer from 0 to 20"
+        sample.logits_topk = iv4
     return ""
 
 

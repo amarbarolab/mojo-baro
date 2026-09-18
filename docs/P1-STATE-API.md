@@ -109,8 +109,9 @@ visible to the router.
 
 ## Out of scope for P1
 
-HIDDEN and LOGITS_TOPK streams over HTTP, the Unix-socket IPC sidecar, HIP IPC handles, delta
-states, MoE packs (MoE export answers 501 until measured).
+The Unix-socket IPC sidecar, HIP IPC handles, delta states, and MoE packs (MoE export answers 501
+until measured) remain out of scope. HIDDEN and LOGITS_TOPK are now exposed through the dense/MoE
+completion HTTP extensions described in `serve/PROTOCOL.md`.
 
 ## Where it was heading (no gates, no order, no kill line)
 

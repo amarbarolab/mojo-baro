@@ -23,6 +23,8 @@ pub enum Event {
     Tok { tok: u32, logprob: Option<f64>, top_logprobs: Vec<(u32, f64)> },
     /// P0a-e: the requested embedding vector, sent once, before `Done`.
     Embed(Vec<f32>),
+    Hidden(Vec<f32>),
+    LogitsTopK(Vec<(u32, f64)>),
     Done(DoneStats),
     Error(String),
 }
@@ -373,6 +375,20 @@ async fn worker(
                         EngineMsg::Embed { id, vector } => {
                             if let Some(out) = active.get(&id) {
                                 let _ = out.send(Event::Embed(vector));
+                            } else {
+                                eprintln!("engine: line for unknown request ignored: {line}");
+                            }
+                        }
+                        EngineMsg::Hidden { id, vector } => {
+                            if let Some(out) = active.get(&id) {
+                                let _ = out.send(Event::Hidden(vector));
+                            } else {
+                                eprintln!("engine: line for unknown request ignored: {line}");
+                            }
+                        }
+                        EngineMsg::LogitsTopK { id, values } => {
+                            if let Some(out) = active.get(&id) {
+                                let _ = out.send(Event::LogitsTopK(values));
                             } else {
                                 eprintln!("engine: line for unknown request ignored: {line}");
                             }

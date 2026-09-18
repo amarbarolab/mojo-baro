@@ -30,6 +30,10 @@ pub struct SampleParams {
     pub frequency_penalty: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_logprobs: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hidden: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logits_topk: Option<u32>,
 }
 
 /// One request line, serialised exactly as the engine's parser expects.
@@ -129,6 +133,8 @@ pub enum EngineMsg {
     /// P0a-e: the requested embedding vector for request `id`, sent once
     /// between the first `Tok` line and `Done`. Does not end the request.
     Embed { id: u64, vector: Vec<f32> },
+    Hidden { id: u64, vector: Vec<f32> },
+    LogitsTopK { id: u64, values: Vec<(u32, f64)> },
     /// Request `id` finished; no more `Tok` lines follow for it.
     Done { id: u64, stats: DoneStats },
     /// Request `id` was rejected before any token was produced.
@@ -222,6 +228,26 @@ pub fn parse_line(line: &str) -> EngineMsg {
                     EngineMsg::Embed { id, vector: floats.into_iter().map(|f| f as f32).collect() }
                 }
                 _ => EngineMsg::Log(raw.to_string()),
+            },
+            None => EngineMsg::Log(raw.to_string()),
+        };
+    }
+    if let Some(vector) = v.get("hidden") {
+        return match vector.as_array() {
+            Some(arr) => match arr.iter().map(|e| e.as_f64()).collect::<Option<Vec<f64>>>() {
+                Some(floats) if floats.iter().all(|f| f.is_finite()) => {
+                    EngineMsg::Hidden { id, vector: floats.into_iter().map(|f| f as f32).collect() }
+                }
+                _ => EngineMsg::Log(raw.to_string()),
+            },
+            None => EngineMsg::Log(raw.to_string()),
+        };
+    }
+    if let Some(values) = v.get("logits_topk") {
+        return match values.as_array() {
+            Some(arr) => EngineMsg::LogitsTopK {
+                id,
+                values: arr.iter().filter_map(|e| Some((get_u32(e, "id")?, get_f64(e, "logit")?))).collect(),
             },
             None => EngineMsg::Log(raw.to_string()),
         };
@@ -330,6 +356,7 @@ mod tests {
                 presence_penalty: None,
                 frequency_penalty: None,
                 top_logprobs: None,
+                ..Default::default()
             },
             schema: None,
             reasoning: None,
@@ -454,6 +481,18 @@ mod tests {
             EngineMsg::Embed { id: 6, vector: vec![0.1, 0.2, -0.3] }
         );
         assert_eq!(parse_line("{\"id\":6,\"embed\":[]}"), EngineMsg::Embed { id: 6, vector: vec![] });
+    }
+
+    #[test]
+    fn latent_stream_lines() {
+        assert_eq!(
+            parse_line("{\"id\":6,\"hidden\":[0.1,-0.2]}"),
+            EngineMsg::Hidden { id: 6, vector: vec![0.1, -0.2] }
+        );
+        assert_eq!(
+            parse_line("{\"id\":6,\"logits_topk\":[{\"id\":3,\"logit\":1.5}]}"),
+            EngineMsg::LogitsTopK { id: 6, values: vec![(3, 1.5)] }
+        );
     }
 
     #[test]

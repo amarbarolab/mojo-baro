@@ -97,6 +97,7 @@ impl Options {
             presence_penalty: None,
             frequency_penalty: None,
             top_logprobs: None,
+            ..Default::default()
         }
     }
 }
@@ -154,6 +155,7 @@ fn ndjson_stream(app: Shared, rx: mpsc::UnboundedReceiver<Event>, mut chunk: imp
             }
             // No Ollama route sets embed; embeddings.rs collects it separately.
             Event::Embed(_) => return None,
+            Event::Hidden(_) | Event::LogitsTopK(_) => return None,
             Event::Done(s) => {
                 ended = true;
                 let reason = acc.finish_reason(s.finish.as_deref());
@@ -282,6 +284,7 @@ pub async fn chat(State(app): State<Shared>, Json(r): Json<OllamaChatReq>) -> Re
         return Ok(ndjson_stream(app.clone(), rx, move |_, kind| match kind {
             ChunkKind::Delta { text, .. } => json!({"model": model, "created_at": created,
                 "message": {"role": "assistant", "content": text}, "done": false}),
+            ChunkKind::Hidden(_) | ChunkKind::LogitsTopK(_) => json!({"done": false}),
             ChunkKind::Finish { reason, stats, tokens } => chat_done_json(&model, &created, n_prompt, tokens.len(), &stats, &reason),
         }));
     }
@@ -363,6 +366,7 @@ pub async fn generate(State(app): State<Shared>, Json(r): Json<OllamaGenerateReq
         let created = now_rfc3339();
         return Ok(ndjson_stream(app.clone(), rx, move |_, kind| match kind {
             ChunkKind::Delta { text, .. } => json!({"model": model, "created_at": created, "response": text, "done": false}),
+            ChunkKind::Hidden(_) | ChunkKind::LogitsTopK(_) => json!({"done": false}),
             ChunkKind::Finish { reason, stats, tokens } => generate_done_json(&model, &created, n_prompt, &stats, &reason, &prompt_ids, &tokens),
         }));
     }

@@ -475,6 +475,8 @@ struct Acc {
     stopped: bool,
     tokens: Vec<u32>,
     logprobs: Vec<LogprobEntry>,
+    hidden: Vec<Vec<f32>>,
+    logits_topk: Vec<Vec<(u32, f64)>>,
 }
 
 impl Acc {
@@ -484,6 +486,8 @@ impl Acc {
             stopped: false,
             tokens: Vec::new(),
             logprobs: Vec::new(),
+            hidden: Vec::new(),
+            logits_topk: Vec::new(),
         }
     }
 
@@ -551,6 +555,8 @@ async fn collect(app: &App, mut rx: mpsc::UnboundedReceiver<Event>) -> Result<(A
             // P0a-e: no OpenAI/Ollama endpoint sets `embed`, so this never
             // fires on those paths; embeddings.rs collects it separately.
             Event::Embed(_) => {}
+            Event::Hidden(vector) => acc.hidden.push(vector),
+            Event::LogitsTopK(values) => acc.logits_topk.push(values),
             Event::Done(s) => {
                 stats = stats_json(&s);
                 break;
@@ -585,6 +591,8 @@ fn sse_stream(
                     chunk(&app, ChunkKind::Delta { text: delta, token: tok, logprob: lp })
                 }
                 Event::Embed(_) => return None,
+                Event::Hidden(vector) => chunk(&app, ChunkKind::Hidden(vector)),
+                Event::LogitsTopK(values) => chunk(&app, ChunkKind::LogitsTopK(values)),
                 Event::Done(s) => {
                     ended = true;
                     let reason = acc.finish_reason(s.finish.as_deref());
@@ -606,12 +614,27 @@ type TokLogprob = (u32, f64, Vec<(u32, f64)>);
 
 enum ChunkKind {
     Delta { text: String, token: u32, logprob: Option<TokLogprob> },
+    Hidden(Vec<f32>),
+    LogitsTopK(Vec<(u32, f64)>),
     Finish { reason: String, stats: Value, tokens: Vec<u32> },
 }
 
 /// `{"id": token_id, "logprob": ...}` list, OpenAI-shaped per token.
 fn top_logprobs_json(top: &[(u32, f64)]) -> Value {
     Value::Array(top.iter().map(|(id, lp)| json!({"id": id, "logprob": lp})).collect())
+}
+
+fn logits_topk_json(top: &[(u32, f64)]) -> Value {
+    Value::Array(top.iter().map(|(id, logit)| json!({"id": id, "logit": logit})).collect())
+}
+
+fn add_latent_fields(out: &mut Value, acc: &Acc, hidden: bool, logits_topk: bool) {
+    if hidden {
+        out["hidden"] = json!(acc.hidden);
+    }
+    if logits_topk {
+        out["logits_topk"] = Value::Array(acc.logits_topk.iter().map(|v| logits_topk_json(v)).collect());
+    }
 }
 
 /// `/v1/completions`' `logprobs` object (OpenAI shape, ids not text since
@@ -684,6 +707,7 @@ impl SamplerFields {
             presence_penalty: self.presence_penalty,
             frequency_penalty: self.frequency_penalty,
             top_logprobs: top_logprobs.filter(|&n| n > 0),
+            ..Default::default()
         }
     }
 }
@@ -707,6 +731,12 @@ struct CompletionReq {
     /// OpenAI: the count of top logprobs to return per token (0/absent = off).
     #[serde(default)]
     logprobs: Option<u32>,
+    /// Baro extension: emit one post-final-norm hidden row per generated token.
+    #[serde(default)]
+    hidden: bool,
+    /// Baro extension: emit raw pre-penalty logits for the top K ids.
+    #[serde(default)]
+    logits_topk: Option<u32>,
     #[serde(flatten)]
     sampler: SamplerFields,
 }
@@ -725,6 +755,15 @@ fn prompt_ids(app: &App, prompt: &Value) -> Result<Vec<u32>, ApiError> {
     }
 }
 
+fn latent_sample(mut sample: protocol::SampleParams, hidden: bool, logits_topk: Option<u32>) -> Result<protocol::SampleParams, ApiError> {
+    if logits_topk.unwrap_or(0) > 20 {
+        return Err(bad("logits_topk must be an integer from 0 to 20"));
+    }
+    sample.hidden = hidden.then_some(true);
+    sample.logits_topk = logits_topk.filter(|&n| n > 0);
+    Ok(sample)
+}
+
 async fn completions(State(app): State<Shared>, Json(r): Json<CompletionReq>) -> Result<Response, ApiError> {
     let g = Gen {
         prompt: prompt_ids(&app, &r.prompt)?,
@@ -734,7 +773,7 @@ async fn completions(State(app): State<Shared>, Json(r): Json<CompletionReq>) ->
         stop: compute_stop(&app, r.stop),
         ckpt: vec![],
         state: (None, None),
-        sample: r.sampler.to_sample_params(r.logprobs),
+        sample: latent_sample(r.sampler.to_sample_params(r.logprobs), r.hidden, r.logits_topk)?,
         schema: None,
         reasoning: None,
         embed: None,
@@ -750,6 +789,12 @@ async fn completions(State(app): State<Shared>, Json(r): Json<CompletionReq>) ->
                 "id": id, "object": "text_completion", "created": created, "model": model,
                 "choices": [{"index": 0, "text": text, "tokens": [token], "finish_reason": null,
                     "logprobs": logprob.map(|(_, lp, top)| json!({"tokens": [token], "token_logprobs": [lp], "top_logprobs": [top_logprobs_json(&top)]}))}]}),
+            ChunkKind::Hidden(vector) => json!({
+                "id": id, "object": "text_completion.chunk", "created": created, "model": model,
+                "hidden": vector, "choices": []}),
+            ChunkKind::LogitsTopK(values) => json!({
+                "id": id, "object": "text_completion.chunk", "created": created, "model": model,
+                "logits_topk": logits_topk_json(&values), "choices": []}),
             ChunkKind::Finish { reason, stats, tokens } => json!({
                 "id": id, "object": "text_completion", "created": created, "model": model,
                 "choices": [{"index": 0, "text": "", "finish_reason": reason}],
@@ -760,13 +805,14 @@ async fn completions(State(app): State<Shared>, Json(r): Json<CompletionReq>) ->
     }
     let (acc, text_out, stats) = collect(&app, rx).await?;
     let reason = acc.finish_reason(stats.get("finish").and_then(Value::as_str));
-    Ok(Json(json!({
+    let mut response = json!({
         "id": id, "object": "text_completion", "created": now(), "model": model,
         "choices": [{"index": 0, "text": text_out, "tokens": acc.tokens, "finish_reason": reason, "logprobs": completion_logprobs_json(&acc.logprobs)}],
         "usage": usage_json(n_prompt, acc.tokens.len(), &stats),
         "timings": stats,
-    }))
-    .into_response())
+    });
+    add_latent_fields(&mut response, &acc, r.hidden, r.logits_topk.unwrap_or(0) > 0);
+    Ok(Json(response).into_response())
 }
 
 // ---- /v1/fork -------------------------------------------------------------------
@@ -895,6 +941,12 @@ struct ChatReq {
     /// token's own logprob (resolved to `top_logprobs: 1` below).
     #[serde(default)]
     top_logprobs: Option<u32>,
+    /// Baro extension: emit one post-final-norm hidden row per generated token.
+    #[serde(default)]
+    hidden: bool,
+    /// Baro extension: emit raw pre-penalty logits for the top K ids.
+    #[serde(default)]
+    logits_topk: Option<u32>,
     #[serde(flatten)]
     sampler: SamplerFields,
 }
@@ -1120,7 +1172,7 @@ async fn chat_completions(State(app): State<Shared>, Json(r): Json<ChatReq>) -> 
         stop: compute_stop(&app, r.stop),
         ckpt,
         state: (None, None),
-        sample: r.sampler.to_sample_params(if r.logprobs == Some(true) { Some(r.top_logprobs.unwrap_or(1)) } else { r.top_logprobs }),
+        sample: latent_sample(r.sampler.to_sample_params(if r.logprobs == Some(true) { Some(r.top_logprobs.unwrap_or(1)) } else { r.top_logprobs }), r.hidden, r.logits_topk)?,
         schema,
         reasoning,
         embed: None,
@@ -1143,6 +1195,12 @@ async fn chat_completions(State(app): State<Shared>, Json(r): Json<ChatReq>) -> 
                 json!({"id": id, "object": "chat.completion.chunk", "created": created, "model": model,
                        "choices": [{"index": 0, "delta": delta, "tokens": [token], "finish_reason": null, "logprobs": lp}]})
             }
+            ChunkKind::Hidden(vector) => json!({
+                "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+                "hidden": vector, "choices": []}),
+            ChunkKind::LogitsTopK(values) => json!({
+                "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+                "logits_topk": logits_topk_json(&values), "choices": []}),
             ChunkKind::Finish { reason, stats, tokens } => json!({
                 "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
                 "choices": [{"index": 0, "delta": {}, "finish_reason": reason}],
@@ -1163,13 +1221,14 @@ async fn chat_completions(State(app): State<Shared>, Json(r): Json<ChatReq>) -> 
     if !calls.is_empty() {
         message["tool_calls"] = tool_calls_response_json(&calls);
     }
-    Ok(Json(json!({
+    let mut response = json!({
         "id": id, "object": "chat.completion", "created": now(), "model": model,
         "choices": [{"index": 0, "message": message, "tokens": acc.tokens, "finish_reason": reason, "logprobs": chat_logprobs_json(&acc.logprobs)}],
         "usage": usage_json(n_prompt, acc.tokens.len(), &stats),
         "timings": stats,
-    }))
-    .into_response())
+    });
+    add_latent_fields(&mut response, &acc, r.hidden, r.logits_topk.unwrap_or(0) > 0);
+    Ok(Json(response).into_response())
 }
 
 #[cfg(test)]

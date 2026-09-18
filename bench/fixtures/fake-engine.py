@@ -24,6 +24,10 @@ def main():
         request_id = int(request.get("id", 0))
         for token in TOKENS:
             emit({"id": request_id, "tok": token})
+            if request.get("hidden"):
+                emit({"id": request_id, "hidden": [0.1, 0.2]})
+            if request.get("logits_topk"):
+                emit({"id": request_id, "logits_topk": [{"id": 7, "logit": 3.5}]})
         emit({
             "id": request_id,
             "done": True,

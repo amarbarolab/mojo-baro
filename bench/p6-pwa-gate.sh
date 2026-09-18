@@ -90,6 +90,19 @@ hmac_status=$(curl -sS -o "$out/hmac-reject.json" -w '%{http_code}' \
 grep -q '"field":"hmac"' "$out/hmac-reject.json" || fail hmac "unsigned import was not rejected by HMAC: $(cat "$out/hmac-reject.json")"
 pass hmac "unsigned state rejected when BARO_STATE_HMAC_KEY is set"
 
+curl -fsS "$url/v1/completions" -H 'content-type: application/json' \
+    -d '{"prompt":[1],"max_tokens":3,"spec":false,"hidden":true,"logits_topk":1}' \
+    > "$out/latent.json"
+jq -e '.hidden | length == 3 and .[0][0] > 0.09 and .[0][1] > 0.19' "$out/latent.json" >/dev/null || fail latent "hidden stream missing: $(cat "$out/latent.json")"
+jq -e '.logits_topk | length == 3 and .[0][0].id == 7 and .[0][0].logit == 3.5' "$out/latent.json" >/dev/null || fail latent "logits_topk stream missing: $(cat "$out/latent.json")"
+pass latent "HTTP completion returns hidden and logits_topk streams"
+curl -fsS -N "$url/v1/completions" -H 'content-type: application/json' \
+    -d '{"prompt":[1],"max_tokens":1,"stream":true,"spec":false,"hidden":true,"logits_topk":1}' \
+    > "$out/latent-sse.txt"
+grep -q '"hidden"' "$out/latent-sse.txt" || fail latent-sse "SSE hidden chunk missing"
+grep -q '"logits_topk"' "$out/latent-sse.txt" || fail latent-sse "SSE logits_topk chunk missing"
+pass latent-sse "SSE emits hidden and logits_topk chunks"
+
 curl -fsS "$url/" > "$out/index.html" || fail assets "GET / failed"
 python3 - "$url" "$out/index.html" "$out/assets.tsv" <<'PY'
 import pathlib

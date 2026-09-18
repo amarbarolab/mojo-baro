@@ -373,6 +373,11 @@ stint (98.3%), was 108.32 before this round.
   after a gate 1 FAIL from a stale folded-head bug that has since been fixed). PARTIAL: refuses with
   501 on the `serve/spark.mojo` engine and on any `BARO_SEQS > 1` engine; those refusal code paths
   compile but were never exercised by a live request, left UNVERIFIED in that report.
+- Completion routes accept Baro latent extensions, `hidden: true` streams one raw post-final-norm
+  hidden row per generated token, and `logits_topk: K` streams raw pre-penalty top-k logits. WORKS
+  on the dense/MoE engine through SSE and non-streaming responses, with `K` bounded to 20. Spark
+  refuses these fields with 400. HTTP shape gate: `bench/p6-pwa-gate.sh`, latent receipt
+  `.work/p14-latent-p6-gate-2/SUMMARY.txt`.
 - Serves speech-in transcription (`POST /v1/audio/transcriptions`, multipart WAV, proxied to a
   whisper-server sidecar). WORKS: 20/20 fixtures transcribed byte-for-byte equal to `whisper-cli` on
   the same model and beam settings (`exchange/lane-P3A-report.md`).
@@ -554,7 +559,7 @@ stint (98.3%), was 108.32 before this round.
     measurements and the falsifiers were kept, since the falsifiers are what caught the real
     `save_state` cross-prompt export bug. This is a descope of the pass/fail framing, not a proof or
     a disproof. No plan-level LatentOS gate is PASS-and-live today.
-  - Out of scope for P1 and still absent: HIDDEN and LOGITS_TOPK streams over HTTP. State-transfer
+  - The HTTP HIDDEN and LOGITS_TOPK streams now exist as dense/MoE completion extensions. State-transfer
     HMAC is enforced when both nodes set the same non-empty `BARO_STATE_HMAC_KEY`; with a key set,
     unsigned or wrong-key state is rejected, while keyless mode accepts only unsigned state.
 ## Models, pipeline and verification

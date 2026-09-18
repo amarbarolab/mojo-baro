@@ -32,6 +32,7 @@ async fn collect_embed(mut rx: mpsc::UnboundedReceiver<Event>) -> Result<Vec<f32
         match ev {
             Event::Tok { .. } => {}
             Event::Embed(v) => vector = Some(v),
+            Event::Hidden(_) | Event::LogitsTopK(_) => {}
             Event::Done(_) => {
                 return vector.ok_or_else(|| {
                     ApiError::Plain(StatusCode::INTERNAL_SERVER_ERROR, "engine finished an embed:true request with no embed line".into())

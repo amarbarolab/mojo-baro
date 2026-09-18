@@ -967,7 +967,7 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
         var moe_w = 1
         var ssm_i = 0
         var att_i = 0
-        var plain_head = cfg.sample.embed == 0 and cfg.sample.temperature <= 0 and cfg.sample.presence_penalty == 0 and cfg.sample.frequency_penalty == 0 and cfg.sample.top_logprobs <= 0 and not st.grammar.__bool__()
+        var plain_head = cfg.sample.embed == 0 and cfg.sample.hidden == 0 and cfg.sample.logits_topk <= 0 and cfg.sample.temperature <= 0 and cfg.sample.presence_penalty == 0 and cfg.sample.frequency_penalty == 0 and cfg.sample.top_logprobs <= 0 and not st.grammar.__bool__()
         var use_mega = cfg.mega and m == 1 and not win_spec and st.pos + 1 >= cfg.n_prompt
         var use_mega_win = cfg.mega_win and win_spec and m == MEGA_MR
         comptime if not MEGA_ALLOWED:
@@ -1595,7 +1595,8 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                 # penalties/logprobs are skipped rather than guessed).
                 var want_pen = cfg.sample.presence_penalty != 0 or cfg.sample.frequency_penalty != 0
                 var want_lp = cfg.sample.top_logprobs > 0
-                if m == 1 and st.pos + 1 >= cfg.n_prompt and (want_pen or want_lp):
+                var want_logits = cfg.sample.logits_topk > 0
+                if m == 1 and st.pos + 1 >= cfg.n_prompt and (want_pen or want_lp or want_logits):
                     var hn = st.pos + 1 - cfg.n_prompt
                     if hn > 0:
                         ctx.enqueue_copy(
@@ -1612,7 +1613,7 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                     # enqueue_copy into a pre-allocated buffer, same class as
                     # the pen_hist_h copy just above, nothing blocking and
                     # nothing touching disk.
-                    if cfg.dump_pen:
+                    if cfg.dump_pen or want_logits:
                         ctx.enqueue_copy(
                             dst_buf=b.dump_row_h,
                             src_buf=DeviceBuffer[f32](ctx, b.logits_d.unsafe_ptr(), VOCAB, owning=False),

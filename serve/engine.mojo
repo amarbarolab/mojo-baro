@@ -974,7 +974,7 @@ def main() raises:
         # possibly 0) could silently never reach it. Force both the
         # megakernel and speculation off for the rest of THIS request instead
         # of letting the parameter fall through unused.
-        var want_extra = sample.presence_penalty != 0 or sample.frequency_penalty != 0 or sample.top_logprobs > 0
+        var want_extra = sample.presence_penalty != 0 or sample.frequency_penalty != 0 or sample.top_logprobs > 0 or sample.hidden == 1 or sample.logits_topk > 0
         var want_grammar = wst.grammar.__bool__()
         if want_extra or want_grammar:
             spec = False
@@ -987,6 +987,8 @@ def main() raises:
         # head and the draw as before (amar_sample_row is argmax-equivalent
         # at temperature <= 0, P-K2).
         var mega_req = mega
+        if want_extra or want_grammar:
+            mega_req = False
         # A1: the megakernel WINDOW writes the window's tokens itself, so it
         # cannot host the speculative sampling rule (which needs the target's
         # full probability rows, not its argmax). Sampling therefore stays on
@@ -1006,6 +1008,7 @@ def main() raises:
         var predicted = List[Int]()
         var force_tok_h = ctx.enqueue_create_host_buffer[DType.int32](1)
         var lg_h = ctx.enqueue_create_host_buffer[f32](VOCAB if margin else 1)
+        var hidden_h = ctx.enqueue_create_host_buffer[f32](H)
         # The stopwatch stays here, in the harness that is never embedded in a
         # gguf: step_window cannot reach t0, t_prefill_end or dt (P-A, 2026-09-08).
         while wst.pos < n_total - 1:
@@ -1019,6 +1022,43 @@ def main() raises:
                 step_window(ctx, bufs, step_cfg, wst)
             else:
                 step_window(ctx, bufs, cfg, wst)
+            if sample.hidden == 1 and pos_before >= len(prompt) - 1:
+                ctx.enqueue_copy(dst_buf=hidden_h, src_buf=DeviceBuffer[f32](ctx, bufs.hn_d.unsafe_ptr(), H, owning=False))
+            if sample.hidden == 1 or sample.logits_topk > 0:
+                ctx.synchronize()
+            if sample.hidden == 1 and pos_before >= len(prompt) - 1:
+                var hl = String("{\"id\":") + String(req_id) + ",\"hidden\":["
+                for hi in range(H):
+                    if hi > 0:
+                        hl += ","
+                    hl += String(hidden_h[hi])
+                print(hl + "]}")
+            if sample.logits_topk > 0 and pos_before >= len(prompt) - 1:
+                var tk = min(sample.logits_topk, 20)
+                var ids = List[Int]()
+                var vals = List[Float64]()
+                for _ in range(tk):
+                    ids.append(-1)
+                    vals.append(-1e30)
+                for vi in range(VOCAB):
+                    var lv = Float64(bufs.dump_row_h[vi])
+                    var at = 0
+                    while at < tk and lv <= vals[at]:
+                        at += 1
+                    if at < tk:
+                        var j = tk - 1
+                        while j > at:
+                            ids[j] = ids[j - 1]
+                            vals[j] = vals[j - 1]
+                            j -= 1
+                        ids[at] = vi
+                        vals[at] = lv
+                var tl = String("{\"id\":") + String(req_id) + ",\"logits_topk\":["
+                for i in range(tk):
+                    if i > 0:
+                        tl += ","
+                    tl += "{\"id\":" + String(ids[i]) + ",\"logit\":" + String(vals[i]) + "}"
+                print(tl + "]}")
             # Item 4 verification (coordinator review, 2026-09-16): the sync
             # and file write live here, in the harness, never in
             # window.mojo. bufs.dump_row_h and bufs.pen_hist_h were staged
