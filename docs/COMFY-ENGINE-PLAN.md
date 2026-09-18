@@ -65,8 +65,8 @@ never shows declared bytes above budget; three repeated runs, identical images a
 
 ## Decisions for the maintainer
 
-- Default model for the node: Qwen2.5-7B coder (JSON and prompts, spark profile, no
-  `response_format`), Spark-X2.5-4B, or the dense Qwen3.5-9B (schema enforcement, 22 GB, ComfyUI
+- Default model for the node: Qwen2.5-7B coder (JSON and prompts, spark profile, response_format
+  enforcement), Spark-X2.5-4B, or the dense Qwen3.5-9B (schema enforcement, 22 GB, ComfyUI
   must unload). Item 0 tells which of these can be resident.
 - Resident or time-sliced, after item 0.
 - Whether the node pack lives in `~/Projects/imports/ComfyUI/custom_nodes/` (ComfyUI-Manager can

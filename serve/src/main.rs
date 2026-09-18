@@ -1226,15 +1226,7 @@ async fn chat_completions(State(app): State<Shared>, Json(r): Json<ChatReq>) -> 
     if r.messages.is_empty() {
         return Err(bad("messages is empty"));
     }
-    // JSON-enforcement item 4/5 (briefs/2026-09-16-json-enforcement-lane.md):
-    // `serve/spark.mojo`'s engine has no grammar wiring, so it keeps the
-    // 400 unconditionally; the dense/MoE engine (serve/engine.mojo) is
-    // told apart by its `ready` line's kmax, which spark's always reports
-    // as 0 (serve/PROTOCOL.md) and the dense/MoE engine never does.
     let schema = match &r.response_format {
-        Some(rf) if app.engine.limits.kmax == 0 => {
-            return Err(bad("response_format is not supported on this engine (no draft head / grammar wiring); dense and MoE only"));
-        }
         Some(rf) => Some(check_response_format(rf)?),
         None => None,
     };

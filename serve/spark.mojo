@@ -12,8 +12,11 @@ from elementwise import amar_rmsnorm_cast, amar_tok_copy
 from matmul_skinny import ROW_WAVES, ROW_THREADS
 from tokenizer import Tokenizer
 from minja import render_chat
-from sample import amar_sample_row, amar_topn_probs, SAMP_THREADS
-from serve_proto import read_line, parse_request, default_sample_params, json_key, json_int
+from sample import amar_sample_row, amar_sample_row_masked, amar_topn_probs, SAMP_THREADS
+from serve_proto import read_line, parse_request, default_sample_params, json_key, json_int, parse_schema_field, parse_reasoning_field
+from grammar_rt import GrammarRuntime, compile_schema_matcher, reasoning_boundary_observe
+from grammar.automaton import Bitset
+from grammar.matcher import Matcher
 from spark_kernels import (
     amar_embed_lookup_f32, amar_gemv_q8, amar_argmax_part, amar_argmax_final, amar_rope_kv_append, amar_attn_decode_swa_gated, amar_rope_plain, amar_bias_add,
     amar_trace_sum,
@@ -120,6 +123,7 @@ comptime k_argmax_final = amar_argmax_final[AM_NB, type_of(amv_l), type_of(amv_l
 comptime samp_x_l = row_major[1, VOCAB]()
 comptime samp_o_l = row_major[1]()
 comptime k_sample = amar_sample_row[type_of(samp_x_l), type_of(samp_o_l), type_of(samp_o_l)]
+comptime k_sample_masked = amar_sample_row_masked[type_of(samp_x_l), type_of(samp_o_l), type_of(samp_o_l)]
 comptime k_tokcp = amar_tok_copy[type_of(samp_o_l), type_of(toks_l)]
 comptime NTOPLP = 20
 comptime topn_l = row_major[1, NTOPLP]()
@@ -353,12 +357,15 @@ def main() raises:
     var topn_probs_d = ctx.enqueue_create_buffer[f32](NTOPLP)
     var topn_ids_h = ctx.enqueue_create_host_buffer[DType.int32](NTOPLP)
     var topn_probs_h = ctx.enqueue_create_host_buffer[f32](NTOPLP)
+    var gmask_h = ctx.enqueue_create_host_buffer[DType.uint64]((VOCAB + 63) // 64)
+    var gmask_d = ctx.enqueue_create_buffer[DType.uint64]((VOCAB + 63) // 64)
     var row_h = ctx.enqueue_create_host_buffer[f32](VOCAB)
     var dump_dir = getenv("BARO_DUMP_LOGITS_DIR", "")
     var OutNorm = wf(ctx, wbuf, off[1 + LSTRIDE * N_LAYERS], H, h_l)
     var out_off = off[2 + LSTRIDE * N_LAYERS]
     var Woq = wq(ctx, wbuf, out_off, VOCAB * H, q_out)
     var Wos = ws(ctx, wbuf, out_off, VOCAB * H, s_out)
+    var grt: Optional[GrammarRuntime] = None
 
     if serve:
         print("{\"ready\":true,\"tmax\":" + String(TMAX) + ",\"mrows\":1,\"kmax\":0,\"spec_k\":0,\"pack\":\"" + packdir + "\"}")
@@ -379,6 +386,11 @@ def main() raises:
         # mode; one-shot stays the default (temperature 0, greedy), matching
         # today's behaviour exactly.
         var sample = default_sample_params()
+        var grammar: Optional[Matcher] = None
+        var grammar_pending_think = False
+        var grammar_think_buf = List[UInt8]()
+        var grammar_stop = False
+        var grammar_mask = Bitset(1)
         var sp_state_save = String("")
         if serve:
             var line_in = read_line(0)
@@ -413,6 +425,25 @@ def main() raises:
                 perr = "embed is not wired for this engine (spark); only the dense engine (serve/engine.mojo) emits it"
             if perr == "" and (sample.hidden == 1 or sample.logits_topk > 0):
                 perr = "hidden/logits_topk are not wired for this engine (spark); use the dense engine (serve/engine.mojo)"
+            var schema_raw = parse_schema_field(line_in.value()) if perr == "" else String("")
+            if perr == "" and schema_raw != "":
+                sample.top_p = 1.0
+                sample.top_k = 0
+                sample.min_p = 0.0
+                if not grt:
+                    try:
+                        grt = Optional(GrammarRuntime(packdir))
+                    except e:
+                        perr = "response_format: grammar runtime failed to load: " + String(e)
+                if perr == "" and grt.value().vocab_size != VOCAB:
+                    perr = "response_format: grammar vocab_size " + String(grt.value().vocab_size) + " != engine VOCAB " + String(VOCAB)
+                if perr == "":
+                    try:
+                        grammar = Optional(compile_schema_matcher(grt.value(), schema_raw))
+                    except e:
+                        perr = "response_format schema: " + String(e)
+                    grammar_pending_think = parse_reasoning_field(line_in.value())
+                    grammar_mask = Bitset(VOCAB)
             if perr != "":
                 print(err_line(req_id, perr))
                 continue
@@ -551,7 +582,20 @@ def main() raises:
                     )
                     ctx.enqueue_copy(dst_buf=topn_ids_h, src_buf=topn_ids_d)
                     ctx.enqueue_copy(dst_buf=topn_probs_h, src_buf=topn_probs_d)
-                if sample.temperature > 0:
+                var grammar_here = grammar.__bool__() and pos + 1 >= n_prompt and not grammar_pending_think
+                if grammar_here:
+                    ref mm = grammar.value()
+                    mm.fill_mask(grammar_mask)
+                    for i in range(len(grammar_mask.words)):
+                        gmask_h[i] = grammar_mask.words[i]
+                    ctx.enqueue_copy(dst_buf=gmask_d, src_buf=gmask_h)
+                    ctx.enqueue_function[k_sample_masked](
+                        LogitsSample, Stok, Sprob, Int32(VOCAB), Float32(sample.temperature), Int32(sample.top_k),
+                        Float32(sample.top_p), Float32(sample.min_p), sample.seed, UInt64(pos),
+                        gmask_d.unsafe_ptr(), Int32((VOCAB + 63) // 64), grid_dim=1, block_dim=SAMP_THREADS,
+                    )
+                    ctx.enqueue_function[k_tokcp](Stok, Toks, Int32(0), Int32(pos + 1), Int32(1), grid_dim=1, block_dim=32)
+                elif sample.temperature > 0:
                     ctx.enqueue_function[k_sample](
                         LogitsSample, Stok, Sprob, Int32(VOCAB), Float32(sample.temperature), Int32(sample.top_k),
                         Float32(sample.top_p), Float32(sample.min_p), sample.seed, UInt64(pos),
@@ -567,6 +611,20 @@ def main() raises:
                     ctx.enqueue_copy(dst_buf=tok1_h, src_buf=DeviceBuffer[DType.int32](ctx, toks_d.unsafe_ptr().unsafe_offset(pos + 1), 1, owning=False))
                     ctx.synchronize()
                     var new_tok = Int(tok1_h[0])
+                    if grammar.__bool__():
+                        ref mm = grammar.value()
+                        if new_tok < 0:
+                            grammar_stop = True
+                        elif grammar_pending_think:
+                            if reasoning_boundary_observe(grammar_think_buf, mm.vocab[].token_bytes[new_tok]):
+                                grammar_pending_think = False
+                        else:
+                            _ = mm.accept(new_tok)
+                            if mm.is_terminated():
+                                grammar_stop = True
+                    if grammar_stop and new_tok < 0:
+                        finish = "stop"
+                        break
                     if want_lp:
                         var lp = 0.0
                         if sample.temperature > 0:
@@ -601,6 +659,9 @@ def main() raises:
                             if matched:
                                 finish = "stop"
                     if finish == "stop":
+                        break
+                    if grammar_stop:
+                        finish = "stop"
                         break
         ctx.synchronize()
         var dt = Float64(perf_counter_ns() - t_gen_start) / 1e9
