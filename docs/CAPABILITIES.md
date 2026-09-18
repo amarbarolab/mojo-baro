@@ -541,11 +541,10 @@ stint (98.3%), was 108.32 before this round.
     permissions problem. Not planned to be revisited in Mojo.
   - **HTTP `.baro` state files: WORKS on one node**, and is a separate mechanism from the socket
     sidecar despite reusing the LAT1 header. This is the P1 export/import API above.
-  - `latentos-agent` as a live daemon: NO CHECK FOUND. `agent.mojo`'s `main()` runs a one-shot boot
-    printout and manifest write; `stage_l7_serve_step`, the only method that reads the store or
-    heartbeats, is defined and never called from `main`. Nothing in this repo shows it running as a
-    persistent service. Cross-host transport (`tcp_listen`/`tcp_connect`/`send_tcp_latent`) has no
-    test referencing it.
+  - `latentos-agent` as a live daemon: WORKS. `--daemon` now keeps the process resident after boot,
+    runs `stage_l7_serve_step` once per second for store eviction and watchdog heartbeats, and writes
+    the manifest before serving. Gate: `bench/latentos-agent-gate.sh`. Cross-host transport
+    (`tcp_listen`/`tcp_connect`/`send_tcp_latent`) remains untested.
   - Measured experiments, kept for their numbers rather than as gate passes: **E12** KV handoff
     scores identically to full re-prefill on task accuracy at 8k/16k/32k. **E14** one reader with N
     followers PASSES at N=3 (3/3) and FAILS at N=10 (9/10), the miss diverging at token 62 of 64

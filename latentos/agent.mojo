@@ -403,3 +403,7 @@ def main() raises:
 
     var agent = LatentAgent(cfg^)
     agent.run_check()
+    if cfg.daemon_mode:
+        print("latentos-agent daemon serving")
+        while agent.stage_l7_serve_step():
+            _ = sys.sys_usleep(1_000_000)
