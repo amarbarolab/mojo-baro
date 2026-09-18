@@ -544,6 +544,35 @@ def q8_0_row_dot[
     return warp.sum(acc.reduce_add())
 
 
+@always_inline
+def q8d_row_dot[
+    XLayout: TensorLayout,
+](
+    X: TileTensor[bf16, XLayout, MutAnyOrigin],
+    W: MutPointer[Scalar[u8], MutAnyOrigin],
+    x_row: Int,
+    q_base: Int,
+    s_base: Int,
+    k_dim: Int,
+) -> Scalar[f32]:
+    comptime assert X.flat_rank == 2
+    var lane = Int(lane_id())
+    var Xv = X.vectorize[1, 16]()
+    var nb = k_dim // 32
+    var acc = SIMD[f32, 16](0)
+    var b = lane // 2
+    var h = lane % 2
+    while b < nb:
+        var raw = W.unsafe_offset(s_base + b * 2).unsafe_bitcast[Scalar[u16]]()[]
+        var d = bitcast[f16, 1](SIMD[u16, 1](raw)).cast[f32]()[0]
+        var q = W.unsafe_offset(q_base + b * 32 + h * 16).unsafe_bitcast[Scalar[i8]]().load[width=16]()
+        var v = (SIMD[f32, 16](d) * q.cast[f32]()).cast[bf16]().cast[f32]()
+        var a = rebind[SIMD[bf16, 16]](Xv[x_row, 2 * b + h]).cast[f32]()
+        acc = fma(v, a, acc)
+        b += 16
+    return warp.sum(acc.reduce_add())
+
+
 def moe_embed_q8_0_pos[
     OLayout: TensorLayout, KLayout: TensorLayout,
 ](
@@ -563,7 +592,7 @@ def moe_embed_q8_0_pos[
     O[block_idx.y, idx] = rebind[O.ElementType](q8_0_value(W, row_base, idx))
 
 
-def moe_matmul_q8_0_m1[
+def moe_matmul_q8d_m1[
     OLayout: TensorLayout, ALayout: TensorLayout,
 ](
     A: TileTensor[bf16, ALayout, MutAnyOrigin],
@@ -571,18 +600,19 @@ def moe_matmul_q8_0_m1[
     O: TileTensor[f32, OLayout, MutAnyOrigin],
     n: Int32,
     k_dim: Int32,
-    row_bytes: Int32,
+    s_off: Int32,
 ):
     comptime assert A.flat_rank == 2 and O.flat_rank == 1
     var row = Int(block_idx.x) * MOE_WAVES + Int(thread_idx.x) // WARP_SIZE
     if row >= Int(n):
         return
-    var dot = q8_0_row_dot(A, W, 0, row * Int(row_bytes), Int(k_dim))
+    var k = Int(k_dim)
+    var dot = q8d_row_dot(A, W, 0, row * k, Int(s_off) + row * (k // 32) * 2, k)
     if lane_id() == 0:
         O[row] = rebind[O.ElementType](dot)
 
 
-def moe_matmul_q8_0_m1_add[
+def moe_matmul_q8d_m1_add[
     OLayout: TensorLayout, ALayout: TensorLayout, XLayout: TensorLayout,
 ](
     A: TileTensor[bf16, ALayout, MutAnyOrigin],
@@ -591,13 +621,14 @@ def moe_matmul_q8_0_m1_add[
     X: TileTensor[f32, XLayout, MutAnyOrigin],
     n: Int32,
     k_dim: Int32,
-    row_bytes: Int32,
+    s_off: Int32,
 ):
     comptime assert A.flat_rank == 2 and O.flat_rank == 1 and X.flat_rank == 1
     var row = Int(block_idx.x) * MOE_WAVES + Int(thread_idx.x) // WARP_SIZE
     if row >= Int(n):
         return
-    var dot = q8_0_row_dot(A, W, 0, row * Int(row_bytes), Int(k_dim))
+    var k = Int(k_dim)
+    var dot = q8d_row_dot(A, W, 0, row * k, Int(s_off) + row * (k // 32) * 2, k)
     if lane_id() == 0:
         O[row] = rebind[O.ElementType](dot)
         X[row] = rebind[X.ElementType](rebind[Scalar[f32]](X[row]) + dot)

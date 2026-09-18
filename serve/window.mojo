@@ -17,7 +17,7 @@ from registry import *
 from expert_tier import ExpertTier
 from serve_proto import SampleParams
 from moe import (
-    moe_embed_q8_0_pos, moe_matmul_q8_0_m1, moe_matmul_q8_0_m1_add,
+    moe_embed_q8_0_pos, moe_matmul_q8d_m1, moe_matmul_q8d_m1_add,
     amar_moe_router_top8_sig, moe_gate_up_q4k_pack,
     amar_moe_down_q4k, amar_moe_down_q6k, moe_gate_up_q8_0, moe_down_q8_0_res,
     moe_gate_up_q4k_zc, amar_moe_down_q4k_zc,
@@ -1110,8 +1110,8 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                 comptime if MEGA_ALLOWED:
                     gemm_w[QF, H](ctx, CurBm, b.wbuf, b.off[w + 1], cfg.pack_q4, Pqf, m)
                 else:
-                    ctx.enqueue_function[moe_matmul_q8_0_m1[type_of(h_layout), type_of(xm_layout)]](
-                        CurBm, b.wbuf.unsafe_ptr().unsafe_offset(b.off[moe_base + 1]), row_f32(ctx, b.qf_d, 0, QF, h_layout), Int32(QF), Int32(H), Int32((H // 32) * 34),
+                    ctx.enqueue_function[moe_matmul_q8d_m1[type_of(h_layout), type_of(xm_layout)]](
+                        CurBm, b.wbuf.unsafe_ptr().unsafe_offset(b.off[moe_base + 1]), row_f32(ctx, b.qf_d, 0, QF, h_layout), Int32(QF), Int32(H), Int32(QF * H),
                         grid_dim=ceildiv(QF, 8), block_dim=256)
                 comptime if MEGA_ALLOWED:
                     ctx.enqueue_function[r_qf](Pqf, Qfm, Int32(m), Int32(QF), grid_dim=ceildiv(m * QF, 256), block_dim=256)
@@ -1121,16 +1121,16 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                 comptime if MEGA_ALLOWED:
                     gemm_w[KV, H](ctx, CurBm, b.wbuf, b.off[w + 2], cfg.pack_q4, Pkv, m)
                 else:
-                    ctx.enqueue_function[moe_matmul_q8_0_m1[type_of(h_layout), type_of(xm_layout)]](
-                        CurBm, b.wbuf.unsafe_ptr().unsafe_offset(b.off[moe_base + 2]), row_f32(ctx, b.k_d, 0, KV, h_layout), Int32(KV), Int32(H), Int32((H // 32) * 34),
+                    ctx.enqueue_function[moe_matmul_q8d_m1[type_of(h_layout), type_of(xm_layout)]](
+                        CurBm, b.wbuf.unsafe_ptr().unsafe_offset(b.off[moe_base + 2]), row_f32(ctx, b.k_d, 0, KV, h_layout), Int32(KV), Int32(H), Int32(KV * H),
                         grid_dim=ceildiv(KV, 8), block_dim=256)
                 comptime if MEGA_ALLOWED:
                     ctx.enqueue_function[r_kv](Pkv, Kflat, Int32(m), Int32(KV), grid_dim=ceildiv(m * KV, 256), block_dim=256)
                 comptime if MEGA_ALLOWED:
                     gemm_w[KV, H](ctx, CurBm, b.wbuf, b.off[w + 3], cfg.pack_q4, Pkv, m)
                 else:
-                    ctx.enqueue_function[moe_matmul_q8_0_m1[type_of(h_layout), type_of(xm_layout)]](
-                        CurBm, b.wbuf.unsafe_ptr().unsafe_offset(b.off[moe_base + 3]), row_f32(ctx, b.v_d, 0, KV, h_layout), Int32(KV), Int32(H), Int32((H // 32) * 34),
+                    ctx.enqueue_function[moe_matmul_q8d_m1[type_of(h_layout), type_of(xm_layout)]](
+                        CurBm, b.wbuf.unsafe_ptr().unsafe_offset(b.off[moe_base + 3]), row_f32(ctx, b.v_d, 0, KV, h_layout), Int32(KV), Int32(H), Int32(KV * H),
                         grid_dim=ceildiv(KV, 8), block_dim=256)
                 comptime if MEGA_ALLOWED:
                     ctx.enqueue_function[r_kv](Pkv, Vflat, Int32(m), Int32(KV), grid_dim=ceildiv(m * KV, 256), block_dim=256)
@@ -1177,8 +1177,8 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                 comptime if MEGA_ALLOWED:
                     gemm_w[H, ATT](ctx, AoBm, b.wbuf, b.off[w + 6], cfg.pack_q4, Ph, m)
                 else:
-                    ctx.enqueue_function[moe_matmul_q8_0_m1_add[type_of(h_layout), type_of(attm_layout), type_of(h_layout)]](
-                        AoBm, b.wbuf.unsafe_ptr().unsafe_offset(b.off[moe_base + 6]), row_f32(ctx, b.p_h_d, 0, H, h_layout), row_f32(ctx, b.x_d, 0, H, h_layout), Int32(H), Int32(ATT), Int32((ATT // 32) * 34),
+                    ctx.enqueue_function[moe_matmul_q8d_m1_add[type_of(h_layout), type_of(attm_layout), type_of(h_layout)]](
+                        AoBm, b.wbuf.unsafe_ptr().unsafe_offset(b.off[moe_base + 6]), row_f32(ctx, b.p_h_d, 0, H, h_layout), row_f32(ctx, b.x_d, 0, H, h_layout), Int32(H), Int32(ATT), Int32(H * ATT),
                         grid_dim=ceildiv(H, 8), block_dim=256)
                 if cfg.dump4 and cfg.dump and m == 1 and layer == cfg.dump_layer and st.pos + 1 >= cfg.n_prompt:
                     # slot 6: the output projection result, the value added to
@@ -1225,11 +1225,11 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                     gemm_w[NH_V, H](ctx, CurBm, b.wbuf, b.off[w + 3], cfg.pack_q4, Pab, m)
                     gemm_w[NH_V, H](ctx, CurBm, b.wbuf, b.off[w + 4], cfg.pack_q4, Pab2, m)
                 else:
-                    ctx.enqueue_function[moe_matmul_q8_0_m1[type_of(h_layout), type_of(xm_layout)]](
-                        CurBm, b.wbuf.unsafe_ptr().unsafe_offset(b.off[moe_base + 1]), row_f32(ctx, b.qkv_d, 0, CONV, h_layout), Int32(CONV), Int32(H), Int32((H // 32) * 34),
+                    ctx.enqueue_function[moe_matmul_q8d_m1[type_of(h_layout), type_of(xm_layout)]](
+                        CurBm, b.wbuf.unsafe_ptr().unsafe_offset(b.off[moe_base + 1]), row_f32(ctx, b.qkv_d, 0, CONV, h_layout), Int32(CONV), Int32(H), Int32(CONV * H),
                         grid_dim=ceildiv(CONV, 8), block_dim=256)
-                    ctx.enqueue_function[moe_matmul_q8_0_m1[type_of(h_layout), type_of(xm_layout)]](
-                        CurBm, b.wbuf.unsafe_ptr().unsafe_offset(b.off[moe_base + 2]), row_f32(ctx, b.p_h_d, 0, H, h_layout), Int32(H), Int32(H), Int32((H // 32) * 34),
+                    ctx.enqueue_function[moe_matmul_q8d_m1[type_of(h_layout), type_of(xm_layout)]](
+                        CurBm, b.wbuf.unsafe_ptr().unsafe_offset(b.off[moe_base + 2]), row_f32(ctx, b.p_h_d, 0, H, h_layout), Int32(H), Int32(H), Int32(NH_V * SSTATE * H),
                         grid_dim=ceildiv(H, 8), block_dim=256)
                     # ssm_alpha/ssm_beta are F32 in the MoE pack; the dense
                     # pack stores them q4. Reading f32 bytes through the q8_0
@@ -1258,8 +1258,8 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                 comptime if MEGA_ALLOWED:
                     ctx.enqueue_function[r_h](Ph, ZmOld, Int32(m), Int32(H), grid_dim=ceildiv(m * H, 256), block_dim=256)
                 else:
-                    ctx.enqueue_function[moe_matmul_q8_0_m1[type_of(moe_inner_layout), type_of(xm_layout)]](
-                        CurBm, b.wbuf.unsafe_ptr().unsafe_offset(b.off[moe_base + 2]), Zflat, Int32(NH_V * SSTATE), Int32(H), Int32((H // 32) * 34),
+                    ctx.enqueue_function[moe_matmul_q8d_m1[type_of(moe_inner_layout), type_of(xm_layout)]](
+                        CurBm, b.wbuf.unsafe_ptr().unsafe_offset(b.off[moe_base + 2]), Zflat, Int32(NH_V * SSTATE), Int32(H), Int32(NH_V * SSTATE * H),
                         grid_dim=ceildiv(NH_V * SSTATE, 8), block_dim=256)
 
                 if cfg.pf2:
@@ -1315,8 +1315,8 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                 comptime if MEGA_ALLOWED:
                     gemm_w[H, H](ctx, ResBmOld, b.wbuf, b.off[w + 9], cfg.pack_q4, Ph, m)
                 else:
-                    ctx.enqueue_function[moe_matmul_q8_0_m1_add[type_of(h_layout), type_of(moe_inner_m_layout), type_of(h_layout)]](
-                        ResBm, b.wbuf.unsafe_ptr().unsafe_offset(b.off[decode_base + 9]), row_f32(ctx, b.p_h_d, 0, H, h_layout), row_f32(ctx, b.x_d, 0, H, h_layout), Int32(H), Int32(NH_V * SSTATE), Int32((NH_V * SSTATE // 32) * 34),
+                    ctx.enqueue_function[moe_matmul_q8d_m1_add[type_of(h_layout), type_of(moe_inner_m_layout), type_of(h_layout)]](
+                        ResBm, b.wbuf.unsafe_ptr().unsafe_offset(b.off[decode_base + 9]), row_f32(ctx, b.p_h_d, 0, H, h_layout), row_f32(ctx, b.x_d, 0, H, h_layout), Int32(H), Int32(NH_V * SSTATE), Int32(H * NH_V * SSTATE),
                         grid_dim=ceildiv(H, 8), block_dim=256)
                 if cfg.dump4 and cfg.dump and m == 1 and layer == cfg.dump_layer and st.pos + 1 >= cfg.n_prompt:
                     # slot 7: the ssm_out projection result, i.e. llama's

@@ -32,8 +32,9 @@ comptime i64 = DType.int64
 comptime ATT = NQH * HD
 comptime INNER = NH_V * SSTATE
 comptime Q8_ROW_H = (H // 32) * 34
-comptime Q8_ROW_ATT = (ATT // 32) * 34
-comptime Q8_ROW_INNER = (INNER // 32) * 34
+comptime Q8S_H = (H // 32) * 2
+comptime Q8S_ATT = (ATT // 32) * 2
+comptime Q8S_INNER = (INNER // 32) * 2
 comptime Q8_ROW_SH = (SH_FFN // 32) * 34
 comptime Q4K_ROW_H = (H // Q4K) * Q4K_BYTES
 comptime Q4K_ROW_E = (E_FFN // Q4K) * Q4K_BYTES
@@ -146,6 +147,48 @@ def q8_dot_u[U: Int, XLayout: TensorLayout](
         var raw = W.unsafe_offset(base).unsafe_bitcast[Scalar[u16]]()[]
         var d = bitcast[f16, 1](SIMD[u16, 1](raw)).cast[f32]()[0]
         var q = W.unsafe_offset(base + 2 + h * 16).unsafe_bitcast[Scalar[i8]]().load[width=16]()
+        var v = (SIMD[f32, 16](d) * q.cast[f32]()).cast[bf16]().cast[f32]()
+        var a = rebind[SIMD[bf16, 16]](Xv[x_row, 2 * b + h]).cast[f32]()
+        acc = fma(v, a, acc)
+        b += 16
+    return warp.sum(acc.reduce_add())
+
+
+@always_inline
+def q8d_dot_u[U: Int, XLayout: TensorLayout](
+    X: TileTensor[bf16, XLayout, MutAnyOrigin],
+    W: MutPointer[Scalar[u8], MutAnyOrigin],
+    x_row: Int,
+    q_base: Int,
+    s_base: Int,
+    k_dim: Int,
+) -> Scalar[f32]:
+    comptime assert X.flat_rank == 2
+    var lane = Int(lane_id())
+    var Xv = X.vectorize[1, 16]()
+    var nb = k_dim // 32
+    var acc = SIMD[f32, 16](0)
+    var b = lane // 2
+    var h = lane % 2
+    while b + (U - 1) * 16 < nb:
+        var raws = InlineArray[Scalar[u16], U](uninitialized=True)
+        var qs = InlineArray[SIMD[i8, 16], U](uninitialized=True)
+        var xs = InlineArray[SIMD[bf16, 16], U](uninitialized=True)
+        comptime for u in range(U):
+            var bb = b + u * 16
+            raws[u] = W.unsafe_offset(s_base + bb * 2).unsafe_bitcast[Scalar[u16]]()[]
+            qs[u] = W.unsafe_offset(q_base + bb * 32 + h * 16).unsafe_bitcast[Scalar[i8]]().load[width=16]()
+            xs[u] = rebind[SIMD[bf16, 16]](Xv[x_row, 2 * bb + h])
+        comptime for u in range(U):
+            var d = bitcast[f16, 1](SIMD[u16, 1](raws[u])).cast[f32]()[0]
+            var v = (SIMD[f32, 16](d) * qs[u].cast[f32]()).cast[bf16]().cast[f32]()
+            var a = xs[u].cast[f32]()
+            acc = fma(v, a, acc)
+        b += U * 16
+    while b < nb:
+        var raw = W.unsafe_offset(s_base + b * 2).unsafe_bitcast[Scalar[u16]]()[]
+        var d = bitcast[f16, 1](SIMD[u16, 1](raw)).cast[f32]()[0]
+        var q = W.unsafe_offset(q_base + b * 32 + h * 16).unsafe_bitcast[Scalar[i8]]().load[width=16]()
         var v = (SIMD[f32, 16](d) * q.cast[f32]()).cast[bf16]().cast[f32]()
         var a = rebind[SIMD[bf16, 16]](Xv[x_row, 2 * b + h]).cast[f32]()
         acc = fma(v, a, acc)
@@ -384,17 +427,17 @@ def mega_moe_body[
             var g = bid * ROW_WAVES + wave
             while g < QF + KV + KV:
                 if g < QF:
-                    var t = q8_dot_u[4](CurB, wbuf.unsafe_offset(o1), 0, g * Q8_ROW_H, H)
+                    var t = q8d_dot_u[4](CurB, wbuf.unsafe_offset(o1), 0, g * H, QF * H + g * Q8S_H, H)
                     if lane == 0:
                         Qfm[0, g] = rebind[Qfm.ElementType](t)
                 elif g < QF + KV:
                     var r = g - QF
-                    var t = q8_dot_u[4](CurB, wbuf.unsafe_offset(o2), 0, r * Q8_ROW_H, H)
+                    var t = q8d_dot_u[4](CurB, wbuf.unsafe_offset(o2), 0, r * H, KV * H + r * Q8S_H, H)
                     if lane == 0:
                         Kflat[0, r] = rebind[Kflat.ElementType](t)
                 else:
                     var r = g - QF - KV
-                    var t = q8_dot_u[4](CurB, wbuf.unsafe_offset(o3), 0, r * Q8_ROW_H, H)
+                    var t = q8d_dot_u[4](CurB, wbuf.unsafe_offset(o3), 0, r * H, KV * H + r * Q8S_H, H)
                     if lane == 0:
                         Vflat[0, r] = rebind[Vflat.ElementType](t)
                 g += nwaves
@@ -488,7 +531,7 @@ def mega_moe_body[
 
             g = bid * ROW_WAVES + wave
             while g < H:
-                var t = q8_dot_u[4](AoB, wbuf.unsafe_offset(o6), 0, g * Q8_ROW_ATT, ATT)
+                var t = q8d_dot_u[4](AoB, wbuf.unsafe_offset(o6), 0, g * ATT, H * ATT + g * Q8S_ATT, ATT)
                 if lane == 0:
                     X[0, g] = rebind[X.ElementType](rebind[Scalar[f32]](X[0, g]) + t)
                 g += nwaves
@@ -506,12 +549,12 @@ def mega_moe_body[
             var g = bid * ROW_WAVES + wave
             while g < CONV + INNER + NH_V + NH_V:
                 if g < CONV:
-                    var t = q8_dot_u[4](CurB, wbuf.unsafe_offset(o1), 0, g * Q8_ROW_H, H)
+                    var t = q8d_dot_u[4](CurB, wbuf.unsafe_offset(o1), 0, g * H, CONV * H + g * Q8S_H, H)
                     if lane == 0:
                         Qkvm[0, g] = rebind[Qkvm.ElementType](t)
                 elif g < CONV + INNER:
                     var r = g - CONV
-                    var t = q8_dot_u[4](CurB, wbuf.unsafe_offset(o2), 0, r * Q8_ROW_H, H)
+                    var t = q8d_dot_u[4](CurB, wbuf.unsafe_offset(o2), 0, r * H, INNER * H + r * Q8S_H, H)
                     if lane == 0:
                         Zm[0, r] = rebind[Zm.ElementType](t)
                 elif g < CONV + INNER + NH_V:
@@ -650,7 +693,7 @@ def mega_moe_body[
 
             g = bid * ROW_WAVES + wave
             while g < H:
-                var t = q8_dot_u[4](ResB, wbuf.unsafe_offset(o9), 0, g * Q8_ROW_INNER, INNER)
+                var t = q8d_dot_u[4](ResB, wbuf.unsafe_offset(o9), 0, g * INNER, H * INNER + g * Q8S_INNER, INNER)
                 if lane == 0:
                     X[0, g] = rebind[X.ElementType](rebind[Scalar[f32]](X[0, g]) + t)
                 g += nwaves

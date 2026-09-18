@@ -110,6 +110,10 @@ def load_pack(ctx: DeviceContext, packdir: String) raises -> Pack:
                 total += n + (n // 32) * 2
             elif dt == "q8_0":
                 # raw ggml Q8_0: 32-value blocks, 32 int8 + one f16 scale
+                if len(dotparts) >= 3:
+                    var cls = String(dotparts[len(dotparts) - 2])
+                    if cls == "attn_q" or cls == "attn_k" or cls == "attn_v" or cls == "attn_output" or cls == "attn_qkv" or cls == "attn_gate" or cls == "ssm_out":
+                        raise Error("pack " + name + " is raw q8_0; the MoE projections must be in the dense q8 layout (tools/moe-pack-q8d.py, R6.3)")
                 total += (n // 32) * 34
             elif dt == "q4_k":
                 # raw ggml Q4_K: 256-value superblocks, 144 bytes each
