@@ -487,9 +487,8 @@ stint (98.3%), was 108.32 before this round.
 - PWA client, served by `baro-serve` itself at `/`. WORKS on the tested surface: a CPU-only
   fake-engine browser gate PASSED, streamed text lands correctly in the DOM, no horizontal overflow
   at 400px width, offline reload serves a controlled shell with the server stopped, service worker
-  registers. PARTIAL: voice input (`MediaRecorder` to `/v1/audio/transcriptions`) is implemented but
-  UNVERIFIED by this gate, since the fake engine used for the gate has no whisper sidecar; only the
-  separate P3a gate (real whisper, not exercised through the PWA UI) is proven. The web assets are
+  registers. WORKS: browser PCM capture, WAV encoding, and `/v1/audio/transcriptions` pass through
+  the PWA browser gate with a real whisper sidecar. The web assets are
   719 LOC against the item's own 600 LOC budget, disclosed and not fixed.
 - ComfyUI custom node (`comfyui-baro`): chat and JSON-schema-constrained nodes calling `baro-serve`
   over HTTP, time-sliced against ComfyUI's own models. WORKS: VRAM receipt confirms the MAX runtime

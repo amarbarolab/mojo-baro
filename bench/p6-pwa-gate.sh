@@ -147,6 +147,17 @@ printf '%s\n' "$expected" > "$out/fake-sequence.txt"
 grep -Fqx "$expected" "$out/chat-dom.txt" || fail chat "DOM reply mismatch: expected $(printf '%q' "$expected"), got $(cat "$out/chat-dom.txt")"
 pass chat "DOM assistant reply equals fake sequence $(printf '%q' "$expected")"
 
+~/iTools/bin/cdp-eval --port "$browser_port" --tab "$url" --timeout 20 \
+    '(() => { const f = window.fetch; window.fetch = async (...a) => { const body = a[1] && a[1].body; const file = body && body.get && body.get("file"); if (file) window.__voiceFile = {size:file.size, type:file.type, name:file.name}; const r = await f(...a); if (String(a[0]).includes("/v1/audio/transcriptions")) { window.__voiceStatus = r.status; window.__voiceBody = await r.clone().text(); } return r; }; class C { constructor() { this.sampleRate = 16000; } createMediaStreamSource() { return {connect(){}, disconnect(){}}; } createScriptProcessor() { const p = {onaudioprocess:null, connect(){ setTimeout(() => p.onaudioprocess({inputBuffer:{getChannelData:() => new Float32Array(1600)}}), 100); }, disconnect(){}}; return p; } createGain() { return {gain:{value:0}, connect(){}, disconnect(){}}; } close() {} } window.AudioContext = C; window.webkitAudioContext = C; navigator.mediaDevices.getUserMedia = async () => new MediaStream(); const m = document.querySelector("#mic"); if (!m || m.hidden) throw new Error("voice controls unavailable"); return "ready"; })()' \
+    > "$out/voice-ready.txt"
+~/iTools/bin/cdp-eval --port "$browser_port" --tab "$url" --timeout 20 \
+    'new Promise(resolve => { const m = document.querySelector("#mic"); m.click(); setTimeout(() => { m.click(); setTimeout(() => resolve(JSON.stringify({class: m.className, hasStream: Boolean(window.__voiceStream)})), 500); }, 1000); })' > "$out/voice-stop.txt"
+~/iTools/bin/cdp-eval --port "$browser_port" --tab "$url" --timeout 45 \
+    'new Promise((resolve, reject) => { const end = Date.now() + 40000; const tick = () => { if (window.__voiceStatus) resolve(JSON.stringify({status: window.__voiceStatus, body: window.__voiceBody, file: window.__voiceFile})); else if (Date.now() > end) reject(new Error("transcription request missing")); else setTimeout(tick, 100); }; tick(); })' \
+    > "$out/voice-status.txt"
+grep -q '"status":200' "$out/voice-status.txt" || fail voice "transcription response $(cat "$out/voice-status.txt")"
+pass voice "browser PCM WAV reached /v1/audio/transcriptions with HTTP 200"
+
 ~/iTools/bin/cdp-eval --port "$browser_port" --tab "$url" \
     'location.reload(); "reloading"' > "$out/reload.txt"
 sleep 1

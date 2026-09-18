@@ -253,33 +253,50 @@ settingsClear.addEventListener("click", () => {
   settingsBackdrop.hidden = true;
 });
 
-// Voice input (P3a): MediaRecorder -> POST /v1/audio/transcriptions.
+// Voice input (P3a): PCM WAV -> POST /v1/audio/transcriptions.
 // Hidden outside a secure context, since getUserMedia requires one.
-if (window.isSecureContext && navigator.mediaDevices && window.MediaRecorder) {
+if (window.isSecureContext && navigator.mediaDevices && (window.AudioContext || window.webkitAudioContext)) {
   micBtn.hidden = false;
-  let recorder = null;
-  let chunks = [];
+  let recording = null;
+
+  function wavBlob(samples, rate) {
+    const b = new ArrayBuffer(44 + samples.length * 2);
+    const v = new DataView(b);
+    const text = (at, s) => [...s].forEach((c, i) => v.setUint8(at + i, c.charCodeAt(0)));
+    text(0, "RIFF"); v.setUint32(4, 36 + samples.length * 2, true); text(8, "WAVE");
+    text(12, "fmt "); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+    v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+    text(36, "data"); v.setUint32(40, samples.length * 2, true);
+    samples.forEach((x, i) => v.setInt16(44 + i * 2, Math.max(-1, Math.min(1, x)) * 0x7fff, true));
+    return new Blob([b], { type: "audio/wav" });
+  }
 
   micBtn.addEventListener("click", async () => {
-    if (recorder && recorder.state === "recording") {
-      recorder.stop();
+    if (recording) {
+      recording.stop();
       return;
     }
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      chunks = [];
-      recorder = new MediaRecorder(stream);
-      recorder.ondataavailable = (e) => {
-        if (e.data.size) chunks.push(e.data);
-      };
-      recorder.onstop = async () => {
-        stream.getTracks().forEach((t) => t.stop());
-        micBtn.classList.remove("recording");
-        const blob = new Blob(chunks, { type: recorder.mimeType || "audio/webm" });
+      const Context = window.AudioContext || window.webkitAudioContext;
+      const context = new Context();
+      const source = context.createMediaStreamSource(stream);
+      const processor = context.createScriptProcessor(4096, 1, 1);
+      const sink = context.createGain();
+      const chunks = [];
+      sink.gain.value = 0;
+      processor.onaudioprocess = (e) => chunks.push(new Float32Array(e.inputBuffer.getChannelData(0)));
+      source.connect(processor); processor.connect(sink); sink.connect(context.destination);
+      recording = { stop() {
+        const rate = context.sampleRate;
+        source.disconnect(); processor.disconnect(); sink.disconnect(); stream.getTracks().forEach((t) => t.stop());
+        context.close(); recording = null; micBtn.classList.remove("recording");
+        const samples = new Float32Array(chunks.reduce((n, x) => n + x.length, 0));
+        chunks.reduce((at, x) => (samples.set(x, at), at + x.length), 0);
         const form = new FormData();
-        form.append("file", blob, "voice.webm");
+        form.append("file", wavBlob(samples, rate), "voice.wav");
         form.append("response_format", "text");
-        try {
+        void (async () => { try {
           const r = await fetch(new URL("/v1/audio/transcriptions", settings.serverUrl), {
             method: "POST",
             body: form,
@@ -292,9 +309,8 @@ if (window.isSecureContext && navigator.mediaDevices && window.MediaRecorder) {
           }
         } catch {
           /* transcription unavailable; the typed path still works */
-        }
-      };
-      recorder.start();
+        }})();
+      }};
       micBtn.classList.add("recording");
     } catch {
       /* mic permission denied or unavailable */
