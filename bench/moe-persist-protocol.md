@@ -489,3 +489,63 @@ the raw-block dot, so it needs the agreement band, not identity) or LDS
 staging of the activation row as the dense kernel does; (2) VGPRs to 192
 or below for 2 blocks per CU (G = 192), which is the occupancy lever this
 round could not pull; (3) expert down at K = 512 uses 16 of 32 lanes.
+
+## R6.3: aligned q8 loads in the persistent kernel (preregistered 2026-09-18, before any build)
+
+Pool (1) from the R6.2 result: the q8 projection phases run at about 400 GB/s
+(2709 of 8391 us) where the launch kernels do the same bytes at 950. R6.2's
+per-wave unroll (`q8_dot_u[4]`) moved nothing, so more loads in flight per
+wave is not the lever at 2 waves per SIMD. The remaining difference between
+the dense megakernel's q8 phase (near HBM rate at the same occupancy,
+`q8_row_dot`) and this one is the weight layout: the raw q8_0 block is 34
+bytes, so every lane's 16-byte q load sits at `b * 34 + 2 + h * 16`, which is
+never 16-byte aligned and straddles a 64-byte line every few blocks; the
+dense layout (R6a pack, `pack-q8d`) puts the 32 int8 of a block at a
+32-byte-aligned address and the f16 scales in their own array.
+
+Change, kernel side (`kernels/mega_moe.mojo`, `kernels/moe.mojo`): a dense-
+addressed twin of the raw-block dot with the SAME lane mapping, the SAME
+per-lane arithmetic (`(d * q).cast[bf16].cast[f32]`, `fma`, `reduce_add`,
+`warp.sum`) and the SAME block order; only the addresses change (q at
+`row * K + b * 32 + h * 16`, scale at `N * K + row * (K / 32) * 2 + b * 2`).
+The eight projection dispatches on the launch path (`moe_matmul_q8_0_m1` /
+`_add` sites in `serve/window.mojo`) and the six projection phases of the
+persistent kernel (attn q/k/v/out, ssm qkv/gate, ssm_out) switch to it. The
+shared-expert q8_0 tensors and the embedding stay raw, as the R6a pack
+leaves them. The engine on the MoE profile then requires the dense
+projections (the loader refuses a `q8_0` projection tensor by name, so a
+raw pack fails loud instead of reading garbage).
+
+Change, pack side: `pack-q8d` no longer exists on disk and `/home` has 14 GB
+free, so it is rebuilt as a btrfs reflink of the raw pack with the 130
+projection tensors rewritten in place (the byte split of `72eeb72`: every
+tensor keeps its byte length and offset, so `index.txt` changes only in the
+dtype column). Receipt: three tensors dequantised value-for-value against
+the raw pack before any engine run.
+
+Predictions, frozen:
+- P-R63-1 (identity): the new engine on `pack-q8d` is bit-identical to the
+  champion `38ee0b7` on `pack` on 20/20 prompts, both arms of it
+  (`BARO_MEGA=0` and `BARO_MEGA=1`), teacher-forced 64/64
+  (`bench/force-ab.sh`). Same values, same per-lane ops, same order; a
+  single differing id falsifies the "same arithmetic" claim and the round
+  stops there.
+- P-R63-2 (mechanism): in the `BARO_PROFILE=5` stamp profile the four q8
+  projection phases fall from 2709 us to at most 1700 us (800 GB/s or
+  better) and the kernel span from 7986 to under 7000 us. If the phases
+  stay above 2300 us with aligned loads, alignment is not the cause; the
+  next pool is LDS staging of the activation row, not another load form.
+- P-R63-3 (launch arm): the launch path with the dense-addressed dot is not
+  slower than the raw dot: `BARO_MEGA=0` on `pack-q8d` within -1% to +3% of
+  the champion's 111.89 (cross-stint) and, in the same stint, the arm the
+  R6.2 A/B measured at 110.90.
+- P-R63-4 (result): same-binary 20-prompt A/B `BARO_MEGA=0` vs `BARO_MEGA=1`
+  on `pack-q8d`, ratio 1.08 to 1.18 (about 120 to 131 tok/s_gen). Kill line
+  unchanged from R6.2: +5% or the default stays `BARO_MEGA=0`.
+
+Procedure: R6.2's (same binary both arms, `bench/ab-prompts.sh` under
+`bench/clock-probe.sh`, power cap and voltage read back, gen 470 per token
+and fail word 0 on the persistent arm, identity column PASS 20/20,
+`isa-loops` fingerprint recorded), preceded by the pack receipt and
+P-R63-1. Every GPU run through `gpu-wait run --timeout`. `run-tests.sh` and
+`tools/ci-checks.sh` green at the commit that carries any default flip.
