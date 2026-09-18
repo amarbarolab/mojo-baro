@@ -188,6 +188,7 @@ async fn main() {
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/fork", post(fork))
         .route("/v1/audio/transcriptions", post(audio::transcriptions))
+        .route("/v1/audio/speech", post(audio::speech))
         .route("/v1/checkpoints", post(checkpoints::create).get(checkpoints::list))
         .route("/v1/checkpoints/{id}", get(checkpoints::get_one).delete(checkpoints::delete))
         .route("/v1/checkpoints/{id}/fork", post(checkpoints::fork))

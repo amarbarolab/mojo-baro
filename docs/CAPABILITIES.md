@@ -384,10 +384,10 @@ stint (98.3%), was 108.32 before this round.
 - Serves speech-in transcription (`POST /v1/audio/transcriptions`, multipart WAV, proxied to a
   whisper-server sidecar). WORKS: 20/20 fixtures transcribed byte-for-byte equal to `whisper-cli` on
   the same model and beam settings (`exchange/lane-P3A-report.md`).
-- Does not serve speech-out (TTS). NOT RUN: P3b (`POST /v1/audio/speech`) was attempted and
-  explicitly skipped by coordinator ruling. The chatterbox runner's venv is absent, the upstream
-  code has no seed control, and its own README leaves CUDA versus CPU/HIP unresolved
-  (`exchange/lane-P3B-report.md`). No route exists.
+- Serves speech-out (`POST /v1/audio/speech`) through a configurable WAV TTS runner. The default
+  local runner is Piper, with `BARO_TTS_BIN`, `BARO_TTS_VOICE`, `BARO_TTS_OUT_DIR`, and
+  `BARO_TTS_TIMEOUT_SECS` overrides. HTTP plumbing gate: `bench/p6-pwa-gate.sh`; Chatterbox
+  quality and speech-in round-trip remain unverified.
 - Serves named state checkpoints as first-class objects (`POST/GET /v1/checkpoints`,
   `GET/DELETE /v1/checkpoints/{id}`, `POST /v1/checkpoints/{id}/fork`): run a prompt once, save full
   engine state to a file, later fork branches that load it and prefill only the suffix. WORKS: this

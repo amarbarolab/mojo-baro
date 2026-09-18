@@ -10,6 +10,7 @@ root=$PWD
 out=${1:-.work/team-C/codex/p6-pwa}
 pack="$out/fake-pack"
 bin=${BARO_SERVE_BIN:-serve/target/release/baro-serve}
+tts_bin=${BARO_TTS_BIN:-$root/bench/fixtures/fake-tts.sh}
 export BARO_STATE_HMAC_KEY=${BARO_STATE_HMAC_KEY:-p6-gate-state-key}
 mkdir -p "$out" "$pack"
 : > "$out/SUMMARY.txt"
@@ -29,6 +30,7 @@ cleanup() {
 trap cleanup EXIT
 
 [ -x bench/fixtures/fake-engine.py ] || fail setup "fake engine is not executable"
+[ -x bench/fixtures/fake-tts.sh ] || fail setup "fake TTS runner is not executable"
 [ -x "$bin" ] || fail setup "build $bin first"
 
 python3 - "$pack/tokenizer.json" <<'PY'
@@ -56,6 +58,8 @@ path.write_text(json.dumps(tokenizer))
 PY
 printf '{"add_bos":false}\n' > "$pack/tokenizer-meta.json"
 
+BARO_TTS_BIN="$tts_bin" \
+BARO_TTS_OUT_DIR="$out/tts" \
 "$root/$bin" \
     --engine "$root/bench/fixtures/fake-engine.py" \
     --pack "$pack" --port 0 \
@@ -70,6 +74,17 @@ for _ in $(seq 1 200); do
 done
 url=$(grep -m1 -oE 'http://[^ ]+' "$out/server.stdout") || fail start "no listening line"
 pass start "$url"
+
+curl -fsS "$url/v1/audio/speech" -H 'content-type: application/json' \
+    -d '{"input":"hello from baro","voice":"gate","response_format":"wav"}' \
+    -o "$out/speech.wav" || fail speech "TTS endpoint failed"
+python3 - "$out/speech.wav" <<'PY'
+import sys, wave
+with wave.open(sys.argv[1], "rb") as wav:
+    assert wav.getnchannels() == 1 and wav.getframerate() == 16000
+    assert wav.getnframes() > 0
+PY
+pass speech "TTS endpoint returned a valid WAV"
 
 pull_model=$(basename "$pack")
 curl -fsS -N "$url/api/pull" -H 'content-type: application/json' \

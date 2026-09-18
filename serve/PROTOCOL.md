@@ -241,6 +241,12 @@ multipart request is `400`; a sidecar start or request failure is `502`; an unav
 sidecar capacity failure is `503`. The fixed P3a fixture gate compares the normalized `text`
 field or plain response byte for byte against the same `whisper-cli` model and settings.
 
+## P3b speech output
+
+`POST /v1/audio/speech` accepts JSON `input`, optional `model` and `voice`, `response_format` set
+to `wav`, and `speed` set to `1`. It runs the configured TTS command with arguments
+`TEXT VOICE OUTPUT_WAV`, defaulting to the local Piper runner, and returns `audio/wav`.
+
 ### Tokenizer files (owned by the tokenizer lane)
 
 `<pack>/tokenizer.json` (HF `tokenizers` format; loaded with the Rust

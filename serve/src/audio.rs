@@ -16,6 +16,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
 
+static TTS_SEQ: AtomicU64 = AtomicU64::new(1);
+
 fn env_str(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.into())
 }
@@ -42,6 +44,10 @@ pub struct AudioSidecar {
     /// gate, `bench/p3a-gate.sh` line 54's own nested call hit the same
     /// thing), so a bare `Command::new("gpu-wait")` fails inside one.
     gpu_wait_bin: String,
+    tts_bin: String,
+    tts_voice: String,
+    tts_out_dir: String,
+    tts_timeout_secs: u64,
     child: tokio::sync::Mutex<Option<Child>>,
     last_used: AtomicU64,
 }
@@ -58,6 +64,10 @@ impl AudioSidecar {
             idle_secs: env_num("BARO_WHISPER_IDLE_SECS", 300u64),
             no_gpu: env_str("BARO_WHISPER_NO_GPU", "0") == "1",
             gpu_wait_bin: env_str("BARO_GPU_WAIT", "$HOME/.local/bin/gpu-wait"),
+            tts_bin: env_str("BARO_TTS_BIN", "$HOME/Projects/ai-models/tts-local/scripts/tts-piper"),
+            tts_voice: env_str("BARO_TTS_VOICE", "en_US-lessac-medium"),
+            tts_out_dir: env_str("BARO_TTS_OUT_DIR", ".work/baro-tts"),
+            tts_timeout_secs: env_num("BARO_TTS_TIMEOUT_SECS", 120u64),
             child: tokio::sync::Mutex::new(None),
             last_used: AtomicU64::new(0),
         }
@@ -292,4 +302,66 @@ pub async fn transcriptions(State(app): State<Shared>, mut multipart: Multipart)
         forward(&app, &boundary, body).await.map_err(|e| ApiError::Plain(StatusCode::BAD_GATEWAY, e))?;
 
     Ok((status, [(axum::http::header::CONTENT_TYPE, resp_content_type)], resp_body).into_response())
+}
+
+fn default_tts_voice() -> String {
+    "en_US-lessac-medium".into()
+}
+
+fn default_tts_format() -> String {
+    "wav".into()
+}
+
+fn default_tts_speed() -> f32 {
+    1.0
+}
+
+#[derive(Deserialize)]
+pub struct SpeechReq {
+    #[allow(dead_code)]
+    #[serde(default)]
+    model: Option<String>,
+    input: String,
+    #[serde(default = "default_tts_voice")]
+    voice: String,
+    #[serde(default = "default_tts_format")]
+    response_format: String,
+    #[serde(default = "default_tts_speed")]
+    speed: f32,
+}
+
+pub async fn speech(State(app): State<Shared>, Json(r): Json<SpeechReq>) -> Result<Response, ApiError> {
+    if r.input.trim().is_empty() {
+        return Err(bad("input is empty"));
+    }
+    if r.response_format != "wav" {
+        return Err(bad("only response_format=wav is supported"));
+    }
+    if (r.speed - 1.0).abs() > f32::EPSILON {
+        return Err(bad("only speed=1 is supported"));
+    }
+    let voice = if r.voice.is_empty() { app.audio.tts_voice.clone() } else { r.voice };
+    tokio::fs::create_dir_all(&app.audio.tts_out_dir).await
+        .map_err(|e| ApiError::Plain(StatusCode::INTERNAL_SERVER_ERROR, format!("create TTS output directory: {e}")))?;
+    let seq = TTS_SEQ.fetch_add(1, Ordering::Relaxed);
+    let output = std::path::Path::new(&app.audio.tts_out_dir)
+        .join(format!("speech-{}-{seq}.wav", std::process::id()));
+    let result = tokio::time::timeout(
+        Duration::from_secs(app.audio.tts_timeout_secs),
+        Command::new(&app.audio.tts_bin).arg(&r.input).arg(&voice).arg(&output).output(),
+    )
+    .await
+    .map_err(|_| ApiError::Plain(StatusCode::GATEWAY_TIMEOUT, "TTS timed out".into()))?
+    .map_err(|e| ApiError::Plain(StatusCode::SERVICE_UNAVAILABLE, format!("start TTS runner: {e}")))?;
+    if !result.status.success() {
+        let _ = tokio::fs::remove_file(&output).await;
+        return Err(ApiError::Plain(StatusCode::BAD_GATEWAY, format!("TTS runner failed: {}", String::from_utf8_lossy(&result.stderr))));
+    }
+    let body = tokio::fs::read(&output).await
+        .map_err(|e| ApiError::Plain(StatusCode::BAD_GATEWAY, format!("read TTS output: {e}")))?;
+    let _ = tokio::fs::remove_file(&output).await;
+    if body.is_empty() {
+        return Err(ApiError::Plain(StatusCode::BAD_GATEWAY, "TTS runner returned an empty WAV".into()));
+    }
+    Ok((StatusCode::OK, [(axum::http::header::CONTENT_TYPE, "audio/wav")], body).into_response())
 }
