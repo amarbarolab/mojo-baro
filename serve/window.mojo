@@ -26,8 +26,9 @@ from moe import (
 )
 from matmul_skinny import amar_matmul_skinny_m1_row, amar_matmul_skinny_m1_row2
 from moe_rows import (
-    moe_matmul_q8d_rows, moe_matmul_q8d_rows_add, moe_router_top8_sig_rows,
-    moe_gate_up_q4k_rows, moe_down_q4k_rows, moe_down_q6k_rows,
+    moe_matmul_q8d_rows_shared, moe_router_top8_sig_rows,
+    moe_pairs_group, moe_gate_up_q4k_grouped, moe_down_q4k_grouped, moe_down_combine,
+    moe_down_q6k_rows,
     moe_shared_gate_up_q8_0_rows, moe_shared_down_q8_0_res_rows, moe_skinny_f32_rows,
 )
 from attn import amar_head_rmsnorm_rope, amar_kv_append2, amar_attn_decode
@@ -644,6 +645,10 @@ struct WindowBufs(Copyable, Movable):
     # Batched MoE prefill (bench/moe-prefill-protocol.md): the chunk's top-8
     # expert ids, [CP, TOPK]. Every other chunk plane reuses a dense one.
     var pf_idx_d: DeviceBuffer[DType.int32]
+    var pf_ge_d: DeviceBuffer[DType.int32]
+    var pf_gp_d: DeviceBuffer[DType.int32]
+    var pf_gs_d: DeviceBuffer[DType.int32]
+    var pf_dn_d: DeviceBuffer[f32]
 
 
 @fieldwise_init
@@ -786,15 +791,25 @@ comptime append2_p = amar_kv_append2[type_of(cache_layout), type_of(kvp_layout),
 comptime gated_pm = amar_ssm_gated_out_rows_bf16[type_of(op_layout), type_of(attp_layout), type_of(n128_layout), type_of(attp_layout)]
 
 
+comptime PF_MR = 8
+comptime PF_NG = CP * TOPK // PF_MR + N_EXP
+comptime pf_ge_layout = row_major[PF_NG]()
+comptime pf_gp_layout = row_major[PF_NG * PF_MR]()
+comptime pf_gs_layout = row_major[2 * N_EXP]()
+comptime pf_dn_layout = row_major[CP * TOPK, H]()
+
+
 def moe_gemm_rows[
-    OL: TensorLayout
+    OL: TensorLayout, AL: TensorLayout, ADD: Bool = False
 ](
-    ctx: DeviceContext, mut b: WindowBufs, A: TileTensor[bf16, type_of(xp_layout), MutAnyOrigin],
-    o: Int, O: TileTensor[f32, OL, MutAnyOrigin], n: Int, m: Int,
+    ctx: DeviceContext, mut b: WindowBufs, A: TileTensor[bf16, AL, MutAnyOrigin],
+    o: Int, O: TileTensor[f32, OL, MutAnyOrigin], n: Int, k: Int, m: Int,
 ) raises:
-    ctx.enqueue_function[moe_matmul_q8d_rows[OL, type_of(xp_layout)]](
-        A, b.wbuf.unsafe_ptr().unsafe_offset(o), O, Int32(n), Int32(H), Int32(n * H),
-        grid_dim=(ceildiv(n, 8), m), block_dim=256)
+    # One weight load feeds PF_MR token accumulators in the same k order as
+    # the m=1 dot (kernels/test_moe_rows.mojo: q8d_shared, bit-exact).
+    ctx.enqueue_function[moe_matmul_q8d_rows_shared[PF_MR, ADD, OL, AL]](
+        A, b.wbuf.unsafe_ptr().unsafe_offset(o), O, Int32(n), Int32(k), Int32(n * k), Int32(m),
+        grid_dim=(ceildiv(n, 8), ceildiv(m, PF_MR)), block_dim=256)
 
 
 def moe_prefill_forward(ctx: DeviceContext, mut b: WindowBufs, m: Int, pos: Int, ring: Int, prof: Bool) raises:
@@ -848,9 +863,9 @@ def moe_prefill_forward(ctx: DeviceContext, mut b: WindowBufs, m: Int, pos: Int,
             var Aopflat = row_f32(ctx, b.aop_d, 0, CP * ATT, attpflat_layout)
             var AoBp = row_bf16(ctx, b.resbp_d, 0, CP * ATT, attpflat_layout)
             var AoBpm = row_bf16(ctx, b.resbp_d, 0, CP * ATT, attp_layout)
-            moe_gemm_rows(ctx, b, CurBp, b.off[w + 1], Qfp, QF, m)
-            moe_gemm_rows(ctx, b, CurBp, b.off[w + 2], Kflat, KV, m)
-            moe_gemm_rows(ctx, b, CurBp, b.off[w + 3], Vflat, KV, m)
+            moe_gemm_rows(ctx, b, CurBp, b.off[w + 1], Qfp, QF, H, m)
+            moe_gemm_rows(ctx, b, CurBp, b.off[w + 2], Kflat, KV, H, m)
+            moe_gemm_rows(ctx, b, CurBp, b.off[w + 3], Vflat, KV, H, m)
             ctx.enqueue_function[split_p](Qfp, Qp, Gatep, grid_dim=(NQH, m), block_dim=HD)
             ctx.enqueue_function[hrr_qp](Qp, Qn, Float32(1e-6), Int32(pos), Int32(NQH), grid_dim=m * NQH, block_dim=HD)
             ctx.enqueue_function[hrr_kvp](Khd, Kn, Float32(1e-6), Int32(pos), Int32(NKVH), grid_dim=m * NKVH, block_dim=HD)
@@ -860,9 +875,7 @@ def moe_prefill_forward(ctx: DeviceContext, mut b: WindowBufs, m: Int, pos: Int,
             else:
                 ctx.enqueue_function[attpw_k](Qp, Kc, Vc, Aop, b.kvtab_d.unsafe_ptr(), Int32(pos), Int32(m), Float32(0.0625), Int32(att_i), grid_dim=(NKVH, ceildiv(m, PW_ROWS)), block_dim=PW_THREADS)
             ctx.enqueue_function[gmul_p](Aopflat, Gatep, AoBp, Int32(m * ATT), grid_dim=ceildiv(m * ATT, 256), block_dim=256)
-            ctx.enqueue_function[moe_matmul_q8d_rows_add[type_of(attp_layout), type_of(xp_layout)]](
-                AoBpm, b.wbuf.unsafe_ptr().unsafe_offset(b.off[w + 6]), Xp, Int32(H), Int32(ATT), Int32(H * ATT),
-                grid_dim=(ceildiv(H, 8), m), block_dim=256)
+            moe_gemm_rows[ADD=True](ctx, b, AoBpm, b.off[w + 6], Xp, H, ATT, m)
             att_i += 1
             nw = 7
         else:
@@ -880,8 +893,8 @@ def moe_prefill_forward(ctx: DeviceContext, mut b: WindowBufs, m: Int, pos: Int,
             var Convp = row_f32(ctx, b.convp_d, 0, CP * CONV, convp_layout)
             var Sop = row_f32(ctx, b.sop_d, 0, CP * INNER, op_layout)
             var ResBp = row_bf16(ctx, b.resbp_d, 0, CP * INNER, attp_layout)
-            moe_gemm_rows(ctx, b, CurBp, b.off[w + 1], Qkvp, CONV, m)
-            moe_gemm_rows(ctx, b, CurBp, b.off[w + 2], Zp, INNER, m)
+            moe_gemm_rows(ctx, b, CurBp, b.off[w + 1], Qkvp, CONV, H, m)
+            moe_gemm_rows(ctx, b, CurBp, b.off[w + 2], Zp, INNER, H, m)
             ctx.enqueue_function[moe_skinny_f32_rows[2, type_of(xp_layout), type_of(ssm_gate_w_layout), type_of(g32p_layout)]](
                 Fp, tens_f32(ctx, b.wbuf, b.off[w + 3], NH_V * H, ssm_gate_w_layout), Arp, Int32(NH_V), Int32(H),
                 grid_dim=(ceildiv(NH_V, ROW_WAVES), m), block_dim=ROW_THREADS)
@@ -896,9 +909,7 @@ def moe_prefill_forward(ctx: DeviceContext, mut b: WindowBufs, m: Int, pos: Int,
             else:
                 ctx.enqueue_function[deltaw_p](SStateAll, Convp, Egp, Betap, Sop, Int32(ring), Int32(ssm_i), Int32(SLOTS), Int32(m), grid_dim=DC_BLOCKS, block_dim=32)
             ctx.enqueue_function[gated_pm](Sop, Zp, Nw, ResBp, grid_dim=(NH_V, m), block_dim=SSTATE)
-            ctx.enqueue_function[moe_matmul_q8d_rows_add[type_of(attp_layout), type_of(xp_layout)]](
-                ResBp, b.wbuf.unsafe_ptr().unsafe_offset(b.off[w + 9]), Xp, Int32(H), Int32(INNER), Int32(H * INNER),
-                grid_dim=(ceildiv(H, 8), m), block_dim=256)
+            moe_gemm_rows[ADD=True](ctx, b, ResBp, b.off[w + 9], Xp, H, INNER, m)
             ssm_i += 1
             nw = 10
         # -- sparse MoE block: router, 8 routed experts, shared expert --
@@ -922,15 +933,27 @@ def moe_prefill_forward(ctx: DeviceContext, mut b: WindowBufs, m: Int, pos: Int,
         if b.tier.active:
             b.tier.stage_layer(ctx, layer)
             up_offset = N_EXP * b.tier.geom[layer].eb
-        ctx.enqueue_function[moe_gate_up_q4k_rows[TOPK, E_FFN, type_of(xp_layout), type_of(pf_idx_layout), type_of(pf_rh_layout)]](
-            CurBp, (b.tier.pf_stage.unsafe_ptr() if b.tier.active else b.wbuf.unsafe_ptr().unsafe_offset(b.off[routed_base])), Idx, RoutedH, Int32(H), Int32(up_offset),
-            grid_dim=(ceildiv(TOPK * E_FFN, MOE_WAVES), m), block_dim=MOE_THREADS)
+        # Pairs (token, k) sorted by expert, PF_MR pairs of one expert per
+        # thread share each weight load; per-element order is the m=1 dot's
+        # and the top-k sum runs in k order afterwards (test_moe_rows: grouped).
+        var Ge = TileTensor[DType.int32, type_of(pf_ge_layout), MutAnyOrigin](b.pf_ge_d, pf_ge_layout)
+        var Gp = TileTensor[DType.int32, type_of(pf_gp_layout), MutAnyOrigin](b.pf_gp_d, pf_gp_layout)
+        var Gs = TileTensor[DType.int32, type_of(pf_gs_layout), MutAnyOrigin](b.pf_gs_d, pf_gs_layout)
+        var ng = m * TOPK // PF_MR + N_EXP
+        ctx.enqueue_function[moe_pairs_group[PF_MR, type_of(pf_idx_layout), type_of(pf_ge_layout), type_of(pf_gp_layout), type_of(pf_gs_layout)]](
+            Idx, Ge, Gp, Gs, Int32(m), Int32(ng), grid_dim=1, block_dim=32)
+        ctx.enqueue_function[moe_gate_up_q4k_grouped[PF_MR, E_FFN, type_of(xp_layout), type_of(pf_ge_layout), type_of(pf_gp_layout), type_of(pf_rh_layout)]](
+            CurBp, (b.tier.pf_stage.unsafe_ptr() if b.tier.active else b.wbuf.unsafe_ptr().unsafe_offset(b.off[routed_base])), Ge, Gp, RoutedH, Int32(H), Int32(up_offset),
+            grid_dim=(ceildiv(E_FFN, MOE_WAVES), ng), block_dim=MOE_THREADS)
         if layer == 34 or layer == 38 or layer == 39:
             ctx.enqueue_function[moe_down_q6k_rows[TOPK, E_FFN, type_of(pf_rh_layout), type_of(pf_idx_layout), type_of(pf_idx_layout), type_of(xp_layout)]](
                 RoutedH, (b.tier.pf_stage.unsafe_ptr().unsafe_offset(2 * up_offset) if b.tier.active else b.wbuf.unsafe_ptr().unsafe_offset(b.off[routed_base + 2])), Idx, Wt, Routed, Int32(H), grid_dim=(ceildiv(H, MOE_WAVES), m), block_dim=MOE_THREADS)
         else:
-            ctx.enqueue_function[moe_down_q4k_rows[TOPK, E_FFN, type_of(pf_rh_layout), type_of(pf_idx_layout), type_of(pf_idx_layout), type_of(xp_layout)]](
-                RoutedH, (b.tier.pf_stage.unsafe_ptr().unsafe_offset(2 * up_offset) if b.tier.active else b.wbuf.unsafe_ptr().unsafe_offset(b.off[routed_base + 2])), Idx, Wt, Routed, Int32(H), grid_dim=(ceildiv(H, MOE_WAVES), m), block_dim=MOE_THREADS)
+            var Dn = row_f32(ctx, b.pf_dn_d, 0, CP * TOPK * H, pf_dn_layout)
+            ctx.enqueue_function[moe_down_q4k_grouped[PF_MR, E_FFN, type_of(pf_rh_layout), type_of(pf_ge_layout), type_of(pf_gp_layout), type_of(pf_dn_layout)]](
+                RoutedH, (b.tier.pf_stage.unsafe_ptr().unsafe_offset(2 * up_offset) if b.tier.active else b.wbuf.unsafe_ptr().unsafe_offset(b.off[routed_base + 2])), Ge, Gp, Dn, Int32(H), grid_dim=(ceildiv(H, MOE_WAVES), ng), block_dim=MOE_THREADS)
+            ctx.enqueue_function[moe_down_combine[TOPK, type_of(pf_dn_layout), type_of(pf_idx_layout), type_of(xp_layout)]](
+                Dn, Wt, Routed, Int32(H), grid_dim=(ceildiv(H, 256), m), block_dim=256)
         var shared_gate = b.off[extra_base + 1]
         ctx.enqueue_function[moe_shared_gate_up_q8_0_rows[SH_FFN, type_of(xp_layout), type_of(pf_sh_layout)]](
             CurBp, b.wbuf.unsafe_ptr().unsafe_offset(shared_gate), SharedH, Int32(H), Int32((H // 32) * 34), Int32(b.off[extra_base + 2] - shared_gate),

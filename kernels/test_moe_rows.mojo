@@ -23,7 +23,8 @@ from moe import (
 from moe_rows import (
     moe_matmul_q8d_rows, moe_matmul_q8d_rows_add, moe_router_top8_sig_rows,
     moe_gate_up_q4k_rows, moe_down_q4k_rows, moe_down_q6k_rows,
-    moe_shared_gate_up_q8_0_rows, moe_shared_down_q8_0_res_rows, moe_skinny_f32_rows,
+    moe_shared_gate_up_q8_0_rows, moe_shared_down_q8_0_res_rows, moe_skinny_f32_rows, moe_matmul_q8d_rows_shared,
+    moe_pairs_group, moe_gate_up_q4k_grouped, moe_down_q4k_grouped, moe_down_combine,
 )
 
 comptime f32 = DType.float32
@@ -56,6 +57,13 @@ comptime hs_one = row_major[1, SH_FFN]()
 comptime hs_flat = row_major[SH_FFN]()
 
 comptime wr_layout = row_major[N_EXP, H]()
+
+comptime GMR = 4
+comptime NG = (T * TOPK + GMR - 1) // GMR + N_EXP
+comptime ge_layout = row_major[NG]()
+comptime gp_layout = row_major[NG * GMR]()
+comptime gs_layout = row_major[2 * N_EXP]()
+comptime dn_layout = row_major[T * TOPK, H]()
 
 comptime Q4_ROW = (H // 256) * 144
 comptime Q4_DROW = (E_FFN // 256) * 144
@@ -95,6 +103,15 @@ def differ(name: String, a: MutPointer[UInt8, MutUntrackedOrigin], b: MutPointer
         if a[unsafe_offset=i] != 0:
             nz += 1
     print(name, "bytes", n, "differ", bad, "nonzero", nz)
+    if bad != 0:
+        var first = -1
+        var last = -1
+        for i in range(n):
+            if a[unsafe_offset=i] != b[unsafe_offset=i]:
+                if first < 0:
+                    first = i
+                last = i
+        print("  first differing byte", first, "(element", first // 4, ") last", last, "(element", last // 4, ")")
     if bad != 0:
         raise Error("FAIL rows parity: " + name + " differs from the m=1 kernel")
     if nz == 0:
@@ -338,7 +355,51 @@ def main() raises:
             Int32(N_EXP), Int32(H), grid_dim=ceildiv(N_EXP, ROW_WAVES), block_dim=ROW_THREADS)
     ctx.synchronize()
     cmp("skinny_f32", skR_d, skM_d, T * N_EXP)
+    # Shared weight loads: MR tokens per thread, T = 5 leaves a clamped tail at MR = 4.
+    var oS_d = ctx.enqueue_create_buffer[f32](T * NOUT)
+    var xS_d = ctx.enqueue_create_buffer[f32](T * H)
+    ctx.enqueue_copy(dst_buf=xS_d, src_buf=res_h)
+    ctx.enqueue_function[moe_matmul_q8d_rows_shared[4, False, type_of(o_rows), type_of(a_rows)]](
+        A, q8d_d.unsafe_ptr(), view(ctx, oS_d, 0, T * NOUT, o_rows), Int32(NOUT), Int32(H), s_off, Int32(T),
+        grid_dim=(g_rows, ceildiv(T, 4)), block_dim=256)
+    ctx.enqueue_function[moe_matmul_q8d_rows_shared[4, True, type_of(o_rows), type_of(a_rows)]](
+        A, q8d_d.unsafe_ptr(), view(ctx, xS_d, 0, T * NOUT, o_rows), Int32(NOUT), Int32(H), s_off, Int32(T),
+        grid_dim=(g_rows, ceildiv(T, 4)), block_dim=256)
+    ctx.synchronize()
+    # Experts grouped: pairs sorted by expert, one weight load per GMR pairs, top-k combine after.
+    var ge_d = ctx.enqueue_create_buffer[i32](NG)
+    var gp_d = ctx.enqueue_create_buffer[i32](NG * GMR)
+    var gs_d = ctx.enqueue_create_buffer[i32](2 * N_EXP)
+    var hG_d = ctx.enqueue_create_buffer[bf16](T * TOPK * E_FFN)
+    var dn_d = ctx.enqueue_create_buffer[f32](T * TOPK * H)
+    var dG_d = ctx.enqueue_create_buffer[f32](T * H)
+    ctx.enqueue_function[moe_pairs_group[GMR, type_of(idx_rows), type_of(ge_layout), type_of(gp_layout), type_of(gs_layout)]](
+        view(ctx, ide_d, 0, T * TOPK, idx_rows), view(ctx, ge_d, 0, NG, ge_layout), view(ctx, gp_d, 0, NG * GMR, gp_layout),
+        view(ctx, gs_d, 0, 2 * N_EXP, gs_layout), Int32(T), Int32(NG), grid_dim=1, block_dim=32)
+    ctx.enqueue_function[moe_gate_up_q4k_grouped[GMR, E_FFN, type_of(a_rows), type_of(ge_layout), type_of(gp_layout), type_of(hh_rows)]](
+        A, q4gu_d.unsafe_ptr(), view(ctx, ge_d, 0, NG, ge_layout), view(ctx, gp_d, 0, NG * GMR, gp_layout),
+        view(ctx, hG_d, 0, T * TOPK * E_FFN, hh_rows), Int32(H), up_off,
+        grid_dim=(ceildiv(E_FFN, MOE_WAVES), NG), block_dim=MOE_THREADS)
+    ctx.enqueue_function[moe_down_q4k_grouped[GMR, E_FFN, type_of(hh_rows), type_of(ge_layout), type_of(gp_layout), type_of(dn_layout)]](
+        view(ctx, hh_d, 0, T * TOPK * E_FFN, hh_rows), q4d_d.unsafe_ptr(), view(ctx, ge_d, 0, NG, ge_layout), view(ctx, gp_d, 0, NG * GMR, gp_layout),
+        view(ctx, dn_d, 0, T * TOPK * H, dn_layout), Int32(H), grid_dim=(ceildiv(H, MOE_WAVES), NG), block_dim=MOE_THREADS)
+    ctx.enqueue_function[moe_down_combine[TOPK, type_of(dn_layout), type_of(idx_rows), type_of(x_rows)]](
+        view(ctx, dn_d, 0, T * TOPK * H, dn_layout), view(ctx, wtR_d, 0, T * TOPK, idx_rows), view(ctx, dG_d, 0, T * H, x_rows),
+        Int32(H), grid_dim=(ceildiv(H, 256), T), block_dim=256)
+    ctx.synchronize()
+    cmp("gate_up_q4k_grouped", hG_d, hM_d, T * TOPK * E_FFN)
+    cmp("down_q4k_grouped", dG_d, dM_d, T * H)
+    cmp("q8d_shared", oS_d, oM_d, T * NOUT)
+    cmp("q8d_shared_add", xS_d, xM_d, T * NOUT)
     cmp("q8d_rows", oR_d, oM_d, T * NOUT)
+    var xr_h = ctx.enqueue_create_host_buffer[f32](T * NOUT)
+    ctx.enqueue_copy(dst_buf=xr_h, src_buf=DeviceBuffer[f32](ctx, xR_d.unsafe_ptr(), T * NOUT, owning=False))
+    ctx.synchronize()
+    var same_as_input = 0
+    for i in range(T * NOUT):
+        if xr_h[i] == res_h[i]:
+            same_as_input += 1
+    print("q8d_rows_add elements equal to the untouched input:", same_as_input, "of", T * NOUT)
     cmp("q8d_rows_add", xR_d, xM_d, T * NOUT)
     cmp("router_idx", idxR_d, idxM_d, T * TOPK)
     cmp("router_wt", wtR_d, wtM_d, T * TOPK)
@@ -348,4 +409,4 @@ def main() raises:
     cmp("down_q6k", d6R_d, d6M_d, T * H)
     cmp("shared_gate_up", sR_d, sM_d, T * SH_FFN)
     cmp("shared_down_res", rR_d, rM_d, T * H)
-    print("PASS moe rows parity: 11 outputs bit-exact over", T, "tokens")
+    print("PASS moe rows parity: 15 outputs bit-exact over", T, "tokens")
