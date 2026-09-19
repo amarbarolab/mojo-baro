@@ -6,7 +6,7 @@ from layout import TileTensor, TensorLayout, row_major, stack_allocation
 from matmul_skinny import ROW_WAVES, ROW_VEC
 from moe import (
     N_EXP, TOPK, MOE_WAVES, MOE_THREADS, Q4K, Q4K_BYTES, Q6K, Q6K_BYTES,
-    q8d_row_dot, q8_0_row_dot, q4k_dot_blocks, q6k_row_dot,
+    q8d_row_dot, q8_0_row_dot, q4k_dot_blocks, q6k_row_dot, q6k_value,
 )
 
 comptime f32 = DType.float32
@@ -535,3 +535,44 @@ def moe_down_combine[
         var dot = rebind[Scalar[f32]](D[t * NSEL + j, c])
         out += rebind[Scalar[f32]](WT[t, j]) * dot
     O[t, c] = rebind[O.ElementType](out)
+
+
+def moe_down_q6k_grouped[
+    MR: Int, FFN: Int,
+    HLayout: TensorLayout, GLayout: TensorLayout, PLayout: TensorLayout, DLayout: TensorLayout,
+](
+    Hb: TileTensor[bf16, HLayout, MutAnyOrigin],
+    WD: MutPointer[Scalar[u8], MutAnyOrigin],
+    GE: TileTensor[i32, GLayout, MutAnyOrigin],
+    GP: TileTensor[i32, PLayout, MutAnyOrigin],
+    D: TileTensor[f32, DLayout, MutAnyOrigin],
+    n: Int32,
+):
+    comptime assert Hb.flat_rank == 2 and GE.flat_rank == 1 and GP.flat_rank == 1 and D.flat_rank == 2
+    var c = Int(block_idx.x) * MOE_WAVES + Int(thread_idx.x) // WARP_SIZE
+    var N = Int(n)
+    if c >= N:
+        return
+    var g = Int(block_idx.y)
+    var e = Int(rebind[Scalar[i32]](GE[g]))
+    if e < 0:
+        return
+    var row_bytes = (FFN // Q6K) * Q6K_BYTES
+    var row_base = e * N * row_bytes + c * row_bytes
+    var rows = InlineArray[Int, MR](fill=0)
+    var p0 = Int(rebind[Scalar[i32]](GP[g * MR]))
+    comptime for u in range(MR):
+        var p = Int(rebind[Scalar[i32]](GP[g * MR + u]))
+        rows[u] = p if p >= 0 else p0
+    var acc = InlineArray[Scalar[f32], MR](fill=0)
+    var k = Int(lane_id())
+    while k < FFN:
+        var v = q6k_value(WD, row_base, k)
+        comptime for u in range(MR):
+            acc[u] += rebind[Scalar[bf16]](Hb[rows[u], k]).cast[f32]() * v
+        k += WARP_SIZE
+    comptime for u in range(MR):
+        var dot = warp.sum(acc[u])
+        var p = Int(rebind[Scalar[i32]](GP[g * MR + u]))
+        if lane_id() == 0 and p >= 0:
+            D[p, c] = rebind[D.ElementType](dot)

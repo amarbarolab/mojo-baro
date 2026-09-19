@@ -27,8 +27,7 @@ from moe import (
 from matmul_skinny import amar_matmul_skinny_m1_row, amar_matmul_skinny_m1_row2
 from moe_rows import (
     moe_matmul_q8d_rows_shared, moe_router_top8_sig_rows,
-    moe_pairs_group, moe_gate_up_q4k_grouped, moe_down_q4k_grouped, moe_down_combine,
-    moe_down_q6k_rows,
+    moe_pairs_group, moe_gate_up_q4k_grouped, moe_down_q4k_grouped, moe_down_q6k_grouped, moe_down_combine,
     moe_shared_gate_up_q8_0_rows, moe_shared_down_q8_0_res_rows, moe_skinny_f32_rows,
 )
 from attn import amar_head_rmsnorm_rope, amar_kv_append2, amar_attn_decode
@@ -792,6 +791,7 @@ comptime gated_pm = amar_ssm_gated_out_rows_bf16[type_of(op_layout), type_of(att
 
 
 comptime PF_MR = 8
+comptime PF_EXACT_T = 256
 comptime PF_NG = CP * TOPK // PF_MR + N_EXP
 comptime pf_ge_layout = row_major[PF_NG]()
 comptime pf_gp_layout = row_major[PF_NG * PF_MR]()
@@ -812,7 +812,7 @@ def moe_gemm_rows[
         grid_dim=(ceildiv(n, 8), ceildiv(m, PF_MR)), block_dim=256)
 
 
-def moe_prefill_forward(ctx: DeviceContext, mut b: WindowBufs, m: Int, pos: Int, ring: Int, prof: Bool) raises:
+def moe_prefill_forward(ctx: DeviceContext, mut b: WindowBufs, m: Int, pos: Int, ring: Int, prof: Bool, n_prompt: Int) raises:
     # Prompt rows pos .. pos+m-1 of the qwen35moe trunk in one chunk
     # (bench/moe-prefill-protocol.md). Projections, router, experts and the
     # shared expert are row-batched siblings of the m=1 kernels (same dot
@@ -826,9 +826,14 @@ def moe_prefill_forward(ctx: DeviceContext, mut b: WindowBufs, m: Int, pos: Int,
         t0 = perf_counter_ns()
     # Identity with replay needs the decode kernels' summation order in
     # attention and in the delta scan (gate 1 diverged on 3 and 4 of 23
-    # prompts with either chunk kernel in). wmma / chunk select the dense
-    # chunk kernels, for speed comparison only.
-    var att_exact = getenv("BARO_PF_ATT", "exact") == "exact"
+    # prompts with either chunk kernel in). Up to PF_EXACT_T prompt tokens
+    # both are exact and the gate is greedy equality. Above it attention is
+    # the WMMA chunk kernel (8k: 24.5 -> 21.0 s) and the gate is
+    # teacher-forced agreement, which is this repo's identity rule past ~256
+    # ids anyway. The chunk scan stays off: 8% at 8k and it diverges at
+    # token 4. BARO_PF_ATT / BARO_PF_SSM = exact | wmma / chunk override.
+    var att_env = getenv("BARO_PF_ATT", "auto")
+    var att_exact = att_env == "exact" or (att_env == "auto" and n_prompt <= PF_EXACT_T)
     var ssm_exact = getenv("BARO_PF_SSM", "exact") == "exact"
     var Toks = TileTensor(b.toks_d, toks_layout)
     var ConvStateAll = TileTensor(b.convstate_d, csall_layout)
@@ -945,15 +950,15 @@ def moe_prefill_forward(ctx: DeviceContext, mut b: WindowBufs, m: Int, pos: Int,
         ctx.enqueue_function[moe_gate_up_q4k_grouped[PF_MR, E_FFN, type_of(xp_layout), type_of(pf_ge_layout), type_of(pf_gp_layout), type_of(pf_rh_layout)]](
             CurBp, (b.tier.pf_stage.unsafe_ptr() if b.tier.active else b.wbuf.unsafe_ptr().unsafe_offset(b.off[routed_base])), Ge, Gp, RoutedH, Int32(H), Int32(up_offset),
             grid_dim=(ceildiv(E_FFN, MOE_WAVES), ng), block_dim=MOE_THREADS)
+        var Dn = row_f32(ctx, b.pf_dn_d, 0, CP * TOPK * H, pf_dn_layout)
         if layer == 34 or layer == 38 or layer == 39:
-            ctx.enqueue_function[moe_down_q6k_rows[TOPK, E_FFN, type_of(pf_rh_layout), type_of(pf_idx_layout), type_of(pf_idx_layout), type_of(xp_layout)]](
-                RoutedH, (b.tier.pf_stage.unsafe_ptr().unsafe_offset(2 * up_offset) if b.tier.active else b.wbuf.unsafe_ptr().unsafe_offset(b.off[routed_base + 2])), Idx, Wt, Routed, Int32(H), grid_dim=(ceildiv(H, MOE_WAVES), m), block_dim=MOE_THREADS)
+            ctx.enqueue_function[moe_down_q6k_grouped[PF_MR, E_FFN, type_of(pf_rh_layout), type_of(pf_ge_layout), type_of(pf_gp_layout), type_of(pf_dn_layout)]](
+                RoutedH, (b.tier.pf_stage.unsafe_ptr().unsafe_offset(2 * up_offset) if b.tier.active else b.wbuf.unsafe_ptr().unsafe_offset(b.off[routed_base + 2])), Ge, Gp, Dn, Int32(H), grid_dim=(ceildiv(H, MOE_WAVES), ng), block_dim=MOE_THREADS)
         else:
-            var Dn = row_f32(ctx, b.pf_dn_d, 0, CP * TOPK * H, pf_dn_layout)
             ctx.enqueue_function[moe_down_q4k_grouped[PF_MR, E_FFN, type_of(pf_rh_layout), type_of(pf_ge_layout), type_of(pf_gp_layout), type_of(pf_dn_layout)]](
                 RoutedH, (b.tier.pf_stage.unsafe_ptr().unsafe_offset(2 * up_offset) if b.tier.active else b.wbuf.unsafe_ptr().unsafe_offset(b.off[routed_base + 2])), Ge, Gp, Dn, Int32(H), grid_dim=(ceildiv(H, MOE_WAVES), ng), block_dim=MOE_THREADS)
-            ctx.enqueue_function[moe_down_combine[TOPK, type_of(pf_dn_layout), type_of(pf_idx_layout), type_of(xp_layout)]](
-                Dn, Wt, Routed, Int32(H), grid_dim=(ceildiv(H, 256), m), block_dim=256)
+        ctx.enqueue_function[moe_down_combine[TOPK, type_of(pf_dn_layout), type_of(pf_idx_layout), type_of(xp_layout)]](
+            Dn, Wt, Routed, Int32(H), grid_dim=(ceildiv(H, 256), m), block_dim=256)
         var shared_gate = b.off[extra_base + 1]
         ctx.enqueue_function[moe_shared_gate_up_q8_0_rows[SH_FFN, type_of(xp_layout), type_of(pf_sh_layout)]](
             CurBp, b.wbuf.unsafe_ptr().unsafe_offset(shared_gate), SharedH, Int32(H), Int32((H // 32) * 34), Int32(b.off[extra_base + 2] - shared_gate),
@@ -1078,7 +1083,7 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
     if st.pos < cfg.pf_rows:
         var mc = min(cfg.pf_chunk, cfg.pf_rows - st.pos)
         comptime if IS_MOE:
-            moe_prefill_forward(ctx, b, mc, st.pos, st.ring, cfg.prof)
+            moe_prefill_forward(ctx, b, mc, st.pos, st.ring, cfg.prof, cfg.n_prompt)
         else:
             prefill_forward(ctx, b.wbuf, b.off, cfg.pack_q4, mc, st.pos, st.ring, cfg.prof, b.toks_d, b.convstate_d, b.sstate_d, b.kc_d, b.vc_d, b.kvtab_d,
                 b.xp_d, b.curbp_d, b.qkvp_d, b.zp_d, b.arp_d, b.brp_d, b.egp_d, b.betap_d, b.convp_d, b.sop_d, b.resbp_d, b.qfp_d,

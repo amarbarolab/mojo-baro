@@ -24,7 +24,7 @@ from moe_rows import (
     moe_matmul_q8d_rows, moe_matmul_q8d_rows_add, moe_router_top8_sig_rows,
     moe_gate_up_q4k_rows, moe_down_q4k_rows, moe_down_q6k_rows,
     moe_shared_gate_up_q8_0_rows, moe_shared_down_q8_0_res_rows, moe_skinny_f32_rows, moe_matmul_q8d_rows_shared,
-    moe_pairs_group, moe_gate_up_q4k_grouped, moe_down_q4k_grouped, moe_down_combine,
+    moe_pairs_group, moe_gate_up_q4k_grouped, moe_down_q4k_grouped, moe_down_combine, moe_down_q6k_grouped,
 )
 
 comptime f32 = DType.float32
@@ -386,8 +386,17 @@ def main() raises:
     ctx.enqueue_function[moe_down_combine[TOPK, type_of(dn_layout), type_of(idx_rows), type_of(x_rows)]](
         view(ctx, dn_d, 0, T * TOPK * H, dn_layout), view(ctx, wtR_d, 0, T * TOPK, idx_rows), view(ctx, dG_d, 0, T * H, x_rows),
         Int32(H), grid_dim=(ceildiv(H, 256), T), block_dim=256)
+    var dn6_d = ctx.enqueue_create_buffer[f32](T * TOPK * H)
+    var d6G_d = ctx.enqueue_create_buffer[f32](T * H)
+    ctx.enqueue_function[moe_down_q6k_grouped[GMR, E_FFN, type_of(hh_rows), type_of(ge_layout), type_of(gp_layout), type_of(dn_layout)]](
+        view(ctx, hh_d, 0, T * TOPK * E_FFN, hh_rows), q6d_d.unsafe_ptr(), view(ctx, ge_d, 0, NG, ge_layout), view(ctx, gp_d, 0, NG * GMR, gp_layout),
+        view(ctx, dn6_d, 0, T * TOPK * H, dn_layout), Int32(H), grid_dim=(ceildiv(H, MOE_WAVES), NG), block_dim=MOE_THREADS)
+    ctx.enqueue_function[moe_down_combine[TOPK, type_of(dn_layout), type_of(idx_rows), type_of(x_rows)]](
+        view(ctx, dn6_d, 0, T * TOPK * H, dn_layout), view(ctx, wtR_d, 0, T * TOPK, idx_rows), view(ctx, d6G_d, 0, T * H, x_rows),
+        Int32(H), grid_dim=(ceildiv(H, 256), T), block_dim=256)
     ctx.synchronize()
     cmp("gate_up_q4k_grouped", hG_d, hM_d, T * TOPK * E_FFN)
+    cmp("down_q6k_grouped", d6G_d, d6M_d, T * H)
     cmp("down_q4k_grouped", dG_d, dM_d, T * H)
     cmp("q8d_shared", oS_d, oM_d, T * NOUT)
     cmp("q8d_shared_add", xS_d, xM_d, T * NOUT)
@@ -409,4 +418,4 @@ def main() raises:
     cmp("down_q6k", d6R_d, d6M_d, T * H)
     cmp("shared_gate_up", sR_d, sM_d, T * SH_FFN)
     cmp("shared_down_res", rR_d, rM_d, T * H)
-    print("PASS moe rows parity: 15 outputs bit-exact over", T, "tokens")
+    print("PASS moe rows parity: 16 outputs bit-exact over", T, "tokens")
