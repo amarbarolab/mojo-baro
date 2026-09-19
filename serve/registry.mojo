@@ -1,5 +1,5 @@
 from std.math import ceildiv
-from std.sys import get_defined_string
+from std.sys import get_defined_string, get_defined_int
 from max.gpu.host import DeviceContext, DeviceBuffer
 from layout import TileTensor, TensorLayout, row_major
 
@@ -57,7 +57,9 @@ comptime i8 = DType.int8
 
 comptime MROWS = SM
 comptime KMAX = SM
-comptime SEQ_CAP = 4
+# Concurrent sequences the KV pool is sized for; each one costs a full
+# tmax of KV, so a single-user long-context build uses -D BARO_SEQ_CAP=1.
+comptime SEQ_CAP = get_defined_int["BARO_SEQ_CAP", 4]()
 comptime SLOTS = KMAX + 1
 comptime CONV_SLOT = N_SSM * 3 * CONV
 comptime SSM_SLOT = N_SSM * NH_V * SSTATE * SSTATE
