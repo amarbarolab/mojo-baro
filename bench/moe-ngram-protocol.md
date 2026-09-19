@@ -47,3 +47,19 @@ compact-hidden-state projector showed no signal. These do not establish a
 cross-model draft or a RegesCore decode speedup. Source receipts live in
 `~/AMDHQ/runs/latent-os/`; current transport/identity APIs are in `latentos/`
 and `serve/latent.mojo`. The target verifier can be reused with a future draft.
+
+## Match gate, 2026-09-19 evening (`bench/moe-ngram-gate-sweep.sh`)
+
+`BARO_NGRAM_MIN` (default 1) requires a suffix match of at least that width
+before drafting; history is now copied incrementally. Draft time fell from
+2.97 s to 0.03 s per 20 prompts. Identity 20/20 at both widths.
+
+| min width | acceptance | windows | reject-first | ngram vs spec-off |
+|---:|---:|---:|---:|---:|
+| 3 | 59.8% | 159 | 55 | 0.99x (96.5 vs 97.4) |
+| 5 | 82.8% | 83 | 12 | 1.00x (96.1 vs 96.3) |
+
+Gating removes the loss but not the ceiling: at 83% acceptance it only breaks
+even, because rows still cost full price. Width 1 did not complete (display
+compositor VRAM contention, the engine fills the card). Some requests in each
+run ran below 50 tok/s from that contention; medians shown.

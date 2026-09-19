@@ -543,6 +543,7 @@ def main() raises:
         kcfg = 1
     if kcfg > KMAX:
         kcfg = KMAX
+    var ngram_min = atol(getenv("BARO_NGRAM_MIN", "1"))
     print("spec k:", kcfg)
     # Prefill plan (bench/prefill-protocol.md): prompt rows 0 .. L-2 go through
     # prefill_forward in chunks of pf_chunk; the last prompt token still runs
@@ -1017,6 +1018,8 @@ def main() raises:
         var ngram_ns = 0
         var verify_ns = 0
         var verify_rows = 0
+        var history = List[Int]()
+        var hist_end = 0
         # The stopwatch stays here, in the harness that is never embedded in a
         # gguf: step_window cannot reach t0, t_prefill_end or dt (P-A, 2026-09-08).
         while wst.pos < n_total - 1:
@@ -1025,13 +1028,18 @@ def main() raises:
             comptime if IS_MOE:
                 if cfg.spec and wst.pos >= len(prompt) and wst.pos + 2 < n_total:
                     var draft_start = perf_counter_ns()
-                    var hn = min(wst.pos + 1, 4096)
-                    ctx.enqueue_copy(dst_buf=bufs.pen_hist_h.create_sub_buffer[DType.int32](0, hn), src_buf=DeviceBuffer[DType.int32](ctx, bufs.toks_d.unsafe_ptr().unsafe_offset(wst.pos + 1 - hn), hn, owning=False))
-                    ctx.synchronize()
-                    var history = List[Int]()
-                    for hi in range(hn):
-                        history.append(Int(bufs.pen_hist_h[hi]))
-                    var proposed = ngram_propose(history, min(min(kcfg, MROWS - 1), n_total - 2 - wst.pos))
+                    # Copy only tokens committed since the last proposal; the
+                    # full 4096-token re-copy per step cost ~20% of decode.
+                    if len(history) == 0:
+                        hist_end = wst.pos + 1 - min(wst.pos + 1, 4096)
+                    var hn = min(wst.pos + 1 - hist_end, 4096)
+                    if hn > 0:
+                        ctx.enqueue_copy(dst_buf=bufs.pen_hist_h.create_sub_buffer[DType.int32](0, hn), src_buf=DeviceBuffer[DType.int32](ctx, bufs.toks_d.unsafe_ptr().unsafe_offset(wst.pos + 1 - hn), hn, owning=False))
+                        ctx.synchronize()
+                        for hi in range(hn):
+                            history.append(Int(bufs.pen_hist_h[hi]))
+                        hist_end = wst.pos + 1
+                    var proposed = ngram_propose(history, min(min(kcfg, MROWS - 1), n_total - 2 - wst.pos), ngram_min)
                     ngram_n = len(proposed)
                     if ngram_n > 0:
                         for ni in range(ngram_n):
