@@ -1,0 +1,499 @@
+# Every setting mojo-baro reads, one table each. Checked against the source by
+# tools/settings-check.py (exit 0 = the template lists exactly what the code reads).
+#
+# kind:    env        read by an engine binary at run time (getenv)
+#          build      a comptime flag, set with -D NAME=VALUE when building
+#          server-env read by baro-serve (Rust) at start
+# type:    int | float | bool | string | path   (bool = "1" on, anything else off)
+# models:  qwen35 (dense engine.mojo), qwen35moe (MoE engine.mojo), spark
+#          (serve/spark.mojo), all, or test (a kernel test/bench binary only)
+# group:   serving | memory | speed | speculation | tier | state | debug | test | build
+# Profiles (profiles/*.toml) set any subset of these; unset = the default here.
+
+# ---------------------------------------------------------------- build flags
+
+[settings.BARO_MODEL]
+kind = "build"
+type = "string"
+default = "qwen35"
+doc = "Model family the engine is compiled for: qwen35 (dense) or qwen35moe."
+models = ["qwen35", "qwen35moe"]
+group = "build"
+
+[settings.BARO_SEQ_CAP]
+kind = "build"
+type = "int"
+default = "4"
+doc = "Concurrent sequences the KV pool is sized for; each costs a full BARO_TMAX of KV, so single-user long context builds with 1."
+models = ["qwen35", "qwen35moe"]
+group = "build"
+
+[settings.BARO_KVQ]
+kind = "build"
+type = "string"
+default = "f32"
+doc = "KV cache dtype: f32, or int8 (dense only, measured RULER 100.0 at 64k and 128k)."
+models = ["qwen35"]
+group = "build"
+
+[settings.BARO_MOE_G]
+kind = "build"
+type = "int"
+default = "96"
+doc = "Grid size of the persistent MoE token kernel: 96, 192 or 288 (anything else means 96)."
+models = ["qwen35moe"]
+group = "build"
+
+[settings.BARO_TRACE_SUM]
+kind = "build"
+type = "int"
+default = "0"
+doc = "Spark engine: build in per-position residual checksums so two runs can be compared cell by cell."
+models = ["spark"]
+group = "build"
+
+# ---------------------------------------------------------------- serving
+
+[settings.BARO_PACK]
+kind = "env"
+type = "path"
+default = ".work/moe-w1/pack"
+doc = "Weight pack directory the engine loads (pack.bin + index.txt, experts.bin for a tier pack)."
+models = ["all"]
+group = "serving"
+
+[settings.BARO_SERVE]
+kind = "env"
+type = "bool"
+default = "0"
+doc = "Serve mode: read JSON requests on stdin and stream tokens; set by baro-serve for its engines."
+models = ["qwen35", "qwen35moe"]
+group = "serving"
+
+[settings.BARO_TMAX]
+kind = "env"
+type = "int"
+default = "1088"
+doc = "Context length the KV pool is sized for, in tokens (MoE f32 KV costs 40,960 bytes per token per sequence)."
+models = ["qwen35", "qwen35moe"]
+group = "memory"
+
+[settings.BARO_POOL]
+kind = "server-env"
+type = "int"
+default = "1"
+doc = "Number of engine processes baro-serve spawns; more than 1 does not fit one 24 GB GPU."
+models = ["all"]
+group = "serving"
+
+[settings.BARO_RUNTIME]
+kind = "server-env"
+type = "string"
+default = ""
+doc = "Runtime identity string hashed into checkpoint ids when the pack has no identity.json; unset falls back to the git commit."
+models = ["all"]
+group = "serving"
+
+[settings.BARO_PROMPT]
+kind = "env"
+type = "path"
+default = "<pack>/prompt-tokens.txt"
+doc = "One-shot mode: token-id file to decode from when not serving."
+models = ["qwen35", "qwen35moe"]
+group = "serving"
+
+[settings.BARO_CHAT]
+kind = "env"
+type = "path"
+default = ""
+doc = "Spark engine: chat JSON file to render with the model's template and decode."
+models = ["spark"]
+group = "serving"
+
+[settings.BARO_GGUF]
+kind = "env"
+type = "path"
+default = ""
+doc = "Spark engine: GGUF to read the tokenizer and chat template from."
+models = ["spark"]
+group = "serving"
+
+[settings.BARO_GEN]
+kind = "env"
+type = "int"
+default = "64"
+doc = "Spark engine: tokens to generate in one-shot mode."
+models = ["spark"]
+group = "serving"
+
+[settings.BARO_PROMPT_TEXT]
+kind = "env"
+type = "path"
+default = ""
+doc = "Spark engine: plain-text prompt file to tokenize and decode."
+models = ["spark"]
+group = "serving"
+
+# ---------------------------------------------------------------- speed paths
+
+[settings.BARO_MEGA]
+kind = "env"
+type = "bool"
+default = "1 on dense, 0 on qwen35moe"
+doc = "Persistent megakernel: one launch per token. On MoE 113.94 vs 110.90 tok/s, opt-in; refuses BARO_TIER and BARO_EXPERTS."
+models = ["qwen35", "qwen35moe"]
+group = "speed"
+
+[settings.BARO_MEGA_WIN]
+kind = "env"
+type = "bool"
+default = "0"
+doc = "Run the speculative verify window through the megakernel instead of the launch path."
+models = ["qwen35"]
+group = "speed"
+
+[settings.BARO_PREFILL]
+kind = "env"
+type = "bool"
+default = "1"
+doc = "Batched prefill (up to BARO_PREFILL_C rows per chunk); qwen35moe has none yet and replays prompts token by token."
+models = ["qwen35"]
+group = "speed"
+
+[settings.BARO_PREFILL_C]
+kind = "env"
+type = "int"
+default = "1024"
+doc = "Prefill chunk size in rows, capped at the compiled CP (1024), floor 16."
+models = ["qwen35"]
+group = "speed"
+
+[settings.BARO_ATT_SPLIT]
+kind = "env"
+type = "bool"
+default = "0"
+doc = "Force split-K decode attention at every context length (sets the threshold to 0)."
+models = ["qwen35", "qwen35moe"]
+group = "speed"
+
+[settings.BARO_ATT_SPLIT_T]
+kind = "env"
+type = "int"
+default = "1088"
+doc = "Context length above which decode attention switches to split-K."
+models = ["qwen35", "qwen35moe"]
+group = "speed"
+
+[settings.BARO_DOT]
+kind = "env"
+type = "bool"
+default = "0"
+doc = "int8-dot FFN path on a non-q4 pack; default off."
+models = ["qwen35"]
+group = "speed"
+
+[settings.BARO_KVTAB]
+kind = "env"
+type = "string"
+default = "identity"
+doc = "KV page-table arm, identity or reverse; a gate falsifier, not a user setting."
+models = ["qwen35", "qwen35moe"]
+group = "debug"
+
+# ---------------------------------------------------------------- speculation
+
+[settings.BARO_SPEC]
+kind = "env"
+type = "bool"
+default = "1"
+doc = "Speculative decoding with the model's MTP draft head (dense; 1.1042x on the 20-prompt median)."
+models = ["qwen35"]
+group = "speculation"
+
+[settings.BARO_SPEC_K]
+kind = "env"
+type = "int"
+default = "2"
+doc = "Draft tokens per speculative window, 1 to KMAX."
+models = ["qwen35", "qwen35moe"]
+group = "speculation"
+
+[settings.BARO_SPEC_DBG]
+kind = "env"
+type = "bool"
+default = "0"
+doc = "Print one line per speculative window (position, rows, accepted)."
+models = ["qwen35", "qwen35moe"]
+group = "debug"
+
+[settings.BARO_DRAFT_Q4]
+kind = "env"
+type = "bool"
+default = "0"
+doc = "Use the pack's q4 copy of the draft head, when the pack has one."
+models = ["qwen35"]
+group = "speculation"
+
+[settings.BARO_FR]
+kind = "env"
+type = "bool"
+default = "0"
+doc = "Use the pack's frequency-restricted draft vocabulary, when the pack has one."
+models = ["qwen35"]
+group = "speculation"
+
+[settings.BARO_NGRAM]
+kind = "env"
+type = "bool"
+default = "0"
+doc = "Prompt-lookup (ngram) speculation on MoE, greedy only; measured 0.76x ungated, 1.00x with BARO_NGRAM_MIN=5."
+models = ["qwen35moe"]
+group = "speculation"
+
+[settings.BARO_NGRAM_MIN]
+kind = "env"
+type = "int"
+default = "1"
+doc = "Shortest suffix match that may draft; 3 gave 0.99x, 5 gave 1.00x."
+models = ["qwen35moe"]
+group = "speculation"
+
+# ---------------------------------------------------------------- expert tier (MoE experts in host RAM)
+
+[settings.BARO_TIER]
+kind = "env"
+type = "int"
+default = ""
+doc = "Experts in host RAM with this many cached per layer in VRAM (64 = 5.2 GB); needs a split pack (tools/pack-split-experts.py)."
+models = ["qwen35moe"]
+group = "tier"
+
+[settings.BARO_TIER_PINNED]
+kind = "env"
+type = "bool"
+default = "1"
+doc = "Keep the host expert store in pinned memory (67.12 vs 48.57 tok/s page-cached)."
+models = ["qwen35moe"]
+group = "tier"
+
+[settings.BARO_TIER_ZC]
+kind = "env"
+type = "bool"
+default = "0"
+doc = "Zero-copy misses: expert kernels read missed experts straight from pinned host memory (72.02 vs 67.71 tok/s)."
+models = ["qwen35moe"]
+group = "tier"
+
+[settings.BARO_TIER_HOT]
+kind = "env"
+type = "bool"
+default = "0"
+doc = "Per-request hot store for re-touched experts; only without pinned memory."
+models = ["qwen35moe"]
+group = "tier"
+
+[settings.BARO_TIER_HOTCAP]
+kind = "env"
+type = "int"
+default = "128"
+doc = "Experts per layer the hot store may hold."
+models = ["qwen35moe"]
+group = "tier"
+
+[settings.BARO_TIER_STAMP]
+kind = "env"
+type = "bool"
+default = "0"
+doc = "Print per-layer tier timing (open, readback, lru, pread, copy) after each request."
+models = ["qwen35moe"]
+group = "debug"
+
+# ---------------------------------------------------------------- state and checkpoints
+
+[settings.BARO_CKPT]
+kind = "env"
+type = "int"
+default = "8"
+doc = "Prefix checkpoints the engine keeps in serve mode, so a repeated prompt prefix skips prefill."
+models = ["qwen35", "qwen35moe"]
+group = "state"
+
+[settings.BARO_CKPT_API]
+kind = "server-env"
+type = "int"
+default = "8"
+doc = "Checkpoints baro-serve's /v1/fork and state API keep on disk."
+models = ["all"]
+group = "state"
+
+[settings.BARO_CKPT_DIR]
+kind = "server-env"
+type = "path"
+default = ".work/checkpoints"
+doc = "Directory for baro-serve's checkpoint files."
+models = ["all"]
+group = "state"
+
+[settings.BARO_STATE_SAVE]
+kind = "env"
+type = "path"
+default = ""
+doc = "Write the KV and SSM state to this file after the request (f32 KV only)."
+models = ["qwen35", "qwen35moe"]
+group = "state"
+
+[settings.BARO_STATE_LOAD]
+kind = "env"
+type = "path"
+default = ""
+doc = "Restore KV and SSM state from this file before the request (f32 KV only)."
+models = ["qwen35", "qwen35moe"]
+group = "state"
+
+[settings.BARO_STATE_INT8]
+kind = "env"
+type = "bool"
+default = "0"
+doc = "Store saved state as int8."
+models = ["qwen35", "qwen35moe"]
+group = "state"
+
+[settings.BARO_STATE_HMAC_KEY]
+kind = "server-env"
+type = "string"
+default = ""
+doc = "Key that signs exported state files; unset means unsigned. A secret: never put it in a profile."
+models = ["all"]
+group = "state"
+
+[settings.BARO_LATENT_SOCK]
+kind = "env"
+type = "path"
+default = ""
+doc = "LatentOS agent socket for state handoff as sealed memfds; set and unreachable raises."
+models = ["qwen35", "qwen35moe"]
+group = "state"
+
+# ---------------------------------------------------------------- debug and verification
+
+[settings.BARO_PROFILE]
+kind = "env"
+type = "int"
+default = "0"
+doc = "Timing breakdown: 1 attn/ssm/ffn/head, 3 draft path split, 5 per-phase stamps; the timed path is otherwise untouched."
+models = ["qwen35", "qwen35moe"]
+group = "debug"
+
+[settings.BARO_EXPERTS]
+kind = "env"
+type = "path"
+default = ""
+doc = "Write the router's top-8 experts per layer per token to this path (instrumentation run)."
+models = ["qwen35moe"]
+group = "debug"
+
+[settings.BARO_FORCE]
+kind = "env"
+type = "path"
+default = ""
+doc = "Teacher forcing: feed these token ids regardless of the model's choice (needs BARO_SPEC=0)."
+models = ["qwen35", "qwen35moe"]
+group = "debug"
+
+[settings.BARO_MARGIN]
+kind = "env"
+type = "bool"
+default = "0"
+doc = "Print the top-2 logits and their gap next to each argmax."
+models = ["qwen35", "qwen35moe"]
+group = "debug"
+
+[settings.BARO_DUMP]
+kind = "env"
+type = "path"
+default = ""
+doc = "Dump intermediate tensors to this file."
+models = ["qwen35", "qwen35moe"]
+group = "debug"
+
+[settings.BARO_DUMP4]
+kind = "env"
+type = "bool"
+default = "0"
+doc = "Dump the four-slot per-layer tensor set instead of the default."
+models = ["qwen35", "qwen35moe"]
+group = "debug"
+
+[settings.BARO_DUMP_DIR]
+kind = "env"
+type = "path"
+default = ""
+doc = "Directory for per-step dumps when BARO_DUMP is set."
+models = ["qwen35", "qwen35moe"]
+group = "debug"
+
+[settings.BARO_DUMP_LAYER]
+kind = "env"
+type = "int"
+default = "0"
+doc = "Layer whose tensors are dumped."
+models = ["qwen35", "qwen35moe"]
+group = "debug"
+
+[settings.BARO_DUMP_LOGITS]
+kind = "env"
+type = "path"
+default = ""
+doc = "Dump each step's raw logits row to this path pattern."
+models = ["qwen35", "qwen35moe"]
+group = "debug"
+
+[settings.BARO_DUMP_LOGITS_DIR]
+kind = "env"
+type = "path"
+default = ""
+doc = "Per-step raw logit row and history dump for an independent host comparison."
+models = ["qwen35", "qwen35moe"]
+group = "debug"
+
+[settings.BARO_TRACE_SUM_DIR]
+kind = "env"
+type = "path"
+default = ""
+doc = "Spark engine: directory for the BARO_TRACE_SUM checksum tables."
+models = ["spark"]
+group = "debug"
+
+# ---------------------------------------------------------------- kernel tests and benches only
+
+[settings.BARO_MOE_ARMS]
+kind = "env"
+type = "int"
+default = "8"
+doc = "test_moe_block: disjoint expert sets rotated so the bench is not served from Infinity Cache."
+models = ["test"]
+group = "test"
+
+[settings.BARO_MOE_BENCH]
+kind = "env"
+type = "bool"
+default = "0"
+doc = "test_moe_block: run the timed bench after the parity check."
+models = ["test"]
+group = "test"
+
+[settings.BARO_MOE_LAYER]
+kind = "env"
+type = "int"
+default = "3"
+doc = "moe_gate1: layer the single-block MoE gate runs."
+models = ["test"]
+group = "test"
+
+[settings.BARO_PREFIX_TOKENS]
+kind = "env"
+type = "path"
+default = "bench/prefill-prompts/p8192.tokens"
+doc = "test_prefix: prompt token file for the prefix-cache test."
+models = ["test"]
+group = "test"
