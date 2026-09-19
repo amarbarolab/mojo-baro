@@ -272,8 +272,11 @@ for help with.
 
 ## Contributing
 
-[CONTRIBUTING.md](CONTRIBUTING.md) covers code changes and the preregistration
-flow. Hardware reports: [docs/amd-family.md](docs/amd-family.md).
+[CONTRIBUTING.md](CONTRIBUTING.md) lists where help is wanted, with the check that
+decides each item, and the template every change fills in: claim, kind, the check you
+ran, the frozen prediction for speed work, the arm receipt, and what you did not verify.
+Issue forms: hardware report, bug report, kernel or speed proposal. Hardware reports:
+[docs/amd-family.md](docs/amd-family.md).
 
 ## License
 
