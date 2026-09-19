@@ -115,7 +115,7 @@ penv=""; pflags=""; psource=file
 if [ -n "$profile" ]; then
   prof=$here/.work/profile
   if [ ! -x "$prof" ] || [ "$here/tools/profile.mojo" -nt "$prof" ]; then
-    "$here/.venv/bin/mojo" build "$here/tools/profile.mojo" -I "${MOJO_TOML_SRC:-$HOME/Projects/imports/databooth-mojo-toml/src}" -o "$prof" > "$work/profile-build.log" 2>&1 \
+    "$here/.venv/bin/mojo" build "$here/tools/profile.mojo" -I "$here" -o "$prof" > "$work/profile-build.log" 2>&1 \
       || die "profile tool build FAILED, see $work/profile-build.log"
   fi
   "$prof" env "$profile" >/dev/null || die "profile $profile is invalid (tools/profile.py check)"

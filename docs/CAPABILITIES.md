@@ -67,8 +67,8 @@ Verification
   `gpu-wait`, 2026-09-19, including the two new parity tests.
 - **`tools/baro --profile NAME`: WORKS as wiring** (`0a44cd4`): `profiles/*.toml` checked against the
   settings template, read by `tools/profile.mojo`, which matches its Python oracle on the three seed
-  profiles; it builds against `~/Projects/imports/databooth-mojo-toml/src`, a path OUTSIDE the repo,
-  so a clone cannot use `--profile` until that is vendored. `--target-accelerator gfx1100` is pinned
+  profiles; its TOML reader is DataBooth/mojo-toml vendored as `toml/` (Apache-2.0), so a clone
+  builds it. `--target-accelerator gfx1100` is pinned
   in `tools/baro`, `bench/preflight.sh`, `bench/quality-run.sh` and `ci-checks` (`88c27cf`).
 
 

@@ -44,7 +44,7 @@
 - Mojo builds that touch `serve/tokenizer.mojo` / `serve/spark.mojo` /
   `serve/engine.mojo` / `serve/latent.mojo` need `-I .` (regex engine, chat-template
   renderer, and the LatentOS sidecar, vendored at repo root as `uregex/` /
-  `minja/` / `latentos/`; upstreams `~/Projects/mojo/mojo-uregex` /
+  `minja/` / `latentos/`; `tools/profile.mojo` likewise reads `toml/`, DataBooth/mojo-toml; upstreams `~/Projects/mojo/mojo-uregex` /
   `~/Projects/mojo/mojo-minja` / `~/AMDHQ/src/latentos`, synced by hand, drift
   checked by `tools/ci-checks.sh` when present).
 - **Bit-exact means a byte test against the m=1 / decode kernel, not a token gate.**

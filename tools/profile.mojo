@@ -1,5 +1,5 @@
 # profile: named run profiles, Mojo port of tools/profile.py (the oracle).
-# TOML via DataBooth/mojo-toml (build with -I ~/Projects/imports/databooth-mojo-toml/src).
+# TOML via DataBooth/mojo-toml, vendored at repo root as toml/ (build with -I .).
 # usage: profile check | env NAME | build NAME | get NAME FIELD
 from std.sys import argv, exit, stderr
 from std.os.path import exists

@@ -71,14 +71,14 @@ if [ ! -f "$UP" ]; then ok "upstream not on this machine, nothing to compare"
 elif diff -q <(tail -n +6 tools/gguf_reader.mojo) "$UP" >/dev/null; then ok "vendored copy is in sync"
 else bad "tools/gguf_reader.mojo has drifted from $UP"; diff -u <(tail -n +6 tools/gguf_reader.mojo) "$UP" | head -20; fi
 
-step "vendored uregex/, minja/ and latentos/ match their upstream"
+step "vendored uregex/, minja/, latentos/ and toml/ match their upstream"
 # serve/tokenizer.mojo imports uregex, serve/spark.mojo imports minja,
 # serve/latent.mojo and serve/engine.mojo import latentos; all three are
 # vendored as real files (repo root uregex/, minja/, latentos/, -I .), not a
 # symlink or a build flag pointing outside the tree, so a clone builds
 # without any of the three sibling trees checked out.
 vendor_drift=0
-for pkg_up in "uregex:$HOME/Projects/mojo/mojo-uregex/src/uregex" "minja:$HOME/Projects/mojo/mojo-minja/src/minja" "latentos:$HOME/AMDHQ/src/latentos"; do
+for pkg_up in "uregex:$HOME/Projects/mojo/mojo-uregex/src/uregex" "minja:$HOME/Projects/mojo/mojo-minja/src/minja" "latentos:$HOME/AMDHQ/src/latentos" "toml:$HOME/Projects/imports/databooth-mojo-toml/src/toml"; do
   pkg=${pkg_up%%:*}; up=${pkg_up#*:}
   if [ ! -d "$up" ]; then ok "$pkg: upstream not on this machine, nothing to compare"; continue
   fi
