@@ -58,15 +58,18 @@ Serving (all from the 2026-09-18 board entries; receipts lost unless a test suit
   token identity gate on real hardware is UNVERIFIED.
 - **LatentOS agent `--daemon` loop: WORKS** (build and liveness gate); the vendored
   `latentos/agent.mojo` carries this block on top of upstream and `ci-checks` allows for it.
-- **Settings template, all 59 `BARO_*` settings, with `tools/settings-check.py`: WORKS** as a
+- **Settings template, all 62 `BARO_*` settings, with `tools/settings-check.py`: WORKS** as a
   ci check (`d163eb5`, `0108788`).
 
 Verification
 - `bench/preflight.sh` (CPU) before any gate; gates take `EXPLORE=1` for runs that may not
   claim (verdict `UNVERIFIED`, exit 3). `./run-tests.sh`: rc=0 on `ea57b60`'s tree under
   `gpu-wait`, 2026-09-19, including the two new parity tests.
-- Not on `main` yet: `lane-r63` `88c27cf` (pin `--target-accelerator`) and `0a44cd4`
-  (`baro --profile NAME`), unreviewed.
+- **`tools/baro --profile NAME`: WORKS as wiring** (`0a44cd4`): `profiles/*.toml` checked against the
+  settings template, read by `tools/profile.mojo`, which matches its Python oracle on the three seed
+  profiles; it builds against `~/Projects/imports/databooth-mojo-toml/src`, a path OUTSIDE the repo,
+  so a clone cannot use `--profile` until that is vendored. `--target-accelerator gfx1100` is pinned
+  in `tools/baro`, `bench/preflight.sh`, `bench/quality-run.sh` and `ci-checks` (`88c27cf`).
 
 
 ## How to read this document

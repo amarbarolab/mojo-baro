@@ -156,9 +156,33 @@ group = "speed"
 kind = "env"
 type = "bool"
 default = "1"
-doc = "Batched prefill (up to BARO_PREFILL_C rows per chunk); qwen35moe has none yet and replays prompts token by token."
-models = ["qwen35"]
+doc = "Batched prefill (up to BARO_PREFILL_C rows per chunk). Default 1 on qwen35; on qwen35moe the default is 0 (prompt replay) and 1 opts into the bit-identical chunk path."
+models = ["qwen35", "qwen35moe"]
 group = "speed"
+
+[settings.BARO_PF_ATT]
+kind = "env"
+type = "string"
+default = "exact"
+doc = "qwen35moe batched prefill attention: exact (decode kernel over rows, identical to replay) or wmma (faster at long context, fails the identity and agreement gates)."
+models = ["qwen35moe"]
+group = "speed"
+
+[settings.BARO_PF_SSM]
+kind = "env"
+type = "string"
+default = "exact"
+doc = "qwen35moe batched prefill delta scan: exact (decode summation order) or chunk (dense chunk scan, flips greedy tokens)."
+models = ["qwen35moe"]
+group = "speed"
+
+[settings.BARO_PF_OVERLAP]
+kind = "env"
+type = "bool"
+default = "1"
+doc = "qwen35moe batched prefill with the expert tier: copy the next layer's experts on a second stream while the current layer computes (two staging slots, about 1 GB VRAM). 0 keeps one stream."
+models = ["qwen35moe"]
+group = "memory"
 
 [settings.BARO_PREFILL_C]
 kind = "env"

@@ -77,8 +77,8 @@
   fixture symlinks dangle, and `lane-merge` fails on receipts alone. Packs are rebuilt
   into `~/.cache/baro/<model>/packs/` by `tools/baro`; a receipt a report cites is
   copied under `exchange/receipts/<lane>/` (small text only) in the same commit.
-  `run-tests.sh` needs `BARO_PACK` pointing at a q4 pack until `.work/engine-pack-q4`
-  is restored.
+  `.work/engine-pack-q4` is a link to the cached pack of the real Qwythos gguf
+  (`sha-cache.tsv` names it; two other cached q4 packs are P5b patched models).
 - **One primary checkout, on `main`; lanes live in worktrees** (`.work/lanes/<lane>`
   or `../mojo-baro-lanes/<lane>`, prepared with `lane-prep`). `lane-status .` before
   opening or merging a lane, `lane-merge <branch>` before the merge. A long-running
