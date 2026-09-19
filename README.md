@@ -272,6 +272,12 @@ thresholds were swept to fill this card. Whether they hold elsewhere is
 unmeasured, which is exactly what [docs/amd-family.md](docs/amd-family.md) asks
 for help with.
 
+## On Android
+
+[baro.apk](https://github.com/amarbaro/baro.apk) is the Android side: a chat client for
+`baro-serve`, and a Mojo engine for arm64 phone CPUs that matches llama.cpp's greedy tokens on
+two phones (not yet wired into the app). The GPU kernels in this repo do not run there.
+
 ## Contributing
 
 [CONTRIBUTING.md](CONTRIBUTING.md) lists where help is wanted, with the check that
