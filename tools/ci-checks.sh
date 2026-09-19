@@ -24,11 +24,11 @@ if "$CENSUS" --check; then ok "every amar_* kernel is reachable"
 else bad "orphaned kernel: it is in kernels/ but no engine, bench or test calls it"; fi
 
 step "docs/KERNELS.md is current"
-cp docs/KERNELS.md .ci-kernels-before.md
+cp docs/KERNELS.md .work/ci-kernels-before.md
 "$CENSUS" >/dev/null
-if diff -q .ci-kernels-before.md docs/KERNELS.md >/dev/null; then ok "generated census matches the committed file"
-else bad "docs/KERNELS.md is stale; regenerate with tools/kernel-census.mojo"; diff -u .ci-kernels-before.md docs/KERNELS.md | head -20; fi
-mv .ci-kernels-before.md docs/KERNELS.md
+if diff -q .work/ci-kernels-before.md docs/KERNELS.md >/dev/null; then ok "generated census matches the committed file"
+else bad "docs/KERNELS.md is stale; regenerate with tools/kernel-census.mojo"; diff -u .work/ci-kernels-before.md docs/KERNELS.md | head -20; fi
+mv .work/ci-kernels-before.md docs/KERNELS.md
 
 step "pre-tokenizer regexes match llama.cpp (serve/pretok-table.json)"
 if python3 tools/pretok-check.py > .work/ci-pretok.log 2>&1; then ok "$(tail -n1 .work/ci-pretok.log)"
