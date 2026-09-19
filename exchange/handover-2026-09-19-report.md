@@ -48,6 +48,12 @@ written: both were marked ask-first and the maintainer has not answered.
    "largest blobs in the rewritten history (top 10)" section with the pack size.
    `test_publish_purge.py` covers both: 25 checks, ends `PASS`. iTools `dad79ea`, `840136b`;
    `index-gen --write` re-run and the row carries the new usage line.
+   The first version of the blobs report killed the run: `head -10` closing the pipe under
+   `set -o pipefail` aborted the script before gitleaks, `--keep-branch` and the verdict, and a
+   real export came out with all eighteen lane branches in it. Fixed in `6b71f08` (subshell with
+   pipefail off) and covered by a fixture with more blobs than the report lists, so the truncating
+   case is actually exercised: 27 checks, PASS. Both exports were then rebuilt with
+   `--keep-branch main`, each ending `PASS -- all verifications clean` with one branch.
 2. **DONE.** New skill `~/Brain/Skills/clean-publish/SKILL.md`, indexed in `Skills/_index.md`,
    symlinked into `~/.claude/skills/.user/clean-publish` by `skill-new.sh`. Brain `62623db5`.
 3. **DONE.** `herdr-ops`: `--effort` marked REQUIRED next to the explicit model in the verified
