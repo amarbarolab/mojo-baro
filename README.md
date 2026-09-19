@@ -282,4 +282,4 @@ Issue forms: hardware report, bug report, kernel or speed proposal. Hardware rep
 
 ## License
 
-Apache-2.0, see [LICENSE](LICENSE). Copyright 2026 AmarBaro Labs.
+Apache-2.0, see [LICENSE](LICENSE). Copyright 2026 amarbaro.org / amarbaro.com.
