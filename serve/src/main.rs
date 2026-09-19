@@ -1108,6 +1108,7 @@ struct ToolStream {
     raw: String,
     content_sent: usize,
     marker: Option<usize>,
+    function_start: usize,
     function_end: Option<usize>,
     scan: usize,
     params: usize,
@@ -1159,12 +1160,13 @@ impl ToolStream {
         if self.function_end.is_none() {
             let i = self.raw[start..].find("<function=")? + start;
             let end = self.raw[i..].find('>')? + i;
+            self.function_start = i + "<function=".len();
             self.function_end = Some(end + 1);
         }
         let function_end = self.function_end?;
         if !self.name_sent {
-            let name_start = self.marker? + "<tool_call><function=".len();
-            let name = self.raw[name_start..function_end - 1].to_string();
+            // The model may put whitespace between <tool_call> and <function=.
+            let name = self.raw[self.function_start..function_end - 1].trim().to_string();
             self.name_sent = true;
             self.scan = function_end;
             self.args_open = true;
@@ -1384,6 +1386,13 @@ mod a5_tests {
         assert_eq!(stream.push("<parameter=city>Paris</parameter>").1.unwrap().arguments, "{\"city\":\"Paris\"");
         assert_eq!(stream.push("</function></tool_call>").1.unwrap().arguments, "}");
         assert!(stream.has_tool());
+    }
+
+    #[test]
+    fn streams_tool_name_after_newline() {
+        let mut stream = ToolStream::default();
+        let name = stream.push("<tool_call>\n<function=write_file>\n").1.unwrap();
+        assert_eq!(name.name.as_deref(), Some("write_file"));
     }
 
     #[test]
