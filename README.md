@@ -161,6 +161,13 @@ defects in our own shim took hipBLASLt from 2497 to 5201 GFLOP/s and erased the
 lead. **A vendor baseline that looks easy to beat is a bug in your harness
 until proven otherwise.**
 
+`bench/` and `exchange/` are a lab notebook, not a product surface. They assume
+the author's machine: llama.cpp checked out at `$HOME/llama.cpp`, models under
+`$HOME/Models`, a local GPU job queue every timed run goes through, and a few
+private tools. Read them for the method and the receipts; expect to edit paths
+before any of it runs elsewhere. The parts meant to run on your machine are
+`./run-tests.sh`, `tools/ci-checks.sh` and the server.
+
 ## The server
 
 `baro-serve` (Rust, `serve/src/`) keeps one engine process alive and speaks
