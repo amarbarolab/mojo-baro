@@ -84,16 +84,17 @@ model=${1:-}; shift || true
 [ -n "$model" ] && [ -f "$model" ] || die "no such model file: ${model:-<none>}"
 model=$(readlink -f "$model")
 
-port=8080; pack=""; work=""; append=0; serve=1; rebuild=0; chat_template_file=""
+port=8080; pack=""; work=""; append=0; serve=1; rebuild=0; chat_template_file=""; profile=""; port_set=0
 while [ $# -gt 0 ]; do
   case $1 in
-    --port) port=$2; shift 2;;
+    --port) port=$2; port_set=1; shift 2;;
     --pack) pack=$(readlink -f "$2"); shift 2;;
     --work) work=$2; shift 2;;
     --append) append=1; shift;;
     --no-serve) serve=0; shift;;
     --rebuild) rebuild=1; shift;;
     --chat-template-file) chat_template_file=$(readlink -f "$2"); shift 2;;
+    --profile) profile=$2; shift 2;;
     *) die "unknown option $1";;
   esac
 done
@@ -107,6 +108,29 @@ meta=$work/meta.json
 py=$here/.venv/bin/python3
 [ -x "$py" ] || py=python3
 "$py" "$here/tools/gguf-extract.py" "$model" --meta > "$meta" || die "cannot read $model"
+# A profile (profiles/NAME.toml, checked against docs/settings-template.toml)
+# supplies env, -D flags, an engine source (the file's harness or this
+# checkout), and optionally a pack and a port. Explicit --pack/--port win.
+penv=""; pflags=""; psource=file
+if [ -n "$profile" ]; then
+  prof=$here/.work/profile
+  if [ ! -x "$prof" ] || [ "$here/tools/profile.mojo" -nt "$prof" ]; then
+    "$here/.venv/bin/mojo" build "$here/tools/profile.mojo" -I "${MOJO_TOML_SRC:-$HOME/Projects/imports/databooth-mojo-toml/src}" -o "$prof" > "$work/profile-build.log" 2>&1 \
+      || die "profile tool build FAILED, see $work/profile-build.log"
+  fi
+  "$prof" env "$profile" >/dev/null || die "profile $profile is invalid (tools/profile.py check)"
+  penv=$("$prof" env "$profile")
+  pflags=$("$prof" build "$profile")
+  psource=$("$prof" get "$profile" source)
+  ppack=$("$prof" get "$profile" pack)
+  pport=$("$prof" get "$profile" port)
+  if [ -z "$pack" ] && [ -n "$ppack" ]; then
+    case $ppack in /*) pack=$ppack;; *) pack=$here/$ppack;; esac
+    [ -d "$pack" ] || die "profile $profile: pack $pack does not exist"
+  fi
+  [ "$port_set" = 1 ] || [ -z "$pport" ] || port=$pport
+  echo "profile: $profile (engine source: $psource${pflags:+, $pflags}${penv:+, env: $penv})"
+fi
 commit=$(kvget baro.kernel.commit)
 kmodel=$(kvget baro.kernel.model)
 [ -n "$commit" ] || die "not a BARO file: no baro.kernel.commit"
@@ -177,8 +201,16 @@ serve)
   hpath=$(kvget baro.run.harness.path); hpath=${hpath:-serve/engine.mojo}
   hname=$(basename "$hpath")
 
+  # Engines built with profile flags or from the checkout get their own slot,
+  # keyed by source, checkout commit and flags; the default engine is unchanged.
+  ename=engine
+  if [ "$psource" = checkout ] || [ -n "$pflags" ]; then
+    ckey="$psource $pflags"
+    [ "$psource" = checkout ] && ckey="$ckey $(git -C "$here" rev-parse HEAD)$(git -C "$here" diff --quiet HEAD -- serve kernels latentos uregex minja || echo -dirty)"
+    ename=engine-$(printf '%s' "$ckey" | sha256sum | cut -c1-12)
+  fi
   built=0
-  if [ "$rebuild" = 1 ] || [ ! -x "$cache/engine" ]; then
+  if [ "$rebuild" = 1 ] || [ ! -x "$cache/$ename" ]; then
     built=1
     ebuild0=$(date +%s)
     src=$cache/src
@@ -211,11 +243,18 @@ serve)
     [ "$hname" = "engine.mojo" ] && [ -n "$kmodel" ] && dflag="-D BARO_MODEL=$kmodel"
     echo "building engine ($hpath${dflag:+, $dflag}) ..."
     # shellcheck disable=SC2086
-    "$mojo" build "${accel[@]}" "$src/$hname" -I "$src" $dflag -o "$cache/engine.new" > "$cache/build.log" 2>&1
-    [ -x "$cache/engine.new" ] || { grep -m3 error "$cache/build.log"; die "engine build FAILED, see $cache/build.log"; }
-    mv -f "$cache/engine.new" "$cache/engine"
+    if [ "$psource" = checkout ]; then
+      [ "$hname" = engine.mojo ] || die "profile source=checkout supports engine.mojo models only"
+      # shellcheck disable=SC2086
+      "$mojo" build "${accel[@]}" "$here/serve/engine.mojo" -I "$here" -I "$here/kernels" -I "$here/serve" $dflag $pflags -o "$cache/$ename.new" > "$cache/build.log" 2>&1
+    else
+      # shellcheck disable=SC2086
+      "$mojo" build "${accel[@]}" "$src/$hname" -I "$src" $dflag $pflags -o "$cache/$ename.new" > "$cache/build.log" 2>&1
+    fi
+    [ -x "$cache/$ename.new" ] || { grep -m3 error "$cache/build.log"; die "engine build FAILED, see $cache/build.log"; }
+    mv -f "$cache/$ename.new" "$cache/$ename"
     ebuild_s=$(( $(date +%s) - ebuild0 ))
-    echo "engine: built in ${ebuild_s}s -> $cache/engine"
+    echo "engine: built in ${ebuild_s}s -> $cache/$ename"
     "$py" - "$work/model-id.json" "$model" "$commit" "$hpath" "${dflag:-none}" "$ebuild_s" <<'PYEOF' > "$cache/manifest.json"
 import json, sys, time
 idjson_path, model, commit, harness, flags, secs = sys.argv[1:7]
@@ -229,7 +268,7 @@ json.dump({
 }, sys.stdout, indent=1)
 PYEOF
   fi
-  echo "engine: $([ $built = 1 ] && echo miss || echo hit) $cache/engine"
+  echo "engine: $([ $built = 1 ] && echo miss || echo hit) $cache/$ename"
 
   # GGUF sha (item 2: packs keyed by id + the checkpoint's own weights, never
   # just id), cached by (path, size, mtime) so a warm `baro serve` never
@@ -242,7 +281,7 @@ PYEOF
     gsha=$(sha256sum "$model" | cut -d' ' -f1)
     echo "$model $statkey $gsha" >> "$shacache"
   fi
-  packdir=$cache/packs/$gsha
+  packdir=${pack:-$cache/packs/$gsha}
   pbuilt=0
   if [ "$rebuild" = 1 ] || [ ! -s "$packdir/index.txt" ]; then
     pbuilt=1
@@ -299,10 +338,10 @@ PYEOF
   [ -z "$renv" ] || echo "env from the file: $renv"
   echo "self-reported: every tok/s this server prints came from the harness the"
   echo "self-reported: model file carries, not from a harness a verifier chose."
-  server_args=(--engine "$cache/engine" --pack "$packdir" --port "$port")
+  server_args=(--engine "$cache/$ename" --pack "$packdir" --port "$port")
   [ -z "$chat_template_file" ] || server_args+=(--chat-template-file "$chat_template_file")
   # shellcheck disable=SC2086
-  exec env $renv "$bs" "${server_args[@]}"
+  exec env $renv $penv "$bs" "${server_args[@]}"
   ;;
 
 run)
@@ -391,7 +430,7 @@ run)
   server_args=(--engine "$work/engine" --pack "$pack" --port "$port")
   [ -z "$chat_template_file" ] || server_args+=(--chat-template-file "$chat_template_file")
   # shellcheck disable=SC2086
-  exec env $renv "$bs" "${server_args[@]}"
+  exec env $renv $penv "$bs" "${server_args[@]}"
   ;;
 
 *)

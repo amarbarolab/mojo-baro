@@ -1,0 +1,10 @@
+[profile]
+name = "regescore-fast"
+model = "qwen35moe"
+description = "RegesCore-35B, all experts in VRAM, default launch path. The recorded champion."
+source = "file"
+speed = "111.89 tok/s decode, 20-prompt median"
+receipt = "docs/BASELINE.md, qwen35moe decode (R6.0b 38ee0b7)"
+
+[env]
+BARO_MEGA = "0"
