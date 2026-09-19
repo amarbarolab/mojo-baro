@@ -935,8 +935,9 @@ def moe_prefill_forward(ctx: DeviceContext, mut b: WindowBufs, m: Int, pos: Int,
             Lg, Idx, Wt, Fp, tens_f32(ctx, b.wbuf, b.off[extra_base + 4], H, h_layout), Sig, Int32(H),
             grid_dim=m, block_dim=MOE_THREADS // MOE_WAVES)
         var up_offset = b.off[routed_base + 1] - b.off[routed_base]
+        var stage_base = 0
         if b.tier.active:
-            b.tier.stage_layer(ctx, layer)
+            stage_base = b.tier.stage_layer(ctx, layer)
             up_offset = N_EXP * b.tier.geom[layer].eb
         # Pairs (token, k) sorted by expert, PF_MR pairs of one expert per
         # thread share each weight load; per-element order is the m=1 dot's
@@ -948,17 +949,19 @@ def moe_prefill_forward(ctx: DeviceContext, mut b: WindowBufs, m: Int, pos: Int,
         ctx.enqueue_function[moe_pairs_group[PF_MR, type_of(pf_idx_layout), type_of(pf_ge_layout), type_of(pf_gp_layout), type_of(pf_gs_layout)]](
             Idx, Ge, Gp, Gs, Int32(m), Int32(ng), grid_dim=1, block_dim=32)
         ctx.enqueue_function[moe_gate_up_q4k_grouped[PF_MR, E_FFN, type_of(xp_layout), type_of(pf_ge_layout), type_of(pf_gp_layout), type_of(pf_rh_layout)]](
-            CurBp, (b.tier.pf_stage.unsafe_ptr() if b.tier.active else b.wbuf.unsafe_ptr().unsafe_offset(b.off[routed_base])), Ge, Gp, RoutedH, Int32(H), Int32(up_offset),
+            CurBp, (b.tier.pf_stage.unsafe_ptr().unsafe_offset(stage_base) if b.tier.active else b.wbuf.unsafe_ptr().unsafe_offset(b.off[routed_base])), Ge, Gp, RoutedH, Int32(H), Int32(up_offset),
             grid_dim=(ceildiv(E_FFN, MOE_WAVES), ng), block_dim=MOE_THREADS)
         var Dn = row_f32(ctx, b.pf_dn_d, 0, CP * TOPK * H, pf_dn_layout)
         if layer == 34 or layer == 38 or layer == 39:
             ctx.enqueue_function[moe_down_q6k_grouped[PF_MR, E_FFN, type_of(pf_rh_layout), type_of(pf_ge_layout), type_of(pf_gp_layout), type_of(pf_dn_layout)]](
-                RoutedH, (b.tier.pf_stage.unsafe_ptr().unsafe_offset(2 * up_offset) if b.tier.active else b.wbuf.unsafe_ptr().unsafe_offset(b.off[routed_base + 2])), Ge, Gp, Dn, Int32(H), grid_dim=(ceildiv(H, MOE_WAVES), ng), block_dim=MOE_THREADS)
+                RoutedH, (b.tier.pf_stage.unsafe_ptr().unsafe_offset(stage_base + 2 * up_offset) if b.tier.active else b.wbuf.unsafe_ptr().unsafe_offset(b.off[routed_base + 2])), Ge, Gp, Dn, Int32(H), grid_dim=(ceildiv(H, MOE_WAVES), ng), block_dim=MOE_THREADS)
         else:
             ctx.enqueue_function[moe_down_q4k_grouped[PF_MR, E_FFN, type_of(pf_rh_layout), type_of(pf_ge_layout), type_of(pf_gp_layout), type_of(pf_dn_layout)]](
-                RoutedH, (b.tier.pf_stage.unsafe_ptr().unsafe_offset(2 * up_offset) if b.tier.active else b.wbuf.unsafe_ptr().unsafe_offset(b.off[routed_base + 2])), Ge, Gp, Dn, Int32(H), grid_dim=(ceildiv(H, MOE_WAVES), ng), block_dim=MOE_THREADS)
+                RoutedH, (b.tier.pf_stage.unsafe_ptr().unsafe_offset(stage_base + 2 * up_offset) if b.tier.active else b.wbuf.unsafe_ptr().unsafe_offset(b.off[routed_base + 2])), Ge, Gp, Dn, Int32(H), grid_dim=(ceildiv(H, MOE_WAVES), ng), block_dim=MOE_THREADS)
         ctx.enqueue_function[moe_down_combine[TOPK, type_of(pf_dn_layout), type_of(pf_idx_layout), type_of(xp_layout)]](
             Dn, Wt, Routed, Int32(H), grid_dim=(ceildiv(H, 256), m), block_dim=256)
+        if b.tier.active:
+            b.tier.stage_next(ctx, layer)
         var shared_gate = b.off[extra_base + 1]
         ctx.enqueue_function[moe_shared_gate_up_q8_0_rows[SH_FFN, type_of(xp_layout), type_of(pf_sh_layout)]](
             CurBp, b.wbuf.unsafe_ptr().unsafe_offset(shared_gate), SharedH, Int32(H), Int32((H // 32) * 34), Int32(b.off[extra_base + 2] - shared_gate),

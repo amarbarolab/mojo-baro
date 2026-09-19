@@ -44,7 +44,7 @@ from std.memory import UnsafePointer
 from std.os import getenv
 from std.time import perf_counter_ns
 
-from max.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
+from max.gpu.host import DeviceContext, DeviceBuffer, HostBuffer, DeviceEvent
 
 from moe_pack import (
     TensorInfo, parse_moe_index, tensor_byte_size, resolve_plain, N_EXP, TOPK,
@@ -184,6 +184,11 @@ struct ExpertTier(Copyable, Movable):
     var bytes_zc: Int
     var pf_stage: DeviceBuffer[DType.uint8]
     var pf_stage_bytes: Int
+    var pf_overlap: Bool
+    var pf_stream_id: Int
+    var pf_slot_layer: List[Int]
+    var pf_copy_ev: List[DeviceEvent]
+    var pf_read_ev: List[DeviceEvent]
 
     def __init__(
         out self, ctx: DeviceContext, packdir: String, cap: Int, n_layers: Int
@@ -198,6 +203,11 @@ struct ExpertTier(Copyable, Movable):
         self.bytes_zc = 0
         self.pf_stage = ctx.enqueue_create_buffer[DType.uint8](1)
         self.pf_stage_bytes = 0
+        self.pf_overlap = False
+        self.pf_stream_id = 0
+        self.pf_slot_layer = [-1, -1]
+        self.pf_copy_ev = [ctx.create_event(), ctx.create_event()]
+        self.pf_read_ev = [ctx.create_event(), ctx.create_event()]
         self.hoste_h = ctx.enqueue_create_host_buffer[DType.int32](TOPK)
         self.hoste_d = ctx.enqueue_create_buffer[DType.int32](TOPK)
         self.hot_active = (not self.pinned) and getenv("BARO_TIER_HOT", "0") == "1"
@@ -293,6 +303,11 @@ struct ExpertTier(Copyable, Movable):
         self.bytes_zc = 0
         self.pf_stage = ctx.enqueue_create_buffer[DType.uint8](1)
         self.pf_stage_bytes = 0
+        self.pf_overlap = False
+        self.pf_stream_id = 0
+        self.pf_slot_layer = [-1, -1]
+        self.pf_copy_ev = [ctx.create_event(), ctx.create_event()]
+        self.pf_read_ev = [ctx.create_event(), ctx.create_event()]
         self.hoste_h = ctx.enqueue_create_host_buffer[DType.int32](1)
         self.hoste_d = ctx.enqueue_create_buffer[DType.int32](1)
         self.n_layers = 0
@@ -322,11 +337,37 @@ struct ExpertTier(Copyable, Movable):
         self.hot_slot_of = List[Dict[Int, Int]]()
         self.hot_next = List[Int]()
 
-    def stage_layer(mut self, ctx: DeviceContext, layer: Int) raises:
-        """Batched prefill (bench/moe-prefill-protocol.md, design item 5): all
-        N_EXP experts of one layer, pinned store to one VRAM staging buffer,
-        gate | up | down. A chunk touches nearly every expert, so the slot
-        cache and its per-row prepare are bypassed and left untouched."""
+    def _stage_copy(mut self, ctx: DeviceContext, layer: Int, slot: Int) raises:
+        var eb = self.geom[layer].eb
+        var ebd = self.geom[layer].ebd
+        var base = slot * self.pf_stage_bytes
+        ctx.enqueue_copy(
+            dst_buf=DeviceBuffer[DType.uint8](ctx, self.pf_stage.unsafe_ptr().unsafe_offset(base), N_EXP * eb, owning=False),
+            src_buf=self.store.create_sub_buffer[DType.uint8](self.geom[layer].gate_off, N_EXP * eb),
+        )
+        ctx.enqueue_copy(
+            dst_buf=DeviceBuffer[DType.uint8](ctx, self.pf_stage.unsafe_ptr().unsafe_offset(base + N_EXP * eb), N_EXP * eb, owning=False),
+            src_buf=self.store.create_sub_buffer[DType.uint8](self.geom[layer].up_off, N_EXP * eb),
+        )
+        ctx.enqueue_copy(
+            dst_buf=DeviceBuffer[DType.uint8](ctx, self.pf_stage.unsafe_ptr().unsafe_offset(base + 2 * N_EXP * eb), N_EXP * ebd, owning=False),
+            src_buf=self.store.create_sub_buffer[DType.uint8](self.geom[layer].down_off, N_EXP * ebd),
+        )
+        self.pf_slot_layer[slot] = layer
+
+    def stage_layer(mut self, ctx: DeviceContext, layer: Int) raises -> Int:
+        """Batched prefill (bench/moe-prefill-protocol.md, design item 5 and
+        round 1b item 3): all N_EXP experts of one layer, pinned store to a
+        VRAM staging slot, gate | up | down; returns the slot's byte base.
+        A chunk touches nearly every expert, so the slot cache and its per-row
+        prepare are bypassed and left untouched.
+
+        Two slots and a second stream: while layer L's kernels read slot
+        L % 2 on the compute stream, layer L+1 copies into the other slot on
+        the copy stream. That copy first waits for the event recorded after
+        layer L-1's kernels (the slot's last reader), and layer L+1's kernels
+        wait for the copy's event. BARO_PF_OVERLAP=0 keeps one stream: the
+        copy is then ordered with the kernels by the queue itself."""
         if not self.pinned:
             raise Error("expert tier: batched prefill needs BARO_TIER_PINNED=1")
         if self.pf_stage_bytes == 0:
@@ -335,23 +376,46 @@ struct ExpertTier(Copyable, Movable):
                 var lb = N_EXP * (2 * self.geom[l].eb + self.geom[l].ebd)
                 if lb > need:
                     need = lb
-            self.pf_stage = ctx.enqueue_create_buffer[DType.uint8](need)
+            self.pf_overlap = getenv("BARO_PF_OVERLAP", "1") == "1"
+            self.pf_stage = ctx.enqueue_create_buffer[DType.uint8](need * (2 if self.pf_overlap else 1))
             self.pf_stage_bytes = need
-            print("BARO_TIER prefill stage:", Float64(need) / 1e9, "GB")
-        var eb = self.geom[layer].eb
-        var ebd = self.geom[layer].ebd
-        ctx.enqueue_copy(
-            dst_buf=DeviceBuffer[DType.uint8](ctx, self.pf_stage.unsafe_ptr(), N_EXP * eb, owning=False),
-            src_buf=self.store.create_sub_buffer[DType.uint8](self.geom[layer].gate_off, N_EXP * eb),
-        )
-        ctx.enqueue_copy(
-            dst_buf=DeviceBuffer[DType.uint8](ctx, self.pf_stage.unsafe_ptr().unsafe_offset(N_EXP * eb), N_EXP * eb, owning=False),
-            src_buf=self.store.create_sub_buffer[DType.uint8](self.geom[layer].up_off, N_EXP * eb),
-        )
-        ctx.enqueue_copy(
-            dst_buf=DeviceBuffer[DType.uint8](ctx, self.pf_stage.unsafe_ptr().unsafe_offset(2 * N_EXP * eb), N_EXP * ebd, owning=False),
-            src_buf=self.store.create_sub_buffer[DType.uint8](self.geom[layer].down_off, N_EXP * ebd),
-        )
+            if self.pf_overlap:
+                _ = ctx.create_stream()
+                self.pf_stream_id = ctx.num_streams() - 1
+            print("BARO_TIER prefill stage:", Float64(need) / 1e9, "GB x", 2 if self.pf_overlap else 1, " overlap stream:", self.pf_stream_id)
+        if not self.pf_overlap:
+            self._stage_copy(ctx, layer, 0)
+            return 0
+        var slot = layer % 2
+        var cctx = ctx.select_stream(self.pf_stream_id)
+        if self.pf_slot_layer[slot] != layer:
+            # Nothing pre-staged this layer (first layer of the first chunk).
+            ctx.synchronize()
+            self._stage_copy(cctx, layer, slot)
+            cctx.stream().synchronize()
+        else:
+            ctx.stream().enqueue_wait_for(self.pf_copy_ev[slot])
+        return slot * self.pf_stage_bytes
+
+    def stage_next(mut self, ctx: DeviceContext, layer: Int) raises:
+        """Call after layer `layer`'s expert kernels are enqueued: starts the
+        next layer's copy into the slot layer - 1 used."""
+        if not self.pf_overlap:
+            return
+        var nxt = (layer + 1) % self.n_layers
+        var slot = nxt % 2
+        var cctx = ctx.select_stream(self.pf_stream_id)
+        # Slot `slot` was last read by layer - 1's kernels; their event was
+        # recorded before this layer's kernels were enqueued, so the copy
+        # runs while this layer computes.
+        cctx.stream().enqueue_wait_for(self.pf_read_ev[slot])
+        self._stage_copy(cctx, nxt, slot)
+        var ev = ctx.create_event()
+        cctx.stream().record_event(ev)
+        var rd = ctx.create_event()
+        ctx.stream().record_event(rd)
+        self.pf_read_ev[layer % 2] = rd^
+        self.pf_copy_ev[slot] = ev^
 
     def layer_base(self, layer: Int) -> Int:
         return layer * self.layer_bytes
