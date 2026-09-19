@@ -1,6 +1,71 @@
 # mojo-baro capabilities
 
-What this repo is and what it can actually do, as of 2026-09-17 on `main` at `2208bdb`.
+What this repo is and what it can actually do, as of 2026-09-17 on `main` at `2208bdb`,
+with the changes of 2026-09-18 and 2026-09-19 (`main` at `ea57b60`) listed first, below.
+
+## Changes since 2026-09-17
+
+Read this section before the rest: where it contradicts a later paragraph, this one is newer.
+Two caveats apply to every line that cites a `.work/` receipt dated before 2026-09-19 03:07:
+the primary `.work/` was recreated empty then, so those receipts are LOST. The status word is
+carried from the board entry that recorded the check; the evidence path no longer resolves.
+
+Engine and kernels
+- **Batched MoE prefill (qwen35moe): WORKS, DEFAULT-OFF (`BARO_PREFILL=1`), bit-identical to
+  replay.** Prompt rows go through `moe_prefill_forward` in 1024-row chunks instead of one m=1
+  window per token. Check: `bench/moe-prefill-identity.sh`, PASS 23/23 prompts equal over 64
+  greedy tokens in tier mode (256-row chunks, so long prompts cross chunk boundaries) and in
+  resident mode, 12 of the 23 exercise prefill; receipts `exchange/receipts/MOEPF/`. Kernel
+  receipts: `kernels/test_moe_rows.mojo` (16 outputs bit-exact vs the m=1 kernels),
+  `kernels/test_ssm_rows.mojo` (delta scan bit-exact over 37 rows). Speed, tier mode, engine
+  clock, 2 repeats, a timing job and not yet the speed gate: 1k 524 to 531 tok/s, 8k 428 to 432,
+  32k 246 to 247, against replay at about 67. Report `exchange/lane-MOEPF-report.md`.
+  - **Tier mode streams one layer of experts per chunk** into two VRAM staging slots, the next
+    layer copying on a second `DeviceStream` while the current one computes (`BARO_PF_OVERLAP`,
+    default on, +1.04 GB VRAM). The 64-slot expert cache is bypassed and left untouched.
+  - **WMMA attention and the dense chunk scan in MoE prefill: DEFAULT-OFF, FAIL identity.**
+    `BARO_PF_ATT=wmma` reads 97.92% teacher-forced agreement against a 99% bar
+    (`bench/moe-prefill-agree.sh`, control arm 64/64); `BARO_PF_SSM=chunk` flips a greedy token
+    at index 4. Both reorder sums. Exact attention is the long-context limiter (32k: 133 s vs
+    84 s with WMMA).
+- **Resident MoE pack on a 24 GB card: PARTIAL, short context only.** MAX's memory pool is about
+  90% of free VRAM; the 21 GB pack leaves 0.08 to 0.4 GB, ran out of memory at an 8k f32 KV cache
+  and ran slower than tier mode at 1k. Tier mode (`BARO_TIER=64 BARO_TIER_PINNED=1
+  BARO_TIER_ZC=1`) is the MoE configuration past 1k context. Check: `pack-fit` (iTools).
+- **MoE prompt-lookup (ngram) speculation: WORKS, DEFAULT-OFF, slower.** `BARO_NGRAM=1`
+  (`ad327e8`, `9cbb683`): identity 20/20, acceptance 37.7%, 76.8 tok/s vs 101.1 spec-off, 0.76x.
+- **`BARO_SEQ_CAP` build flag: WORKS** (`92784e9`), the KV sequence count; `-D BARO_SEQ_CAP=1`
+  is what lets one 131072-token sequence fit.
+- **R6.3, dense-addressed q8 dot for the MoE projections (`d684fb2`): PRESENT, UNMEASURED.** The
+  launch path uses it and passes the prefill identity gate above; the preregistered persistent-
+  kernel A/B (`0931e90`) has no numbers.
+
+Serving (all from the 2026-09-18 board entries; receipts lost unless a test suite is named)
+- **`POST /v1/audio/speech` (TTS): WORKS**, WAV through a configurable runner, Piper verified.
+- **PWA browser voice into `/v1/audio/transcriptions`: WORKS** against the whisper sidecar.
+- **Streaming tool-call deltas: WORKS**, OpenAI-shaped name and argument fragments from the
+  `<tool_call>` grammar; newline-after-tag fix `6b21092`.
+- **`hidden: true` and `logits_topk: K` on completions: WORKS**, JSON and SSE.
+- **LAT1 state HMAC (`BARO_STATE_HMAC_KEY`): WORKS**, unsigned or wrong-key imports rejected.
+- **Ollama `POST /api/pull`: WORKS** for the loaded pack, 404 otherwise (Rust tests 81 + 11).
+- **Router prefix affinity with cold-miss locking: WORKS** (router unit tests 13, CPU HTTP gate).
+- **Spark JSON schema enforcement: IMPLEMENTED, live gate UNVERIFIED.**
+- **Chat template file overrides (`8978f10`), request bodies up to 64 MiB (`ff8e523`): WORKS**
+  by their commits; no separate gate named.
+- **`tools/baro eval`, `eval-all`, `multi-serve --devices`: WORKS as CLI wiring**; the two-device
+  token identity gate on real hardware is UNVERIFIED.
+- **LatentOS agent `--daemon` loop: WORKS** (build and liveness gate); the vendored
+  `latentos/agent.mojo` carries this block on top of upstream and `ci-checks` allows for it.
+- **Settings template, all 59 `BARO_*` settings, with `tools/settings-check.py`: WORKS** as a
+  ci check (`d163eb5`, `0108788`).
+
+Verification
+- `bench/preflight.sh` (CPU) before any gate; gates take `EXPLORE=1` for runs that may not
+  claim (verdict `UNVERIFIED`, exit 3). `./run-tests.sh`: rc=0 on `ea57b60`'s tree under
+  `gpu-wait`, 2026-09-19, including the two new parity tests.
+- Not on `main` yet: `lane-r63` `88c27cf` (pin `--target-accelerator`) and `0a44cd4`
+  (`baro --profile NAME`), unreviewed.
+
 
 ## How to read this document
 
@@ -261,6 +326,7 @@ a test).
     cited, only when `BARO_TMAX` is raised at build/run time; the
     committed defaults (TMAX=1088, split threshold=TMAX) are sized for
     short-context decode speed, not long context.
+- **Batched MoE prefill: WORKS, DEFAULT-OFF.** See "Changes since 2026-09-17" at the top.
 - **WMMA prefill attention: PARTIAL, not merged into the main tree.**
   `amar_attn_prefill_wmma` (`attn.mojo`) is registered (`attpw_k`) and used
   in the prefill-long-context lane (`docs/prefill-long-ctx-2026-09-11.md`,
