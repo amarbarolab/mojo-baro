@@ -232,6 +232,46 @@ def amar_ssm_delta_step[
         barrier()
 
 
+def amar_ssm_delta_rows[
+    S0Layout: TensorLayout, CLayout: TensorLayout, GLayout: TensorLayout,
+    OLayout: TensorLayout
+](
+    SAll: TileTensor[f32, S0Layout, MutAnyOrigin],
+    ConvOut: TileTensor[f32, CLayout, MutAnyOrigin],
+    Eg: TileTensor[f32, GLayout, MutAnyOrigin],
+    Beta: TileTensor[f32, GLayout, MutAnyOrigin],
+    O: TileTensor[f32, OLayout, MutAnyOrigin],
+    ring: Int32, ssm_i: Int32, slots: Int32, m: Int32,
+):
+    comptime assert SAll.flat_rank == 5 and ConvOut.flat_rank == 2
+    comptime assert Eg.flat_rank == 2 and O.flat_rank == 3
+    var h = block_idx.x
+    var j = thread_idx.x
+    var kh = h % NH_K
+    var si = Int(ssm_i)
+    var rs = Int(ring) % Int(slots)
+    var ws = (Int(ring) + Int(m)) % Int(slots)
+    var col = SIMD[f32, SSTATE]()
+    comptime for i in range(SSTATE):
+        col[i] = rebind[Scalar[f32]](SAll[rs, si, h, i, j])
+    for r in range(Int(m)):
+        var eg = rebind[Scalar[f32]](Eg[r, h])
+        var beta = rebind[Scalar[f32]](Beta[r, h])
+        var vj = rebind[Scalar[f32]](ConvOut[r, 2 * KDIM + h * SSTATE + j])
+        var sk: Float32 = 0
+        comptime for i in range(SSTATE):
+            sk += col[i] * eg * rebind[Scalar[f32]](ConvOut[r, KDIM + kh * SSTATE + i])
+        var d = (vj - sk) * beta
+        var o: Float32 = 0
+        comptime for i in range(SSTATE):
+            var s = col[i] * eg + rebind[Scalar[f32]](ConvOut[r, KDIM + kh * SSTATE + i]) * d
+            col[i] = s
+            o += s * rebind[Scalar[f32]](ConvOut[r, kh * SSTATE + i])
+        O[r, h, j] = rebind[O.ElementType](o)
+    comptime for i in range(SSTATE):
+        SAll[ws, si, h, i, j] = rebind[SAll.ElementType](col[i])
+
+
 def amar_ssm_gated_out[
     OLayout: TensorLayout, ZLayout: TensorLayout, NLayout: TensorLayout,
     RLayout: TensorLayout

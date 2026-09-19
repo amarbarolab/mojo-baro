@@ -12,6 +12,8 @@ cmake --build "$S" -j"$(nproc)" >/dev/null
 # MOEPF: row-batched MoE kernels bit-exact against their m=1 siblings
 ./.venv/bin/mojo build kernels/test_moe_rows.mojo -o .work/test_moe_rows -I kernels
 ./.work/test_moe_rows
+./.venv/bin/mojo build kernels/test_ssm_rows.mojo -o .work/test_ssm_rows -I kernels
+./.work/test_ssm_rows
 
 # M1a prefix checkpoints: byte-exact restore against the real engine path
 # (needs the q4 pack at BARO_PACK, default .work/engine-pack-q4).

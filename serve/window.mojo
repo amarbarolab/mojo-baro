@@ -14,6 +14,7 @@ from std.time import perf_counter_ns
 from max.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
 from layout import TileTensor, TensorLayout, row_major
 from registry import *
+from std.os import getenv
 from expert_tier import ExpertTier
 from serve_proto import SampleParams
 from moe import (
@@ -29,7 +30,7 @@ from moe_rows import (
     moe_gate_up_q4k_rows, moe_down_q4k_rows, moe_down_q6k_rows,
     moe_shared_gate_up_q8_0_rows, moe_shared_down_q8_0_res_rows, moe_skinny_f32_rows,
 )
-from attn import amar_head_rmsnorm_rope, amar_kv_append2
+from attn import amar_head_rmsnorm_rope, amar_kv_append2, amar_attn_decode
 from ssm import amar_ssm_gated_out_rows_bf16
 from ssm import amar_widen_bf16, amar_ssm_gated_out_bf16
 from elementwise import amar_rmsnorm_cast2
@@ -780,6 +781,7 @@ comptime pf_rh_layout = row_major[CP * TOPK, E_FFN]()
 comptime pf_sh_layout = row_major[CP, SH_FFN]()
 comptime hrr_qp = amar_head_rmsnorm_rope[type_of(qp_layout), type_of(hd_layout)]
 comptime hrr_kvp = amar_head_rmsnorm_rope[type_of(kvp_layout), type_of(hd_layout)]
+comptime att_pk = amar_attn_decode[type_of(qp_layout), type_of(cache_layout), type_of(qp_layout), N_ATT]
 comptime append2_p = amar_kv_append2[type_of(cache_layout), type_of(kvp_layout), N_ATT]
 comptime gated_pm = amar_ssm_gated_out_rows_bf16[type_of(op_layout), type_of(attp_layout), type_of(n128_layout), type_of(attp_layout)]
 
@@ -807,6 +809,12 @@ def moe_prefill_forward(ctx: DeviceContext, mut b: WindowBufs, m: Int, pos: Int,
     if prof:
         ctx.synchronize()
         t0 = perf_counter_ns()
+    # Identity with replay needs the decode kernels' summation order in
+    # attention and in the delta scan (gate 1 diverged on 3 and 4 of 23
+    # prompts with either chunk kernel in). wmma / chunk select the dense
+    # chunk kernels, for speed comparison only.
+    var att_exact = getenv("BARO_PF_ATT", "exact") == "exact"
+    var ssm_exact = getenv("BARO_PF_SSM", "exact") == "exact"
     var Toks = TileTensor(b.toks_d, toks_layout)
     var ConvStateAll = TileTensor(b.convstate_d, csall_layout)
     var SStateAll = TileTensor(b.sstate_d, ssall_layout)
@@ -847,7 +855,10 @@ def moe_prefill_forward(ctx: DeviceContext, mut b: WindowBufs, m: Int, pos: Int,
             ctx.enqueue_function[hrr_qp](Qp, Qn, Float32(1e-6), Int32(pos), Int32(NQH), grid_dim=m * NQH, block_dim=HD)
             ctx.enqueue_function[hrr_kvp](Khd, Kn, Float32(1e-6), Int32(pos), Int32(NKVH), grid_dim=m * NKVH, block_dim=HD)
             ctx.enqueue_function[append2_p](Kc, Vc, Khd, Vhd, b.kvtab_d.unsafe_ptr(), Int32(pos), Int32(att_i), grid_dim=(NKVH, m, 2), block_dim=HD)
-            ctx.enqueue_function[attpw_k](Qp, Kc, Vc, Aop, b.kvtab_d.unsafe_ptr(), Int32(pos), Int32(m), Float32(0.0625), Int32(att_i), grid_dim=(NKVH, ceildiv(m, PW_ROWS)), block_dim=PW_THREADS)
+            if att_exact:
+                ctx.enqueue_function[att_pk](Qp, Kc, Vc, Aop, b.kvtab_d.unsafe_ptr(), Int32(pos + 1), Float32(0.0625), Int32(att_i), grid_dim=(NQH, m), block_dim=HD)
+            else:
+                ctx.enqueue_function[attpw_k](Qp, Kc, Vc, Aop, b.kvtab_d.unsafe_ptr(), Int32(pos), Int32(m), Float32(0.0625), Int32(att_i), grid_dim=(NKVH, ceildiv(m, PW_ROWS)), block_dim=PW_THREADS)
             ctx.enqueue_function[gmul_p](Aopflat, Gatep, AoBp, Int32(m * ATT), grid_dim=ceildiv(m * ATT, 256), block_dim=256)
             ctx.enqueue_function[moe_matmul_q8d_rows_add[type_of(attp_layout), type_of(xp_layout)]](
                 AoBpm, b.wbuf.unsafe_ptr().unsafe_offset(b.off[w + 6]), Xp, Int32(H), Int32(ATT), Int32(H * ATT),
@@ -880,7 +891,10 @@ def moe_prefill_forward(ctx: DeviceContext, mut b: WindowBufs, m: Int, pos: Int,
             ctx.enqueue_function[gates_p](Arp, Brp, Egp, Betap, SsmA, DtB, Int32(m), grid_dim=ceildiv(m * NH_V, 256), block_dim=256)
             ctx.enqueue_function[conv_p](Qkvp, ConvStateAll, Cw, Convp, Int32(ring), Int32(ssm_i), Int32(SLOTS), Int32(m), grid_dim=ceildiv(CONV, 256), block_dim=256)
             ctx.enqueue_function[l2_p](Convp, Int32(m), grid_dim=(NH_V, m), block_dim=SSTATE)
-            ctx.enqueue_function[deltaw_p](SStateAll, Convp, Egp, Betap, Sop, Int32(ring), Int32(ssm_i), Int32(SLOTS), Int32(m), grid_dim=DC_BLOCKS, block_dim=32)
+            if ssm_exact:
+                ctx.enqueue_function[deltar_p](SStateAll, Convp, Egp, Betap, Sop, Int32(ring), Int32(ssm_i), Int32(SLOTS), Int32(m), grid_dim=NH_V, block_dim=SSTATE)
+            else:
+                ctx.enqueue_function[deltaw_p](SStateAll, Convp, Egp, Betap, Sop, Int32(ring), Int32(ssm_i), Int32(SLOTS), Int32(m), grid_dim=DC_BLOCKS, block_dim=32)
             ctx.enqueue_function[gated_pm](Sop, Zp, Nw, ResBp, grid_dim=(NH_V, m), block_dim=SSTATE)
             ctx.enqueue_function[moe_matmul_q8d_rows_add[type_of(attp_layout), type_of(xp_layout)]](
                 ResBp, b.wbuf.unsafe_ptr().unsafe_offset(b.off[w + 9]), Xp, Int32(H), Int32(INNER), Int32(H * INNER),

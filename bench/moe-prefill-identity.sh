@@ -4,16 +4,16 @@
 #   bench/moe-prefill-identity.sh ENGINE PACK OUT [resident|tier]
 # env: SET=mtp (20 bench/mtp-prompts, the brief's gate) | long (prefill-prompts 128/512/1024,
 #      crosses chunk boundaries with PFC) | all;  QUICK=N first N prompts;  PFC=chunk rows (default
-#      engine CP);  EXPLORE=1 skips the preflight check and caps the verdict at UNVERIFIED, exit 3;  NGEN=64;  TMAXV=BARO_TMAX (default 2048, read back from the ready line).
+#      engine CP);  XENV='K=V ...' extra engine env, both arms (diagnostic toggles);  EXPLORE=1 skips the preflight check and caps the verdict at UNVERIFIED, exit 3;  NGEN=64;  TMAXV=BARO_TMAX (default 2048, read back from the ready line).
 # PASS = every prompt's NGEN tokens equal AND the batched arm's own echo shows prefill rows > 0 on
 # every prompt long enough to prefill. Prompts under PF_MIN + 1 tokens are listed as NOT EXERCISED.
 # Receipts: OUT/arm.txt, OUT/{replay,batched}.log, OUT/summary.tsv.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 eng=$1; pack=$2; out=$3; mode=${4:-resident}
-set_=${SET:-mtp}; quick=${QUICK:-0}; pfc=${PFC:-0}; ngen=${NGEN:-64}; tmax=${TMAXV:-2048}; explore=${EXPLORE:-0}
+set_=${SET:-mtp}; quick=${QUICK:-0}; pfc=${PFC:-0}; ngen=${NGEN:-64}; tmax=${TMAXV:-2048}; explore=${EXPLORE:-0}; xenv=${XENV:-}
 if [ -z "${GPU_WAITING_ROOM_JOB:-}" ] && command -v gpu-wait >/dev/null; then
-  exec gpu-wait run --timeout 3600 -- env SET="$set_" QUICK="$quick" PFC="$pfc" NGEN="$ngen" TMAXV="$tmax" EXPLORE="$explore" "$0" "$@"
+  exec gpu-wait run --timeout 3600 -- env SET="$set_" QUICK="$quick" PFC="$pfc" NGEN="$ngen" TMAXV="$tmax" EXPLORE="$explore" XENV="$xenv" "$0" "$@"
 fi
 mkdir -p "$out"
 if [ "$explore" = 1 ]; then echo "EXPLORE=1: preflight not checked, this run can end UNVERIFIED (exit 3) or FAIL, never PASS"
@@ -35,7 +35,7 @@ if [ "$quick" != 0 ]; then files=("${files[@]:0:$quick}"); fi
 { echo "gate=moe-prefill-identity mode=$mode set=$set_ explore=$explore quick=$quick pfc=$pfc ngen=$ngen tmax=$tmax prompts=${#files[@]}"
   echo "eng=$eng sha=$(sha256sum "$eng" | cut -c1-16)"
   echo "pack=$pack index_sha=$(sha256sum "$pack/index.txt" | cut -c1-16) pack_bytes=$(stat -c %s "$pack/pack.bin")"
-  echo "modeenv='$modeenv' pfcenv='$pfcenv'"
+  echo "modeenv='$modeenv' pfcenv='$pfcenv' xenv='$xenv'"
   echo "pcie=$(cat /sys/bus/pci/devices/0000:00:01.1/current_link_speed)"
   echo "commit=$(git rev-parse --short HEAD) dirty='$(git status --short | tr '\n' ';')'"; } | tee "$out/arm.txt"
 
@@ -50,7 +50,7 @@ done
 
 run_arm() { # name BARO_PREFILL
   # shellcheck disable=SC2086
-  env BARO_SERVE=1 BARO_MEGA=0 BARO_SPEC=0 BARO_TMAX="$tmax" BARO_PREFILL="$2" BARO_PACK="$pack" $modeenv $pfcenv "$eng" \
+  env BARO_SERVE=1 BARO_MEGA=0 BARO_SPEC=0 BARO_TMAX="$tmax" BARO_PREFILL="$2" BARO_PACK="$pack" $modeenv $pfcenv $xenv "$eng" \
     < "$out/req.jsonl" > "$out/$1.log" 2>&1 || { echo "FAIL $1 arm: engine exited non-zero, see $out/$1.log"; exit 1; }
   if grep -qiE 'NOT-RESIDENT|^Error|error:|Unhandled exception' "$out/$1.log"; then
     echo "FAIL $1 arm: fail word in $out/$1.log"; exit 1
