@@ -19,7 +19,9 @@ Engine and kernels
   receipts: `kernels/test_moe_rows.mojo` (16 outputs bit-exact vs the m=1 kernels),
   `kernels/test_ssm_rows.mojo` (delta scan bit-exact over 37 rows). Speed, tier mode, engine
   clock, 2 repeats, a timing job and not yet the speed gate: 1k 524 to 531 tok/s, 8k 428 to 432,
-  32k 246 to 247, against replay at about 67. Report `exchange/lane-MOEPF-report.md`.
+  32k 246 to 247, against replay at about 67. Long context: one served chat request of 75,052
+  tokens through `baro-serve` in tier mode answered a needle at 0.95 of the prompt, first token
+  after 651 s (`bench/moe-prefill-needle.sh`, PASS). Report `exchange/lane-MOEPF-report.md`.
   - **Tier mode streams one layer of experts per chunk** into two VRAM staging slots, the next
     layer copying on a second `DeviceStream` while the current one computes (`BARO_PF_OVERLAP`,
     default on, +1.04 GB VRAM). The 64-slot expert cache is bypassed and left untouched.

@@ -1,0 +1,7 @@
+gate=moe-prefill-needle port=8096 timeout_s=300 needle_words=75000
+eng=$HOME/Projects/mojo/mojo-baro/.work/lanes/moepf/.work/moepf/engine-moe-seq1 sha=8e3ac27723707a03
+pack=$HOME/Projects/mojo/mojo-baro/.work/latent-spec/pack-tier index_sha=669ef829ba8b4d6d pack_bytes=2678180352
+modeenv='BARO_MEGA=0 BARO_TIER=64 BARO_TIER_PINNED=1 BARO_TIER_ZC=1 BARO_TMAX=131072 BARO_PREFILL=1'
+pcie=16.0 GT/s PCIe
+commit=e989de1 dirty=''
+server readback: listening on http://127.0.0.1:8096

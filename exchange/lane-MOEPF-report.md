@@ -13,13 +13,14 @@ the Build_Area read, rocm-doctor, the speed and needle gate scripts and the MAX 
 |---|---|---|
 | G1 identity, tier | PASS 23/23 equal over 64 tokens, 12 exercise prefill, 256-row chunks | `bench/moe-prefill-identity.sh`, receipts `exchange/receipts/MOEPF/g1-tier-*` |
 | G1 identity, resident | PASS 23/23 equal over 64 tokens, 12 exercise prefill | same script, `g1-resident-*` |
-| G2 speed | PENDING at the time of this commit (running); receipts below are a timing job, not the gate | `bench/moe-prefill-speed.sh` |
-| G3 needle, about 100k tokens, tier | PENDING (running) | `bench/moe-prefill-needle.sh` |
+| G2 speed | NOT RUN: the maintainer needed the machine at 22:38 and stopped the queue. The numbers below are a timing job (2 repeats, engine clock), not the gate | `bench/moe-prefill-speed.sh`, ready to run |
+| G3 needle, tier, `BARO_SEQ_CAP=1`, `BARO_TMAX=131072` | PASS at 75,052 prompt tokens (not the brief's 100k: 75,000 words came out 1:1 in tokens): HTTP 200, answer contains `5071-DELTA-15` placed at 0.95 of the prompt, engine echo `prefill rows: 75052`, first token after 651 s (about 115 tok/s average, exact attention). A 100k rerun was not done | `bench/moe-prefill-needle.sh`, `exchange/receipts/MOEPF/g3-needle-*` |
 | G4 `run-tests.sh` | rc=0 under gpu-wait on the lane tree | `exchange/receipts/MOEPF/run-tests-tail.log` |
-| G4 `tools/ci-checks.sh` | see the merge commit | |
+| G4 `tools/ci-checks.sh` | passed on the lane tree inside `lane-merge` (READY) before the fast-forward to `main` `ea57b60`; the docs-only commit after it was not re-checked (UNVERIFIED) | `lane-merge lane-moepf` |
 
-`BARO_PREFILL` stays OPT-IN for the MoE profile (`BARO_PREFILL=1`). The protocol's adoption rule
-flips the default only after G3; that is a one-line follow-up, not part of this merge.
+`BARO_PREFILL` stays OPT-IN for the MoE profile (`BARO_PREFILL=1`). G1, G3 (at 75k) and G4
+passed, so the protocol's adoption rule is met except for G3's length; the default flip is a
+one-line follow-up left for the maintainer to call, together with the 100k rerun and G2.
 
 Of the 20 `bench/mtp-prompts` the brief names, only 9 have the 17 tokens that reach PF_MIN, the
 longest prefills 58 rows and none crosses a chunk. The gate therefore adds 128, 512 and 1024

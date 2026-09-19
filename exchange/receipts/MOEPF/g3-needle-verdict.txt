@@ -1,0 +1,4 @@
+wrote $HOME/Projects/mojo/mojo-baro/.work/lanes/moepf/.work/moepf/gates/g3-needle/request.json (75022 words, needle at 0.950 of the prompt), code 5071-DELTA-15
+first token: 651.326s  total: 651.406s
+PASS answer contains needle value '5071-DELTA-15'
+PASS moe-prefill-needle: see $HOME/Projects/mojo/mojo-baro/.work/lanes/moepf/.work/moepf/gates/g3-needle/response.txt and $HOME/Projects/mojo/mojo-baro/.work/lanes/moepf/.work/moepf/gates/g3-needle/server.log
