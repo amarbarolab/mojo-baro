@@ -4,19 +4,20 @@
 #   bench/moe-prefill-identity.sh ENGINE PACK OUT [resident|tier]
 # env: SET=mtp (20 bench/mtp-prompts, the brief's gate) | long (prefill-prompts 128/512/1024,
 #      crosses chunk boundaries with PFC) | all;  QUICK=N first N prompts;  PFC=chunk rows (default
-#      engine CP);  NGEN=64;  TMAXV=BARO_TMAX (default 2048, read back from the ready line).
+#      engine CP);  EXPLORE=1 skips the preflight check and caps the verdict at UNVERIFIED, exit 3;  NGEN=64;  TMAXV=BARO_TMAX (default 2048, read back from the ready line).
 # PASS = every prompt's NGEN tokens equal AND the batched arm's own echo shows prefill rows > 0 on
 # every prompt long enough to prefill. Prompts under PF_MIN + 1 tokens are listed as NOT EXERCISED.
 # Receipts: OUT/arm.txt, OUT/{replay,batched}.log, OUT/summary.tsv.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 eng=$1; pack=$2; out=$3; mode=${4:-resident}
-set_=${SET:-mtp}; quick=${QUICK:-0}; pfc=${PFC:-0}; ngen=${NGEN:-64}; tmax=${TMAXV:-2048}
+set_=${SET:-mtp}; quick=${QUICK:-0}; pfc=${PFC:-0}; ngen=${NGEN:-64}; tmax=${TMAXV:-2048}; explore=${EXPLORE:-0}
 if [ -z "${GPU_WAITING_ROOM_JOB:-}" ] && command -v gpu-wait >/dev/null; then
-  exec gpu-wait run --timeout 3600 -- env SET="$set_" QUICK="$quick" PFC="$pfc" NGEN="$ngen" TMAXV="$tmax" "$0" "$@"
+  exec gpu-wait run --timeout 3600 -- env SET="$set_" QUICK="$quick" PFC="$pfc" NGEN="$ngen" TMAXV="$tmax" EXPLORE="$explore" "$0" "$@"
 fi
 mkdir -p "$out"
-bench/preflight.sh --check || { echo "FAIL preflight: tree changed since the last passing bench/preflight.sh"; exit 1; }
+if [ "$explore" = 1 ]; then echo "EXPLORE=1: preflight not checked, this run can end UNVERIFIED (exit 3) or FAIL, never PASS"
+else bench/preflight.sh --check || { echo "FAIL preflight: tree changed since the last passing bench/preflight.sh"; exit 1; }; fi
 case "$mode" in
   resident) modeenv="" ;;
   tier) modeenv="BARO_TIER=64 BARO_TIER_PINNED=1 BARO_TIER_ZC=1" ;;
@@ -31,7 +32,7 @@ if [ "$set_" = long ] || [ "$set_" = all ]; then files+=(bench/prefill-prompts/p
 [ "${#files[@]}" -gt 0 ] || { echo "FAIL args: SET '$set_' selects no prompts"; exit 1; }
 if [ "$quick" != 0 ]; then files=("${files[@]:0:$quick}"); fi
 
-{ echo "gate=moe-prefill-identity mode=$mode set=$set_ quick=$quick pfc=$pfc ngen=$ngen tmax=$tmax prompts=${#files[@]}"
+{ echo "gate=moe-prefill-identity mode=$mode set=$set_ explore=$explore quick=$quick pfc=$pfc ngen=$ngen tmax=$tmax prompts=${#files[@]}"
   echo "eng=$eng sha=$(sha256sum "$eng" | cut -c1-16)"
   echo "pack=$pack index_sha=$(sha256sum "$pack/index.txt" | cut -c1-16) pack_bytes=$(stat -c %s "$pack/pack.bin")"
   echo "modeenv='$modeenv' pfcenv='$pfcenv'"
@@ -62,9 +63,9 @@ run_arm batched 1
 grep -q '^BARO_PREFILL: False' "$out/replay.log" || { echo "FAIL replay arm VOID: engine did not echo BARO_PREFILL: False"; exit 1; }
 grep -q '^BARO_PREFILL: True' "$out/batched.log" || { echo "FAIL batched arm VOID: engine did not echo BARO_PREFILL: True"; exit 1; }
 
-python3 - "$out" "$ngen" <<'EOF'
+python3 - "$out" "$ngen" "$explore" <<'EOF'
 import json, re, sys
-out, ngen = sys.argv[1], int(sys.argv[2])
+out, ngen, explore = sys.argv[1], int(sys.argv[2]), sys.argv[3] == "1"
 names = {int(a): (b, int(c)) for a, b, c in (l.rstrip("\n").split("\t") for l in open(f"{out}/names.tsv"))}
 def load(arm):
     toks, rows = {}, []
@@ -102,5 +103,7 @@ ex = len(names) - len(idle)
 print(f"exercised {ex}/{len(names)} (NOT EXERCISED, under PF_MIN+1 tokens: {' '.join(idle) or 'none'})")
 if bad:
     print(f"FAIL {len(bad)}/{len(names)} {' '.join(bad)}  (name@first divergent token index), see {out}/summary.tsv"); sys.exit(1)
+if explore:
+    print(f"UNVERIFIED (EXPLORE=1, no preflight): {len(names)}/{len(names)} equal over {ngen} tokens, {ex} exercised prefill"); sys.exit(3)
 print(f"PASS identity {len(names)}/{len(names)} equal over {ngen} tokens, {ex} exercised prefill, see {out}/summary.tsv")
 EOF
