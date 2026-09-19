@@ -791,7 +791,6 @@ comptime gated_pm = amar_ssm_gated_out_rows_bf16[type_of(op_layout), type_of(att
 
 
 comptime PF_MR = 8
-comptime PF_EXACT_T = 256
 comptime PF_NG = CP * TOPK // PF_MR + N_EXP
 comptime pf_ge_layout = row_major[PF_NG]()
 comptime pf_gp_layout = row_major[PF_NG * PF_MR]()
@@ -826,14 +825,12 @@ def moe_prefill_forward(ctx: DeviceContext, mut b: WindowBufs, m: Int, pos: Int,
         t0 = perf_counter_ns()
     # Identity with replay needs the decode kernels' summation order in
     # attention and in the delta scan (gate 1 diverged on 3 and 4 of 23
-    # prompts with either chunk kernel in). Up to PF_EXACT_T prompt tokens
-    # both are exact and the gate is greedy equality. Above it attention is
-    # the WMMA chunk kernel (8k: 24.5 -> 21.0 s) and the gate is
-    # teacher-forced agreement, which is this repo's identity rule past ~256
-    # ids anyway. The chunk scan stays off: 8% at 8k and it diverges at
-    # token 4. BARO_PF_ATT / BARO_PF_SSM = exact | wmma / chunk override.
-    var att_env = getenv("BARO_PF_ATT", "auto")
-    var att_exact = att_env == "exact" or (att_env == "auto" and n_prompt <= PF_EXACT_T)
+    # prompts with either chunk kernel in), so both are exact by default at
+    # every length. BARO_PF_ATT=wmma is opt-in: 8k 24.5 -> 21.0 s, but its
+    # teacher-forced agreement vs replay was 61, 63, 64 of 64 (mean 97.92%),
+    # under the 99% bar set before the run (bench/moe-prefill-agree.sh).
+    # BARO_PF_SSM=chunk: 8% at 8k, diverges at token 4.
+    var att_exact = getenv("BARO_PF_ATT", "exact") != "wmma"
     var ssm_exact = getenv("BARO_PF_SSM", "exact") == "exact"
     var Toks = TileTensor(b.toks_d, toks_layout)
     var ConvStateAll = TileTensor(b.convstate_d, csall_layout)
