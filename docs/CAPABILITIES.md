@@ -75,7 +75,7 @@ Verification
 ## How to read this document
 
 A one-line-per-capability map of everything below, with the status words and the
-switches, is [`docs/CAPABILITIES-INDEX.md`](CAPABILITIES-INDEX.md).
+switches, is the "What it can do" section of the [README](../README.md).
 
 This is a capability reference, not a plan and not a sales sheet. The rule it is
 written under: a capability appears here with the check that proves it, or it
