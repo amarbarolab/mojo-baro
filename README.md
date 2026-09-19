@@ -202,12 +202,14 @@ script calls `./.venv/bin/mojo`, never a system Mojo.
 
 ```sh
 uv sync            # repo-local .venv with the pinned Mojo/MAX toolchain
-./run-tests.sh     # builds the shim, runs the parity tests and the kernel census
+./run-tests.sh     # builds the shim, runs the parity tests and the kernel census;
+                   # without a model pack it skips the one test that needs one and exits 3
 ./bench/run.py     # correctness gate, then throughput
 ```
 
 Serving a model, one command, any supported GGUF (self-describing `-BARO-*.gguf`
-bakes; `~/Models/library/INDEX.md` lists the verified ones):
+bakes, made from a Hugging Face GGUF or checkpoint by the import pipeline; the
+model roster and the pipeline are in [docs/CAPABILITIES.md](docs/CAPABILITIES.md)):
 
 ```sh
 tools/baro serve MODEL.gguf [--port 8080] [--chat-template-file PATH] [--rebuild]

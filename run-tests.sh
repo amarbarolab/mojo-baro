@@ -17,8 +17,17 @@ cmake --build "$S" -j"$(nproc)" >/dev/null
 
 # M1a prefix checkpoints: byte-exact restore against the real engine path
 # (needs the q4 pack at BARO_PACK, default .work/engine-pack-q4).
-./.venv/bin/mojo build kernels/test_prefix.mojo -o .work/test_prefix -I . -I kernels -I serve
-./.work/test_prefix
+# A fresh clone has no pack: every other test below is self-contained, this one is
+# skipped LOUDLY and the script ends with exit 3, not 0. Build a pack from any
+# qwen35 GGUF with `tools/baro run MODEL.gguf --no-serve` (it prints the pack dir).
+pack=${BARO_PACK:-.work/engine-pack-q4}; skipped=""
+if [ -f "$pack/pack.bin" ]; then
+  ./.venv/bin/mojo build kernels/test_prefix.mojo -o .work/test_prefix -I . -I kernels -I serve
+  BARO_PACK="$pack" ./.work/test_prefix
+else
+  skipped="test_prefix (no q4 pack at $pack)"
+  echo "SKIP $skipped"
+fi
 
 # C3 host reference sampler: pure CPU, no accelerator needed, matched
 # against kernels/sample.mojo's semantics (lane-KSAMP).
@@ -56,3 +65,9 @@ mkdir -p .work/katt
 
 ./.venv/bin/mojo build tools/kernel-census.mojo -o .work/kernel-census
 ./.work/kernel-census --check
+if [ -n "$skipped" ]; then
+  echo "INCOMPLETE: every pack-free test passed; SKIPPED $skipped."
+  echo "  Build one: tools/baro run MODEL.gguf --no-serve   then   BARO_PACK=<printed pack dir> ./run-tests.sh"
+  exit 3
+fi
+echo "PASS run-tests: all tests, pack $pack"
