@@ -4,7 +4,7 @@ from max.gpu.host import DeviceContext, DeviceBuffer
 from layout import TileTensor, TensorLayout, row_major
 
 from elementwise import (
-    amar_rmsnorm, amar_rmsnorm_cast, amar_rmsnorm_cast2, amar_embed_lookup_pos, amar_argmax_pos, amar_tok_copy, amar_tok_remap,
+    amar_rmsnorm, amar_rmsnorm_cast, amar_rmsnorm_cast2, amar_rmsnorm_cast2_rows, amar_embed_lookup_pos, amar_argmax_pos, amar_tok_copy, amar_tok_remap,
     amar_quantize_q8_rows,
 )
 from matmul_skinny import (
@@ -291,6 +291,7 @@ comptime dcomb_k = amar_dattn_combine[HD, MEGA_G, type_of(p_att_layout), type_of
 comptime gmul_k = amar_gate_mul_cast[type_of(attflat_layout), type_of(attflat_layout), type_of(attflat_layout)]
 
 comptime rmsc_p = amar_rmsnorm_cast[type_of(xp_layout), type_of(h_layout), type_of(xp_layout)]
+comptime rmsc2_p = amar_rmsnorm_cast2_rows[type_of(xp_layout), type_of(h_layout), type_of(xp_layout), type_of(xp_layout)]
 comptime embed_p = amar_embed_lookup_pos[type_of(emb_layout), type_of(xp_layout), type_of(toks_layout)]
 comptime gates_p = amar_ssm_gates_rows[type_of(g32p_layout), type_of(g32p_layout), type_of(g32_layout)]
 comptime conv_p = amar_ssm_conv_chunk[type_of(qfp_layout), type_of(csall_layout), type_of(cw_layout), type_of(convp_layout)]

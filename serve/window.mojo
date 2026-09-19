@@ -32,7 +32,7 @@ from moe_rows import (
 from attn import amar_head_rmsnorm_rope, amar_kv_append2
 from ssm import amar_ssm_gated_out_rows_bf16
 from ssm import amar_widen_bf16, amar_ssm_gated_out_bf16
-from elementwise import amar_rmsnorm_cast2, amar_rmsnorm_cast2_rows
+from elementwise import amar_rmsnorm_cast2
 from grammar.automaton import Bitset
 from grammar.matcher import Matcher
 from grammar_rt import reasoning_boundary_observe
@@ -778,7 +778,6 @@ comptime pf_idx_layout = row_major[CP, TOPK]()
 comptime pf_sig_layout = row_major[CP]()
 comptime pf_rh_layout = row_major[CP * TOPK, E_FFN]()
 comptime pf_sh_layout = row_major[CP, SH_FFN]()
-comptime rmsc2_p = amar_rmsnorm_cast2_rows[type_of(xp_layout), type_of(h_layout), type_of(xp_layout), type_of(xp_layout)]
 comptime hrr_qp = amar_head_rmsnorm_rope[type_of(qp_layout), type_of(hd_layout)]
 comptime hrr_kvp = amar_head_rmsnorm_rope[type_of(kvp_layout), type_of(hd_layout)]
 comptime append2_p = amar_kv_append2[type_of(cache_layout), type_of(kvp_layout), N_ATT]

@@ -27,6 +27,7 @@ must be reachable from `serve/registry.mojo`, a bench, or a test.
 | `amar_rmsnorm` | `elementwise.mojo` | `XLayout: TensorLayout, GLayout: TensorLayout, OLayout: TensorLayout` | rms_m, rms_h2 | serve/registry.mojo, kernels/test_attn_block.mojo, kernels/test_elementwise.mojo, kernels/test_mega_block.mojo, kernels/test_ssm_block.mojo |
 | `amar_rmsnorm_cast` | `elementwise.mojo` | `XLayout: TensorLayout, GLayout: TensorLayout, OLayout: TensorLayout` | rmsc_k, rmsc_h2, rmsc_p | serve/registry.mojo, serve/spark.mojo, kernels/test_mega_block.mojo |
 | `amar_rmsnorm_cast2` | `elementwise.mojo` | `XLayout: TensorLayout, GLayout: TensorLayout, OLayout: TensorLayout, FLayout: TensorLayout` |  | serve/registry.mojo |
+| `amar_rmsnorm_cast2_rows` | `elementwise.mojo` | `XLayout: TensorLayout, GLayout: TensorLayout, OLayout: TensorLayout, FLayout: TensorLayout` | rmsc2_p | serve/registry.mojo |
 | `amar_rope_rows` | `elementwise.mojo` | `XLayout: TensorLayout` |  | kernels/test_elementwise.mojo |
 | `amar_softmax_rows` | `elementwise.mojo` | `XLayout: TensorLayout` |  | kernels/test_elementwise.mojo |
 | `amar_swiglu` | `elementwise.mojo` | `GLayout: TensorLayout, ULayout: TensorLayout, OLayout: TensorLayout` |  | kernels/test_elementwise.mojo, kernels/test_q8_gemm.mojo |
@@ -46,7 +47,7 @@ must be reachable from `serve/registry.mojo`, a bench, or a test.
 | `amar_matmul_prefill_lds` | `matmul_prefill_lds.mojo` | `WDT: DType, WM: Int, WN: Int, TM: Int, TN: Int, ACC: Bool, ALayout: TensorLayout, QLayout: TensorLayout, SLayout: TensorLayout, CLayout: TensorLayout` |  | serve/registry.mojo, bench/bench_prefill.mojo, kernels/test_prefill.mojo |
 | `amar_matmul_skinny` | `matmul_skinny.mojo` | `in_dtype: DType, ALayout: TensorLayout, BLayout: TensorLayout, PLayout: TensorLayout` |  | bench/bench_coldcache.mojo, bench/bench_decode.mojo, kernels/test_attn_block.mojo, kernels/test_gguf_gemm.mojo, kernels/test_q8_gemm.mojo, kernels/test_ssm_block.mojo |
 | `amar_matmul_skinny_m1` | `matmul_skinny.mojo` | `in_dtype: DType, CPT: Int, ALayout: TensorLayout, BLayout: TensorLayout, PLayout: TensorLayout` |  | bench/bench_coldcache_m1.mojo, bench/bench_coldcache_q8row.mojo, bench/bench_coldcache_row.mojo |
-| `amar_matmul_skinny_m1_row` | `matmul_skinny.mojo` | `in_dtype: DType, UNROLL: Int, ALayout: TensorLayout, WLayout: TensorLayout, OLayout: TensorLayout` |  | bench/bench_coldcache_q8row.mojo, bench/bench_coldcache_row.mojo, kernels/test_moe_block.mojo |
+| `amar_matmul_skinny_m1_row` | `matmul_skinny.mojo` | `in_dtype: DType, UNROLL: Int, ALayout: TensorLayout, WLayout: TensorLayout, OLayout: TensorLayout` |  | bench/bench_coldcache_q8row.mojo, bench/bench_coldcache_row.mojo, kernels/test_moe_block.mojo, kernels/test_moe_rows.mojo |
 | `amar_matmul_skinny_m1_row2` | `matmul_skinny.mojo` | `in_dtype: DType, UNROLL: Int, ALayout: TensorLayout, WLayout: TensorLayout, OLayout: TensorLayout` |  | serve/registry.mojo |
 | `amar_matmul_skinny_q4row` | `matmul_skinny.mojo` | `UNROLL: Int, MR: Int, ALayout: TensorLayout, QLayout: TensorLayout, SLayout: TensorLayout, PLayout: TensorLayout` |  | bench/bench_coldcache_mrow.mojo, kernels/test_mega_block.mojo |
 | `amar_matmul_skinny_q4rowb` | `matmul_skinny.mojo` | `UNROLL: Int, MR: Int, ALayout: TensorLayout, QLayout: TensorLayout, SLayout: TensorLayout, PLayout: TensorLayout, KSPLIT: Int = 1` |  | serve/registry.mojo, bench/bench_coldcache_mrow.mojo, bench/bench_fixedm_kernel_invariance.mojo, bench/bench_prefill.mojo, bench/bench_prefill_abl.mojo, kernels/test_prefill.mojo |
@@ -68,13 +69,13 @@ must be reachable from `serve/registry.mojo`, a bench, or a test.
 | `amar_mega_window` | `mega.mojo` | `MR: Int, RELOAD: Bool, Q4: Bool, XL: TensorLayout, CBL: TensorLayout, QkvL: TensorLayout, G32mL: TensorLayout, ConvL: TensorLayout, OmL: TensorLayout, CsL: TensorLayout, SsL: TensorLayout, QfL: TensorLayout, KvfL: TensorLayout, QmL: TensorLayout, GfL: TensorLayout, PfL: TensorLayout, FbL: TensorLayout, OffL: TensorLayout, CtrL: TensorLayout, TkL: TensorLayout, DkL: TensorLayout, NL: Int, NAT: Int,` | mega_win_k, mega_win_q4_k | serve/registry.mojo, kernels/test_mega_block.mojo |
 | `amar_mega_moe_token` | `mega_moe.mojo` | `CsL: TensorLayout, SsL: TensorLayout, NL: Int, NAT: Int,` | mega_moe_k | serve/registry.mojo |
 | `amar_moe_down` | `moe.mojo` | `NSEL: Int, FFN: Int, HLayout: TensorLayout, DLayout: TensorLayout, ILayout: TensorLayout, WLayout: TensorLayout, OLayout: TensorLayout` |  | kernels/test_moe_block.mojo |
-| `amar_moe_down_q4k` | `moe.mojo` | `NSEL: Int, FFN: Int, HLayout: TensorLayout, ILayout: TensorLayout, WLayout: TensorLayout, OLayout: TensorLayout` |  | kernels/test_moe_block.mojo |
+| `amar_moe_down_q4k` | `moe.mojo` | `NSEL: Int, FFN: Int, HLayout: TensorLayout, ILayout: TensorLayout, WLayout: TensorLayout, OLayout: TensorLayout` |  | kernels/test_moe_block.mojo, kernels/test_moe_rows.mojo |
 | `amar_moe_down_q4k_zc` | `moe.mojo` | `NSEL: Int, FFN: Int, HLayout: TensorLayout, ILayout: TensorLayout, WLayout: TensorLayout, OLayout: TensorLayout` |  | kernels/test_moe_block.mojo |
-| `amar_moe_down_q6k` | `moe.mojo` | `NSEL: Int, FFN: Int, HLayout: TensorLayout, ILayout: TensorLayout, WLayout: TensorLayout, OLayout: TensorLayout` |  | serve/registry.mojo |
+| `amar_moe_down_q6k` | `moe.mojo` | `NSEL: Int, FFN: Int, HLayout: TensorLayout, ILayout: TensorLayout, WLayout: TensorLayout, OLayout: TensorLayout` |  | serve/registry.mojo, kernels/test_moe_rows.mojo |
 | `amar_moe_gate_up` | `moe.mojo` | `NSEL: Int, FFN: Int, XLayout: TensorLayout, GLayout: TensorLayout, ULayout: TensorLayout, ILayout: TensorLayout, HLayout: TensorLayout` |  | kernels/test_moe_block.mojo |
 | `amar_moe_gate_up_q4k` | `moe.mojo` | `NSEL: Int, FFN: Int, XLayout: TensorLayout, ILayout: TensorLayout, HLayout: TensorLayout` |  | kernels/test_moe_block.mojo |
 | `amar_moe_router_top8` | `moe.mojo` | `LLayout: TensorLayout, ILayout: TensorLayout, WLayout: TensorLayout` |  | kernels/test_moe_block.mojo |
-| `amar_moe_router_top8_sig` | `moe.mojo` | `LLayout: TensorLayout, ILayout: TensorLayout, WLayout: TensorLayout, XLayout: TensorLayout, GLayout: TensorLayout, OLayout: TensorLayout` |  | serve/registry.mojo |
+| `amar_moe_router_top8_sig` | `moe.mojo` | `LLayout: TensorLayout, ILayout: TensorLayout, WLayout: TensorLayout, XLayout: TensorLayout, GLayout: TensorLayout, OLayout: TensorLayout` |  | serve/registry.mojo, kernels/test_moe_rows.mojo |
 | `amar_moe_sig_gate` | `moe.mojo` | `XLayout: TensorLayout, GLayout: TensorLayout, OLayout: TensorLayout` |  | kernels/test_moe_block.mojo |
 | `amar_realign_gather` | `realign_kernels.mojo` | `TLayout: TensorLayout, PLayout: TensorLayout, PartLayout: TensorLayout` |  | kernels/test_realign.mojo |
 | `amar_realign_reduce` | `realign_kernels.mojo` | `PartLayout: TensorLayout, ELayout: TensorLayout` |  | kernels/test_realign.mojo |
@@ -127,6 +128,7 @@ Every `kernels/test_*.mojo`, the gate script that runs it, and its first docstri
 | `test_mega_block.mojo` | tools/mega-gate.sh | Stage 1+2+3 (+ multi-row window) gate of bench/megakernel-protocol.md. |
 | `test_mmq.mojo` | manual | Parity for the int8 MMQ prefill path (bench/prefill-protocol.md R5). |
 | `test_moe_block.mojo` | manual | Parity: one decode token through the qwen35moe sparse-MoE block on GPU vs the numpy reference (tools/moe-ref.py implementing transformers Qwen3_5MoeSparseMoeBlock). |
+| `test_moe_rows.mojo` | run-tests.sh | Parity: the row-batched MoE kernels (kernels/moe_rows.mojo) against the m=1 kernels they are siblings of, BIT-EXACT, token by token. |
 | `test_prefill.mojo` | tools/merge-gate.sh | Parity for the prefill kernels (bench/prefill-protocol.md, lane prefill). |
 | `test_prefix.mojo` | run-tests.sh | Byte-exact prefix checkpoint restore (bench/chat-protocol.md M1a, P-F1). |
 | `test_q8_gemm.mojo` | manual | Milestone-6 checks: int8 dequant-in-kernel GEMM + fused SwiGLU epilogue. |
