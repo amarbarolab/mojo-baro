@@ -206,11 +206,12 @@ serve)
 
     mojo=$here/.venv/bin/mojo
     [ -x "$mojo" ] || die "no $mojo; run 'uv sync' in the checkout first (the pinned toolchain is max[all]==26.5.0)"
+    accel=(--target-accelerator "${BARO_TARGET_ACCELERATOR:-gfx1100}")
     dflag=""
     [ "$hname" = "engine.mojo" ] && [ -n "$kmodel" ] && dflag="-D BARO_MODEL=$kmodel"
     echo "building engine ($hpath${dflag:+, $dflag}) ..."
     # shellcheck disable=SC2086
-    "$mojo" build "$src/$hname" -I "$src" $dflag -o "$cache/engine.new" > "$cache/build.log" 2>&1
+    "$mojo" build "${accel[@]}" "$src/$hname" -I "$src" $dflag -o "$cache/engine.new" > "$cache/build.log" 2>&1
     [ -x "$cache/engine.new" ] || { grep -m3 error "$cache/build.log"; die "engine build FAILED, see $cache/build.log"; }
     mv -f "$cache/engine.new" "$cache/engine"
     ebuild_s=$(( $(date +%s) - ebuild0 ))
@@ -334,6 +335,7 @@ run)
 
   mojo=$here/.venv/bin/mojo
   [ -x "$mojo" ] || die "no $mojo; run 'uv sync' in the checkout first (the pinned toolchain is max[all]==26.5.0)"
+  accel=(--target-accelerator "${BARO_TARGET_ACCELERATOR:-gfx1100}")
   dflag=""; [ -n "$kmodel" ] && dflag="-D BARO_MODEL=$kmodel"
   # An engine already built from THIS file's harness is reused. Compiling is
   # minutes of CPU, and the GPU rule (docs/NEXT-PLAN.md) says a gate holds the
@@ -345,7 +347,7 @@ run)
   else
     echo "building engine (model ${kmodel:-qwen35}) ..."
     # shellcheck disable=SC2086
-    "$mojo" build "$src/engine.mojo" -I "$src" $dflag -o "$work/engine" > "$work/build.log" 2>&1
+    "$mojo" build "${accel[@]}" "$src/engine.mojo" -I "$src" $dflag -o "$work/engine" > "$work/build.log" 2>&1
     [ -x "$work/engine" ] || { grep -m3 error "$work/build.log"; die "engine build FAILED, see $work/build.log"; }
     printf '%s' "$esha" > "$work/engine.harness.sha"
   fi
