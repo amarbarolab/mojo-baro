@@ -26,7 +26,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use axum::extract::{Request as AxumRequest, State};
+use axum::extract::{DefaultBodyLimit, Request as AxumRequest, State};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
@@ -210,6 +210,9 @@ async fn main() {
         .route("/v1/state/export", post(state::export))
         .route("/v1/state/import", post(state::import))
         .with_state(app.clone())
+        // axum's 2 MB default refuses a 110k-token prompt; a full 262,144-token
+        // context as text or token ids fits well under 64 MiB.
+        .layer(DefaultBodyLimit::max(64 << 20))
         .layer(middleware::from_fn(access_log));
 
     let listener = match tokio::net::TcpListener::bind((opts.host.as_str(), opts.port)).await {
