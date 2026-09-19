@@ -11,6 +11,7 @@ cd "$(dirname "$0")/.."
 KEY=$1; QUICK=${QUICK:-0}
 bench/preflight.sh --check
 PY=$PWD/.venv/bin/python3; MOJO=$PWD/.venv/bin/mojo; LB=$HOME/llama.cpp/build/bin
+ACCEL=(--target-accelerator "${BARO_TARGET_ACCELERATOR:-gfx1100}")
 WIKI=$HOME/Models/quant-lab/wikitext-2-raw/wiki.test.raw
 OUT=.work/quality/$KEY; rm -rf "$OUT"; mkdir -p "$OUT"
 ok() { echo "OK $1: $2" | tee -a "$OUT/SUMMARY.txt"; }
@@ -40,10 +41,10 @@ TOK=http://127.0.0.1:$TOKP
 chunks=$([ "$QUICK" -gt 0 ] && echo 2 || echo 8)
 if [ "$engine" = spark ]; then
   mkdir -p "$OUT/prof"; .work/gen-profile "$baro_gguf" "$OUT/prof/profile.mojo" > "$OUT/build.log" 2>&1 || die build "$OUT/build.log"
-  "$MOJO" build serve/spark.mojo -I . -I kernels -I serve -I "$OUT/prof" -o "$OUT/engine-head" >> "$OUT/build.log" 2>&1 || die build "$OUT/build.log"
+  "$MOJO" build "${ACCEL[@]}" serve/spark.mojo -I . -I kernels -I serve -I "$OUT/prof" -o "$OUT/engine-head" >> "$OUT/build.log" 2>&1 || die build "$OUT/build.log"
 else
   dflag=(); [ "$engine" = moe ] && dflag=(-D BARO_MODEL=qwen35moe)
-  "$MOJO" build serve/engine.mojo -I . -I kernels "${dflag[@]}" -o "$OUT/engine-head" > "$OUT/build.log" 2>&1 || die build "$OUT/build.log"
+  "$MOJO" build "${ACCEL[@]}" serve/engine.mojo -I . -I kernels "${dflag[@]}" -o "$OUT/engine-head" > "$OUT/build.log" 2>&1 || die build "$OUT/build.log"
 fi
 gpu 1800 env $renv "$PY" bench/quality-ppl-run.py --engine "$OUT/engine-head" --pack "$cache_pack" --text "$WIKI" --tok-url $TOK \
   --ref-prompt "$(jq -r '.["baro.run.prompt.tokens"]' <<<"$meta")" --ref-tokens "$(jq -r '.["baro.run.ref.tokens"]' <<<"$meta")" \

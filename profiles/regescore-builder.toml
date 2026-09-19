@@ -1,0 +1,19 @@
+[profile]
+name = "regescore-builder"
+model = "qwen35moe"
+description = "RegesCore-35B for agent work: experts in host RAM, 131,072-token context, one sequence. Leaves VRAM for the desktop."
+source = "checkout"
+pack = ".work/latent-spec/pack-tier"
+port = 8099
+speed = "67.5 tok/s decode at 131,072 context; prompts prefill one token at a time (~79 tok/s)"
+receipt = "Brain 2026-09-19-session-findings, profiles experiment step 0"
+
+[env]
+BARO_MEGA = "0"
+BARO_TIER = "64"
+BARO_TIER_PINNED = "1"
+BARO_TIER_ZC = "1"
+BARO_TMAX = "131072"
+
+[build]
+BARO_SEQ_CAP = "1"
