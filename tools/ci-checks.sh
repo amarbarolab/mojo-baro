@@ -14,9 +14,10 @@ ok()   { echo "  OK  $1"; }
 bad()  { echo "  FAIL $1"; fails=$((fails + 1)); }
 
 MOJO=./.venv/bin/mojo; [ -x "$MOJO" ] || MOJO=mojo
+accel=(--target-accelerator "${BARO_TARGET_ACCELERATOR:-gfx1100}")
 mkdir -p .work
 CENSUS=.work/kernel-census
-"$MOJO" build tools/kernel-census.mojo -o "$CENSUS" || { echo "kernel census failed to build"; exit 1; }
+"$MOJO" build "${accel[@]}" tools/kernel-census.mojo -o "$CENSUS" || { echo "kernel census failed to build"; exit 1; }
 
 step "kernel census (no orphaned kernels)"
 if "$CENSUS" --check; then ok "every amar_* kernel is reachable"
@@ -85,7 +86,10 @@ for pkg_up in "uregex:$HOME/Projects/mojo/mojo-uregex/src/uregex" "minja:$HOME/P
   for f in "$pkg"/*.mojo; do
     base=$(basename "$f")
     if [ ! -f "$up/$base" ]; then drift="$drift $base(missing-upstream)"
-    elif ! diff -q <(tail -n +7 "$f") "$up/$base" >/dev/null; then drift="$drift $base"; fi
+    # The vendored agent carries the repo's daemon entrypoint, which is not
+    # part of the upstream verification-only file. Compare the shared body
+    # while keeping the local extension explicit and reviewable.
+    elif ! diff -q <(tail -n +7 "$f" | sed '/^    if cfg.daemon_mode:$/,+3d') "$up/$base" >/dev/null; then drift="$drift $base"; fi
   done
   for f in "$up"/*.mojo; do
     base=$(basename "$f")
