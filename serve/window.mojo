@@ -763,8 +763,8 @@ comptime moe_shared_flat_layout = row_major[SH_FFN]()
 comptime moe_inner_layout = row_major[NH_V * SSTATE]()
 comptime moe_inner_m_layout = row_major[1, NH_V * SSTATE]()
 comptime moe_om_layout = row_major[1, NH_V, SSTATE]()
-def moe_ffn(ctx: DeviceContext, mut b: WindowBufs, Xm: TileTensor[f32, type_of(xm_layout), MutAnyOrigin], CurBm: TileTensor[bf16, type_of(xm_layout), MutAnyOrigin], w: Int, layer: Int, routed_base: Int, extra_base: Int, trace_slot: Int = -1) raises:
-    var Xres = row_f32(ctx, b.x_d, 0, H, moe_vec_layout)
+def moe_ffn(ctx: DeviceContext, mut b: WindowBufs, Xm: TileTensor[f32, type_of(xm_layout), MutAnyOrigin], CurBm: TileTensor[bf16, type_of(xm_layout), MutAnyOrigin], w: Int, layer: Int, routed_base: Int, extra_base: Int, trace_slot: Int = -1, xrow: Int = 0) raises:
+    var Xres = row_f32(ctx, b.x_d, xrow * H, H, moe_vec_layout)
     var X = row_f32(ctx, b.p_h_d, 0, H, moe_vec_layout)
     var X2 = row_f32(ctx, b.p_h_d, 0, H, h2_layout)
     var sigmoid = row_f32(ctx, b.p_v_d, 0, 1, moe_one_layout)
@@ -860,8 +860,8 @@ def draft_draw(
     )
 
 
-def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: WindowState) raises:
-    var Xm = TileTensor(b.x_d, xm_layout)
+def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: WindowState, ngram_n: Int = 0) raises:
+    var Xm = row_f32(ctx, b.x_d, 0, MROWS * H, xm_layout)
     var CurBm = TileTensor(b.curb_d, xm_layout)
     var moe_z_d = ctx.enqueue_create_buffer[f32](NH_V * SSTATE)
     var moe_res_d = ctx.enqueue_create_buffer[bf16](NH_V * SSTATE)
@@ -904,7 +904,12 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
             # Gate 2 is deliberately the smallest decode path: one row per
             # call, including prompt replay.
             m = 1
-        if cfg.spec and not (st.pos + 1 < cfg.n_prompt):
+        if ngram_n > 0:
+            m = ngram_n + 1
+            win_spec = True
+            st.n_drafted += ngram_n
+            st.n_spec_windows += 1
+        if cfg.spec and MEGA_ALLOWED and not (st.pos + 1 < cfg.n_prompt):
             # process: tokens st.pos_prev+1..pos through the draft head with the
             # trunk's h rows (row r = h(st.pos_prev + r)); last row = draft step 0.
             var nproc = st.pos - st.pos_prev
@@ -1049,407 +1054,431 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
                         Toks, Dtok0, Hnm0, b.hmax_d.unsafe_ptr(), b.hidx_d.unsafe_ptr(),
                         Int32(st.ring), Int32(SLOTS), Int32(st.pos), Int32(m), Int32(0), Int32(0), Int32(cfg.att_split), grid_dim=MEGA_G_WIN, block_dim=ROW_THREADS,
                     )
+        var window_m = m
+        var window_pos = st.pos
+        var window_ring = st.ring
         for layer in range(0 if (use_mega or use_mega_win) else N_LAYERS):
-            if cfg.prof:
-                ctx.synchronize()
-                st.tp = perf_counter_ns()
-                st.tq = st.tp
-            # -- attention / ssm sub-block --
-            var moe_base = moe_w
-            var decode_base = w
-            comptime if not MEGA_ALLOWED:
-                decode_base = moe_base
-            comptime if MEGA_ALLOWED:
-                ctx.enqueue_function[rmsc_k](
-                    Xm, tens_f32(ctx, b.wbuf, b.off[decode_base], H, h_layout), CurBm,
-                    Int32(H), Float32(1e-6), grid_dim=m, block_dim=256,
-                )
-            else:
-                ctx.enqueue_function[rmsc2_k](
-                    Xm, tens_f32(ctx, b.wbuf, b.off[decode_base], H, h_layout), CurBm,
-                    row_f32(ctx, b.logits_d, 0, H, h2_layout),
-                    Int32(H), Float32(1e-6), grid_dim=m, block_dim=256,
-                )
-
-            if is_attn(layer):
-                var Wqq = tens_q8q(ctx, b.wbuf, b.off[decode_base + 1], H * QF, q_h_qf)
-                var Wqs = tens_q8s(ctx, b.wbuf, b.off[decode_base + 1], H * QF, s_h_qf)
-                var Wkq = tens_q8q(ctx, b.wbuf, b.off[decode_base + 2], H * KV, q_h_kv)
-                var Wks = tens_q8s(ctx, b.wbuf, b.off[decode_base + 2], H * KV, s_h_kv)
-                var Wvq = tens_q8q(ctx, b.wbuf, b.off[decode_base + 3], H * KV, q_h_kv)
-                var Wvs = tens_q8s(ctx, b.wbuf, b.off[decode_base + 3], H * KV, s_h_kv)
-                var Qn = tens_f32(ctx, b.wbuf, b.off[decode_base + 4], HD, hd_layout)
-                var Kn = tens_f32(ctx, b.wbuf, b.off[decode_base + 5], HD, hd_layout)
-                var Woq = tens_q8q(ctx, b.wbuf, b.off[decode_base + 6], H * H, q_h_h)
-                var Wos = tens_q8s(ctx, b.wbuf, b.off[decode_base + 6], H * H, s_h_h)
-                var Pqf = TileTensor(b.p_qf_d, p_qf)
-                var Pkv = TileTensor(b.p_kv_d, p_kv)
-                var Ph = TileTensor(b.p_h_d, p_h)
-                var Qfm = TileTensor(b.qf_d, qfm_layout)
-                var Q = TileTensor(b.q_d, qm_layout)
-                var Gate = TileTensor(b.gate_d, attflat_layout)
-                var Kflat = TileTensor(b.k_d, kvm_flat)
-                var Khd = TileTensor(b.k_d, kvm_layout)
-                var Vflat = TileTensor(b.v_d, kvm_flat)
-                var Vhd = TileTensor(b.v_d, kvm_layout)
-                var kcb = DeviceBuffer[KVT](
-                    ctx, b.kc_d.unsafe_ptr(),
-                    b.kvpool, owning=False,
-                )
-                var vcb = DeviceBuffer[KVT](
-                    ctx, b.vc_d.unsafe_ptr(),
-                    b.kvpool, owning=False,
-                )
-                var Kc = TileTensor(kcb, cache_layout)
-                var Vc = TileTensor(vcb, cache_layout)
-                var Ao = TileTensor(b.ao_d, qm_layout)
-                var Aoflat = TileTensor(b.ao_d, attflat_layout)
-                var AoB = TileTensor(b.resb_d, attflat_layout)
-                var AoBm = TileTensor(b.resb_d, attm_layout)
-
-                comptime if MEGA_ALLOWED:
-                    gemm_w[QF, H](ctx, CurBm, b.wbuf, b.off[w + 1], cfg.pack_q4, Pqf, m)
-                else:
-                    ctx.enqueue_function[moe_matmul_q8d_m1[type_of(h_layout), type_of(xm_layout)]](
-                        CurBm, b.wbuf.unsafe_ptr().unsafe_offset(b.off[moe_base + 1]), row_f32(ctx, b.qf_d, 0, QF, h_layout), Int32(QF), Int32(H), Int32(QF * H),
-                        grid_dim=ceildiv(QF, 8), block_dim=256)
-                comptime if MEGA_ALLOWED:
-                    ctx.enqueue_function[r_qf](Pqf, Qfm, Int32(m), Int32(QF), grid_dim=ceildiv(m * QF, 256), block_dim=256)
-                if cfg.dump4 and cfg.dump and m == 1 and layer == cfg.dump_layer and st.pos + 1 >= cfg.n_prompt:
-                    # slots 8-11: llama Qcur_full-N, the fused q+gate projection
-                    ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr().unsafe_offset(8 * H), QF, owning=False), src_buf=DeviceBuffer[f32](ctx, b.qf_d.unsafe_ptr(), QF, owning=False))
-                comptime if MEGA_ALLOWED:
-                    gemm_w[KV, H](ctx, CurBm, b.wbuf, b.off[w + 2], cfg.pack_q4, Pkv, m)
-                else:
-                    ctx.enqueue_function[moe_matmul_q8d_m1[type_of(h_layout), type_of(xm_layout)]](
-                        CurBm, b.wbuf.unsafe_ptr().unsafe_offset(b.off[moe_base + 2]), row_f32(ctx, b.k_d, 0, KV, h_layout), Int32(KV), Int32(H), Int32(KV * H),
-                        grid_dim=ceildiv(KV, 8), block_dim=256)
-                comptime if MEGA_ALLOWED:
-                    ctx.enqueue_function[r_kv](Pkv, Kflat, Int32(m), Int32(KV), grid_dim=ceildiv(m * KV, 256), block_dim=256)
-                comptime if MEGA_ALLOWED:
-                    gemm_w[KV, H](ctx, CurBm, b.wbuf, b.off[w + 3], cfg.pack_q4, Pkv, m)
-                else:
-                    ctx.enqueue_function[moe_matmul_q8d_m1[type_of(h_layout), type_of(xm_layout)]](
-                        CurBm, b.wbuf.unsafe_ptr().unsafe_offset(b.off[moe_base + 3]), row_f32(ctx, b.v_d, 0, KV, h_layout), Int32(KV), Int32(H), Int32(KV * H),
-                        grid_dim=ceildiv(KV, 8), block_dim=256)
-                comptime if MEGA_ALLOWED:
-                    ctx.enqueue_function[r_kv](Pkv, Vflat, Int32(m), Int32(KV), grid_dim=ceildiv(m * KV, 256), block_dim=256)
-                ctx.enqueue_function[split_k](Qfm, Q, Gate, grid_dim=(NQH, m), block_dim=HD)
-                comptime if MEGA_ALLOWED:
-                    ctx.enqueue_function[hrms_q](Q, Qn, Float32(1e-6), grid_dim=m * NQH, block_dim=HD)
-                    ctx.enqueue_function[hrms_kv](Khd, Kn, Float32(1e-6), grid_dim=m * NKVH, block_dim=HD)
-                else:
-                    ctx.enqueue_function[hrr_q](Q, Qn, Float32(1e-6), Int32(st.pos), Int32(NQH), grid_dim=m * NQH, block_dim=HD)
-                    ctx.enqueue_function[hrr_kv](Khd, Kn, Float32(1e-6), Int32(st.pos), Int32(NKVH), grid_dim=m * NKVH, block_dim=HD)
-                if cfg.dump4 and cfg.dump and m == 1 and layer == cfg.dump_layer and st.pos + 1 >= cfg.n_prompt:
-                    # slots 12-13: llama Qcur_normed-N, after the per-head q norm
-                    ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr().unsafe_offset(12 * H), ATT, owning=False), src_buf=DeviceBuffer[f32](ctx, b.q_d.unsafe_ptr(), ATT, owning=False))
-                if cfg.dump4 and cfg.dump and m == 1 and layer == cfg.dump_layer and st.pos + 1 >= cfg.n_prompt:
-                    # slot 16: llama Kcur_normed-N, after the per-head k norm
-                    ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr().unsafe_offset(16 * H), KV, owning=False), src_buf=DeviceBuffer[f32](ctx, b.k_d.unsafe_ptr(), KV, owning=False))
-                comptime if MEGA_ALLOWED:
-                    ctx.enqueue_function[rope_q](Q, Int32(st.pos), Int32(NQH), grid_dim=(NQH, m), block_dim=32)
-                    ctx.enqueue_function[rope_k](Khd, Int32(st.pos), Int32(NKVH), grid_dim=(NKVH, m), block_dim=32)
-                if cfg.dump4 and cfg.dump and m == 1 and layer == cfg.dump_layer and st.pos + 1 >= cfg.n_prompt:
-                    # slots 14-15: llama Qcur-N, q after rope
-                    ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr().unsafe_offset(14 * H), ATT, owning=False), src_buf=DeviceBuffer[f32](ctx, b.q_d.unsafe_ptr(), ATT, owning=False))
-                if cfg.dump4 and cfg.dump and m == 1 and layer == cfg.dump_layer and st.pos + 1 >= cfg.n_prompt:
-                    # slot 17: llama Kcur-N, k after rope
-                    ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr().unsafe_offset(17 * H), KV, owning=False), src_buf=DeviceBuffer[f32](ctx, b.k_d.unsafe_ptr(), KV, owning=False))
-                comptime if MEGA_ALLOWED:
-                    ctx.enqueue_function[append_k](Kc, Khd, b.kvtab_d.unsafe_ptr(), Int32(st.pos), Int32(att_i), grid_dim=(NKVH, m), block_dim=HD)
-                    ctx.enqueue_function[append_k](Vc, Vhd, b.kvtab_d.unsafe_ptr(), Int32(st.pos), Int32(att_i), grid_dim=(NKVH, m), block_dim=HD)
-                else:
-                    ctx.enqueue_function[append2_k](Kc, Vc, Khd, Vhd, b.kvtab_d.unsafe_ptr(), Int32(st.pos), Int32(att_i), grid_dim=(NKVH, m, 2), block_dim=HD)
-                if st.pos + 1 > cfg.att_split:
-                    var dns = dattn_nsplit[HD, DATT_NLD, NKVH](st.pos + 1, m, MEGA_G)
-                    var Pa = TileTensor(b.p_ffn_d, p_att_layout)
-                    ctx.enqueue_function[datt_k](Q, Kc, Vc, Ao, Pa, b.kvtab_d.unsafe_ptr(), Int32(st.pos + 1), Int32(dns), Float32(0.0625), Int32(att_i), grid_dim=(NKVH, dns, m), block_dim=ROW_THREADS)
-                    if dns > 1:
-                        ctx.enqueue_function[dcomb_k](Pa, Ao, Int32(dns), grid_dim=m * NQH, block_dim=ROW_THREADS)
-                else:
-                    ctx.enqueue_function[att_k](Q, Kc, Vc, Ao, b.kvtab_d.unsafe_ptr(), Int32(st.pos + 1), Float32(0.0625), Int32(att_i), grid_dim=(NQH, m), block_dim=HD)
-                if cfg.dump4 and cfg.dump and m == 1 and layer == cfg.dump_layer and st.pos + 1 >= cfg.n_prompt:
-                    # slots 4-5: attention output before the gate and the output
-                    # projection, ATT=4096 floats, i.e. llama's attn_output-N.
-                    ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr().unsafe_offset(4 * H), ATT, owning=False), src_buf=DeviceBuffer[f32](ctx, b.ao_d.unsafe_ptr(), ATT, owning=False))
-                ctx.enqueue_function[gmul_k](Aoflat, Gate, AoB, Int32(m * ATT), grid_dim=ceildiv(m * ATT, 256), block_dim=256)
-                comptime if MEGA_ALLOWED:
-                    gemm_w[H, ATT](ctx, AoBm, b.wbuf, b.off[w + 6], cfg.pack_q4, Ph, m)
-                else:
-                    ctx.enqueue_function[moe_matmul_q8d_m1_add[type_of(h_layout), type_of(attm_layout), type_of(h_layout)]](
-                        AoBm, b.wbuf.unsafe_ptr().unsafe_offset(b.off[moe_base + 6]), row_f32(ctx, b.p_h_d, 0, H, h_layout), row_f32(ctx, b.x_d, 0, H, h_layout), Int32(H), Int32(ATT), Int32(H * ATT),
-                        grid_dim=ceildiv(H, 8), block_dim=256)
-                if cfg.dump4 and cfg.dump and m == 1 and layer == cfg.dump_layer and st.pos + 1 >= cfg.n_prompt:
-                    # slot 6: the output projection result, the value added to
-                    # the residual. Splits "attention is wrong" from "o_proj is
-                    # wrong" in one run.
-                    ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr().unsafe_offset(6 * H), H, owning=False), src_buf=DeviceBuffer[f32](ctx, b.p_h_d.unsafe_ptr(), H, owning=False))
-                comptime if MEGA_ALLOWED:
-                    ctx.enqueue_function[r_add](Ph, Xm, Int32(m), Int32(H), grid_dim=ceildiv(m * H, 256), block_dim=256)
-                att_i += 1
-                w += 7
-            else:
-                var Wqkvq = tens_q8q(ctx, b.wbuf, b.off[decode_base + 1], H * CONV, q_h_qf)
-                var Wqkvs = tens_q8s(ctx, b.wbuf, b.off[decode_base + 1], H * CONV, s_h_qf)
-                var Wzq = tens_q8q(ctx, b.wbuf, b.off[decode_base + 2], H * H, q_h_h)
-                var Wzs = tens_q8s(ctx, b.wbuf, b.off[decode_base + 2], H * H, s_h_h)
-                var Waq = tens_q8q(ctx, b.wbuf, b.off[decode_base + 3], H * NH_V, q_h_32)
-                var Was = tens_q8s(ctx, b.wbuf, b.off[decode_base + 3], H * NH_V, s_h_32)
-                var Wbq = tens_q8q(ctx, b.wbuf, b.off[decode_base + 4], H * NH_V, q_h_32)
-                var Wbs = tens_q8s(ctx, b.wbuf, b.off[decode_base + 4], H * NH_V, s_h_32)
-                var Cw = tens_f32(ctx, b.wbuf, b.off[decode_base + 5], CONV * 4, cw_layout)
-                var SsmA = tens_f32(ctx, b.wbuf, b.off[decode_base + 6], NH_V, g32_layout)
-                var DtB = tens_f32(ctx, b.wbuf, b.off[decode_base + 7], NH_V, g32_layout)
-                var Nw = tens_f32(ctx, b.wbuf, b.off[decode_base + 8], SSTATE, n128_layout)
-                var Wsoutq = tens_q8q(ctx, b.wbuf, b.off[decode_base + 9], H * H, q_h_h)
-                var Wsouts = tens_q8s(ctx, b.wbuf, b.off[decode_base + 9], H * H, s_h_h)
-                var Pq = TileTensor(b.p_qf_d, p_qf)
-                var Ph = TileTensor(b.p_h_d, p_h)
-                var Pab = TileTensor(b.p_32_d, p_32)
-                var Pab2 = TileTensor(b.p_32b_d, p_32)
-                var Qkvm = TileTensor(b.qkv_d, qfm_layout)
-                var Zm = TileTensor[f32, type_of(moe_inner_m_layout), MutAnyOrigin](moe_z_d, moe_inner_m_layout)
-                var Zflat = row_f32(ctx, moe_z_d, 0, NH_V * SSTATE, moe_inner_layout)
-                var ZmOld = TileTensor(b.z_d, xm_layout)
-                var Eg = TileTensor(b.eg_d, g32m_layout)
-                var Beta = TileTensor(b.beta_d, g32m_layout)
-                var Conv = TileTensor(b.conv_d, convm_layout)
-                var So = TileTensor(b.so_d, om_layout)
-                var ResBm = TileTensor[bf16, type_of(moe_inner_m_layout), MutAnyOrigin](moe_res_d, moe_inner_m_layout)
-                var ResBmOld = TileTensor(b.resb_d, xm_layout)
-
-                comptime if MEGA_ALLOWED:
-                    gemm_w[CONV, H](ctx, CurBm, b.wbuf, b.off[w + 1], cfg.pack_q4, Pq, m)
-                    gemm_w[H, H](ctx, CurBm, b.wbuf, b.off[w + 2], cfg.pack_q4, Ph, m)
-                    gemm_w[NH_V, H](ctx, CurBm, b.wbuf, b.off[w + 3], cfg.pack_q4, Pab, m)
-                    gemm_w[NH_V, H](ctx, CurBm, b.wbuf, b.off[w + 4], cfg.pack_q4, Pab2, m)
-                else:
-                    ctx.enqueue_function[moe_matmul_q8d_m1[type_of(h_layout), type_of(xm_layout)]](
-                        CurBm, b.wbuf.unsafe_ptr().unsafe_offset(b.off[moe_base + 1]), row_f32(ctx, b.qkv_d, 0, CONV, h_layout), Int32(CONV), Int32(H), Int32(CONV * H),
-                        grid_dim=ceildiv(CONV, 8), block_dim=256)
-                    ctx.enqueue_function[moe_matmul_q8d_m1[type_of(h_layout), type_of(xm_layout)]](
-                        CurBm, b.wbuf.unsafe_ptr().unsafe_offset(b.off[moe_base + 2]), row_f32(ctx, b.p_h_d, 0, H, h_layout), Int32(H), Int32(H), Int32(NH_V * SSTATE * H),
-                        grid_dim=ceildiv(H, 8), block_dim=256)
-                    # ssm_alpha/ssm_beta are F32 in the MoE pack; the dense
-                    # pack stores them q4. Reading f32 bytes through the q8_0
-                    # kernel made every beta sigmoid saturate to exactly
-                    # 0.0/1.0 (W3 gate 2 bug 4, 2026-09-12). f32 weights need
-                    # the skinny f32 matmul and an f32 copy of the activation.
-                    # R4: these two used to be zeroed here, 60 memsets per
-                    # token. amar_ssm_reduce_gates sums SPLITK partials, and on
-                    # this profile only partial 0 row 0 is ever written (by the
-                    # two skinny f32 matmuls below, which WRITE their output
-                    # rather than accumulate into it), so the rest of the plane
-                    # has to be zero but never stops being zero. It is zeroed
-                    # once at allocation instead. The dense profile's gemm_w
-                    # partial writer is not compiled into this build
-                    # (MEGA_ALLOWED is False for the MoE), which is what makes
-                    # that safe; if a future path writes these planes per
-                    # layer, the zeroing has to come back with it.
-                    var Xg = row_f32(ctx, b.logits_d, 0, H, h2_layout)
-                    ctx.enqueue_function[amar_matmul_skinny_m1_row2[f32, 2, type_of(h2_layout), type_of(ssm_gate_w_layout), type_of(ssm_gate_o_layout)]](
-                        Xg, tens_f32(ctx, b.wbuf, b.off[moe_base + 3], NH_V * H, ssm_gate_w_layout),
-                        tens_f32(ctx, b.wbuf, b.off[moe_base + 4], NH_V * H, ssm_gate_w_layout),
-                        row_f32(ctx, b.p_32_d, 0, NH_V, ssm_gate_o_layout), row_f32(ctx, b.p_32b_d, 0, NH_V, ssm_gate_o_layout),
-                        Int32(NH_V), Int32(H), grid_dim=ceildiv(2 * NH_V, ROW_WAVES), block_dim=ROW_THREADS)
-                comptime if MEGA_ALLOWED:
-                    ctx.enqueue_function[r_qf](Pq, Qkvm, Int32(m), Int32(CONV), grid_dim=ceildiv(m * CONV, 256), block_dim=256)
-                comptime if MEGA_ALLOWED:
-                    ctx.enqueue_function[r_h](Ph, ZmOld, Int32(m), Int32(H), grid_dim=ceildiv(m * H, 256), block_dim=256)
-                else:
-                    ctx.enqueue_function[moe_matmul_q8d_m1[type_of(moe_inner_layout), type_of(xm_layout)]](
-                        CurBm, b.wbuf.unsafe_ptr().unsafe_offset(b.off[moe_base + 2]), Zflat, Int32(NH_V * SSTATE), Int32(H), Int32(NH_V * SSTATE * H),
-                        grid_dim=ceildiv(NH_V * SSTATE, 8), block_dim=256)
-
-                if cfg.pf2:
+            var layer_w = w
+            var layer_moe_w = moe_w
+            var layer_ssm_i = ssm_i
+            var layer_att_i = att_i
+            # Layer-major verification: reuse the proven row kernels and
+            # scratch storage, preserving a state-ring slot per candidate.
+            # Only the head is batched; this is not a fused MoE GEMM.
+            for token_row in range(window_m if IS_MOE else 1):
+                comptime if IS_MOE:
+                    m = 1
+                    st.pos = window_pos + token_row
+                    st.ring = (window_ring + token_row) % SLOTS
+                    Xm = row_f32(ctx, b.x_d, token_row * H, H, xm_layout)
+                    w = layer_w
+                    moe_w = layer_moe_w
+                    ssm_i = layer_ssm_i
+                    att_i = layer_att_i
+                if cfg.prof:
                     ctx.synchronize()
-                    var nw = perf_counter_ns()
-                    st.pc[0] += Int(nw - st.tq)
-                    st.tq = nw
-                ctx.enqueue_function[rgates_k](Pab, Pab2, Eg, Beta, SsmA, DtB, Int32(m), grid_dim=1, block_dim=NH_V)
-                if cfg.pf2:
-                    ctx.synchronize()
-                    var nw = perf_counter_ns()
-                    st.pc[1] += Int(nw - st.tq)
-                    st.tq = nw
-                ctx.enqueue_function[conv_k](Qkvm, ConvStateAll, Cw, Conv, Int32(st.ring), Int32(ssm_i), Int32(SLOTS), Int32(m), grid_dim=ceildiv(CONV, 256), block_dim=256)
-                if cfg.pf2:
-                    ctx.synchronize()
-                    var nw = perf_counter_ns()
-                    st.pc[2] += Int(nw - st.tq)
-                    st.tq = nw
-                ctx.enqueue_function[l2_k](Conv, Int32(m), grid_dim=NH_V, block_dim=SSTATE)
-                if cfg.pf2:
-                    ctx.synchronize()
-                    var nw = perf_counter_ns()
-                    st.pc[3] += Int(nw - st.tq)
-                    st.tq = nw
-                if cfg.dump4 and cfg.dump and m == 1 and layer == cfg.dump_layer and st.pos + 1 >= cfg.n_prompt:
-                    # slot 4: conv output after l2norm (llama conv_output_silu /
-                    # Qcur_normed). slot 5: the two gate vectors, Eg then Beta,
-                    # NH_V each (llama a_softplus / beta_sigmoid).
-                    ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr().unsafe_offset(8 * H), CONV, owning=False), src_buf=DeviceBuffer[f32](ctx, b.conv_d.unsafe_ptr(), CONV, owning=False))
-                    ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr().unsafe_offset(5 * H), NH_V, owning=False), src_buf=DeviceBuffer[f32](ctx, b.eg_d.unsafe_ptr(), NH_V, owning=False))
-                    ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr().unsafe_offset(5 * H + NH_V), NH_V, owning=False), src_buf=DeviceBuffer[f32](ctx, b.beta_d.unsafe_ptr(), NH_V, owning=False))
-                delta_dispatch(ctx, SStateAll, Conv, Eg, Beta, So, Int32(st.ring), Int32(ssm_i), Int32(SLOTS), m)
-                if cfg.dump4 and cfg.dump and m == 1 and layer == cfg.dump_layer and st.pos + 1 >= cfg.n_prompt:
-                    # slot 6: delta-scan output, before the output gate.
-                    ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr().unsafe_offset(6 * H), NH_V * SSTATE, owning=False), src_buf=DeviceBuffer[f32](ctx, b.so_d.unsafe_ptr(), NH_V * SSTATE, owning=False))
-                if cfg.pf2:
-                    ctx.synchronize()
-                    var nw = perf_counter_ns()
-                    st.pc[4] += Int(nw - st.tq)
-                    st.tq = nw
+                    st.tp = perf_counter_ns()
+                    st.tq = st.tp
+                # -- attention / ssm sub-block --
+                var moe_base = moe_w
+                var decode_base = w
+                comptime if not MEGA_ALLOWED:
+                    decode_base = moe_base
                 comptime if MEGA_ALLOWED:
-                    ctx.enqueue_function[gated_k](So, ZmOld, Nw, ResBmOld, Int32(m), grid_dim=NH_V, block_dim=SSTATE)
+                    ctx.enqueue_function[rmsc_k](
+                        Xm, tens_f32(ctx, b.wbuf, b.off[decode_base], H, h_layout), CurBm,
+                        Int32(H), Float32(1e-6), grid_dim=m, block_dim=256,
+                    )
                 else:
-                    ctx.enqueue_function[amar_ssm_gated_out_bf16[type_of(om_layout), type_of(moe_inner_m_layout), type_of(n128_layout), type_of(moe_inner_m_layout)]](
-                        So, Zm, Nw, ResBm, Int32(m), grid_dim=NH_V, block_dim=SSTATE)
+                    ctx.enqueue_function[rmsc2_k](
+                        Xm, tens_f32(ctx, b.wbuf, b.off[decode_base], H, h_layout), CurBm,
+                        row_f32(ctx, b.logits_d, 0, H, h2_layout),
+                        Int32(H), Float32(1e-6), grid_dim=m, block_dim=256,
+                    )
 
-                if cfg.pf2:
-                    ctx.synchronize()
-                    var nw = perf_counter_ns()
-                    st.pc[5] += Int(nw - st.tq)
-                    st.tq = nw
-                comptime if MEGA_ALLOWED:
-                    gemm_w[H, H](ctx, ResBmOld, b.wbuf, b.off[w + 9], cfg.pack_q4, Ph, m)
-                else:
-                    ctx.enqueue_function[moe_matmul_q8d_m1_add[type_of(h_layout), type_of(moe_inner_m_layout), type_of(h_layout)]](
-                        ResBm, b.wbuf.unsafe_ptr().unsafe_offset(b.off[decode_base + 9]), row_f32(ctx, b.p_h_d, 0, H, h_layout), row_f32(ctx, b.x_d, 0, H, h_layout), Int32(H), Int32(NH_V * SSTATE), Int32(H * NH_V * SSTATE),
-                        grid_dim=ceildiv(H, 8), block_dim=256)
-                if cfg.dump4 and cfg.dump and m == 1 and layer == cfg.dump_layer and st.pos + 1 >= cfg.n_prompt:
-                    # slot 7: the ssm_out projection result, i.e. llama's
-                    # linear_attn_out, the last value before the residual add.
-                    ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr().unsafe_offset(7 * H), H, owning=False), src_buf=DeviceBuffer[f32](ctx, b.p_h_d.unsafe_ptr(), H, owning=False))
-                comptime if MEGA_ALLOWED:
-                    ctx.enqueue_function[r_add](Ph, Xm, Int32(m), Int32(H), grid_dim=ceildiv(m * H, 256), block_dim=256)
-                ssm_i += 1
-                w += 10
-
-            if cfg.prof:
-                ctx.synchronize()
-                var now = perf_counter_ns()
                 if is_attn(layer):
-                    st.pf_att += Int(now - st.tp)
-                else:
-                    st.pf_ssm += Int(now - st.tp)
-                    if cfg.pf2:
-                        st.pc[6] += Int(now - st.tq)
-                st.tp = now
-                st.tq = now
-            if cfg.dump and m == 1 and st.pos + 1 >= cfg.n_prompt:
-                if not cfg.dump4:
-                    ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr().unsafe_offset((2 * layer) * H), H, owning=False), src_buf=DeviceBuffer[f32](ctx, b.x_d.unsafe_ptr(), H, owning=False))
-                if cfg.dump4 and layer == cfg.dump_layer:
-                    ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr(), H, owning=False), src_buf=DeviceBuffer[f32](ctx, b.x_d.unsafe_ptr(), H, owning=False))
-            # -- ffn sub-block --
-            if cfg.pf4:
-                ctx.synchronize()
-                st.tq = perf_counter_ns()
-            var ffn_norm_base = w
-            comptime if not MEGA_ALLOWED:
-                ffn_norm_base = moe_base + (7 if is_attn(layer) else 10)
-            comptime if MEGA_ALLOWED:
-                ctx.enqueue_function[rmsc_k](
-                    Xm, tens_f32(ctx, b.wbuf, b.off[ffn_norm_base], H, h_layout), CurBm,
-                    Int32(H), Float32(1e-6), grid_dim=m, block_dim=256,
-                )
-            else:
-                ctx.enqueue_function[rmsc2_k](
-                    Xm, tens_f32(ctx, b.wbuf, b.off[ffn_norm_base], H, h_layout), CurBm,
-                    row_f32(ctx, b.p_h_d, 0, H, h2_layout),
-                    Int32(H), Float32(1e-6), grid_dim=m, block_dim=256,
-                )
-            if cfg.dump4 and cfg.dump and m == 1 and st.pos + 1 >= cfg.n_prompt and layer == cfg.dump_layer:
-                var DbgNorm = row_f32(ctx, b.p_h_d, 0, H, moe_vec_layout)
-                ctx.enqueue_function[amar_widen_bf16[type_of(moe_vec_layout), type_of(moe_vec_layout)]](row_bf16(ctx, b.curb_d, 0, H, moe_vec_layout), DbgNorm, Int32(H), grid_dim=ceildiv(H, 256), block_dim=256)
-                ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr().unsafe_offset(H), H, owning=False), src_buf=DeviceBuffer[f32](ctx, b.p_h_d.unsafe_ptr(), H, owning=False))
-            if cfg.pf4:
-                ctx.synchronize()
-                var nw = perf_counter_ns()
-                st.fc[0] += Int(nw - st.tq)
-                st.tq = nw
-            comptime if not MEGA_ALLOWED:
-                moe_ffn(ctx, b, Xm, CurBm, moe_base, layer, moe_base + (8 if is_attn(layer) else 11), moe_base + (11 if is_attn(layer) else 14),
-                        st.pos if cfg.expert_trace else -1)
-            var Wfgq = tens_q8q(ctx, b.wbuf, b.off[w + 1], H * FFN, q_h_ffn)
-            var Wfgs = tens_q8s(ctx, b.wbuf, b.off[w + 1], H * FFN, s_h_ffn)
-            var Wfuq = tens_q8q(ctx, b.wbuf, b.off[w + 2], H * FFN, q_h_ffn)
-            var Wfus = tens_q8s(ctx, b.wbuf, b.off[w + 2], H * FFN, s_h_ffn)
-            var Wfdq = tens_q8q(ctx, b.wbuf, b.off[w + 3], FFN * H, q_ffn_h)
-            var Wfds = tens_q8s(ctx, b.wbuf, b.off[w + 3], FFN * H, s_ffn_h)
-            var Pg = TileTensor(b.p_ffn_d, p_ffn)
-            var Pu = TileTensor(b.p_ffn2_d, p_ffn)
-            var Ph2 = TileTensor(b.p_h_d, p_h)
-            var FgBm = TileTensor(b.fgb_d, ffnm_layout)
-            var AqH = TileTensor(b.aq_d, aqm_h)
-            var AsH = TileTensor(b.asc_d, asm_h)
-            var use_dot = cfg.dot3 and m >= 3
-            if use_dot:
-                quant_rows(ctx, CurBm, AqH, AsH, m, H)
-                gemm_q8dot(ctx, AqH, AsH, Wfgq, Wfgs, Pg, m, FFN, H)
-            else:
-                comptime if MEGA_ALLOWED:
-                    gemm_w[FFN, H](ctx, CurBm, b.wbuf, b.off[w + 1], cfg.pack_q4, Pg, m)
-            if cfg.pf4:
-                ctx.synchronize()
-                var nw = perf_counter_ns()
-                st.fc[1] += Int(nw - st.tq)
-                st.tq = nw
-            if use_dot:
-                gemm_q8dot(ctx, AqH, AsH, Wfuq, Wfus, Pu, m, FFN, H)
-            else:
-                comptime if MEGA_ALLOWED:
-                    gemm_w[FFN, H](ctx, CurBm, b.wbuf, b.off[w + 2], cfg.pack_q4, Pu, m)
-            if cfg.pf4:
-                ctx.synchronize()
-                var nw = perf_counter_ns()
-                st.fc[2] += Int(nw - st.tq)
-                st.tq = nw
-            comptime if MEGA_ALLOWED:
-                ctx.enqueue_function[r_swiglu](Pg, Pu, FgBm, Int32(m), Int32(FFN), grid_dim=ceildiv(m * FFN, 256), block_dim=256)
-            if cfg.pf4:
-                ctx.synchronize()
-                var nw = perf_counter_ns()
-                st.fc[3] += Int(nw - st.tq)
-                st.tq = nw
-            if use_dot:
-                var AqF = TileTensor(b.aq_d, aqm_ffn)
-                var AsF = TileTensor(b.asc_d, asm_ffn)
-                quant_rows(ctx, FgBm, AqF, AsF, m, FFN)
-                gemm_q8dot(ctx, AqF, AsF, Wfdq, Wfds, Ph2, m, H, FFN)
-            else:
-                comptime if MEGA_ALLOWED:
-                    gemm_w[H, FFN](ctx, FgBm, b.wbuf, b.off[w + 3], cfg.pack_q4, Ph2, m)
-            if cfg.pf4:
-                ctx.synchronize()
-                var nw = perf_counter_ns()
-                st.fc[4] += Int(nw - st.tq)
-                st.tq = nw
-            comptime if MEGA_ALLOWED:
-                ctx.enqueue_function[r_add](Ph2, Xm, Int32(m), Int32(H), grid_dim=ceildiv(m * H, 256), block_dim=256)
-            if cfg.pf4:
-                ctx.synchronize()
-                var nw = perf_counter_ns()
-                st.fc[5] += Int(nw - st.tq)
-                st.tq = nw
-            w += 4
-            if is_attn(layer):
-                moe_w += 16
-            else:
-                moe_w += 19
-            if cfg.dump and m == 1 and st.pos + 1 >= cfg.n_prompt:
-                if not cfg.dump4:
-                    ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr().unsafe_offset((2 * layer + 1) * H), H, owning=False), src_buf=DeviceBuffer[f32](ctx, b.x_d.unsafe_ptr(), H, owning=False))
-                if cfg.dump4 and layer == cfg.dump_layer:
-                    ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr().unsafe_offset(2 * H), H, owning=False), src_buf=DeviceBuffer[f32](ctx, b.x_d.unsafe_ptr(), H, owning=False))
-            if cfg.prof:
-                ctx.synchronize()
-                var now = perf_counter_ns()
-                st.pf_ffn += Int(now - st.tp)
-                st.tp = now
+                    var Wqq = tens_q8q(ctx, b.wbuf, b.off[decode_base + 1], H * QF, q_h_qf)
+                    var Wqs = tens_q8s(ctx, b.wbuf, b.off[decode_base + 1], H * QF, s_h_qf)
+                    var Wkq = tens_q8q(ctx, b.wbuf, b.off[decode_base + 2], H * KV, q_h_kv)
+                    var Wks = tens_q8s(ctx, b.wbuf, b.off[decode_base + 2], H * KV, s_h_kv)
+                    var Wvq = tens_q8q(ctx, b.wbuf, b.off[decode_base + 3], H * KV, q_h_kv)
+                    var Wvs = tens_q8s(ctx, b.wbuf, b.off[decode_base + 3], H * KV, s_h_kv)
+                    var Qn = tens_f32(ctx, b.wbuf, b.off[decode_base + 4], HD, hd_layout)
+                    var Kn = tens_f32(ctx, b.wbuf, b.off[decode_base + 5], HD, hd_layout)
+                    var Woq = tens_q8q(ctx, b.wbuf, b.off[decode_base + 6], H * H, q_h_h)
+                    var Wos = tens_q8s(ctx, b.wbuf, b.off[decode_base + 6], H * H, s_h_h)
+                    var Pqf = TileTensor(b.p_qf_d, p_qf)
+                    var Pkv = TileTensor(b.p_kv_d, p_kv)
+                    var Ph = TileTensor(b.p_h_d, p_h)
+                    var Qfm = TileTensor(b.qf_d, qfm_layout)
+                    var Q = TileTensor(b.q_d, qm_layout)
+                    var Gate = TileTensor(b.gate_d, attflat_layout)
+                    var Kflat = TileTensor(b.k_d, kvm_flat)
+                    var Khd = TileTensor(b.k_d, kvm_layout)
+                    var Vflat = TileTensor(b.v_d, kvm_flat)
+                    var Vhd = TileTensor(b.v_d, kvm_layout)
+                    var kcb = DeviceBuffer[KVT](
+                        ctx, b.kc_d.unsafe_ptr(),
+                        b.kvpool, owning=False,
+                    )
+                    var vcb = DeviceBuffer[KVT](
+                        ctx, b.vc_d.unsafe_ptr(),
+                        b.kvpool, owning=False,
+                    )
+                    var Kc = TileTensor(kcb, cache_layout)
+                    var Vc = TileTensor(vcb, cache_layout)
+                    var Ao = TileTensor(b.ao_d, qm_layout)
+                    var Aoflat = TileTensor(b.ao_d, attflat_layout)
+                    var AoB = TileTensor(b.resb_d, attflat_layout)
+                    var AoBm = TileTensor(b.resb_d, attm_layout)
 
+                    comptime if MEGA_ALLOWED:
+                        gemm_w[QF, H](ctx, CurBm, b.wbuf, b.off[w + 1], cfg.pack_q4, Pqf, m)
+                    else:
+                        ctx.enqueue_function[moe_matmul_q8d_m1[type_of(h_layout), type_of(xm_layout)]](
+                            CurBm, b.wbuf.unsafe_ptr().unsafe_offset(b.off[moe_base + 1]), row_f32(ctx, b.qf_d, 0, QF, h_layout), Int32(QF), Int32(H), Int32(QF * H),
+                            grid_dim=ceildiv(QF, 8), block_dim=256)
+                    comptime if MEGA_ALLOWED:
+                        ctx.enqueue_function[r_qf](Pqf, Qfm, Int32(m), Int32(QF), grid_dim=ceildiv(m * QF, 256), block_dim=256)
+                    if cfg.dump4 and cfg.dump and m == 1 and layer == cfg.dump_layer and st.pos + 1 >= cfg.n_prompt:
+                        # slots 8-11: llama Qcur_full-N, the fused q+gate projection
+                        ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr().unsafe_offset(8 * H), QF, owning=False), src_buf=DeviceBuffer[f32](ctx, b.qf_d.unsafe_ptr(), QF, owning=False))
+                    comptime if MEGA_ALLOWED:
+                        gemm_w[KV, H](ctx, CurBm, b.wbuf, b.off[w + 2], cfg.pack_q4, Pkv, m)
+                    else:
+                        ctx.enqueue_function[moe_matmul_q8d_m1[type_of(h_layout), type_of(xm_layout)]](
+                            CurBm, b.wbuf.unsafe_ptr().unsafe_offset(b.off[moe_base + 2]), row_f32(ctx, b.k_d, 0, KV, h_layout), Int32(KV), Int32(H), Int32(KV * H),
+                            grid_dim=ceildiv(KV, 8), block_dim=256)
+                    comptime if MEGA_ALLOWED:
+                        ctx.enqueue_function[r_kv](Pkv, Kflat, Int32(m), Int32(KV), grid_dim=ceildiv(m * KV, 256), block_dim=256)
+                    comptime if MEGA_ALLOWED:
+                        gemm_w[KV, H](ctx, CurBm, b.wbuf, b.off[w + 3], cfg.pack_q4, Pkv, m)
+                    else:
+                        ctx.enqueue_function[moe_matmul_q8d_m1[type_of(h_layout), type_of(xm_layout)]](
+                            CurBm, b.wbuf.unsafe_ptr().unsafe_offset(b.off[moe_base + 3]), row_f32(ctx, b.v_d, 0, KV, h_layout), Int32(KV), Int32(H), Int32(KV * H),
+                            grid_dim=ceildiv(KV, 8), block_dim=256)
+                    comptime if MEGA_ALLOWED:
+                        ctx.enqueue_function[r_kv](Pkv, Vflat, Int32(m), Int32(KV), grid_dim=ceildiv(m * KV, 256), block_dim=256)
+                    ctx.enqueue_function[split_k](Qfm, Q, Gate, grid_dim=(NQH, m), block_dim=HD)
+                    comptime if MEGA_ALLOWED:
+                        ctx.enqueue_function[hrms_q](Q, Qn, Float32(1e-6), grid_dim=m * NQH, block_dim=HD)
+                        ctx.enqueue_function[hrms_kv](Khd, Kn, Float32(1e-6), grid_dim=m * NKVH, block_dim=HD)
+                    else:
+                        ctx.enqueue_function[hrr_q](Q, Qn, Float32(1e-6), Int32(st.pos), Int32(NQH), grid_dim=m * NQH, block_dim=HD)
+                        ctx.enqueue_function[hrr_kv](Khd, Kn, Float32(1e-6), Int32(st.pos), Int32(NKVH), grid_dim=m * NKVH, block_dim=HD)
+                    if cfg.dump4 and cfg.dump and m == 1 and layer == cfg.dump_layer and st.pos + 1 >= cfg.n_prompt:
+                        # slots 12-13: llama Qcur_normed-N, after the per-head q norm
+                        ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr().unsafe_offset(12 * H), ATT, owning=False), src_buf=DeviceBuffer[f32](ctx, b.q_d.unsafe_ptr(), ATT, owning=False))
+                    if cfg.dump4 and cfg.dump and m == 1 and layer == cfg.dump_layer and st.pos + 1 >= cfg.n_prompt:
+                        # slot 16: llama Kcur_normed-N, after the per-head k norm
+                        ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr().unsafe_offset(16 * H), KV, owning=False), src_buf=DeviceBuffer[f32](ctx, b.k_d.unsafe_ptr(), KV, owning=False))
+                    comptime if MEGA_ALLOWED:
+                        ctx.enqueue_function[rope_q](Q, Int32(st.pos), Int32(NQH), grid_dim=(NQH, m), block_dim=32)
+                        ctx.enqueue_function[rope_k](Khd, Int32(st.pos), Int32(NKVH), grid_dim=(NKVH, m), block_dim=32)
+                    if cfg.dump4 and cfg.dump and m == 1 and layer == cfg.dump_layer and st.pos + 1 >= cfg.n_prompt:
+                        # slots 14-15: llama Qcur-N, q after rope
+                        ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr().unsafe_offset(14 * H), ATT, owning=False), src_buf=DeviceBuffer[f32](ctx, b.q_d.unsafe_ptr(), ATT, owning=False))
+                    if cfg.dump4 and cfg.dump and m == 1 and layer == cfg.dump_layer and st.pos + 1 >= cfg.n_prompt:
+                        # slot 17: llama Kcur-N, k after rope
+                        ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr().unsafe_offset(17 * H), KV, owning=False), src_buf=DeviceBuffer[f32](ctx, b.k_d.unsafe_ptr(), KV, owning=False))
+                    comptime if MEGA_ALLOWED:
+                        ctx.enqueue_function[append_k](Kc, Khd, b.kvtab_d.unsafe_ptr(), Int32(st.pos), Int32(att_i), grid_dim=(NKVH, m), block_dim=HD)
+                        ctx.enqueue_function[append_k](Vc, Vhd, b.kvtab_d.unsafe_ptr(), Int32(st.pos), Int32(att_i), grid_dim=(NKVH, m), block_dim=HD)
+                    else:
+                        ctx.enqueue_function[append2_k](Kc, Vc, Khd, Vhd, b.kvtab_d.unsafe_ptr(), Int32(st.pos), Int32(att_i), grid_dim=(NKVH, m, 2), block_dim=HD)
+                    if st.pos + 1 > cfg.att_split:
+                        var dns = dattn_nsplit[HD, DATT_NLD, NKVH](st.pos + 1, m, MEGA_G)
+                        var Pa = TileTensor(b.p_ffn_d, p_att_layout)
+                        ctx.enqueue_function[datt_k](Q, Kc, Vc, Ao, Pa, b.kvtab_d.unsafe_ptr(), Int32(st.pos + 1), Int32(dns), Float32(0.0625), Int32(att_i), grid_dim=(NKVH, dns, m), block_dim=ROW_THREADS)
+                        if dns > 1:
+                            ctx.enqueue_function[dcomb_k](Pa, Ao, Int32(dns), grid_dim=m * NQH, block_dim=ROW_THREADS)
+                    else:
+                        ctx.enqueue_function[att_k](Q, Kc, Vc, Ao, b.kvtab_d.unsafe_ptr(), Int32(st.pos + 1), Float32(0.0625), Int32(att_i), grid_dim=(NQH, m), block_dim=HD)
+                    if cfg.dump4 and cfg.dump and m == 1 and layer == cfg.dump_layer and st.pos + 1 >= cfg.n_prompt:
+                        # slots 4-5: attention output before the gate and the output
+                        # projection, ATT=4096 floats, i.e. llama's attn_output-N.
+                        ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr().unsafe_offset(4 * H), ATT, owning=False), src_buf=DeviceBuffer[f32](ctx, b.ao_d.unsafe_ptr(), ATT, owning=False))
+                    ctx.enqueue_function[gmul_k](Aoflat, Gate, AoB, Int32(m * ATT), grid_dim=ceildiv(m * ATT, 256), block_dim=256)
+                    comptime if MEGA_ALLOWED:
+                        gemm_w[H, ATT](ctx, AoBm, b.wbuf, b.off[w + 6], cfg.pack_q4, Ph, m)
+                    else:
+                        ctx.enqueue_function[moe_matmul_q8d_m1_add[type_of(h_layout), type_of(attm_layout), type_of(h_layout)]](
+                            AoBm, b.wbuf.unsafe_ptr().unsafe_offset(b.off[moe_base + 6]), row_f32(ctx, b.p_h_d, 0, H, h_layout), row_f32(ctx, b.x_d, token_row * H, H, h_layout), Int32(H), Int32(ATT), Int32(H * ATT),
+                            grid_dim=ceildiv(H, 8), block_dim=256)
+                    if cfg.dump4 and cfg.dump and m == 1 and layer == cfg.dump_layer and st.pos + 1 >= cfg.n_prompt:
+                        # slot 6: the output projection result, the value added to
+                        # the residual. Splits "attention is wrong" from "o_proj is
+                        # wrong" in one run.
+                        ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr().unsafe_offset(6 * H), H, owning=False), src_buf=DeviceBuffer[f32](ctx, b.p_h_d.unsafe_ptr(), H, owning=False))
+                    comptime if MEGA_ALLOWED:
+                        ctx.enqueue_function[r_add](Ph, Xm, Int32(m), Int32(H), grid_dim=ceildiv(m * H, 256), block_dim=256)
+                    att_i += 1
+                    w += 7
+                else:
+                    var Wqkvq = tens_q8q(ctx, b.wbuf, b.off[decode_base + 1], H * CONV, q_h_qf)
+                    var Wqkvs = tens_q8s(ctx, b.wbuf, b.off[decode_base + 1], H * CONV, s_h_qf)
+                    var Wzq = tens_q8q(ctx, b.wbuf, b.off[decode_base + 2], H * H, q_h_h)
+                    var Wzs = tens_q8s(ctx, b.wbuf, b.off[decode_base + 2], H * H, s_h_h)
+                    var Waq = tens_q8q(ctx, b.wbuf, b.off[decode_base + 3], H * NH_V, q_h_32)
+                    var Was = tens_q8s(ctx, b.wbuf, b.off[decode_base + 3], H * NH_V, s_h_32)
+                    var Wbq = tens_q8q(ctx, b.wbuf, b.off[decode_base + 4], H * NH_V, q_h_32)
+                    var Wbs = tens_q8s(ctx, b.wbuf, b.off[decode_base + 4], H * NH_V, s_h_32)
+                    var Cw = tens_f32(ctx, b.wbuf, b.off[decode_base + 5], CONV * 4, cw_layout)
+                    var SsmA = tens_f32(ctx, b.wbuf, b.off[decode_base + 6], NH_V, g32_layout)
+                    var DtB = tens_f32(ctx, b.wbuf, b.off[decode_base + 7], NH_V, g32_layout)
+                    var Nw = tens_f32(ctx, b.wbuf, b.off[decode_base + 8], SSTATE, n128_layout)
+                    var Wsoutq = tens_q8q(ctx, b.wbuf, b.off[decode_base + 9], H * H, q_h_h)
+                    var Wsouts = tens_q8s(ctx, b.wbuf, b.off[decode_base + 9], H * H, s_h_h)
+                    var Pq = TileTensor(b.p_qf_d, p_qf)
+                    var Ph = TileTensor(b.p_h_d, p_h)
+                    var Pab = TileTensor(b.p_32_d, p_32)
+                    var Pab2 = TileTensor(b.p_32b_d, p_32)
+                    var Qkvm = TileTensor(b.qkv_d, qfm_layout)
+                    var Zm = TileTensor[f32, type_of(moe_inner_m_layout), MutAnyOrigin](moe_z_d, moe_inner_m_layout)
+                    var Zflat = row_f32(ctx, moe_z_d, 0, NH_V * SSTATE, moe_inner_layout)
+                    var ZmOld = TileTensor(b.z_d, xm_layout)
+                    var Eg = TileTensor(b.eg_d, g32m_layout)
+                    var Beta = TileTensor(b.beta_d, g32m_layout)
+                    var Conv = TileTensor(b.conv_d, convm_layout)
+                    var So = TileTensor(b.so_d, om_layout)
+                    var ResBm = TileTensor[bf16, type_of(moe_inner_m_layout), MutAnyOrigin](moe_res_d, moe_inner_m_layout)
+                    var ResBmOld = TileTensor(b.resb_d, xm_layout)
+
+                    comptime if MEGA_ALLOWED:
+                        gemm_w[CONV, H](ctx, CurBm, b.wbuf, b.off[w + 1], cfg.pack_q4, Pq, m)
+                        gemm_w[H, H](ctx, CurBm, b.wbuf, b.off[w + 2], cfg.pack_q4, Ph, m)
+                        gemm_w[NH_V, H](ctx, CurBm, b.wbuf, b.off[w + 3], cfg.pack_q4, Pab, m)
+                        gemm_w[NH_V, H](ctx, CurBm, b.wbuf, b.off[w + 4], cfg.pack_q4, Pab2, m)
+                    else:
+                        ctx.enqueue_function[moe_matmul_q8d_m1[type_of(h_layout), type_of(xm_layout)]](
+                            CurBm, b.wbuf.unsafe_ptr().unsafe_offset(b.off[moe_base + 1]), row_f32(ctx, b.qkv_d, 0, CONV, h_layout), Int32(CONV), Int32(H), Int32(CONV * H),
+                            grid_dim=ceildiv(CONV, 8), block_dim=256)
+                        ctx.enqueue_function[moe_matmul_q8d_m1[type_of(h_layout), type_of(xm_layout)]](
+                            CurBm, b.wbuf.unsafe_ptr().unsafe_offset(b.off[moe_base + 2]), row_f32(ctx, b.p_h_d, 0, H, h_layout), Int32(H), Int32(H), Int32(NH_V * SSTATE * H),
+                            grid_dim=ceildiv(H, 8), block_dim=256)
+                        # ssm_alpha/ssm_beta are F32 in the MoE pack; the dense
+                        # pack stores them q4. Reading f32 bytes through the q8_0
+                        # kernel made every beta sigmoid saturate to exactly
+                        # 0.0/1.0 (W3 gate 2 bug 4, 2026-09-12). f32 weights need
+                        # the skinny f32 matmul and an f32 copy of the activation.
+                        # R4: these two used to be zeroed here, 60 memsets per
+                        # token. amar_ssm_reduce_gates sums SPLITK partials, and on
+                        # this profile only partial 0 row 0 is ever written (by the
+                        # two skinny f32 matmuls below, which WRITE their output
+                        # rather than accumulate into it), so the rest of the plane
+                        # has to be zero but never stops being zero. It is zeroed
+                        # once at allocation instead. The dense profile's gemm_w
+                        # partial writer is not compiled into this build
+                        # (MEGA_ALLOWED is False for the MoE), which is what makes
+                        # that safe; if a future path writes these planes per
+                        # layer, the zeroing has to come back with it.
+                        var Xg = row_f32(ctx, b.logits_d, 0, H, h2_layout)
+                        ctx.enqueue_function[amar_matmul_skinny_m1_row2[f32, 2, type_of(h2_layout), type_of(ssm_gate_w_layout), type_of(ssm_gate_o_layout)]](
+                            Xg, tens_f32(ctx, b.wbuf, b.off[moe_base + 3], NH_V * H, ssm_gate_w_layout),
+                            tens_f32(ctx, b.wbuf, b.off[moe_base + 4], NH_V * H, ssm_gate_w_layout),
+                            row_f32(ctx, b.p_32_d, 0, NH_V, ssm_gate_o_layout), row_f32(ctx, b.p_32b_d, 0, NH_V, ssm_gate_o_layout),
+                            Int32(NH_V), Int32(H), grid_dim=ceildiv(2 * NH_V, ROW_WAVES), block_dim=ROW_THREADS)
+                    comptime if MEGA_ALLOWED:
+                        ctx.enqueue_function[r_qf](Pq, Qkvm, Int32(m), Int32(CONV), grid_dim=ceildiv(m * CONV, 256), block_dim=256)
+                    comptime if MEGA_ALLOWED:
+                        ctx.enqueue_function[r_h](Ph, ZmOld, Int32(m), Int32(H), grid_dim=ceildiv(m * H, 256), block_dim=256)
+                    else:
+                        ctx.enqueue_function[moe_matmul_q8d_m1[type_of(moe_inner_layout), type_of(xm_layout)]](
+                            CurBm, b.wbuf.unsafe_ptr().unsafe_offset(b.off[moe_base + 2]), Zflat, Int32(NH_V * SSTATE), Int32(H), Int32(NH_V * SSTATE * H),
+                            grid_dim=ceildiv(NH_V * SSTATE, 8), block_dim=256)
+
+                    if cfg.pf2:
+                        ctx.synchronize()
+                        var nw = perf_counter_ns()
+                        st.pc[0] += Int(nw - st.tq)
+                        st.tq = nw
+                    ctx.enqueue_function[rgates_k](Pab, Pab2, Eg, Beta, SsmA, DtB, Int32(m), grid_dim=1, block_dim=NH_V)
+                    if cfg.pf2:
+                        ctx.synchronize()
+                        var nw = perf_counter_ns()
+                        st.pc[1] += Int(nw - st.tq)
+                        st.tq = nw
+                    ctx.enqueue_function[conv_k](Qkvm, ConvStateAll, Cw, Conv, Int32(st.ring), Int32(ssm_i), Int32(SLOTS), Int32(m), grid_dim=ceildiv(CONV, 256), block_dim=256)
+                    if cfg.pf2:
+                        ctx.synchronize()
+                        var nw = perf_counter_ns()
+                        st.pc[2] += Int(nw - st.tq)
+                        st.tq = nw
+                    ctx.enqueue_function[l2_k](Conv, Int32(m), grid_dim=NH_V, block_dim=SSTATE)
+                    if cfg.pf2:
+                        ctx.synchronize()
+                        var nw = perf_counter_ns()
+                        st.pc[3] += Int(nw - st.tq)
+                        st.tq = nw
+                    if cfg.dump4 and cfg.dump and m == 1 and layer == cfg.dump_layer and st.pos + 1 >= cfg.n_prompt:
+                        # slot 4: conv output after l2norm (llama conv_output_silu /
+                        # Qcur_normed). slot 5: the two gate vectors, Eg then Beta,
+                        # NH_V each (llama a_softplus / beta_sigmoid).
+                        ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr().unsafe_offset(8 * H), CONV, owning=False), src_buf=DeviceBuffer[f32](ctx, b.conv_d.unsafe_ptr(), CONV, owning=False))
+                        ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr().unsafe_offset(5 * H), NH_V, owning=False), src_buf=DeviceBuffer[f32](ctx, b.eg_d.unsafe_ptr(), NH_V, owning=False))
+                        ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr().unsafe_offset(5 * H + NH_V), NH_V, owning=False), src_buf=DeviceBuffer[f32](ctx, b.beta_d.unsafe_ptr(), NH_V, owning=False))
+                    delta_dispatch(ctx, SStateAll, Conv, Eg, Beta, So, Int32(st.ring), Int32(ssm_i), Int32(SLOTS), m)
+                    if cfg.dump4 and cfg.dump and m == 1 and layer == cfg.dump_layer and st.pos + 1 >= cfg.n_prompt:
+                        # slot 6: delta-scan output, before the output gate.
+                        ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr().unsafe_offset(6 * H), NH_V * SSTATE, owning=False), src_buf=DeviceBuffer[f32](ctx, b.so_d.unsafe_ptr(), NH_V * SSTATE, owning=False))
+                    if cfg.pf2:
+                        ctx.synchronize()
+                        var nw = perf_counter_ns()
+                        st.pc[4] += Int(nw - st.tq)
+                        st.tq = nw
+                    comptime if MEGA_ALLOWED:
+                        ctx.enqueue_function[gated_k](So, ZmOld, Nw, ResBmOld, Int32(m), grid_dim=NH_V, block_dim=SSTATE)
+                    else:
+                        ctx.enqueue_function[amar_ssm_gated_out_bf16[type_of(om_layout), type_of(moe_inner_m_layout), type_of(n128_layout), type_of(moe_inner_m_layout)]](
+                            So, Zm, Nw, ResBm, Int32(m), grid_dim=NH_V, block_dim=SSTATE)
+
+                    if cfg.pf2:
+                        ctx.synchronize()
+                        var nw = perf_counter_ns()
+                        st.pc[5] += Int(nw - st.tq)
+                        st.tq = nw
+                    comptime if MEGA_ALLOWED:
+                        gemm_w[H, H](ctx, ResBmOld, b.wbuf, b.off[w + 9], cfg.pack_q4, Ph, m)
+                    else:
+                        ctx.enqueue_function[moe_matmul_q8d_m1_add[type_of(h_layout), type_of(moe_inner_m_layout), type_of(h_layout)]](
+                            ResBm, b.wbuf.unsafe_ptr().unsafe_offset(b.off[decode_base + 9]), row_f32(ctx, b.p_h_d, 0, H, h_layout), row_f32(ctx, b.x_d, token_row * H, H, h_layout), Int32(H), Int32(NH_V * SSTATE), Int32(H * NH_V * SSTATE),
+                            grid_dim=ceildiv(H, 8), block_dim=256)
+                    if cfg.dump4 and cfg.dump and m == 1 and layer == cfg.dump_layer and st.pos + 1 >= cfg.n_prompt:
+                        # slot 7: the ssm_out projection result, i.e. llama's
+                        # linear_attn_out, the last value before the residual add.
+                        ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr().unsafe_offset(7 * H), H, owning=False), src_buf=DeviceBuffer[f32](ctx, b.p_h_d.unsafe_ptr(), H, owning=False))
+                    comptime if MEGA_ALLOWED:
+                        ctx.enqueue_function[r_add](Ph, Xm, Int32(m), Int32(H), grid_dim=ceildiv(m * H, 256), block_dim=256)
+                    ssm_i += 1
+                    w += 10
+
+                if cfg.prof:
+                    ctx.synchronize()
+                    var now = perf_counter_ns()
+                    if is_attn(layer):
+                        st.pf_att += Int(now - st.tp)
+                    else:
+                        st.pf_ssm += Int(now - st.tp)
+                        if cfg.pf2:
+                            st.pc[6] += Int(now - st.tq)
+                    st.tp = now
+                    st.tq = now
+                if cfg.dump and m == 1 and st.pos + 1 >= cfg.n_prompt:
+                    if not cfg.dump4:
+                        ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr().unsafe_offset((2 * layer) * H), H, owning=False), src_buf=DeviceBuffer[f32](ctx, b.x_d.unsafe_ptr(), H, owning=False))
+                    if cfg.dump4 and layer == cfg.dump_layer:
+                        ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr(), H, owning=False), src_buf=DeviceBuffer[f32](ctx, b.x_d.unsafe_ptr(), H, owning=False))
+                # -- ffn sub-block --
+                if cfg.pf4:
+                    ctx.synchronize()
+                    st.tq = perf_counter_ns()
+                var ffn_norm_base = w
+                comptime if not MEGA_ALLOWED:
+                    ffn_norm_base = moe_base + (7 if is_attn(layer) else 10)
+                comptime if MEGA_ALLOWED:
+                    ctx.enqueue_function[rmsc_k](
+                        Xm, tens_f32(ctx, b.wbuf, b.off[ffn_norm_base], H, h_layout), CurBm,
+                        Int32(H), Float32(1e-6), grid_dim=m, block_dim=256,
+                    )
+                else:
+                    ctx.enqueue_function[rmsc2_k](
+                        Xm, tens_f32(ctx, b.wbuf, b.off[ffn_norm_base], H, h_layout), CurBm,
+                        row_f32(ctx, b.p_h_d, 0, H, h2_layout),
+                        Int32(H), Float32(1e-6), grid_dim=m, block_dim=256,
+                    )
+                if cfg.dump4 and cfg.dump and m == 1 and st.pos + 1 >= cfg.n_prompt and layer == cfg.dump_layer:
+                    var DbgNorm = row_f32(ctx, b.p_h_d, 0, H, moe_vec_layout)
+                    ctx.enqueue_function[amar_widen_bf16[type_of(moe_vec_layout), type_of(moe_vec_layout)]](row_bf16(ctx, b.curb_d, 0, H, moe_vec_layout), DbgNorm, Int32(H), grid_dim=ceildiv(H, 256), block_dim=256)
+                    ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr().unsafe_offset(H), H, owning=False), src_buf=DeviceBuffer[f32](ctx, b.p_h_d.unsafe_ptr(), H, owning=False))
+                if cfg.pf4:
+                    ctx.synchronize()
+                    var nw = perf_counter_ns()
+                    st.fc[0] += Int(nw - st.tq)
+                    st.tq = nw
+                comptime if not MEGA_ALLOWED:
+                    moe_ffn(ctx, b, Xm, CurBm, moe_base, layer, moe_base + (8 if is_attn(layer) else 11), moe_base + (11 if is_attn(layer) else 14),
+                            st.pos if cfg.expert_trace else -1, token_row)
+                var Wfgq = tens_q8q(ctx, b.wbuf, b.off[w + 1], H * FFN, q_h_ffn)
+                var Wfgs = tens_q8s(ctx, b.wbuf, b.off[w + 1], H * FFN, s_h_ffn)
+                var Wfuq = tens_q8q(ctx, b.wbuf, b.off[w + 2], H * FFN, q_h_ffn)
+                var Wfus = tens_q8s(ctx, b.wbuf, b.off[w + 2], H * FFN, s_h_ffn)
+                var Wfdq = tens_q8q(ctx, b.wbuf, b.off[w + 3], FFN * H, q_ffn_h)
+                var Wfds = tens_q8s(ctx, b.wbuf, b.off[w + 3], FFN * H, s_ffn_h)
+                var Pg = TileTensor(b.p_ffn_d, p_ffn)
+                var Pu = TileTensor(b.p_ffn2_d, p_ffn)
+                var Ph2 = TileTensor(b.p_h_d, p_h)
+                var FgBm = TileTensor(b.fgb_d, ffnm_layout)
+                var AqH = TileTensor(b.aq_d, aqm_h)
+                var AsH = TileTensor(b.asc_d, asm_h)
+                var use_dot = cfg.dot3 and m >= 3
+                if use_dot:
+                    quant_rows(ctx, CurBm, AqH, AsH, m, H)
+                    gemm_q8dot(ctx, AqH, AsH, Wfgq, Wfgs, Pg, m, FFN, H)
+                else:
+                    comptime if MEGA_ALLOWED:
+                        gemm_w[FFN, H](ctx, CurBm, b.wbuf, b.off[w + 1], cfg.pack_q4, Pg, m)
+                if cfg.pf4:
+                    ctx.synchronize()
+                    var nw = perf_counter_ns()
+                    st.fc[1] += Int(nw - st.tq)
+                    st.tq = nw
+                if use_dot:
+                    gemm_q8dot(ctx, AqH, AsH, Wfuq, Wfus, Pu, m, FFN, H)
+                else:
+                    comptime if MEGA_ALLOWED:
+                        gemm_w[FFN, H](ctx, CurBm, b.wbuf, b.off[w + 2], cfg.pack_q4, Pu, m)
+                if cfg.pf4:
+                    ctx.synchronize()
+                    var nw = perf_counter_ns()
+                    st.fc[2] += Int(nw - st.tq)
+                    st.tq = nw
+                comptime if MEGA_ALLOWED:
+                    ctx.enqueue_function[r_swiglu](Pg, Pu, FgBm, Int32(m), Int32(FFN), grid_dim=ceildiv(m * FFN, 256), block_dim=256)
+                if cfg.pf4:
+                    ctx.synchronize()
+                    var nw = perf_counter_ns()
+                    st.fc[3] += Int(nw - st.tq)
+                    st.tq = nw
+                if use_dot:
+                    var AqF = TileTensor(b.aq_d, aqm_ffn)
+                    var AsF = TileTensor(b.asc_d, asm_ffn)
+                    quant_rows(ctx, FgBm, AqF, AsF, m, FFN)
+                    gemm_q8dot(ctx, AqF, AsF, Wfdq, Wfds, Ph2, m, H, FFN)
+                else:
+                    comptime if MEGA_ALLOWED:
+                        gemm_w[H, FFN](ctx, FgBm, b.wbuf, b.off[w + 3], cfg.pack_q4, Ph2, m)
+                if cfg.pf4:
+                    ctx.synchronize()
+                    var nw = perf_counter_ns()
+                    st.fc[4] += Int(nw - st.tq)
+                    st.tq = nw
+                comptime if MEGA_ALLOWED:
+                    ctx.enqueue_function[r_add](Ph2, Xm, Int32(m), Int32(H), grid_dim=ceildiv(m * H, 256), block_dim=256)
+                if cfg.pf4:
+                    ctx.synchronize()
+                    var nw = perf_counter_ns()
+                    st.fc[5] += Int(nw - st.tq)
+                    st.tq = nw
+                w += 4
+                if is_attn(layer):
+                    moe_w += 16
+                else:
+                    moe_w += 19
+                if cfg.dump and m == 1 and st.pos + 1 >= cfg.n_prompt:
+                    if not cfg.dump4:
+                        ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr().unsafe_offset((2 * layer + 1) * H), H, owning=False), src_buf=DeviceBuffer[f32](ctx, b.x_d.unsafe_ptr(), H, owning=False))
+                    if cfg.dump4 and layer == cfg.dump_layer:
+                        ctx.enqueue_copy(dst_buf=DeviceBuffer[f32](ctx, b.dbg_d.unsafe_ptr().unsafe_offset(2 * H), H, owning=False), src_buf=DeviceBuffer[f32](ctx, b.x_d.unsafe_ptr(), H, owning=False))
+                if cfg.prof:
+                    ctx.synchronize()
+                    var now = perf_counter_ns()
+                    st.pf_ffn += Int(now - st.tp)
+                    st.tp = now
+
+        m = window_m
+        st.pos = window_pos
+        st.ring = window_ring
+        Xm = row_f32(ctx, b.x_d, 0, MROWS * H, xm_layout)
         var head_folded = use_mega and plain_head
         comptime if not MEGA_ALLOWED:
             head_folded = False

@@ -14,6 +14,7 @@ from std.os import getenv
 from kvpage import PageTable
 from std.sys import exit, has_accelerator
 from std.time import perf_counter_ns
+from ngram import ngram_propose
 
 from max.algorithm import parallelize
 from max.gpu.host import DeviceContext, DeviceBuffer
@@ -572,7 +573,7 @@ def main() raises:
     # llama-handoff.sh) and the engine raises if the two are combined, so an
     # unpinned identity gate fails loudly rather than measuring the wrong arm.
     # Still gated on MEGA_ALLOWED: the MoE profile has no draft head.
-    var spec_env = MEGA_ALLOWED and getenv("BARO_SPEC", "1") == "1"
+    var spec_env = (MEGA_ALLOWED and getenv("BARO_SPEC", "1") == "1") or (IS_MOE and getenv("BARO_NGRAM", "0") == "1")
     print("BARO_SPEC:", spec_env)
     var spec_dbg = getenv("BARO_SPEC_DBG", "0") == "1"
     # B4 stage 2 (bench/moe-locality-protocol.md): BARO_EXPERTS=<path> writes
@@ -978,6 +979,10 @@ def main() raises:
         var want_grammar = wst.grammar.__bool__()
         if want_extra or want_grammar:
             spec = False
+        comptime if IS_MOE:
+            # Prompt lookup currently verifies plain greedy tokens only.
+            if sample.temperature > 0 or sample.embed != 0 or dump or expert_trace or len(stop_seqs) > 0:
+                spec = False
         # A6 (bench/chat-protocol.md A6): every m == 1 decode step runs the
         # megakernel. window.mojo folds the head (argmax inside the launch)
         # only for a plain greedy request; sampling, penalties, top_logprobs
@@ -1009,10 +1014,32 @@ def main() raises:
         var force_tok_h = ctx.enqueue_create_host_buffer[DType.int32](1)
         var lg_h = ctx.enqueue_create_host_buffer[f32](VOCAB if margin else 1)
         var hidden_h = ctx.enqueue_create_host_buffer[f32](H)
+        var ngram_ns = 0
+        var verify_ns = 0
+        var verify_rows = 0
         # The stopwatch stays here, in the harness that is never embedded in a
         # gguf: step_window cannot reach t0, t_prefill_end or dt (P-A, 2026-09-08).
         while wst.pos < n_total - 1:
             var pos_before = wst.pos
+            var ngram_n = 0
+            comptime if IS_MOE:
+                if cfg.spec and wst.pos >= len(prompt) and wst.pos + 2 < n_total:
+                    var draft_start = perf_counter_ns()
+                    var hn = min(wst.pos + 1, 4096)
+                    ctx.enqueue_copy(dst_buf=bufs.pen_hist_h.create_sub_buffer[DType.int32](0, hn), src_buf=DeviceBuffer[DType.int32](ctx, bufs.toks_d.unsafe_ptr().unsafe_offset(wst.pos + 1 - hn), hn, owning=False))
+                    ctx.synchronize()
+                    var history = List[Int]()
+                    for hi in range(hn):
+                        history.append(Int(bufs.pen_hist_h[hi]))
+                    var proposed = ngram_propose(history, min(min(kcfg, MROWS - 1), n_total - 2 - wst.pos))
+                    ngram_n = len(proposed)
+                    if ngram_n > 0:
+                        for ni in range(ngram_n):
+                            bufs.win_h[ni] = Int32(proposed[ni])
+                        ctx.enqueue_copy(dst_buf=DeviceBuffer[DType.int32](ctx, bufs.toks_d.unsafe_ptr().unsafe_offset(wst.pos + 1), ngram_n, owning=False), src_buf=bufs.win_h.create_sub_buffer[DType.int32](0, ngram_n))
+                        ctx.synchronize()
+                    ngram_ns += Int(perf_counter_ns() - draft_start)
+            var verify_start = perf_counter_ns()
             if len(ckpt_hints) > 0 and wst.pos < pf_rows:
                 # A hint may fall inside what would otherwise be one big
                 # prefill chunk; cap this call's chunk so wst.pos actually
@@ -1021,7 +1048,11 @@ def main() raises:
                 step_cfg.pf_chunk = min(cfg.pf_chunk, next_ckpt_stop(ckpt_hints, wst.pos, pf_rows) - wst.pos)
                 step_window(ctx, bufs, step_cfg, wst)
             else:
-                step_window(ctx, bufs, cfg, wst)
+                step_window(ctx, bufs, cfg, wst, ngram_n)
+            if ngram_n > 0:
+                ctx.synchronize()
+                verify_ns += Int(perf_counter_ns() - verify_start)
+                verify_rows += ngram_n + 1
             if sample.hidden == 1 and pos_before >= len(prompt) - 1:
                 ctx.enqueue_copy(dst_buf=hidden_h, src_buf=DeviceBuffer[f32](ctx, bufs.hn_d.unsafe_ptr(), H, owning=False))
             if sample.hidden == 1 or sample.logits_topk > 0:
@@ -1479,6 +1510,9 @@ def main() raises:
             done_line += ",\"finish\":\"" + finish + "\""
             if spec:
                 done_line += ",\"drafted\":" + String(wst.n_drafted) + ",\"accepted\":" + String(wst.n_accepted) + ",\"k\":" + String(kcfg)
+                comptime if IS_MOE:
+                    done_line += ",\"draft_kind\":\"ngram\",\"windows\":" + String(wst.n_spec_windows) + ",\"verify_rows\":" + String(verify_rows)
+                    done_line += ",\"draft_s\":" + String(Float64(ngram_ns) / 1e9) + ",\"verify_s\":" + String(Float64(verify_ns) / 1e9)
             print(done_line + "}")
             continue
 
