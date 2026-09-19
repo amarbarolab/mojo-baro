@@ -47,5 +47,44 @@
   `minja/` / `latentos/`; upstreams `~/Projects/mojo/mojo-uregex` /
   `~/Projects/mojo/mojo-minja` / `~/AMDHQ/src/latentos`, synced by hand, drift
   checked by `tools/ci-checks.sh` when present).
-- Verify: `./run-tests.sh`, `./bench/run.py [bench-src.mojo]`, parity tests
-  in `kernels/test_*.mojo` (build AOT into `.work/`, `-I kernels`).
+- **Bit-exact means a byte test against the m=1 / decode kernel, not a token gate.**
+  New multi-row kernels call the m=1 dot helpers with the same per-element order
+  (`kernels/test_moe_rows.mojo`, `kernels/test_ssm_rows.mojo`). The dense chunk
+  kernels `amar_attn_prefill_wmma` and `amar_ssm_delta_chunk_w` reorder sums (the scan
+  differs from the decode step in 87% of outputs and flipped a greedy token at index
+  4): never reuse them where replay identity is the gate. A kernel that fails greedy
+  equality gets a teacher-forced agreement gate with a same-arm control and a bar set
+  BEFORE the run; WMMA attention in MoE prefill read 97.92% against 99% and stayed
+  opt-in.
+- **`gpu-wait run` carries neither your environment nor your stdin.** Knobs go in
+  as `env K=V` inside the queued command; a redirect goes inside it too (`bash -c`,
+  or the script re-execs itself under the queue). An engine fed an empty stdin prints
+  ready, exits 0 and the job is green with nothing served. `gpu-wait gpu` prints a
+  10 KB dict: parse it, never print it.
+- **Budget VRAM against MAX's pool, not the card.** MAX takes about 90% of the VRAM
+  free at start. The resident qwen35moe pack (21 GB) leaves 0.08 to 0.4 GB and ran out
+  of memory at an 8k f32 KV cache, then ran slower than tier mode at 1k. `pack-fit
+  PACK --tmax N [--tier CAP] --used-gb 0.75` before any resident arm; tier mode
+  (`BARO_TIER=64 BARO_TIER_PINNED=1 BARO_TIER_ZC=1`) is the MoE arm past 1k context.
+- **Exploratory gate runs say so in their exit code.** A gate that cannot pass its
+  `bench/preflight.sh --check` yet runs with `EXPLORE=1`: verdict capped at
+  `UNVERIFIED`, exit 3, never PASS. A gate also counts how many of its inputs reach
+  the feature's threshold and names the rest NOT EXERCISED (9 of the 20 `mtp-prompts`
+  reach PF_MIN + 1 = 17 tokens; none crosses a prefill chunk).
+- **`.work/` is not storage.** It is gitignored and was recreated empty on 2026-09-19
+  03:07: `engine-pack-q4`, `m5`, `spark`, `refcache` and every receipt path cited by
+  the board and by `exchange/` reports before that date are gone, the lane worktrees'
+  fixture symlinks dangle, and `lane-merge` fails on receipts alone. Packs are rebuilt
+  into `~/.cache/baro/<model>/packs/` by `tools/baro`; a receipt a report cites is
+  copied under `exchange/receipts/<lane>/` (small text only) in the same commit.
+  `run-tests.sh` needs `BARO_PACK` pointing at a q4 pack until `.work/engine-pack-q4`
+  is restored.
+- **One primary checkout, on `main`; lanes live in worktrees** (`.work/lanes/<lane>`
+  or `../mojo-baro-lanes/<lane>`, prepared with `lane-prep`). `lane-status .` before
+  opening or merging a lane, `lane-merge <branch>` before the merge. A long-running
+  shared branch checked out in the primary directory (lane-r63 carried 31 commits of
+  serve, audio, router and kernel work for two days) hides what is and is not on main.
+- Verify: `bench/preflight.sh` (CPU only: `tools/ci-checks.sh`, every test and both
+  engines build; gate scripts call `--check`), `./run-tests.sh` under `gpu-wait`,
+  `./bench/run.py [bench-src.mojo]`, parity tests in `kernels/test_*.mojo` (build AOT
+  into `.work/`, `-I kernels`). Protocol rules P1 to P20: `bench/PROTOCOL-RULES.md`.
