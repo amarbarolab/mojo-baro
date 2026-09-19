@@ -1,0 +1,8 @@
+{"id":1,"done":true,"n":16,"prefill_s":0.691415808,"decode_s":0.35013996999999997,"tok_s":42.84001052493379,"cached":0,"prefill_rows":127,"restore_s":0.011881663,"checkpoints":0,"finish":"length"}
+{"id":2,"done":true,"n":16,"prefill_s":1.928081803,"decode_s":0.29188741500000015,"tok_s":51.38967707806105,"cached":0,"prefill_rows":1023,"restore_s":0.01040922,"checkpoints":0,"finish":"length"}
+{"id":3,"done":true,"n":16,"prefill_s":18.943014409,"decode_s":0.29127869499999903,"tok_s":51.49707224553464,"cached":0,"prefill_rows":8191,"restore_s":0.010550931,"checkpoints":0,"finish":"length"}
+{"id":4,"done":true,"n":16,"prefill_s":132.532885626,"decode_s":0.3573666990000106,"tok_s":41.97369268589728,"cached":0,"prefill_rows":32767,"restore_s":0.010462452,"checkpoints":0,"finish":"length"}
+{"id":1,"done":true,"n":16,"prefill_s":0.692005162,"decode_s":0.37483226299999994,"tok_s":40.017899953291916,"cached":0,"prefill_rows":127,"restore_s":0.011262559,"checkpoints":0,"finish":"length"}
+{"id":2,"done":true,"n":16,"prefill_s":1.95282861,"decode_s":0.29513747300000004,"tok_s":50.82377323194062,"cached":0,"prefill_rows":1023,"restore_s":0.010549147,"checkpoints":0,"finish":"length"}
+{"id":3,"done":true,"n":16,"prefill_s":19.144558058,"decode_s":0.2922177779999977,"tok_s":51.33157914848055,"cached":0,"prefill_rows":8191,"restore_s":0.010431507,"checkpoints":0,"finish":"length"}
+{"id":4,"done":true,"n":16,"prefill_s":133.393900138,"decode_s":0.34918430900000885,"tok_s":42.957256707659276,"cached":0,"prefill_rows":32767,"restore_s":0.010256148,"checkpoints":0,"finish":"length"}

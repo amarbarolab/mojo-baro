@@ -1,0 +1,40 @@
+PASS gate B topn T 0.0 k 0 p 1.0 min_p 0.0 N 20 row 1 : ids equal, max |dp| 8.940697e-08 top id 165170 p 0.2950226
+PASS gate B topn T 0.0 k 0 p 1.0 min_p 0.0 N 20 row 2 : ids equal, max |dp| 1.1920929e-07 top id 173773 p 0.29502246
+PASS: penalties and top-N probs match the host reference on 3 rows
+Failed to initialize Crashpad.  Crash reporting will not be available.  Cause: while locating crashpad handler: unable to locate crashpad handler executable
+$HOME/Projects/mojo/mojo-baro/.work/lanes/moepf/kernels/test_sample_mask.mojo:61:23: warning: positional `__getitem__` is deprecated, use `unsafe_offset=` instead
+            row[i] = p[i]
+                     ~^~~
+<unknown>:0: note: '__getitem__' declared here
+PASS A synthetic : masked argmax 72705 (top-3 cleared) and 60033 (5 allowed) match host
+PASS B synthetic : 96 masked draws match host token and prob; sparse mask (5 low ids, top_k up to 40) never returned -1
+PASS C synthetic : chi-square 4.486810109219798 df 8 crit 26.317913719340165 over 20000 draws under the top-3-cleared mask, forbidden drawn 0
+PASS D synthetic : masked probs vs host max |dp| 1.4901161e-08 , masked tokens 0, T=0 one-hot on the masked argmax 60033
+PASS E synthetic : unmasked T=0 argmax 144280 == host; full mask == unmasked on 16/16 draws
+PASS: masked sampling matches the host reference on 1 rows
+Failed to initialize Crashpad.  Crash reporting will not be available.  Cause: while locating crashpad handler: unable to locate crashpad handler executable
+Imported from $HOME/Projects/mojo/mojo-baro/.work/lanes/moepf/kernels/test_spark_attn.mojo:12:
+$HOME/Projects/mojo/mojo-baro/.work/lanes/moepf/kernels/attn.mojo:30:21: warning: positional `__getitem__` is deprecated, use `unsafe_offset=` instead
+    return ((Int(tab[t >> KVPSH]) * NAT + att_i) * NKVH_ + kvh) * (KVPAGE * HD_ + KVPAD) + (t & (KVPAGE - 1)) * HD_
+                 ~~~^~~~~~~~~~~~
+<unknown>:0: note: '__getitem__' declared here
+KATT dump HD 64 NQH 32 NKVH 8 pool 393216 -> .work/katt/hd64_*.bin
+KATT dump HD 128 NQH 28 NKVH 4 pool 393216 -> .work/katt/hd128_*.bin
+KATT dump HD 256 NQH 16 NKVH 4 pool 786432 -> .work/katt/hd256_*.bin
+HD 64: appended K max|err| vs f64 rope 3.835e-05, V copied exactly: True
+HD 64 full: max|err| 9.028e-04, violations 0/4096, bf16-exact 1.0000
+HD 64 swa: max|err| 1.544e-03, violations 0/4096, bf16-exact 0.9993
+HD 128: appended K max|err| vs f64 rope 2.983e-05, V copied exactly: True
+HD 128 full: max|err| 4.848e-04, violations 0/7168, bf16-exact 0.9994
+HD 128 swa: max|err| 8.330e-04, violations 0/7168, bf16-exact 0.9994
+HD 256: appended K max|err| vs f64 rope 5.872e-05, V copied exactly: True
+HD 256 full: max|err| 4.881e-04, violations 0/8192, bf16-exact 0.9988
+HD 256 swa: max|err| 9.742e-04, violations 0/8192, bf16-exact 0.9991
+PASS: spark attention parity at HD 64/128/256
+Failed to initialize Crashpad.  Crash reporting will not be available.  Cause: while locating crashpad handler: unable to locate crashpad handler executable
+PASS: latent mint/ingest round trip, conv 589824 ssm 12582912 floats exact
+Failed to initialize Crashpad.  Crash reporting will not be available.  Cause: while locating crashpad handler: unable to locate crashpad handler executable
+PASS
+Failed to initialize Crashpad.  Crash reporting will not be available.  Cause: while locating crashpad handler: unable to locate crashpad handler executable
+107 kernels, 60 in registry, 0 orphans
+rc=0

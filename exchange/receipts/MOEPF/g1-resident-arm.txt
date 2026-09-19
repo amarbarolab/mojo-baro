@@ -1,0 +1,8 @@
+gate=moe-prefill-identity mode=resident set=all explore=0 quick=0 pfc=0 ngen=64 tmax=2048 prompts=23
+eng=$HOME/Projects/mojo/mojo-baro/.work/lanes/moepf/.work/moepf/engine-moe-final sha=aba05f6214bd152b
+pack=$HOME/Projects/mojo/mojo-baro/.work/moe-ngram/pack index_sha=78b89186e137eb3c pack_bytes=21005191680
+modeenv='' pfcenv='' xenv=''
+pcie=16.0 GT/s PCIe
+commit=e989de1 dirty=''
+replay readback: BARO_PREFILL: False  chunk 1024
+batched readback: BARO_PREFILL: True  chunk 1024
