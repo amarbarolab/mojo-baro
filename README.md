@@ -463,4 +463,7 @@ Issue forms: hardware report, bug report, kernel or speed proposal. Hardware rep
 
 ## License
 
-Apache-2.0, see [LICENSE](LICENSE). Copyright 2026 amarbaro.org / amarbaro.com.
+Apache-2.0, see [LICENSE](LICENSE) and [NOTICE](NOTICE). Copyright 2026 amarbaro.org /
+amarbaro.com. Third-party material is named in the NOTICE: the vendored `toml/` reader
+(DataBooth, Apache-2.0) and the pre-tokenizer regexes in `serve/pretok-table.json`
+(from llama.cpp, MIT). llama.cpp is fetched at a pinned commit, never redistributed.

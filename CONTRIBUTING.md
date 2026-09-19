@@ -129,3 +129,26 @@ that every repo path the docs cite exists, and that the receipts in `results/`
 are internally consistent. GitHub Actions runs it on every push and pull
 request. It is not a substitute for `./run-tests.sh`: no hosted runner has an
 RDNA3 card, so the kernels themselves are only verified on hardware.
+
+## Sign off what you send
+
+Every commit in a pull request carries a `Signed-off-by:` line, which `git
+commit -s` adds for you:
+
+```
+Signed-off-by: Your Name <your@email>
+```
+
+That line is the Developer Certificate of Origin (DCO 1.1, at
+[developercertificate.org](https://developercertificate.org/)): you are stating
+that you wrote the change, or that you have the right to submit it, and that it
+may be distributed under this project's Apache-2.0 license. Nothing more is
+asked of you. You keep the copyright in your own work.
+
+There is no contributor licence agreement here, and there will not be one. A
+CLA would ask you to hand over rights so the project could be relicensed later
+without asking you; a project that takes patches from strangers and reserves
+the option to close the source is asking for a favour it has not earned. The
+consequence is deliberate: once a contribution lands, this repository can only
+change its licence with the agreement of everyone whose work is in it, which is
+the guarantee that Apache-2.0 here means Apache-2.0 for good.
