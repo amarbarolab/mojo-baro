@@ -182,6 +182,8 @@ struct ExpertTier(Copyable, Movable):
     var hoste_h: HostBuffer[DType.int32]
     var hoste_d: DeviceBuffer[DType.int32]
     var bytes_zc: Int
+    var pf_stage: DeviceBuffer[DType.uint8]
+    var pf_stage_bytes: Int
 
     def __init__(
         out self, ctx: DeviceContext, packdir: String, cap: Int, n_layers: Int
@@ -194,6 +196,8 @@ struct ExpertTier(Copyable, Movable):
         self.pinned = getenv("BARO_TIER_PINNED", "1") == "1"
         self.zc = self.pinned and getenv("BARO_TIER_ZC", "0") == "1"
         self.bytes_zc = 0
+        self.pf_stage = ctx.enqueue_create_buffer[DType.uint8](1)
+        self.pf_stage_bytes = 0
         self.hoste_h = ctx.enqueue_create_host_buffer[DType.int32](TOPK)
         self.hoste_d = ctx.enqueue_create_buffer[DType.int32](TOPK)
         self.hot_active = (not self.pinned) and getenv("BARO_TIER_HOT", "0") == "1"
@@ -287,6 +291,8 @@ struct ExpertTier(Copyable, Movable):
         self.pinned = False
         self.zc = False
         self.bytes_zc = 0
+        self.pf_stage = ctx.enqueue_create_buffer[DType.uint8](1)
+        self.pf_stage_bytes = 0
         self.hoste_h = ctx.enqueue_create_host_buffer[DType.int32](1)
         self.hoste_d = ctx.enqueue_create_buffer[DType.int32](1)
         self.n_layers = 0
@@ -315,6 +321,37 @@ struct ExpertTier(Copyable, Movable):
         self.hot_store = ctx.enqueue_create_host_buffer[DType.uint8](1)
         self.hot_slot_of = List[Dict[Int, Int]]()
         self.hot_next = List[Int]()
+
+    def stage_layer(mut self, ctx: DeviceContext, layer: Int) raises:
+        """Batched prefill (bench/moe-prefill-protocol.md, design item 5): all
+        N_EXP experts of one layer, pinned store to one VRAM staging buffer,
+        gate | up | down. A chunk touches nearly every expert, so the slot
+        cache and its per-row prepare are bypassed and left untouched."""
+        if not self.pinned:
+            raise Error("expert tier: batched prefill needs BARO_TIER_PINNED=1")
+        if self.pf_stage_bytes == 0:
+            var need = 0
+            for l in range(self.n_layers):
+                var lb = N_EXP * (2 * self.geom[l].eb + self.geom[l].ebd)
+                if lb > need:
+                    need = lb
+            self.pf_stage = ctx.enqueue_create_buffer[DType.uint8](need)
+            self.pf_stage_bytes = need
+            print("BARO_TIER prefill stage:", Float64(need) / 1e9, "GB")
+        var eb = self.geom[layer].eb
+        var ebd = self.geom[layer].ebd
+        ctx.enqueue_copy(
+            dst_buf=DeviceBuffer[DType.uint8](ctx, self.pf_stage.unsafe_ptr(), N_EXP * eb, owning=False),
+            src_buf=self.store.create_sub_buffer[DType.uint8](self.geom[layer].gate_off, N_EXP * eb),
+        )
+        ctx.enqueue_copy(
+            dst_buf=DeviceBuffer[DType.uint8](ctx, self.pf_stage.unsafe_ptr().unsafe_offset(N_EXP * eb), N_EXP * eb, owning=False),
+            src_buf=self.store.create_sub_buffer[DType.uint8](self.geom[layer].up_off, N_EXP * eb),
+        )
+        ctx.enqueue_copy(
+            dst_buf=DeviceBuffer[DType.uint8](ctx, self.pf_stage.unsafe_ptr().unsafe_offset(2 * N_EXP * eb), N_EXP * ebd, owning=False),
+            src_buf=self.store.create_sub_buffer[DType.uint8](self.geom[layer].down_off, N_EXP * ebd),
+        )
 
     def layer_base(self, layer: Int) -> Int:
         return layer * self.layer_bytes

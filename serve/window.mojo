@@ -24,8 +24,15 @@ from moe import (
     MOE_WAVES, MOE_THREADS, N_EXP, TOPK, E_FFN, SH_FFN,
 )
 from matmul_skinny import amar_matmul_skinny_m1_row, amar_matmul_skinny_m1_row2
+from moe_rows import (
+    moe_matmul_q8d_rows, moe_matmul_q8d_rows_add, moe_router_top8_sig_rows,
+    moe_gate_up_q4k_rows, moe_down_q4k_rows, moe_down_q6k_rows,
+    moe_shared_gate_up_q8_0_rows, moe_shared_down_q8_0_res_rows, moe_skinny_f32_rows,
+)
+from attn import amar_head_rmsnorm_rope, amar_kv_append2
+from ssm import amar_ssm_gated_out_rows_bf16
 from ssm import amar_widen_bf16, amar_ssm_gated_out_bf16
-from elementwise import amar_rmsnorm_cast2
+from elementwise import amar_rmsnorm_cast2, amar_rmsnorm_cast2_rows
 from grammar.automaton import Bitset
 from grammar.matcher import Matcher
 from grammar_rt import reasoning_boundary_observe
@@ -633,6 +640,9 @@ struct WindowBufs(Copyable, Movable):
     # window.mojo when cfg.dump_pen; read and written to disk only by
     # serve/engine.mojo, the harness.
     var dump_row_h: HostBuffer[f32]
+    # Batched MoE prefill (bench/moe-prefill-protocol.md): the chunk's top-8
+    # expert ids, [CP, TOPK]. Every other chunk plane reuses a dense one.
+    var pf_idx_d: DeviceBuffer[DType.int32]
 
 
 @fieldwise_init
@@ -763,6 +773,164 @@ comptime moe_shared_flat_layout = row_major[SH_FFN]()
 comptime moe_inner_layout = row_major[NH_V * SSTATE]()
 comptime moe_inner_m_layout = row_major[1, NH_V * SSTATE]()
 comptime moe_om_layout = row_major[1, NH_V, SSTATE]()
+comptime pf_lg_layout = row_major[CP, N_EXP]()
+comptime pf_idx_layout = row_major[CP, TOPK]()
+comptime pf_sig_layout = row_major[CP]()
+comptime pf_rh_layout = row_major[CP * TOPK, E_FFN]()
+comptime pf_sh_layout = row_major[CP, SH_FFN]()
+comptime rmsc2_p = amar_rmsnorm_cast2_rows[type_of(xp_layout), type_of(h_layout), type_of(xp_layout), type_of(xp_layout)]
+comptime hrr_qp = amar_head_rmsnorm_rope[type_of(qp_layout), type_of(hd_layout)]
+comptime hrr_kvp = amar_head_rmsnorm_rope[type_of(kvp_layout), type_of(hd_layout)]
+comptime append2_p = amar_kv_append2[type_of(cache_layout), type_of(kvp_layout), N_ATT]
+comptime gated_pm = amar_ssm_gated_out_rows_bf16[type_of(op_layout), type_of(attp_layout), type_of(n128_layout), type_of(attp_layout)]
+
+
+def moe_gemm_rows[
+    OL: TensorLayout
+](
+    ctx: DeviceContext, mut b: WindowBufs, A: TileTensor[bf16, type_of(xp_layout), MutAnyOrigin],
+    o: Int, O: TileTensor[f32, OL, MutAnyOrigin], n: Int, m: Int,
+) raises:
+    ctx.enqueue_function[moe_matmul_q8d_rows[OL, type_of(xp_layout)]](
+        A, b.wbuf.unsafe_ptr().unsafe_offset(o), O, Int32(n), Int32(H), Int32(n * H),
+        grid_dim=(ceildiv(n, 8), m), block_dim=256)
+
+
+def moe_prefill_forward(ctx: DeviceContext, mut b: WindowBufs, m: Int, pos: Int, ring: Int, prof: Bool) raises:
+    # Prompt rows pos .. pos+m-1 of the qwen35moe trunk in one chunk
+    # (bench/moe-prefill-protocol.md). Projections, router, experts and the
+    # shared expert are row-batched siblings of the m=1 kernels (same dot
+    # helpers, token on the grid's y axis), so they are bit-identical to
+    # replay. Attention and the SSM scan reuse the dense chunk kernels.
+    # Weight index map per layer is the decode path's (16 entries for an
+    # attention layer, 19 for an SSM layer).
+    var t0 = 0
+    if prof:
+        ctx.synchronize()
+        t0 = perf_counter_ns()
+    var Toks = TileTensor(b.toks_d, toks_layout)
+    var ConvStateAll = TileTensor(b.convstate_d, csall_layout)
+    var SStateAll = TileTensor(b.sstate_d, ssall_layout)
+    var Xp = row_f32(ctx, b.xp_d, 0, CP * H, xp_layout)
+    var CurBp = row_bf16(ctx, b.curbp_d, 0, CP * H, xp_layout)
+    var Fp = row_f32(ctx, b.zp_d, 0, CP * H, xp_layout)
+    ctx.enqueue_function[moe_embed_q8_0_pos[type_of(xp_layout), type_of(toks_layout)]](
+        b.wbuf.unsafe_ptr().unsafe_offset(b.off[0]), Xp, Toks, Int32(pos), Int32(H),
+        Int32((H // 32) * 34), grid_dim=(ceildiv(H, 256), m), block_dim=256)
+    var w = 1
+    var ssm_i = 0
+    var att_i = 0
+    for layer in range(N_LAYERS):
+        ctx.enqueue_function[rmsc2_p](Xp, tens_f32(ctx, b.wbuf, b.off[w], H, h_layout), CurBp, Fp, Int32(H), Float32(1e-6), grid_dim=m, block_dim=256)
+        var nw = 0
+        if is_attn(layer):
+            var Qn = tens_f32(ctx, b.wbuf, b.off[w + 4], HD, hd_layout)
+            var Kn = tens_f32(ctx, b.wbuf, b.off[w + 5], HD, hd_layout)
+            var Qfp = row_f32(ctx, b.qfp_d, 0, CP * QF, qfp_layout)
+            var Qp = row_f32(ctx, b.qp_d, 0, CP * ATT, qp_layout)
+            var Gatep = row_f32(ctx, b.gatep_d, 0, CP * ATT, attpflat_layout)
+            var Kflat = row_f32(ctx, b.kp_d, 0, CP * KV, kvp_flat)
+            var Khd = row_f32(ctx, b.kp_d, 0, CP * KV, kvp_layout)
+            var Vflat = row_f32(ctx, b.vp_d, 0, CP * KV, kvp_flat)
+            var Vhd = row_f32(ctx, b.vp_d, 0, CP * KV, kvp_layout)
+            var kcb = DeviceBuffer[KVT](ctx, b.kc_d.unsafe_ptr(), b.kvpool, owning=False)
+            var vcb = DeviceBuffer[KVT](ctx, b.vc_d.unsafe_ptr(), b.kvpool, owning=False)
+            var Kc = TileTensor(kcb, cache_layout)
+            var Vc = TileTensor(vcb, cache_layout)
+            var Aop = row_f32(ctx, b.aop_d, 0, CP * ATT, qp_layout)
+            var Aopflat = row_f32(ctx, b.aop_d, 0, CP * ATT, attpflat_layout)
+            var AoBp = row_bf16(ctx, b.resbp_d, 0, CP * ATT, attpflat_layout)
+            var AoBpm = row_bf16(ctx, b.resbp_d, 0, CP * ATT, attp_layout)
+            moe_gemm_rows(ctx, b, CurBp, b.off[w + 1], Qfp, QF, m)
+            moe_gemm_rows(ctx, b, CurBp, b.off[w + 2], Kflat, KV, m)
+            moe_gemm_rows(ctx, b, CurBp, b.off[w + 3], Vflat, KV, m)
+            ctx.enqueue_function[split_p](Qfp, Qp, Gatep, grid_dim=(NQH, m), block_dim=HD)
+            ctx.enqueue_function[hrr_qp](Qp, Qn, Float32(1e-6), Int32(pos), Int32(NQH), grid_dim=m * NQH, block_dim=HD)
+            ctx.enqueue_function[hrr_kvp](Khd, Kn, Float32(1e-6), Int32(pos), Int32(NKVH), grid_dim=m * NKVH, block_dim=HD)
+            ctx.enqueue_function[append2_p](Kc, Vc, Khd, Vhd, b.kvtab_d.unsafe_ptr(), Int32(pos), Int32(att_i), grid_dim=(NKVH, m, 2), block_dim=HD)
+            ctx.enqueue_function[attpw_k](Qp, Kc, Vc, Aop, b.kvtab_d.unsafe_ptr(), Int32(pos), Int32(m), Float32(0.0625), Int32(att_i), grid_dim=(NKVH, ceildiv(m, PW_ROWS)), block_dim=PW_THREADS)
+            ctx.enqueue_function[gmul_p](Aopflat, Gatep, AoBp, Int32(m * ATT), grid_dim=ceildiv(m * ATT, 256), block_dim=256)
+            ctx.enqueue_function[moe_matmul_q8d_rows_add[type_of(attp_layout), type_of(xp_layout)]](
+                AoBpm, b.wbuf.unsafe_ptr().unsafe_offset(b.off[w + 6]), Xp, Int32(H), Int32(ATT), Int32(H * ATT),
+                grid_dim=(ceildiv(H, 8), m), block_dim=256)
+            att_i += 1
+            nw = 7
+        else:
+            comptime INNER = NH_V * SSTATE
+            var Cw = tens_f32(ctx, b.wbuf, b.off[w + 5], CONV * 4, cw_layout)
+            var SsmA = tens_f32(ctx, b.wbuf, b.off[w + 6], NH_V, g32_layout)
+            var DtB = tens_f32(ctx, b.wbuf, b.off[w + 7], NH_V, g32_layout)
+            var Nw = tens_f32(ctx, b.wbuf, b.off[w + 8], SSTATE, n128_layout)
+            var Qkvp = row_f32(ctx, b.qkvp_d, 0, CP * CONV, qfp_layout)
+            var Zp = row_f32(ctx, b.gatep_d, 0, CP * INNER, attp_layout)
+            var Arp = row_f32(ctx, b.arp_d, 0, CP * NH_V, g32p_layout)
+            var Brp = row_f32(ctx, b.brp_d, 0, CP * NH_V, g32p_layout)
+            var Egp = row_f32(ctx, b.egp_d, 0, CP * NH_V, g32p_layout)
+            var Betap = row_f32(ctx, b.betap_d, 0, CP * NH_V, g32p_layout)
+            var Convp = row_f32(ctx, b.convp_d, 0, CP * CONV, convp_layout)
+            var Sop = row_f32(ctx, b.sop_d, 0, CP * INNER, op_layout)
+            var ResBp = row_bf16(ctx, b.resbp_d, 0, CP * INNER, attp_layout)
+            moe_gemm_rows(ctx, b, CurBp, b.off[w + 1], Qkvp, CONV, m)
+            moe_gemm_rows(ctx, b, CurBp, b.off[w + 2], Zp, INNER, m)
+            ctx.enqueue_function[moe_skinny_f32_rows[2, type_of(xp_layout), type_of(ssm_gate_w_layout), type_of(g32p_layout)]](
+                Fp, tens_f32(ctx, b.wbuf, b.off[w + 3], NH_V * H, ssm_gate_w_layout), Arp, Int32(NH_V), Int32(H),
+                grid_dim=(ceildiv(NH_V, ROW_WAVES), m), block_dim=ROW_THREADS)
+            ctx.enqueue_function[moe_skinny_f32_rows[2, type_of(xp_layout), type_of(ssm_gate_w_layout), type_of(g32p_layout)]](
+                Fp, tens_f32(ctx, b.wbuf, b.off[w + 4], NH_V * H, ssm_gate_w_layout), Brp, Int32(NH_V), Int32(H),
+                grid_dim=(ceildiv(NH_V, ROW_WAVES), m), block_dim=ROW_THREADS)
+            ctx.enqueue_function[gates_p](Arp, Brp, Egp, Betap, SsmA, DtB, Int32(m), grid_dim=ceildiv(m * NH_V, 256), block_dim=256)
+            ctx.enqueue_function[conv_p](Qkvp, ConvStateAll, Cw, Convp, Int32(ring), Int32(ssm_i), Int32(SLOTS), Int32(m), grid_dim=ceildiv(CONV, 256), block_dim=256)
+            ctx.enqueue_function[l2_p](Convp, Int32(m), grid_dim=(NH_V, m), block_dim=SSTATE)
+            ctx.enqueue_function[deltaw_p](SStateAll, Convp, Egp, Betap, Sop, Int32(ring), Int32(ssm_i), Int32(SLOTS), Int32(m), grid_dim=DC_BLOCKS, block_dim=32)
+            ctx.enqueue_function[gated_pm](Sop, Zp, Nw, ResBp, grid_dim=(NH_V, m), block_dim=SSTATE)
+            ctx.enqueue_function[moe_matmul_q8d_rows_add[type_of(attp_layout), type_of(xp_layout)]](
+                ResBp, b.wbuf.unsafe_ptr().unsafe_offset(b.off[w + 9]), Xp, Int32(H), Int32(INNER), Int32(H * INNER),
+                grid_dim=(ceildiv(H, 8), m), block_dim=256)
+            ssm_i += 1
+            nw = 10
+        # -- sparse MoE block: router, 8 routed experts, shared expert --
+        var routed_base = w + nw + 1
+        var extra_base = w + nw + 4
+        ctx.enqueue_function[rmsc2_p](Xp, tens_f32(ctx, b.wbuf, b.off[w + nw], H, h_layout), CurBp, Fp, Int32(H), Float32(1e-6), grid_dim=m, block_dim=256)
+        var Lg = row_f32(ctx, b.qp_d, 0, CP * N_EXP, pf_lg_layout)
+        var Idx = TileTensor[DType.int32, type_of(pf_idx_layout), MutAnyOrigin](b.pf_idx_d, pf_idx_layout)
+        var Wt = row_f32(ctx, b.arp_d, 0, CP * TOPK, pf_idx_layout)
+        var Sig = row_f32(ctx, b.brp_d, 0, CP, pf_sig_layout)
+        var RoutedH = row_bf16(ctx, b.resbp_d, 0, CP * TOPK * E_FFN, pf_rh_layout)
+        var Routed = row_f32(ctx, b.aop_d, 0, CP * H, xp_layout)
+        var SharedH = row_bf16(ctx, b.fgbp_d, 0, CP * SH_FFN, pf_sh_layout)
+        ctx.enqueue_function[moe_skinny_f32_rows[2, type_of(xp_layout), type_of(moe_router_layout), type_of(pf_lg_layout)]](
+            Fp, tens_f32(ctx, b.wbuf, b.off[extra_base], N_EXP * H, moe_router_layout), Lg, Int32(N_EXP), Int32(H),
+            grid_dim=(ceildiv(N_EXP, ROW_WAVES), m), block_dim=ROW_THREADS)
+        ctx.enqueue_function[moe_router_top8_sig_rows[type_of(pf_lg_layout), type_of(pf_idx_layout), type_of(pf_idx_layout), type_of(xp_layout), type_of(h_layout), type_of(pf_sig_layout)]](
+            Lg, Idx, Wt, Fp, tens_f32(ctx, b.wbuf, b.off[extra_base + 4], H, h_layout), Sig, Int32(H),
+            grid_dim=m, block_dim=MOE_THREADS // MOE_WAVES)
+        var up_offset = b.off[routed_base + 1] - b.off[routed_base]
+        if b.tier.active:
+            b.tier.stage_layer(ctx, layer)
+            up_offset = N_EXP * b.tier.geom[layer].eb
+        ctx.enqueue_function[moe_gate_up_q4k_rows[TOPK, E_FFN, type_of(xp_layout), type_of(pf_idx_layout), type_of(pf_rh_layout)]](
+            CurBp, (b.tier.pf_stage.unsafe_ptr() if b.tier.active else b.wbuf.unsafe_ptr().unsafe_offset(b.off[routed_base])), Idx, RoutedH, Int32(H), Int32(up_offset),
+            grid_dim=(ceildiv(TOPK * E_FFN, MOE_WAVES), m), block_dim=MOE_THREADS)
+        if layer == 34 or layer == 38 or layer == 39:
+            ctx.enqueue_function[moe_down_q6k_rows[TOPK, E_FFN, type_of(pf_rh_layout), type_of(pf_idx_layout), type_of(pf_idx_layout), type_of(xp_layout)]](
+                RoutedH, (b.tier.pf_stage.unsafe_ptr().unsafe_offset(2 * up_offset) if b.tier.active else b.wbuf.unsafe_ptr().unsafe_offset(b.off[routed_base + 2])), Idx, Wt, Routed, Int32(H), grid_dim=(ceildiv(H, MOE_WAVES), m), block_dim=MOE_THREADS)
+        else:
+            ctx.enqueue_function[moe_down_q4k_rows[TOPK, E_FFN, type_of(pf_rh_layout), type_of(pf_idx_layout), type_of(pf_idx_layout), type_of(xp_layout)]](
+                RoutedH, (b.tier.pf_stage.unsafe_ptr().unsafe_offset(2 * up_offset) if b.tier.active else b.wbuf.unsafe_ptr().unsafe_offset(b.off[routed_base + 2])), Idx, Wt, Routed, Int32(H), grid_dim=(ceildiv(H, MOE_WAVES), m), block_dim=MOE_THREADS)
+        var shared_gate = b.off[extra_base + 1]
+        ctx.enqueue_function[moe_shared_gate_up_q8_0_rows[SH_FFN, type_of(xp_layout), type_of(pf_sh_layout)]](
+            CurBp, b.wbuf.unsafe_ptr().unsafe_offset(shared_gate), SharedH, Int32(H), Int32((H // 32) * 34), Int32(b.off[extra_base + 2] - shared_gate),
+            grid_dim=(ceildiv(SH_FFN, MOE_WAVES), m), block_dim=MOE_THREADS)
+        ctx.enqueue_function[moe_shared_down_q8_0_res_rows[SH_FFN, type_of(pf_sh_layout), type_of(pf_sig_layout), type_of(xp_layout), type_of(xp_layout)]](
+            SharedH, b.wbuf.unsafe_ptr().unsafe_offset(b.off[extra_base + 3]), Sig, Routed, Xp, Int32(H), Int32((SH_FFN // 32) * 34),
+            grid_dim=(ceildiv(H, MOE_WAVES), m), block_dim=MOE_THREADS)
+        w += nw + 9
+    if prof:
+        ctx.synchronize()
+        print("moe prefill chunk: rows", m, " pos", pos, " s", Float64(Int(perf_counter_ns() - t0)) / 1e9)
+
+
 def moe_ffn(ctx: DeviceContext, mut b: WindowBufs, Xm: TileTensor[f32, type_of(xm_layout), MutAnyOrigin], CurBm: TileTensor[bf16, type_of(xm_layout), MutAnyOrigin], w: Int, layer: Int, routed_base: Int, extra_base: Int, trace_slot: Int = -1, xrow: Int = 0) raises:
     var Xres = row_f32(ctx, b.x_d, xrow * H, H, moe_vec_layout)
     var X = row_f32(ctx, b.p_h_d, 0, H, moe_vec_layout)
@@ -873,9 +1041,12 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
     var SStateAll = TileTensor(b.sstate_d, ssall_layout)
     if st.pos < cfg.pf_rows:
         var mc = min(cfg.pf_chunk, cfg.pf_rows - st.pos)
-        prefill_forward(ctx, b.wbuf, b.off, cfg.pack_q4, mc, st.pos, st.ring, cfg.prof, b.toks_d, b.convstate_d, b.sstate_d, b.kc_d, b.vc_d, b.kvtab_d,
-            b.xp_d, b.curbp_d, b.qkvp_d, b.zp_d, b.arp_d, b.brp_d, b.egp_d, b.betap_d, b.convp_d, b.sop_d, b.resbp_d, b.qfp_d,
-            b.qp_d, b.gatep_d, b.kp_d, b.vp_d, b.aop_d, b.gp_d, b.up_d, b.fgbp_d, st.pfx)
+        comptime if IS_MOE:
+            moe_prefill_forward(ctx, b, mc, st.pos, st.ring, cfg.prof)
+        else:
+            prefill_forward(ctx, b.wbuf, b.off, cfg.pack_q4, mc, st.pos, st.ring, cfg.prof, b.toks_d, b.convstate_d, b.sstate_d, b.kc_d, b.vc_d, b.kvtab_d,
+                b.xp_d, b.curbp_d, b.qkvp_d, b.zp_d, b.arp_d, b.brp_d, b.egp_d, b.betap_d, b.convp_d, b.sop_d, b.resbp_d, b.qfp_d,
+                b.qp_d, b.gatep_d, b.kp_d, b.vp_d, b.aop_d, b.gp_d, b.up_d, b.fgbp_d, st.pfx)
         st.ring = (st.ring + mc) % SLOTS
         st.pos_prev = st.pos
         st.pos += mc
@@ -883,11 +1054,14 @@ def step_window(ctx: DeviceContext, mut b: WindowBufs, cfg: WindowCfg, mut st: W
             if cfg.prof:
                 var other = st.pfx[3] - st.pfx[0] - st.pfx[1] - st.pfx[2]
                 print("prefill split s: attn", Float64(st.pfx[0]) / 1e9, " ssm_scan", Float64(st.pfx[1]) / 1e9, " gemm", Float64(st.pfx[2]) / 1e9, " other", Float64(other) / 1e9, " total", Float64(st.pfx[3]) / 1e9)
-            var Xtail = row_f32(ctx, b.xp_d, (mc - cfg.pf_tail) * H, MROWS * H, xm_layout)
-            ctx.enqueue_function[rms_m](
-                Xtail, tens_f32(ctx, b.wbuf, b.off[1 + N_SSM * 10 + N_ATT * 7 + N_LAYERS * 4], H, h_layout),
-                TileTensor(b.hn_d, xm_layout), Int32(H), Float32(1e-6), grid_dim=cfg.pf_tail, block_dim=256,
-            )
+            # The tail's normed rows feed the draft head, which the MoE
+            # profile does not have; its weight index is the dense pack's.
+            comptime if not IS_MOE:
+                var Xtail = row_f32(ctx, b.xp_d, (mc - cfg.pf_tail) * H, MROWS * H, xm_layout)
+                ctx.enqueue_function[rms_m](
+                    Xtail, tens_f32(ctx, b.wbuf, b.off[1 + N_SSM * 10 + N_ATT * 7 + N_LAYERS * 4], H, h_layout),
+                    TileTensor(b.hn_d, xm_layout), Int32(H), Float32(1e-6), grid_dim=cfg.pf_tail, block_dim=256,
+                )
             st.pos_prev = st.pos - cfg.pf_tail
     else:
         var m = 1

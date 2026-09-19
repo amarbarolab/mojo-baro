@@ -561,13 +561,19 @@ def main() raises:
     var pf_chunk = min(atol(getenv("BARO_PREFILL_C", String(CP))), CP)
     if pf_chunk < PF_MIN:
         pf_chunk = PF_MIN
-    # The MoE profile has no m>1 MoE prefill yet (W5); replay its prompt rows
-    # through the verified m=1 path. Dense profiles retain batched prefill.
-    # Scoped on IS_MOE, not MEGA_ALLOWED: the two coincide today only because
-    # qwen35moe is the single profile with the mega kernel off, so gating on
-    # MEGA_ALLOWED would silently disable batched prefill for the first dense
-    # profile that turns the mega kernel off for its own reasons.
-    var pf_on = not IS_MOE and getenv("BARO_PREFILL", "1") == "1"
+    # The MoE profile's batched prefill (bench/moe-prefill-protocol.md) is
+    # opt-in until its gates pass: BARO_PREFILL=1 turns it on, the default
+    # replays the prompt rows through the verified m=1 path. Dense profiles
+    # default on. Scoped on IS_MOE, not MEGA_ALLOWED: the two coincide today
+    # only because qwen35moe is the single profile with the mega kernel off.
+    # A tier without the pinned store cannot stage a layer per chunk, and an
+    # expert trace wants every prompt row's ids, so both fall back to replay.
+    var pf_on = getenv("BARO_PREFILL", "0" if IS_MOE else "1") == "1"
+    if IS_MOE and pf_on and getenv("BARO_TIER", "") != "" and getenv("BARO_TIER_PINNED", "1") != "1":
+        pf_on = False
+    if IS_MOE and pf_on and getenv("BARO_EXPERTS", "") != "":
+        pf_on = False
+    print("BARO_PREFILL:", pf_on, " chunk", pf_chunk)
     # Default ON since 2026-09-12: draft decode measured 1.1042x on the frozen
     # 20-prompt median. Every BARO_FORCE caller pins BARO_SPEC=0 explicitly
     # (force-ab.sh, force-ab-serve.sh, dense-run.sh, ornith-run.sh,

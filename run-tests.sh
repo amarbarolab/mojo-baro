@@ -9,6 +9,10 @@ cmake --build "$S" -j"$(nproc)" >/dev/null
   -Xlinker -L"$S" -Xlinker -lamarbaro_shim -Xlinker -rpath -Xlinker "$S"
 ./.work/test_gemm
 
+# MOEPF: row-batched MoE kernels bit-exact against their m=1 siblings
+./.venv/bin/mojo build kernels/test_moe_rows.mojo -o .work/test_moe_rows -I kernels
+./.work/test_moe_rows
+
 # M1a prefix checkpoints: byte-exact restore against the real engine path
 # (needs the q4 pack at BARO_PACK, default .work/engine-pack-q4).
 ./.venv/bin/mojo build kernels/test_prefix.mojo -o .work/test_prefix -I . -I kernels -I serve

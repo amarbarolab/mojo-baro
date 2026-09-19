@@ -149,6 +149,54 @@ def amar_rmsnorm_cast2[
         i += EW_THREADS
 
 
+def amar_rmsnorm_cast2_rows[
+    XLayout: TensorLayout, GLayout: TensorLayout, OLayout: TensorLayout,
+    FLayout: TensorLayout
+](
+    X: TileTensor[f32, XLayout, MutAnyOrigin],
+    G: TileTensor[f32, GLayout, MutAnyOrigin],
+    O: TileTensor[DType.bfloat16, OLayout, MutAnyOrigin],
+    F: TileTensor[f32, FLayout, MutAnyOrigin],
+    n: Int32,
+    eps: Float32,
+):
+    comptime assert X.flat_rank == 2 and G.flat_rank == 1 and O.flat_rank == 2 and F.flat_rank == 2
+
+    var N = Int(n)
+    var row = block_idx.x
+    var tid = thread_idx.x
+
+    var partial: Float32 = 0
+    var i = tid
+    while i < N:
+        var v = rebind[Scalar[f32]](X[row, i])
+        partial += v * v
+        i += EW_THREADS
+
+    var sums = stack_allocation[
+        f32, address_space = AddressSpace.SHARED
+    ](row_major[EW_THREADS // WARP_SIZE]())
+    var wsum = warp.sum(partial)
+    if lane_id() == 0:
+        sums[tid // WARP_SIZE] = rebind[sums.ElementType](wsum)
+    barrier()
+    var total: Float32 = 0
+    comptime for w in range(EW_THREADS // WARP_SIZE):
+        total += rebind[Scalar[f32]](sums[w])
+
+    var scale = rsqrt(total / Float32(N) + eps)
+    i = tid
+    while i < N:
+        var h = (
+            rebind[Scalar[f32]](X[row, i])
+            * scale
+            * rebind[Scalar[f32]](G[i])
+        ).cast[DType.bfloat16]()
+        O[row, i] = rebind[O.ElementType](h)
+        F[row, i] = rebind[F.ElementType](h.cast[f32]())
+        i += EW_THREADS
+
+
 def amar_swiglu[
     GLayout: TensorLayout, ULayout: TensorLayout, OLayout: TensorLayout
 ](
