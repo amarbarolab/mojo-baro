@@ -402,8 +402,8 @@ different piece:
    reusable "verify-window expert union" metric the way this repo's own
    in-flight `bench/expert-overlap` trace does.** EcoSpec is the closest
    (same underlying quantity, "expert scattering" vs. this repo's union
-   size), independently arrived at in the same window (EcoSpec: 14 Jul 2026;
-   this repo's trace commit: aa356c2, same week per git log) rather than
+   size), independently arrived at (EcoSpec: 14 Jul 2026, two months before
+   this repo's trace commit aa356c2 of 2026-09-19) rather than
    built on each other; worth reading EcoSpec's cost model against the
    local measurement before the next MoE speculation round.
 3. **No oversight mechanism (Tuned Lens, Patchscopes, or otherwise) has been
